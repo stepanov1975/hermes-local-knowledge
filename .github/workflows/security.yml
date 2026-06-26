@@ -93,6 +93,7 @@ jobs:
               data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
               project = data.get("project", {})
               present = present or bool(project.get("dependencies"))
+              present = present or bool(project.get("optional-dependencies"))
           print(f"present={str(present).lower()}")
           PY
 
@@ -105,6 +106,7 @@ jobs:
               pip-audit --progress-spinner off -r "${requirements_file}"
             done
           else
+            python -m pip install -e '.[test]'
             pip-audit --progress-spinner off
           fi
 

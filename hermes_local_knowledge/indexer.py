@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -324,14 +325,71 @@ def should_skip_path(path: Path) -> bool:
     return any(part in EXCLUDED_DIR_NAMES for part in path.parts)
 
 
-def iter_files_followlinks(root: Path, filename: str | None = None, suffixes: set[str] | None = None) -> Iterable[Path]:
+def path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def is_within_allowed_roots(path: Path, allowed_roots: Sequence[Path]) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    return any(path_is_relative_to(resolved, allowed_root) for allowed_root in allowed_roots)
+
+
+def stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return (stat_result.st_dev, stat_result.st_ino)
+
+
+def iter_files_followlinks(
+    root: Path,
+    filename: str | None = None,
+    suffixes: set[str] | None = None,
+    *,
+    allowed_roots: Sequence[Path] | None = None,
+) -> Iterable[Path]:
     if not root.exists():
         return
+    allowed = tuple((allowed_roots or (root,)))
+    resolved_allowed_roots = tuple(path.expanduser().resolve() for path in allowed if path.exists())
+    seen_dirs: set[tuple[int, int]] = set()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        dirnames[:] = sorted(name for name in dirnames if name not in EXCLUDED_DIR_NAMES)
+        current_dir = Path(dirpath)
+        if not is_within_allowed_roots(current_dir, resolved_allowed_roots):
+            dirnames[:] = []
+            continue
+        current_key = stat_key(current_dir)
+        if current_key is None or current_key in seen_dirs:
+            dirnames[:] = []
+            continue
+        seen_dirs.add(current_key)
+
+        kept_dirnames: list[str] = []
+        for dirname in sorted(dirnames):
+            if dirname in EXCLUDED_DIR_NAMES:
+                continue
+            child = current_dir / dirname
+            if not is_within_allowed_roots(child, resolved_allowed_roots):
+                continue
+            child_key = stat_key(child)
+            if child_key is None or child_key in seen_dirs:
+                continue
+            kept_dirnames.append(dirname)
+        dirnames[:] = kept_dirnames
+
         for file_name in sorted(filenames):
             path = Path(dirpath) / file_name
             if should_skip_path(path):
+                continue
+            if not is_within_allowed_roots(path, resolved_allowed_roots):
                 continue
             if filename is not None and file_name != filename:
                 continue
@@ -344,11 +402,11 @@ def scan_skills(root: Path, hermes_home: Path, settings: IndexSettings | None = 
     settings = settings or IndexSettings()
     artifacts: dict[str, Artifact] = {}
     sources = [
-        *((root / rel, "custom_skill_source") for rel in settings.custom_skill_dirs),
-        (hermes_home / "skills", "runtime_skill"),
+        *((root / rel, "custom_skill_source", (root,)) for rel in settings.custom_skill_dirs),
+        (hermes_home / "skills", "runtime_skill", (root, hermes_home)),
     ]
-    for skill_root, source in sources:
-        for skill_md in iter_files_followlinks(skill_root, filename="SKILL.md") or []:
+    for skill_root, source, allowed_roots in sources:
+        for skill_md in iter_files_followlinks(skill_root, filename="SKILL.md", allowed_roots=allowed_roots) or []:
             text = safe_read_text(skill_md)
             fm = parse_frontmatter(text)
             name = str(fm.get("name") or skill_md.parent.name).strip()
@@ -409,7 +467,7 @@ def scan_scripts(root: Path, settings: IndexSettings | None = None) -> list[Arti
     artifacts: list[Artifact] = []
     script_roots = [root / rel for rel in settings.script_dirs]
     for script_root in script_roots:
-        for path in iter_files_followlinks(script_root, suffixes=SCRIPT_SUFFIXES) or []:
+        for path in iter_files_followlinks(script_root, suffixes=SCRIPT_SUFFIXES, allowed_roots=(root,)) or []:
             text = safe_read_text(path, max_chars=50_000)
             rel = path.relative_to(root)
             title = rel.as_posix()
@@ -558,34 +616,40 @@ def load_yaml_if_available(path: Path) -> Any:
         return None
 
 
-def parse_mcp_servers_fallback(text: str) -> dict[str, dict[str, Any]]:
-    servers: dict[str, dict[str, Any]] = {}
-    in_mcp = False
+def parse_mcp_servers_fallback(text: str) -> dict[str, tuple[dict[str, Any], str]]:
+    servers: dict[str, tuple[dict[str, Any], str]] = {}
+    section: str | None = None
     in_servers = False
     current: str | None = None
+    current_path = "mcp.servers"
     for raw_line in text.splitlines():
-        if re.match(r"^\S", raw_line):
-            in_mcp = raw_line.startswith("mcp:")
-            in_servers = False
+        top_level = re.match(r"^([A-Za-z0-9_-]+):\s*$", raw_line)
+        if top_level:
+            section = top_level.group(1)
+            in_servers = section == "mcp_servers"
+            current_path = "mcp_servers" if in_servers else "mcp.servers"
             current = None
             continue
-        if not in_mcp:
+        if section not in {"mcp", "mcp_servers"}:
             continue
-        if re.match(r"^\s+servers:\s*$", raw_line):
+        if section == "mcp" and re.match(r"^\s+servers:\s*$", raw_line):
             in_servers = True
+            current_path = "mcp.servers"
             current = None
             continue
         if not in_servers:
             continue
-        server_match = re.match(r"^\s{4}([A-Za-z0-9_-]+):\s*$", raw_line)
+        server_indent = 2 if section == "mcp_servers" else 4
+        value_indent = server_indent + 2
+        server_match = re.match(rf"^\s{{{server_indent}}}([A-Za-z0-9_-]+):\s*$", raw_line)
         if server_match:
             server_name = server_match.group(1)
             current = server_name
-            servers[server_name] = {}
+            servers[server_name] = ({}, current_path)
             continue
-        value_match = re.match(r"^\s{6}([A-Za-z0-9_-]+):\s*(.+)$", raw_line)
+        value_match = re.match(rf"^\s{{{value_indent}}}([A-Za-z0-9_-]+):\s*(.+)$", raw_line)
         if current and value_match:
-            servers[current][value_match.group(1)] = value_match.group(2).strip().strip("'\"")
+            servers[current][0][value_match.group(1)] = value_match.group(2).strip().strip("'\"")
     return servers
 
 
@@ -596,18 +660,21 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
     if not text:
         return []
     config = load_yaml_if_available(config_path)
-    servers: dict[str, Any] = {}
+    servers: dict[str, tuple[Any, str]] = {}
     if isinstance(config, dict):
         mcp = config.get("mcp")
         if isinstance(mcp, dict):
             maybe_servers = mcp.get("servers")
             if isinstance(maybe_servers, dict):
-                servers = maybe_servers
+                servers.update((str(name), (data, "mcp.servers")) for name, data in maybe_servers.items())
+        native_servers = config.get("mcp_servers")
+        if isinstance(native_servers, dict):
+            servers.update((str(name), (data, "mcp_servers")) for name, data in native_servers.items())
     if not servers:
         servers = parse_mcp_servers_fallback(text)
 
     artifacts: list[Artifact] = []
-    for name, data in sorted(servers.items()):
+    for name, (data, config_path_key) in sorted(servers.items()):
         if not isinstance(data, dict):
             data = {}
         command = str(data.get("command") or "")
@@ -627,7 +694,7 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
                 id=artifact_id,
                 type="mcp_server",
                 title=name,
-                path=f"{display_path(config_path)}#mcp.servers.{name}",
+                path=f"{display_path(config_path)}#{config_path_key}.{name}",
                 summary=summary[:700],
                 triggers=triggers,
                 entities=entities,
@@ -724,19 +791,29 @@ def dedupe_edges(edges: Iterable[Edge]) -> list[Edge]:
 
 def write_jsonl(path: Path, artifacts: Sequence[Artifact]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for artifact in artifacts:
-            row = asdict(artifact)
-            row.pop("search_text", None)
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    temp_file = tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False)
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            for artifact in artifacts:
+                row = asdict(artifact)
+                row.pop("search_text", None)
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def build_sqlite(path: Path, artifacts: Sequence[Artifact], edges: Sequence[Edge]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path.unlink()
-    conn = sqlite3.connect(str(path))
+    temp_file = tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False)
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+    conn: sqlite3.Connection | None = None
     try:
+        conn = sqlite3.connect(str(temp_path))
         conn.execute("PRAGMA journal_mode=OFF")
         conn.execute("PRAGMA synchronous=OFF")
         conn.execute(
@@ -827,8 +904,14 @@ def build_sqlite(path: Path, artifacts: Sequence[Artifact], edges: Sequence[Edge
             [(edge.source, edge.target, edge.kind, edge.evidence) for edge in edges],
         )
         conn.commit()
-    finally:
         conn.close()
+        os.replace(temp_path, path)
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        finally:
+            temp_path.unlink(missing_ok=True)
 
 
 def build_index(

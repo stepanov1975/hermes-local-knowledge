@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from hermes_local_knowledge import indexer as lci
 
@@ -212,6 +216,75 @@ def test_configured_markdown_dirs_support_knowledge_and_nested_paths(tmp_path: P
     assert by_id["memory_doc:knowledge-memory"].type == "memory_doc"
     assert by_id["runbook:docs-runbooks-ops"].type == "runbook"
     assert by_id["skill_support_doc:nested-skills-demo-guide"].type == "skill_support_doc"
+
+
+def test_followlink_scanner_prunes_cycles_and_external_targets(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks are not supported on this platform")
+    root = tmp_path / "repo"
+    external = tmp_path / "external"
+    write(root / "scripts" / "inside.py", '"""Inside root."""\n')
+    write(external / "secret.py", '"""Outside root."""\n')
+    os.symlink(root / "scripts", root / "scripts" / "loop")
+    os.symlink(external, root / "scripts" / "external")
+
+    paths = list(lci.iter_files_followlinks(root / "scripts", suffixes={".py"}, allowed_roots=(root,)))
+    rel_paths = {path.relative_to(root).as_posix() for path in paths}
+
+    assert rel_paths == {"scripts/inside.py"}
+
+
+def test_build_sqlite_preserves_existing_db_when_rebuild_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    lci.build_index(root, output_dir, hermes_home)
+    db_path = output_dir / "index.sqlite"
+    before = db_path.read_bytes()
+
+    def fail_connect(_path: str) -> sqlite3.Connection:
+        raise RuntimeError("simulated sqlite failure")
+
+    monkeypatch.setattr(lci.sqlite3, "connect", fail_connect)
+
+    with pytest.raises(RuntimeError, match="simulated sqlite failure"):
+        lci.build_sqlite(db_path, [], [])
+
+    assert db_path.read_bytes() == before
+
+
+def test_scan_mcp_servers_supports_native_top_level_config(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  siyuan:
+    command: /tmp/siyuan-mcp/run.sh
+""",
+    )
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:siyuan"]
+    assert artifacts[0].path.endswith("#mcp_servers.siyuan")
+
+
+def test_scan_mcp_servers_fallback_supports_native_top_level_config(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  github:
+    command: uvx
+""",
+    )
+    monkeypatch.setattr(lci, "load_yaml_if_available", lambda _path: None)
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:github"]
+    assert artifacts[0].path.endswith("#mcp_servers.github")
 
 
 def test_cli_build_default_output_dir_uses_hermes_home_not_source_root(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]

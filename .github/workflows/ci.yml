@@ -35,7 +35,9 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
+          python -m pip install hermes-agent
           python -m pip install -e '.[test]'
+          hermes --version
 
       - name: Run tests
         run: python -m pytest -q

@@ -37,6 +37,8 @@ hermes plugins install "file://$(pwd)" --enable
 hermes gateway restart
 ```
 
+This is a Hermes **directory plugin**. `pip install` makes the Python package importable for CLI/library use, but it does not install or enable the Hermes plugin because the plugin metadata lives at the repository root for `hermes plugins install`.
+
 ## Configuration
 
 Put non-secret settings in `~/.hermes/config.yaml`:
@@ -100,7 +102,7 @@ Indexed artifact types:
 | `runbook` | `<source_root>/docs/**`, `<source_root>/main_docker_server/**`, `app_*.md` |
 | `skill_support_doc` | Markdown support docs under configured custom skill dirs |
 | `cron_job` | `$HERMES_HOME/cron/jobs.json` |
-| `mcp_server` | `$HERMES_HOME/config.yaml` `mcp.servers` entries |
+| `mcp_server` | `$HERMES_HOME/config.yaml` `mcp_servers` entries, plus legacy `mcp.servers` entries |
 
 ## Generated state
 
@@ -143,6 +145,12 @@ python -m hermes_local_knowledge.indexer search 'paperless review' \
 ```bash
 python -m pip install -e '.[test]'
 python -m pytest
+```
+
+The full test suite includes a Hermes plugin install smoke test. Install Hermes Agent first if `hermes` is not already on `PATH`:
+
+```bash
+python -m pip install hermes-agent
 ```
 
 The tests verify:

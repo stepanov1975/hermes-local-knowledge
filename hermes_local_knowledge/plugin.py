@@ -389,6 +389,45 @@ def _json_list(values: list[str] | None) -> str:
     return json.dumps(values or [], ensure_ascii=False)
 
 
+USAGE_EVENT_COLUMNS: dict[str, str] = {
+    "session_id": "TEXT",
+    "task_id": "TEXT",
+    "tool_call_id": "TEXT",
+    "query": "TEXT",
+    "artifact_id": "TEXT",
+    "artifact_type": "TEXT",
+    "limit_value": "INTEGER",
+    "rebuild_requested": "INTEGER NOT NULL DEFAULT 0",
+    "rebuilt": "INTEGER",
+    "success": "INTEGER NOT NULL DEFAULT 1",
+    "error": "TEXT",
+    "result_count": "INTEGER",
+    "top_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+    "top_types_json": "TEXT NOT NULL DEFAULT '[]'",
+    "latency_ms": "INTEGER",
+    "root": "TEXT",
+    "db_path": "TEXT",
+}
+
+FEEDBACK_COLUMNS: dict[str, str] = {
+    "event_id": "INTEGER",
+    "query": "TEXT",
+    "artifact_id": "TEXT",
+    "note": "TEXT",
+    "session_id": "TEXT",
+    "task_id": "TEXT",
+    "tool_call_id": "TEXT",
+    "root": "TEXT",
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
 def _usage_context(kwargs: dict[str, Any]) -> dict[str, str]:
     return {
         "session_id": _clean_text(kwargs.get("session_id"), limit=128),
@@ -441,6 +480,8 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_columns(conn, "usage_events", USAGE_EVENT_COLUMNS)
+    _ensure_columns(conn, "feedback", FEEDBACK_COLUMNS)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_tool ON usage_events(tool)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_query ON usage_events(query)")

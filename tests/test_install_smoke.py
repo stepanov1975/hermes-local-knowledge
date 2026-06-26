@@ -38,6 +38,8 @@ def run_command(command: list[str], *, env: dict[str, str], cwd: Path | None = N
 
 def test_hermes_plugin_install_register_and_search_smoke(tmp_path: Path) -> None:
     if shutil.which("hermes") is None:
+        if os.environ.get("CI"):
+            pytest.fail("hermes CLI is required for CI plugin install smoke")
         pytest.skip("hermes CLI is not available")
 
     hermes_home = tmp_path / "hermes_home"

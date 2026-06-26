@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 from hermes_local_knowledge import plugin
@@ -187,3 +188,39 @@ def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):
     assert any(row["rating"] == "wrong_artifact" for row in report["recent_negative_feedback"])
     assert any(item["type"] == "zero_result_query" for item in report["improvement_candidates"])
     assert any(item["type"] == "feedback_wrong_artifact" for item in report["improvement_candidates"])
+
+
+def test_usage_db_migrates_preserved_legacy_schema(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True)
+    conn = sqlite3.connect(state_dir / "usage.sqlite")
+    try:
+        conn.execute(
+            "CREATE TABLE usage_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, tool TEXT NOT NULL, query TEXT)"
+        )
+        conn.execute("CREATE TABLE feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, rating TEXT NOT NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    search = json.loads(plugin._handle_search({"query": "paperless review automation", "limit": 3, "rebuild": True}))
+    assert search["success"] is True
+    assert isinstance(search["usage_event_id"], int)
+
+    feedback = json.loads(plugin._handle_feedback({"event_id": search["usage_event_id"], "rating": "useful"}))
+    assert feedback["success"] is True
+    assert isinstance(feedback["feedback_id"], int)
+
+    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+    assert report["success"] is True
+    assert report["total_events"] >= 2
+
+    conn = sqlite3.connect(state_dir / "usage.sqlite")
+    try:
+        usage_columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_events)")}
+        feedback_columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
+    finally:
+        conn.close()
+    assert {"success", "latency_ms", "db_path", "top_ids_json"} <= usage_columns
+    assert {"event_id", "artifact_id", "session_id", "root"} <= feedback_columns
