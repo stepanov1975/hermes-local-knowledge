@@ -194,6 +194,38 @@ tags: [AcmeCloud]
     assert "runbook:runbooks-acme" in by_id
 
 
+def test_configured_markdown_dirs_support_knowledge_and_nested_paths(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    write(root / "knowledge" / "memory.md", "# Knowledge memory\n\nReusable local facts.\n")
+    write(root / "docs" / "runbooks" / "ops.md", "# Ops runbook\n\nOperational docs.\n")
+    write(root / "nested" / "skills" / "demo" / "guide.md", "# Skill support guide\n\nSupport doc.\n")
+    settings = lci.IndexSettings(
+        custom_skill_dirs=("nested/skills",),
+        script_dirs=("bin",),
+        memory_dirs=("knowledge",),
+        runbook_dirs=("docs/runbooks",),
+    )
+
+    artifacts = lci.scan_markdown_docs(root, settings)
+
+    by_id = {artifact.id: artifact for artifact in artifacts}
+    assert by_id["memory_doc:knowledge-memory"].type == "memory_doc"
+    assert by_id["runbook:docs-runbooks-ops"].type == "runbook"
+    assert by_id["skill_support_doc:nested-skills-demo-guide"].type == "skill_support_doc"
+
+
+def test_cli_build_default_output_dir_uses_hermes_home_not_source_root(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    default_state_dir = hermes_home / "local_knowledge"
+
+    assert lci.main(["build", "--root", str(root), "--hermes-home", str(hermes_home)]) == 0
+    build_out = capsys.readouterr().out
+
+    assert str(default_state_dir / "index.sqlite") in build_out
+    assert (default_state_dir / "index.sqlite").exists()
+    assert (default_state_dir / "index.jsonl").exists()
+    assert not (root / "knowledge" / "index.sqlite").exists()
+
 def test_cli_build_and_search_json(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"

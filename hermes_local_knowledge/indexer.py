@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 DEFAULT_ROOT = Path.cwd()
-DEFAULT_OUTPUT_DIR = DEFAULT_ROOT / "knowledge"
+DEFAULT_STATE_DIR_NAME = "local_knowledge"
 
 SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".cjs", ".mjs", ".js"}
 EXCLUDED_DIR_NAMES = {
@@ -162,6 +162,12 @@ def hermes_home_from_env() -> Path:
     return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
 
 
+def default_output_dir(hermes_home: Path | None = None) -> Path:
+    """Default generated state directory outside the indexed source tree."""
+    base = hermes_home.expanduser() if hermes_home is not None else hermes_home_from_env()
+    return base / DEFAULT_STATE_DIR_NAME
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "artifact"
@@ -190,6 +196,21 @@ def display_path(path: Path, *, root: Path | None = None) -> str:
         return "~/" + expanded.resolve().relative_to(Path.home()).as_posix()
     except ValueError:
         return expanded.as_posix()
+
+
+def relative_config_parts(value: str) -> tuple[str, ...]:
+    """Return normalized relative path parts from a scanner config entry."""
+    return tuple(part for part in Path(str(value)).parts if part not in ("", "."))
+
+
+def relpath_matches_config_dir(rel: Path, configured_dirs: Sequence[str]) -> bool:
+    """True when a relative path is inside one configured source directory."""
+    rel_parts = rel.parts
+    for configured in configured_dirs:
+        parts = relative_config_parts(configured)
+        if parts and rel_parts[: len(parts)] == parts:
+            return True
+    return False
 
 
 def safe_read_text(path: Path, *, max_chars: int = 200_000) -> str:
@@ -415,12 +436,11 @@ def scan_scripts(root: Path, settings: IndexSettings | None = None) -> list[Arti
 def doc_type_for_path(root: Path, path: Path, settings: IndexSettings | None = None) -> str:
     settings = settings or IndexSettings()
     rel = path.relative_to(root)
-    first = rel.parts[0] if rel.parts else ""
-    if first in settings.memory_dirs:
+    if relpath_matches_config_dir(rel, settings.memory_dirs):
         return "memory_doc"
-    if first in settings.runbook_dirs or rel.name.startswith("app_"):
+    if relpath_matches_config_dir(rel, settings.runbook_dirs) or rel.name.startswith("app_"):
         return "runbook"
-    if any(part in settings.custom_skill_dirs for part in rel.parts):
+    if relpath_matches_config_dir(rel, settings.custom_skill_dirs):
         return "skill_support_doc"
     return "doc"
 
@@ -433,8 +453,6 @@ def scan_markdown_docs(root: Path, settings: IndexSettings | None = None) -> lis
             continue
         rel = path.relative_to(root)
         if rel.name == "SKILL.md":
-            continue
-        if rel.parts[0] == "knowledge" and rel.name != "README.md":
             continue
         text = safe_read_text(path)
         summary = first_heading_or_paragraph(text) or f"Markdown document {rel.as_posix()}"
@@ -1023,7 +1041,7 @@ def print_results(rows: Sequence[dict[str, Any]]) -> None:
 
 
 def add_common_db_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--db", type=Path, default=DEFAULT_OUTPUT_DIR / "index.sqlite", help="SQLite index path")
+    parser.add_argument("--db", type=Path, default=default_output_dir() / "index.sqlite", help="SQLite index path")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1033,7 +1051,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     build_parser = subparsers.add_parser("build", help="build index.sqlite and index.jsonl")
     build_parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="source directory to index")
     build_parser.add_argument("--hermes-home", type=Path, default=hermes_home_from_env(), help="Hermes home directory")
-    build_parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="output directory")
+    build_parser.add_argument("--output-dir", type=Path, default=None, help="output directory (default: <hermes-home>/local_knowledge)")
 
     search_parser = subparsers.add_parser("search", help="search artifacts")
     search_parser.add_argument("query", help="search query")
@@ -1056,15 +1074,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "build":
-        artifacts, edges = build_index(args.root, args.output_dir, args.hermes_home)
+        output_dir = args.output_dir if args.output_dir is not None else default_output_dir(args.hermes_home)
+        artifacts, edges = build_index(args.root, output_dir, args.hermes_home)
         counts: dict[str, int] = {}
         for artifact in artifacts:
             counts[artifact.type] = counts.get(artifact.type, 0) + 1
         print(f"Built {len(artifacts)} artifacts and {len(edges)} edges")
         for artifact_type, count in sorted(counts.items()):
             print(f"  {artifact_type}: {count}")
-        print(f"SQLite: {args.output_dir / 'index.sqlite'}")
-        print(f"JSONL:  {args.output_dir / 'index.jsonl'}")
+        print(f"SQLite: {output_dir / 'index.sqlite'}")
+        print(f"JSONL:  {output_dir / 'index.jsonl'}")
         return 0
 
     if args.command == "search":

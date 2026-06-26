@@ -10,9 +10,11 @@ Recommended config in `~/.hermes/config.yaml`:
 
 ```yaml
 local_knowledge:
-  source_root: ~/repos/hermes-customizations   # directory to index
-  state_dir: ~/.hermes/local_knowledge         # generated sqlite/jsonl/usage state
+  source_root: ~/repos/<your-local-docs-or-customizations>  # directory to index
+  state_dir: ~/.hermes/local_knowledge                      # generated sqlite/jsonl/usage state
 ```
+
+You can omit `source_root` to index only this Hermes profile's runtime artifacts under `$HERMES_HOME`.
 
 Restart the gateway or start a new Hermes session for the tools to appear.
 

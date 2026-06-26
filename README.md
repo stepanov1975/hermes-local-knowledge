@@ -28,7 +28,8 @@ hermes gateway restart
 For local development:
 
 ```bash
-hermes plugins install file:///home/alex/repos/hermes-local-knowledge --enable
+cd /path/to/hermes-local-knowledge
+hermes plugins install "file://$(pwd)" --enable
 hermes gateway restart
 ```
 
@@ -38,7 +39,7 @@ Put non-secret settings in `~/.hermes/config.yaml`:
 
 ```yaml
 local_knowledge:
-  source_root: ~/repos/hermes-customizations
+  source_root: ~/repos/<your-local-docs-or-customizations>
   state_dir: ~/.hermes/local_knowledge
 ```
 
@@ -68,11 +69,11 @@ Use that shape on Alex's main instance if you want to preserve existing `usage.s
 
 ## Configurable source layout
 
-Defaults match Alex's Hermes customization repo but are configurable:
+The scanner defaults match the original Hermes customization layout, but all source directories are configurable:
 
 ```yaml
 local_knowledge:
-  source_root: ~/repos/hermes-customizations
+  source_root: ~/repos/<your-local-docs-or-customizations>
   state_dir: ~/.hermes/local_knowledge
   custom_skill_dirs: [custom_skills]
   script_dirs: [scripts, hermes_home/scripts]
@@ -124,7 +125,7 @@ You can build/query without loading Hermes:
 
 ```bash
 python -m hermes_local_knowledge.indexer build \
-  --root ~/repos/hermes-customizations \
+  --root ~/repos/<your-local-docs-or-customizations> \
   --hermes-home ~/.hermes \
   --output-dir ~/.hermes/local_knowledge
 
