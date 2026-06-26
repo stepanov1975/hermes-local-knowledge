@@ -77,7 +77,15 @@ def _tuple_value(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
     if value in (None, ""):
         return default
     if isinstance(value, str):
-        return tuple(item.strip() for item in value.split(",") if item.strip()) or default
+        text = value.strip()
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        items = tuple(
+            item.strip().strip("'\"")
+            for item in text.split(",")
+            if item.strip().strip("'\"")
+        )
+        return items or default
     if isinstance(value, (list, tuple)):
         items = tuple(str(item).strip() for item in value if str(item).strip())
         return items or default
@@ -97,9 +105,15 @@ def _runtime_config() -> RuntimeConfig:
     ).resolve()
 
     defaults = IndexSettings()
-    known_entities = _tuple_value(_config_value("known_entities", "entities"), defaults.known_entities)
+    known_entities = _tuple_value(
+        _config_value("known_entities", "entities"),
+        defaults.known_entities,
+    )
     settings = IndexSettings(
-        custom_skill_dirs=_tuple_value(_config_value("custom_skill_dirs"), defaults.custom_skill_dirs),
+        custom_skill_dirs=_tuple_value(
+            _config_value("custom_skill_dirs"),
+            defaults.custom_skill_dirs,
+        ),
         script_dirs=_tuple_value(_config_value("script_dirs"), defaults.script_dirs),
         memory_dirs=_tuple_value(_config_value("memory_dirs"), defaults.memory_dirs),
         runbook_dirs=_tuple_value(_config_value("runbook_dirs"), defaults.runbook_dirs),

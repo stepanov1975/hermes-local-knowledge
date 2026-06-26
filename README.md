@@ -26,6 +26,25 @@ From a git repo:
 
 ```bash
 hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --enable
+```
+
+For private GitHub repositories, prefer the SSH form above. HTTPS clones may
+fail in non-interactive Hermes sessions if GitHub credentials are not already
+available to `git`.
+
+Configure the source tree to index:
+
+```bash
+hermes config set local_knowledge.source_root "$HOME/repos/your-local-docs-or-customizations"
+hermes config set local_knowledge.state_dir "$HOME/.hermes/local_knowledge"
+hermes config set local_knowledge.custom_skill_dirs skills
+hermes config set local_knowledge.include_markdown_docs true
+```
+
+Then restart the gateway from outside the running gateway process, or send
+`/restart` from a gateway chat such as Telegram:
+
+```bash
 hermes gateway restart
 ```
 

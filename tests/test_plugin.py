@@ -193,8 +193,9 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
         f"""local_knowledge:
   source_root: {repo}
   state_dir: {state_dir}
-  known_entities:
-    - Paperless
+  custom_skill_dirs: '[custom_skills]'
+  script_dirs: '[scripts]'
+  known_entities: '[Paperless]'
 """,
     )
 
@@ -202,8 +203,29 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
 
     assert cfg.source_root == repo.resolve()
     assert cfg.state_dir == state_dir.resolve()
+    assert cfg.index_settings.custom_skill_dirs == ("custom_skills",)
+    assert cfg.index_settings.script_dirs == ("scripts",)
     assert cfg.index_settings.known_entities == ("Paperless",)
     assert cfg.index_settings.include_markdown_docs is True
+
+
+def test_tuple_value_accepts_common_cli_list_strings():
+    default = ("default",)
+
+    assert plugin._tuple_value("skills", default) == ("skills",)
+    assert plugin._tuple_value("skills, custom_skills", default) == (
+        "skills",
+        "custom_skills",
+    )
+    assert plugin._tuple_value("[skills]", default) == ("skills",)
+    assert plugin._tuple_value("['skills', 'custom_skills']", default) == (
+        "skills",
+        "custom_skills",
+    )
+    assert plugin._tuple_value('["skills", "custom_skills"]', default) == (
+        "skills",
+        "custom_skills",
+    )
 
 
 def test_implicit_hermes_home_source_skips_root_markdown(tmp_path, monkeypatch):
