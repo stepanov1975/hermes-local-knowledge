@@ -82,6 +82,29 @@ def test_register_exposes_native_tools():
     assert all(call["check_fn"] is plugin.check_knowledge_available for call in calls)
 
 
+def test_plugin_handlers_honor_compatibility_module_monkeypatches(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[str] = []
+    fake_root = Path("/tmp/fake-local-knowledge-root")
+
+    def fake_repo_root() -> Path:
+        calls.append("repo_root")
+        return fake_root
+
+    def fake_ensure_index(root: Path, *, rebuild: bool = False):  # type: ignore[no-untyped-def]
+        calls.append(f"ensure:{root}:{rebuild}")
+        raise RuntimeError("sentinel wrapper patch used")
+
+    monkeypatch.setattr(plugin, "_repo_root", fake_repo_root)
+    monkeypatch.setattr(plugin, "_ensure_index", fake_ensure_index)
+    monkeypatch.setattr(plugin, "_record_usage", lambda *args, **kwargs: None)
+
+    payload = json.loads(plugin._handle_search({"query": "demo", "rebuild": True}))
+
+    assert calls == ["repo_root", f"ensure:{fake_root}:True"]
+    assert payload["success"] is False
+    assert "sentinel wrapper patch used" in payload["error"]
+
+
 def test_search_get_and_neighbors_build_missing_index_in_state_dir(tmp_path, monkeypatch):
     repo, hermes_home, state_dir = make_temp_repo(tmp_path)
     configure_env(monkeypatch, repo, hermes_home, state_dir)

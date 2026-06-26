@@ -179,6 +179,37 @@ def test_indexer_build_index_honors_compatibility_monkeypatches(tmp_path: Path, 
     assert (tmp_path / "state" / "index.sqlite").exists()
 
 
+def test_indexer_main_honors_compatibility_build_index_monkeypatch(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    calls: list[tuple[Path, Path, Path]] = []
+
+    def fake_build(root: Path, output_dir: Path, hermes_home: Path, settings=None):  # type: ignore[no-untyped-def]
+        calls.append((root, output_dir, hermes_home))
+        return [], []
+
+    monkeypatch.setattr(lci, "build_index", fake_build)
+
+    rc = lci.main(
+        [
+            "build",
+            "--root",
+            str(tmp_path / "root"),
+            "--hermes-home",
+            str(tmp_path / "hermes_home"),
+            "--output-dir",
+            str(tmp_path / "state"),
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [(tmp_path / "root", tmp_path / "state", tmp_path / "hermes_home")]
+    assert "Built 0 artifacts and 0 edges" in capsys.readouterr().out
+
+
+def test_default_known_entities_are_portable() -> None:
+    assert set(lci.DEFAULT_KNOWN_ENTITIES) == {"Hermes", "GitHub", "MCP", "Cron"}
+    assert len(lci.DEFAULT_KNOWN_ENTITIES) == len(set(lci.DEFAULT_KNOWN_ENTITIES))
+
+
 def test_get_artifact_decodes_json_fields(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"

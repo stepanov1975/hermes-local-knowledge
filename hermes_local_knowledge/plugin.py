@@ -1,8 +1,9 @@
 """Hermes plugin exposing a local capability index as native tools."""
 from __future__ import annotations
 
+from . import handlers as _handlers
 from . import indexer
-from .handlers import _handle_feedback, _handle_get, _handle_neighbors, _handle_search, _handle_usage_report
+from .handlers import HandlerDeps
 from .runtime import (
     RuntimeConfig,
     _coerce_bool,
@@ -51,6 +52,44 @@ from .telemetry import (
     _utc_now,
 )
 from .tooling import tool_error, tool_result
+
+
+def _handler_deps() -> HandlerDeps:
+    """Resolve handler dependencies from this compatibility module's globals."""
+    return HandlerDeps(
+        coerce_bool=_coerce_bool,
+        coerce_int=_coerce_int,
+        ensure_index=_ensure_index,
+        index_module=_index_module,
+        record_feedback=_record_feedback,
+        record_usage=_record_usage,
+        repo_root=_repo_root,
+        tool_error=tool_error,
+        tool_result=tool_result,
+        usage_context=_usage_context,
+        usage_db_path=_usage_db_path,
+        usage_report=_usage_report,
+    )
+
+
+def _handle_search(args, **kwargs) -> str:
+    return _handlers._handle_search(args, deps=_handler_deps(), **kwargs)
+
+
+def _handle_get(args, **kwargs) -> str:
+    return _handlers._handle_get(args, deps=_handler_deps(), **kwargs)
+
+
+def _handle_neighbors(args, **kwargs) -> str:
+    return _handlers._handle_neighbors(args, deps=_handler_deps(), **kwargs)
+
+
+def _handle_feedback(args, **kwargs) -> str:
+    return _handlers._handle_feedback(args, deps=_handler_deps(), **kwargs)
+
+
+def _handle_usage_report(args, **kwargs) -> str:
+    return _handlers._handle_usage_report(args, deps=_handler_deps(), **kwargs)
 
 
 def register(ctx) -> None:

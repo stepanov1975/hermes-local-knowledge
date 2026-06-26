@@ -1,6 +1,7 @@
 """Constants for the local knowledge indexer."""
 from __future__ import annotations
 
+import getpass
 from pathlib import Path
 
 DEFAULT_ROOT = Path.cwd()
@@ -18,35 +19,23 @@ EXCLUDED_DIR_NAMES = {
     "venv",
     ".venv",
 }
-DEFAULT_KNOWN_ENTITIES = [
-    "Hermes",
-    "Paperless",
-    "SiYuan",
-    "Docker",
-    "Hindsight",
-    "Home Assistant",
-    "Pangolin",
-    "Jellyfin",
-    "Vikunja",
-    "Firefly",
-    "LinkAce",
-    "Heimdall",
-    "Wazuh",
-    "n8n",
-    "Evolution",
-    "GitHub",
-    "Telegram",
-    "MCP",
-    "Cron",
-    "Hadera",
-]
+DEFAULT_KNOWN_ENTITIES = ["Hermes", "GitHub", "MCP", "Cron"]
+
+def _runtime_stopwords() -> set[str]:
+    try:
+        username = getpass.getuser().strip().lower()
+    except Exception:
+        return set()
+    if len(username) < 3:
+        return set()
+    return {username}
+
 STOPWORDS = {
     "about",
     "after",
     "again",
     "against",
     "agent",
-    "alex",
     "and",
     "are",
     "before",
@@ -85,7 +74,7 @@ STOPWORDS = {
     "using",
     "when",
     "with",
-}
+} | _runtime_stopwords()
 
 QUERY_STOPWORDS = {
     "find",

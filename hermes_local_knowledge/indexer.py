@@ -19,7 +19,7 @@ if __package__ in (None, ""):  # pragma: no cover - direct script execution comp
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "hermes_local_knowledge"
 
-from .cli import add_common_db_arg, main, parse_args, print_results
+from .cli import add_common_db_arg, main as _cli_main, parse_args, print_results
 from .constants import (
     DEFAULT_KNOWN_ENTITIES,
     DEFAULT_ROOT,
@@ -109,6 +109,16 @@ def build_index(
     write_jsonl(output_dir / "index.jsonl", artifacts)
     build_sqlite(output_dir / "index.sqlite", artifacts, edges)
     return artifacts, edges
+
+def main(argv=None) -> int:
+    """Run the CLI through this compatibility module's function seams."""
+    return _cli_main(
+        argv,
+        build_index_fn=build_index,
+        search_index_fn=search_index,
+        get_artifact_fn=get_artifact,
+        get_neighbors_fn=get_neighbors,
+    )
 
 __all__ = [
     "Artifact",

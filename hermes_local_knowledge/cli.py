@@ -53,11 +53,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_common_db_arg(neighbors_parser)
     return parser.parse_args(argv)
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    build_index_fn=build_index,
+    search_index_fn=search_index,
+    get_artifact_fn=get_artifact,
+    get_neighbors_fn=get_neighbors,
+) -> int:
     args = parse_args(argv)
     if args.command == "build":
         output_dir = args.output_dir if args.output_dir is not None else default_output_dir(args.hermes_home)
-        artifacts, edges = build_index(args.root, output_dir, args.hermes_home)
+        artifacts, edges = build_index_fn(args.root, output_dir, args.hermes_home)
         counts: dict[str, int] = {}
         for artifact in artifacts:
             counts[artifact.type] = counts.get(artifact.type, 0) + 1
@@ -69,7 +76,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "search":
-        rows = search_index(args.db, args.query, limit=args.limit)
+        rows = search_index_fn(args.db, args.query, limit=args.limit)
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
         else:
@@ -77,7 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "get":
-        row = get_artifact(args.db, args.artifact_id)
+        row = get_artifact_fn(args.db, args.artifact_id)
         if row is None:
             print(f"Artifact not found: {args.artifact_id}", file=sys.stderr)
             return 1
@@ -88,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "neighbors":
-        rows = get_neighbors(args.db, args.artifact_id)
+        rows = get_neighbors_fn(args.db, args.artifact_id)
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
         else:

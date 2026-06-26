@@ -61,17 +61,11 @@ Environment variables are supported for development and tests:
 
 If no `source_root` is configured, the plugin defaults to `HERMES_HOME`, which still lets it index runtime skills, cron, and MCP config. For a useful router, point it at a repo or directory containing your local docs/scripts/skills.
 
-## Preserving Alex's current history
+## Preserving existing history
 
-Alex's original deployment stores generated index and feedback under the customization repo:
-
-```yaml
-local_knowledge:
-  source_root: ~/repos/hermes-customizations
-  state_dir: ~/repos/hermes-customizations/knowledge
-```
-
-Use that shape on Alex's main instance if you want to preserve existing `usage.sqlite` history while moving the plugin code into this standalone repo. New instances should usually use `~/.hermes/local_knowledge` for `state_dir`.
+If you are replacing an older deployment, point `state_dir` at the directory
+that already contains `usage.sqlite` before restarting Hermes. New instances
+should usually use `~/.hermes/local_knowledge` for `state_dir`.
 
 ## Configurable source layout
 
