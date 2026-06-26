@@ -257,7 +257,8 @@ def _load_hermes_config() -> dict[str, Any]:
         config = load_config()
         return config if isinstance(config, dict) else {}
     except Exception:
-        return {}
+        config = indexer.load_yaml_if_available(_get_hermes_home() / "config.yaml")
+        return config if isinstance(config, dict) else {}
 
 
 def _section_config() -> dict[str, Any]:

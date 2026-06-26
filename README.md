@@ -1,5 +1,9 @@
 # Hermes Local Knowledge
 
+[![CI](https://github.com/stepanov1975/hermes-local-knowledge/actions/workflows/ci.yml/badge.svg)](https://github.com/stepanov1975/hermes-local-knowledge/actions/workflows/ci.yml)
+[![Security scans](https://github.com/stepanov1975/hermes-local-knowledge/actions/workflows/security.yml/badge.svg)](https://github.com/stepanov1975/hermes-local-knowledge/actions/workflows/security.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Reusable Hermes Agent plugin for routing local questions to the right local artifact: skills, scripts, runbooks, cron jobs, MCP servers, and supporting docs.
 
 The router indexes **whole artifacts**, not arbitrary RAG chunks. Its job is to answer: *which local artifact should the agent inspect first?*
@@ -21,7 +25,7 @@ Native Hermes tools under the `local_knowledge` toolset:
 From a git repo:
 
 ```bash
-hermes plugins install owner/hermes-local-knowledge --enable
+hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --enable
 hermes gateway restart
 ```
 
@@ -137,6 +141,7 @@ python -m hermes_local_knowledge.indexer search 'paperless review' \
 ## Development
 
 ```bash
+python -m pip install -e '.[test]'
 python -m pytest
 ```
 
@@ -148,3 +153,15 @@ The tests verify:
 - native Hermes plugin registration handlers;
 - feedback/usage-report closed loop;
 - config/env resolution.
+
+## Repository hygiene and security
+
+This repo includes baseline GitHub hygiene for a private reusable plugin:
+
+- `LICENSE` with MIT terms;
+- CI on Python 3.11 and 3.12;
+- Dependabot config for GitHub Actions and Python packaging metadata;
+- security scans for Gitleaks, actionlint, Semgrep, zizmor, ShellCheck, and gated pip-audit;
+- issue/PR templates and CODEOWNERS.
+
+See [`SECURITY.md`](SECURITY.md) and [`docs/github-security.md`](docs/github-security.md) for reporting, local validation, and manual GitHub settings.

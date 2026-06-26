@@ -1,0 +1,14 @@
+title = "hermes-local-knowledge gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented placeholder values that are intentionally non-secret"
+regexes = [
+  '''(?i)^your-local-docs-or-customizations$''',
+  '''(?i)^your-token$''',
+  '''(?i)^your-api-key$''',
+  '''(?i)^example-token$''',
+  '''(?i)^dummy-token$''',
+]
