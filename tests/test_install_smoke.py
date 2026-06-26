@@ -103,11 +103,47 @@ tags: [demo, reusable]
         textwrap.dedent(
             """
             import importlib.abc
+            import importlib.metadata
             import json
             import os
             import sys
             from hermes_cli.plugins import PluginManager
             from tools.registry import registry
+
+            def _without_packaged_local_knowledge_entrypoint(entry_points):
+                rows = [
+                    ep for ep in entry_points
+                    if not (ep.group == "hermes_agent.plugins" and ep.name == "local_knowledge")
+                ]
+                try:
+                    return importlib.metadata.EntryPoints(rows)
+                except Exception:
+                    class FilteredEntryPoints(list):
+                        def select(self, **params):
+                            group = params.get("group")
+                            name = params.get("name")
+                            return FilteredEntryPoints([
+                                ep for ep in self
+                                if (group is None or ep.group == group) and (name is None or ep.name == name)
+                            ])
+                    return FilteredEntryPoints(rows)
+
+            # This smoke validates Hermes directory-plugin install/loading. The
+            # test environment may also have this repo installed editable for
+            # test dependencies, which creates the same-named pip entry point.
+            # Hermes Agent 0.17 loads entry points after user plugins, so filter
+            # that package entry point here or the test asserts the wrong path.
+            _entry_points = importlib.metadata.entry_points
+            def _entry_points_without_packaged_plugin(*args, **kwargs):
+                eps = _entry_points(*args, **kwargs)
+                if isinstance(eps, dict):
+                    return {
+                        group: _without_packaged_local_knowledge_entrypoint(group_eps)
+                        if group == "hermes_agent.plugins" else group_eps
+                        for group, group_eps in eps.items()
+                    }
+                return _without_packaged_local_knowledge_entrypoint(eps)
+            importlib.metadata.entry_points = _entry_points_without_packaged_plugin
 
             class BlockAmbientLocalKnowledge(importlib.abc.MetaPathFinder):
                 def find_spec(self, fullname, path=None, target=None):
