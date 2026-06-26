@@ -139,9 +139,7 @@ def doc_type_for_path(root: Path, path: Path, settings: IndexSettings | None = N
 def scan_markdown_docs(root: Path, settings: IndexSettings | None = None) -> list[Artifact]:
     settings = settings or IndexSettings()
     artifacts: list[Artifact] = []
-    for path in sorted(root.rglob("*.md")):
-        if should_skip_path(path):
-            continue
+    for path in iter_files_followlinks(root, suffixes={".md"}, allowed_roots=(root,), followlinks=False) or []:
         rel = path.relative_to(root)
         if rel.name == "SKILL.md":
             continue

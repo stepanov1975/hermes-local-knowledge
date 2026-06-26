@@ -156,6 +156,29 @@ def test_build_index_writes_searchable_artifacts_and_edges(tmp_path: Path) -> No
     assert any(edge.source == "cron:paperless-reviewer" and edge.target == "skill:paperless-review-automation" for edge in edges)
 
 
+def test_indexer_build_index_honors_compatibility_monkeypatches(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[str] = []
+
+    def fake_collect(root: Path, hermes_home: Path, settings: lci.IndexSettings | None = None) -> list[lci.Artifact]:
+        calls.append(f"collect:{root.name}:{hermes_home.name}:{settings is None}")
+        return []
+
+    def fake_edges(artifacts: list[lci.Artifact]) -> list[lci.Edge]:
+        calls.append(f"edges:{len(artifacts)}")
+        return []
+
+    monkeypatch.setattr(lci, "collect_artifacts", fake_collect)
+    monkeypatch.setattr(lci, "build_edges", fake_edges)
+
+    artifacts, edges = lci.build_index(tmp_path / "root", tmp_path / "state", tmp_path / "hermes_home")
+
+    assert artifacts == []
+    assert edges == []
+    assert calls == ["collect:root:hermes_home:True", "edges:0"]
+    assert (tmp_path / "state" / "index.jsonl").exists()
+    assert (tmp_path / "state" / "index.sqlite").exists()
+
+
 def test_get_artifact_decodes_json_fields(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"
@@ -234,6 +257,27 @@ def test_followlink_scanner_prunes_cycles_and_external_targets(tmp_path: Path) -
     rel_paths = {path.relative_to(root).as_posix() for path in paths}
 
     assert rel_paths == {"scripts/inside.py"}
+
+
+def test_markdown_scanner_prunes_cycles_and_external_targets(tmp_path: Path) -> None:
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks are not supported on this platform")
+    root = tmp_path / "repo"
+    external = tmp_path / "external"
+    write(root / "docs" / "inside.md", "# Inside\n\nVisible runbook.\n")
+    write(root / "a" / "placeholder.txt", "placeholder\n")
+    write(root / ".git" / "secret.md", "# Git Secret\n\nExcluded even through symlinks.\n")
+    write(external / "secret.md", "# Secret\n\nOutside root.\n")
+    os.symlink(root / "docs", root / "docs" / "loop")
+    os.symlink(root / "docs", root / "docs-alias")
+    os.symlink(root / "docs", root / "a" / "docs-link")
+    os.symlink(root / ".git", root / "visible-git")
+    os.symlink(external, root / "docs" / "external")
+    os.symlink(external / "secret.md", root / "docs" / "linked-secret.md")
+
+    artifacts = lci.scan_markdown_docs(root)
+
+    assert [artifact.id for artifact in artifacts] == ["runbook:docs-inside"]
 
 
 def test_build_sqlite_preserves_existing_db_when_rebuild_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

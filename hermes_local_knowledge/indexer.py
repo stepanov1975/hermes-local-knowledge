@@ -11,14 +11,16 @@ implementation lives in focused submodules.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 if __package__ in (None, ""):  # pragma: no cover - direct script execution compatibility
     import sys as _sys
-    from pathlib import Path as _Path
 
-    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "hermes_local_knowledge"
 
-from hermes_local_knowledge.cli import add_common_db_arg, main, parse_args, print_results
-from hermes_local_knowledge.constants import (
+from .cli import add_common_db_arg, main, parse_args, print_results
+from .constants import (
     DEFAULT_KNOWN_ENTITIES,
     DEFAULT_ROOT,
     DEFAULT_STATE_DIR_NAME,
@@ -27,8 +29,8 @@ from hermes_local_knowledge.constants import (
     SCRIPT_SUFFIXES,
     STOPWORDS,
 )
-from hermes_local_knowledge.models import Artifact, Edge, IndexSettings
-from hermes_local_knowledge.paths import (
+from .models import Artifact, Edge, IndexSettings
+from .paths import (
     default_output_dir,
     display_path,
     hermes_home_from_env,
@@ -39,7 +41,7 @@ from hermes_local_knowledge.paths import (
     should_skip_path,
     stat_key,
 )
-from hermes_local_knowledge.scanners import (
+from .scanners import (
     build_edges,
     collect_artifacts,
     dedupe_edges,
@@ -56,9 +58,8 @@ from hermes_local_knowledge.scanners import (
     script_summary,
     skill_support_file_names,
 )
-from hermes_local_knowledge.search import search_index
-from hermes_local_knowledge.storage import (
-    build_index,
+from .search import search_index
+from .storage import (
     build_sqlite,
     connect_readonly,
     decode_artifact_row,
@@ -66,7 +67,7 @@ from hermes_local_knowledge.storage import (
     get_neighbors,
     write_jsonl,
 )
-from hermes_local_knowledge.text_utils import (
+from .text_utils import (
     extract_entities,
     extract_paths,
     first_heading_or_paragraph,
@@ -87,6 +88,27 @@ from hermes_local_knowledge.text_utils import (
     type_priority,
     unique_preserve_order,
 )
+
+
+def build_index(
+    root: Path,
+    output_dir: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None = None,
+) -> tuple[list[Artifact], list[Edge]]:
+    """Build an index through the compatibility-module function seams.
+
+    The implementation modules own normal runtime behavior, but this public
+    wrapper intentionally calls names re-exported from this module so existing
+    tests/tools that monkeypatch ``indexer.collect_artifacts`` or
+    ``indexer.build_edges`` keep working after the module split.
+    """
+    artifacts = collect_artifacts(root, hermes_home, settings)
+    edges = build_edges(artifacts)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(output_dir / "index.jsonl", artifacts)
+    build_sqlite(output_dir / "index.sqlite", artifacts, edges)
+    return artifacts, edges
 
 __all__ = [
     "Artifact",

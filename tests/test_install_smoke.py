@@ -63,11 +63,36 @@ tags: [demo, reusable]
             "HERMES_HOME": str(hermes_home),
             "LOCAL_KNOWLEDGE_ROOT": str(source_root),
             "LOCAL_KNOWLEDGE_STATE_DIR": str(state_dir),
+            "EXPECTED_PLUGIN_ROOT": str((hermes_home / "plugins" / "local_knowledge").resolve()),
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
+    env.pop("PYTHONPATH", None)
 
-    run_command(["hermes", "plugins", "install", f"file://{REPO_ROOT}", "--enable"], env=env)
+    plugin_source = tmp_path / "plugin_source"
+    shutil.copytree(
+        REPO_ROOT,
+        plugin_source,
+        ignore=shutil.ignore_patterns(".git", ".pytest_cache", "__pycache__", "*.pyc", "*.egg-info"),
+    )
+    run_command(["git", "init", "-q"], env=env, cwd=plugin_source)
+    run_command(["git", "add", "."], env=env, cwd=plugin_source)
+    run_command(
+        [
+            "git",
+            "-c",
+            "user.name=Hermes Test",
+            "-c",
+            "user.email=hermes-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "test plugin source",
+        ],
+        env=env,
+        cwd=plugin_source,
+    )
+    run_command(["hermes", "plugins", "install", f"file://{plugin_source}", "--enable"], env=env)
     listing = run_command(["hermes", "plugins", "list", "--user", "--json"], env=env)
     plugins = json.loads(listing.stdout)
     assert any(item["name"] == "local_knowledge" and item["status"] == "enabled" for item in plugins)
@@ -77,12 +102,34 @@ tags: [demo, reusable]
         smoke_script,
         textwrap.dedent(
             """
+            import importlib.abc
             import json
+            import os
+            import sys
             from hermes_cli.plugins import PluginManager
             from tools.registry import registry
 
+            class BlockAmbientLocalKnowledge(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "hermes_local_knowledge" or fullname.startswith("hermes_local_knowledge."):
+                        raise ModuleNotFoundError(f"ambient top-level import blocked: {fullname}")
+                    return None
+
+            for name in list(sys.modules):
+                if name == "hermes_local_knowledge" or name.startswith("hermes_local_knowledge."):
+                    del sys.modules[name]
+            sys.meta_path.insert(0, BlockAmbientLocalKnowledge())
+
             manager = PluginManager()
             manager.discover_and_load(force=True)
+            module_files = {
+                name: getattr(module, "__file__", "")
+                for name, module in sys.modules.items()
+                if name.startswith("hermes_plugins.") and ".hermes_local_knowledge" in name
+            }
+            expected_root = os.environ["EXPECTED_PLUGIN_ROOT"]
+            assert module_files, "local_knowledge implementation modules were not loaded"
+            assert all(path and os.path.realpath(path).startswith(expected_root) for path in module_files.values()), module_files
             entry = registry.get_entry("knowledge_search")
             assert entry is not None, "knowledge_search was not registered"
             payload = json.loads(entry.handler({"query": "demo reusable", "rebuild": True}, session_id="pytest-smoke"))
@@ -94,12 +141,13 @@ tags: [demo, reusable]
                 "ids": [row["id"] for row in payload["results"]],
                 "root": payload["root"],
                 "state_dir": payload["state_dir"],
+                "module_files": module_files,
             }, sort_keys=True))
             """
         ).strip()
         + "\n",
     )
-    result = run_command([sys.executable, str(smoke_script)], env=env)
+    result = run_command([sys.executable, str(smoke_script)], env=env, cwd=tmp_path)
     payload = json.loads(result.stdout)
 
     assert payload["tool"] == "knowledge_search"

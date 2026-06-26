@@ -48,6 +48,20 @@ def is_within_allowed_roots(path: Path, allowed_roots: Sequence[Path]) -> bool:
         return False
     return any(path_is_relative_to(resolved, allowed_root) for allowed_root in allowed_roots)
 
+def has_excluded_part_within_allowed_roots(path: Path, allowed_roots: Sequence[Path]) -> bool:
+    """Return whether a resolved path crosses an excluded name under an allowed root."""
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return True
+    for allowed_root in allowed_roots:
+        try:
+            rel = resolved.relative_to(allowed_root)
+        except ValueError:
+            continue
+        return should_skip_path(rel)
+    return True
+
 def stat_key(path: Path) -> tuple[int, int] | None:
     try:
         stat_result = path.stat()
@@ -61,15 +75,19 @@ def iter_files_followlinks(
     suffixes: set[str] | None = None,
     *,
     allowed_roots: Sequence[Path] | None = None,
+    followlinks: bool = True,
 ) -> Iterable[Path]:
     if not root.exists():
         return
     allowed = tuple((allowed_roots or (root,)))
     resolved_allowed_roots = tuple(path.expanduser().resolve() for path in allowed if path.exists())
     seen_dirs: set[tuple[int, int]] = set()
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=followlinks):
         current_dir = Path(dirpath)
         if not is_within_allowed_roots(current_dir, resolved_allowed_roots):
+            dirnames[:] = []
+            continue
+        if has_excluded_part_within_allowed_roots(current_dir, resolved_allowed_roots):
             dirnames[:] = []
             continue
         current_key = stat_key(current_dir)
@@ -79,15 +97,19 @@ def iter_files_followlinks(
         seen_dirs.add(current_key)
 
         kept_dirnames: list[str] = []
-        for dirname in sorted(dirnames):
+        pending_dir_keys: set[tuple[int, int]] = set()
+        for dirname in sorted(dirnames, key=lambda name: ((current_dir / name).is_symlink(), name)):
             if dirname in EXCLUDED_DIR_NAMES:
                 continue
             child = current_dir / dirname
             if not is_within_allowed_roots(child, resolved_allowed_roots):
                 continue
-            child_key = stat_key(child)
-            if child_key is None or child_key in seen_dirs:
+            if has_excluded_part_within_allowed_roots(child, resolved_allowed_roots):
                 continue
+            child_key = stat_key(child)
+            if child_key is None or child_key in seen_dirs or child_key in pending_dir_keys:
+                continue
+            pending_dir_keys.add(child_key)
             kept_dirnames.append(dirname)
         dirnames[:] = kept_dirnames
 
@@ -96,6 +118,8 @@ def iter_files_followlinks(
             if should_skip_path(path):
                 continue
             if not is_within_allowed_roots(path, resolved_allowed_roots):
+                continue
+            if has_excluded_part_within_allowed_roots(path, resolved_allowed_roots):
                 continue
             if filename is not None and file_name != filename:
                 continue
