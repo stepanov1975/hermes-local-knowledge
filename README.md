@@ -1,0 +1,149 @@
+# Hermes Local Knowledge
+
+Reusable Hermes Agent plugin for routing local questions to the right local artifact: skills, scripts, runbooks, cron jobs, MCP servers, and supporting docs.
+
+The router indexes **whole artifacts**, not arbitrary RAG chunks. Its job is to answer: *which local artifact should the agent inspect first?*
+
+## What it provides
+
+Native Hermes tools under the `local_knowledge` toolset:
+
+| Tool | Purpose |
+| --- | --- |
+| `knowledge_search` | Search indexed local artifacts and auto-build the index if missing. |
+| `knowledge_get` | Fetch one artifact by id. |
+| `knowledge_neighbors` | Traverse conservative graph edges for one artifact. |
+| `knowledge_feedback` | Record lookup quality feedback locally. |
+| `knowledge_usage_report` | Summarize usage, zero-result queries, errors, and feedback. |
+
+## Install
+
+From a git repo:
+
+```bash
+hermes plugins install owner/hermes-local-knowledge --enable
+hermes gateway restart
+```
+
+For local development:
+
+```bash
+hermes plugins install file:///home/alex/repos/hermes-local-knowledge --enable
+hermes gateway restart
+```
+
+## Configuration
+
+Put non-secret settings in `~/.hermes/config.yaml`:
+
+```yaml
+local_knowledge:
+  source_root: ~/repos/hermes-customizations
+  state_dir: ~/.hermes/local_knowledge
+```
+
+`source_root` is the directory being indexed. `state_dir` is generated local state and should not be committed.
+
+Environment variables are supported for development and tests:
+
+| Variable | Meaning |
+| --- | --- |
+| `LOCAL_KNOWLEDGE_ROOT` | Overrides `local_knowledge.source_root`. |
+| `LOCAL_KNOWLEDGE_STATE_DIR` | Overrides `local_knowledge.state_dir`. |
+| `HERMES_HOME` | Selects the Hermes profile/runtime home to inspect. |
+
+If no `source_root` is configured, the plugin defaults to `HERMES_HOME`, which still lets it index runtime skills, cron, and MCP config. For a useful router, point it at a repo or directory containing your local docs/scripts/skills.
+
+## Preserving Alex's current history
+
+Alex's original deployment stores generated index and feedback under the customization repo:
+
+```yaml
+local_knowledge:
+  source_root: ~/repos/hermes-customizations
+  state_dir: ~/repos/hermes-customizations/knowledge
+```
+
+Use that shape on Alex's main instance if you want to preserve existing `usage.sqlite` history while moving the plugin code into this standalone repo. New instances should usually use `~/.hermes/local_knowledge` for `state_dir`.
+
+## Configurable source layout
+
+Defaults match Alex's Hermes customization repo but are configurable:
+
+```yaml
+local_knowledge:
+  source_root: ~/repos/hermes-customizations
+  state_dir: ~/.hermes/local_knowledge
+  custom_skill_dirs: [custom_skills]
+  script_dirs: [scripts, hermes_home/scripts]
+  memory_dirs: [memory]
+  runbook_dirs: [docs, main_docker_server]
+  known_entities:
+    - Hermes
+    - Docker
+    - Paperless
+    - Home Assistant
+```
+
+Indexed artifact types:
+
+| Type | Default source |
+| --- | --- |
+| `skill` | `<source_root>/custom_skills/**/SKILL.md` plus runtime `$HERMES_HOME/skills/**/SKILL.md` |
+| `script` | `<source_root>/scripts/**`, `<source_root>/hermes_home/scripts/**` |
+| `memory_doc` | `<source_root>/memory/*.md` |
+| `runbook` | `<source_root>/docs/**`, `<source_root>/main_docker_server/**`, `app_*.md` |
+| `skill_support_doc` | Markdown support docs under configured custom skill dirs |
+| `cron_job` | `$HERMES_HOME/cron/jobs.json` |
+| `mcp_server` | `$HERMES_HOME/config.yaml` `mcp.servers` entries |
+
+## Generated state
+
+The plugin writes:
+
+```text
+<state_dir>/index.sqlite
+<state_dir>/index.jsonl
+<state_dir>/usage.sqlite
+```
+
+These are generated or local-only state. Do not commit them.
+
+## Usage-history-informed behavior
+
+This standalone shape keeps the lessons from the initial deployment:
+
+- hyphenated human queries such as `manifest-backed backup` are split into safe SQLite FTS prefix terms;
+- search ranking prefers exact/title/trigger hits so specific skills such as `paperless-review-automation` outrank generic helpers;
+- Docker/self-hosted update wording is covered by artifact-level runbook search, not just script search;
+- feedback and zero-result telemetry stays local and is summarized by `knowledge_usage_report` before changing ranking or source coverage.
+
+## CLI use
+
+You can build/query without loading Hermes:
+
+```bash
+python -m hermes_local_knowledge.indexer build \
+  --root ~/repos/hermes-customizations \
+  --hermes-home ~/.hermes \
+  --output-dir ~/.hermes/local_knowledge
+
+python -m hermes_local_knowledge.indexer search 'paperless review' \
+  --db ~/.hermes/local_knowledge/index.sqlite \
+  --limit 8
+```
+
+## Development
+
+```bash
+python -m pytest
+```
+
+The tests verify:
+
+- artifact scanning and SQLite/JSONL generation;
+- state directory separation from source directory;
+- configurable layout and entity hints;
+- native Hermes plugin registration handlers;
+- feedback/usage-report closed loop;
+- config/env resolution.

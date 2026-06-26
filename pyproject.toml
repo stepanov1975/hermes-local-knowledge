@@ -1,0 +1,13 @@
+[project]
+name = "hermes-local-knowledge"
+version = "0.2.0"
+description = "Reusable Hermes Agent plugin for local capability indexing"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Hermes Agent" }]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
