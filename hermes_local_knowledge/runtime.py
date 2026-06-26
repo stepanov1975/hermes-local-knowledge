@@ -4,12 +4,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .models import IndexSettings
 from .scanners import load_yaml_if_available
 from .schemas import CONFIG_SECTION, ROOT_ENV, STATE_ENV
 from .storage import build_index
+
+BuildIndexFn = Callable[[Path, Path, Path, IndexSettings], tuple[list[Any], list[Any]]]
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
@@ -84,8 +86,9 @@ def _tuple_value(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
 def _runtime_config() -> RuntimeConfig:
     hermes_home = _path_value(_config_value("hermes_home"), _get_hermes_home()).resolve()
     env_root = os.environ.get(ROOT_ENV)
+    configured_root = env_root or _config_value("source_root", "root")
     source_root = _path_value(
-        env_root or _config_value("source_root", "root"),
+        configured_root,
         hermes_home,
     ).resolve()
     state_dir = _path_value(
@@ -101,6 +104,10 @@ def _runtime_config() -> RuntimeConfig:
         memory_dirs=_tuple_value(_config_value("memory_dirs"), defaults.memory_dirs),
         runbook_dirs=_tuple_value(_config_value("runbook_dirs"), defaults.runbook_dirs),
         known_entities=known_entities,
+        include_markdown_docs=_coerce_bool(
+            _config_value("include_markdown_docs"),
+            default=configured_root not in (None, ""),
+        ),
     )
     return RuntimeConfig(source_root, hermes_home, state_dir, settings)
 
@@ -121,7 +128,12 @@ def _db_path(root: Path) -> Path:
 def _usage_db_path(root: Path) -> Path:
     return _output_dir(root) / "usage.sqlite"
 
-def _ensure_index(root: Path, *, rebuild: bool = False) -> tuple[Path, dict[str, Any]]:
+def _ensure_index(
+    root: Path,
+    *,
+    rebuild: bool = False,
+    build_index_fn: BuildIndexFn | None = None,
+) -> tuple[Path, dict[str, Any]]:
     cfg = _runtime_config()
     db_path = cfg.state_dir / "index.sqlite"
     metadata: dict[str, Any] = {
@@ -131,7 +143,8 @@ def _ensure_index(root: Path, *, rebuild: bool = False) -> tuple[Path, dict[str,
         "rebuilt": False,
     }
     if rebuild or not db_path.exists():
-        artifacts, edges = build_index(
+        build = build_index_fn or build_index
+        artifacts, edges = build(
             cfg.source_root,
             cfg.state_dir,
             cfg.hermes_home,

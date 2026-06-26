@@ -37,7 +37,7 @@ hermes plugins install "file://$(pwd)" --enable
 hermes gateway restart
 ```
 
-This is a Hermes **directory plugin**. `pip install` makes the Python package importable for CLI/library use, but it does not install or enable the Hermes plugin because the plugin metadata lives at the repository root for `hermes plugins install`.
+Directory install with `hermes plugins install` is the recommended path. The package also exposes a `hermes_agent.plugins` entry point for environments that install plugin packages into the same Python environment Hermes uses.
 
 ## Configuration
 
@@ -59,7 +59,7 @@ Environment variables are supported for development and tests:
 | `LOCAL_KNOWLEDGE_STATE_DIR` | Overrides `local_knowledge.state_dir`. |
 | `HERMES_HOME` | Selects the Hermes profile/runtime home to inspect. |
 
-If no `source_root` is configured, the plugin defaults to `HERMES_HOME`, which still lets it index runtime skills, cron, and MCP config. For a useful router, point it at a repo or directory containing your local docs/scripts/skills.
+If no `source_root` is configured, the plugin defaults to `HERMES_HOME` and indexes runtime skills, cron, and MCP config, but it does **not** scan arbitrary root-level Markdown notes unless `include_markdown_docs: true` is set explicitly. For a useful router, point `source_root` at a repo or directory containing your local docs/scripts/skills.
 
 ## Preserving existing history
 
@@ -69,7 +69,7 @@ should usually use `~/.hermes/local_knowledge` for `state_dir`.
 
 ## Configurable source layout
 
-The scanner defaults match the original Hermes customization layout, but all source directories are configurable:
+The scanner defaults are intentionally generic, and all source directories are configurable:
 
 ```yaml
 local_knowledge:
@@ -78,12 +78,12 @@ local_knowledge:
   custom_skill_dirs: [custom_skills]
   script_dirs: [scripts, hermes_home/scripts]
   memory_dirs: [memory]
-  runbook_dirs: [docs, main_docker_server]
+  runbook_dirs: [docs]
+  include_markdown_docs: true
   known_entities:
     - Hermes
-    - Docker
-    - Paperless
-    - Home Assistant
+    - AcmeCloud
+    - InternalAPI
 ```
 
 Indexed artifact types:
@@ -93,7 +93,7 @@ Indexed artifact types:
 | `skill` | `<source_root>/custom_skills/**/SKILL.md` plus runtime `$HERMES_HOME/skills/**/SKILL.md` |
 | `script` | `<source_root>/scripts/**`, `<source_root>/hermes_home/scripts/**` |
 | `memory_doc` | `<source_root>/memory/*.md` |
-| `runbook` | `<source_root>/docs/**`, `<source_root>/main_docker_server/**`, `app_*.md` |
+| `runbook` | `<source_root>/docs/**`, plus `app_*.md` files under the source root |
 | `skill_support_doc` | Markdown support docs under configured custom skill dirs |
 | `cron_job` | `$HERMES_HOME/cron/jobs.json` |
 | `mcp_server` | `$HERMES_HOME/config.yaml` `mcp_servers` entries, plus legacy `mcp.servers` entries |
@@ -115,8 +115,8 @@ These are generated or local-only state. Do not commit them.
 This standalone shape keeps the lessons from the initial deployment:
 
 - hyphenated human queries such as `manifest-backed backup` are split into safe SQLite FTS prefix terms;
-- search ranking prefers exact/title/trigger hits so specific skills such as `paperless-review-automation` outrank generic helpers;
-- Docker/self-hosted update wording is covered by artifact-level runbook search, not just script search;
+- search ranking prefers exact/title/trigger hits so specific skills outrank generic helpers;
+- operations/update wording is covered by artifact-level runbook search, not just script search;
 - feedback and zero-result telemetry stays local and is summarized by `knowledge_usage_report` before changing ranking or source coverage.
 
 ## CLI use
@@ -129,7 +129,7 @@ python -m hermes_local_knowledge.indexer build \
   --hermes-home ~/.hermes \
   --output-dir ~/.hermes/local_knowledge
 
-python -m hermes_local_knowledge.indexer search 'paperless review' \
+python -m hermes_local_knowledge.indexer search 'backup runbook' \
   --db ~/.hermes/local_knowledge/index.sqlite \
   --limit 8
 ```

@@ -323,7 +323,7 @@ def collect_artifacts(root: Path, hermes_home: Path, settings: IndexSettings | N
     artifacts = [
         *scan_skills(root, hermes_home, settings),
         *scan_scripts(root, settings),
-        *scan_markdown_docs(root, settings),
+        *(scan_markdown_docs(root, settings) if settings.include_markdown_docs else []),
         *scan_cron_jobs(root, hermes_home, settings),
         *scan_mcp_servers(root, hermes_home, settings),
     ]

@@ -1,6 +1,8 @@
 """Hermes plugin exposing a local capability index as native tools."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from . import handlers as _handlers
 from . import indexer
 from .handlers import HandlerDeps
@@ -10,7 +12,7 @@ from .runtime import (
     _coerce_int,
     _config_value,
     _db_path,
-    _ensure_index,
+    _ensure_index as _runtime_ensure_index,
     _get_hermes_home,
     _index_module,
     _load_hermes_config,
@@ -52,6 +54,15 @@ from .telemetry import (
     _utc_now,
 )
 from .tooling import tool_error, tool_result
+
+
+def _ensure_index(root: Path, *, rebuild: bool = False):
+    """Build through this compatibility module's index-module seam."""
+    return _runtime_ensure_index(
+        root,
+        rebuild=rebuild,
+        build_index_fn=_index_module(root).build_index,
+    )
 
 
 def _handler_deps() -> HandlerDeps:

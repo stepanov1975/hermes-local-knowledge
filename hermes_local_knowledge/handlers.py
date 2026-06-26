@@ -44,9 +44,16 @@ def _index_attr(deps: HandlerDeps, root: Path, name: str, fallback):
         return fallback
     return getattr(deps.index_module(root), name, fallback)
 
+def _validate_args(args: Any, deps: HandlerDeps) -> str | None:
+    if isinstance(args, dict):
+        return None
+    return deps.tool_error("args must be an object", success=False)
+
 
 def _handle_search(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
     deps = _handler_deps(deps)
+    if error := _validate_args(args, deps):
+        return error
     started = time.perf_counter()
     context = deps.usage_context(kwargs)
     query = str(args.get("query") or "").strip()
@@ -113,6 +120,8 @@ def _handle_search(args: dict[str, Any], *, deps: HandlerDeps | None = None, **k
 
 def _handle_get(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
     deps = _handler_deps(deps)
+    if error := _validate_args(args, deps):
+        return error
     started = time.perf_counter()
     context = deps.usage_context(kwargs)
     artifact_id = str(args.get("artifact_id") or "").strip()
@@ -188,6 +197,8 @@ def _handle_get(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwar
 
 def _handle_neighbors(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
     deps = _handler_deps(deps)
+    if error := _validate_args(args, deps):
+        return error
     started = time.perf_counter()
     context = deps.usage_context(kwargs)
     artifact_id = str(args.get("artifact_id") or "").strip()
@@ -269,6 +280,8 @@ def _handle_neighbors(args: dict[str, Any], *, deps: HandlerDeps | None = None, 
 
 def _handle_feedback(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
     deps = _handler_deps(deps)
+    if error := _validate_args(args, deps):
+        return error
     started = time.perf_counter()
     context = deps.usage_context(kwargs)
     rating = str(args.get("rating") or "").strip().lower()
@@ -335,6 +348,8 @@ def _handle_feedback(args: dict[str, Any], *, deps: HandlerDeps | None = None, *
 
 def _handle_usage_report(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
     deps = _handler_deps(deps)
+    if error := _validate_args(args, deps):
+        return error
     started = time.perf_counter()
     context = deps.usage_context(kwargs)
     days = deps.coerce_int(args.get("days"), default=14, minimum=1, maximum=365)

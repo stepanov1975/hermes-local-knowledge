@@ -89,6 +89,10 @@ from .text_utils import (
     unique_preserve_order,
 )
 
+REPO_SCRIPT = Path(__file__).resolve()
+KNOWN_ENTITIES = DEFAULT_KNOWN_ENTITIES
+DEFAULT_OUTPUT_DIR = DEFAULT_ROOT / DEFAULT_STATE_DIR_NAME
+
 
 def build_index(
     root: Path,
@@ -122,13 +126,16 @@ def main(argv=None) -> int:
 
 __all__ = [
     "Artifact",
+    "DEFAULT_OUTPUT_DIR",
     "DEFAULT_KNOWN_ENTITIES",
     "DEFAULT_ROOT",
     "DEFAULT_STATE_DIR_NAME",
     "EXCLUDED_DIR_NAMES",
     "Edge",
     "IndexSettings",
+    "KNOWN_ENTITIES",
     "QUERY_STOPWORDS",
+    "REPO_SCRIPT",
     "SCRIPT_SUFFIXES",
     "STOPWORDS",
     "add_common_db_arg",

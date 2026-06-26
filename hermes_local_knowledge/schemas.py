@@ -30,8 +30,8 @@ KNOWLEDGE_SEARCH_SCHEMA: dict[str, Any] = {
     "description": (
         "Search a local capability index to find the right local skill, "
         "script, runbook, cron job, MCP wrapper, or service doc to inspect first. "
-        "Use this before broad file search for Hermes-local, homelab, Paperless, "
-        "Docker, SiYuan/wiki, cron, MCP, or service-operation questions. Builds "
+        "Use this before broad file search for local Hermes customizations, "
+        "service-operation docs, cron jobs, MCP servers, or project runbooks. Builds "
         "the index automatically when missing. Usage is logged locally for "
         "closed-loop router improvement."
     ),
@@ -40,7 +40,7 @@ KNOWLEDGE_SEARCH_SCHEMA: dict[str, Any] = {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Natural-language search query, e.g. 'paperless review' or 'siyuan mcp'.",
+                "description": "Natural-language search query, e.g. 'backup runbook' or 'mcp wrapper'.",
             },
             "limit": {
                 "type": "integer",
@@ -77,7 +77,7 @@ KNOWLEDGE_GET_SCHEMA: dict[str, Any] = {
         "properties": {
             "artifact_id": {
                 "type": "string",
-                "description": "Artifact id such as skill:paperless-review-automation or cron:paperless-reviewer.",
+                "description": "Artifact id such as skill:backup-runbook or cron:daily-review.",
             },
             "include_neighbors": {
                 "type": "boolean",

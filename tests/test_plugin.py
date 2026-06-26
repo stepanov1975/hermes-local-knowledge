@@ -105,6 +105,45 @@ def test_plugin_handlers_honor_compatibility_module_monkeypatches(monkeypatch) -
     assert "sentinel wrapper patch used" in payload["error"]
 
 
+def test_plugin_rebuild_uses_compatibility_index_module(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    calls: list[str] = []
+
+    class FakeIndex:
+        def build_index(self, root: Path, output_dir: Path, home: Path, settings=None):  # type: ignore[no-untyped-def]
+            calls.append(f"build:{root}:{output_dir}:{home}:{settings is not None}")
+            return [], []
+
+        def search_index(self, db_path: Path, query: str, limit: int = 8):  # type: ignore[no-untyped-def]
+            calls.append(f"search:{db_path}:{query}:{limit}")
+            return []
+
+    monkeypatch.setattr(plugin, "_index_module", lambda _root: FakeIndex())
+
+    payload = json.loads(plugin._handle_search({"query": "demo", "rebuild": True}))
+
+    assert payload["success"] is True
+    assert payload["rebuilt"] is True
+    assert calls == [
+        f"build:{repo.resolve()}:{state_dir.resolve()}:{hermes_home.resolve()}:True",
+        f"search:{state_dir.resolve() / 'index.sqlite'}:demo:8",
+    ]
+
+
+def test_handlers_return_json_errors_for_malformed_args() -> None:
+    for handler in (
+        plugin._handle_search,
+        plugin._handle_get,
+        plugin._handle_neighbors,
+        plugin._handle_feedback,
+        plugin._handle_usage_report,
+    ):
+        payload = json.loads(handler(None))
+        assert payload["success"] is False
+        assert payload["error"] == "args must be an object"
+
+
 def test_search_get_and_neighbors_build_missing_index_in_state_dir(tmp_path, monkeypatch):
     repo, hermes_home, state_dir = make_temp_repo(tmp_path)
     configure_env(monkeypatch, repo, hermes_home, state_dir)
@@ -164,6 +203,25 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
     assert cfg.source_root == repo.resolve()
     assert cfg.state_dir == state_dir.resolve()
     assert cfg.index_settings.known_entities == ("Paperless",)
+    assert cfg.index_settings.include_markdown_docs is True
+
+
+def test_implicit_hermes_home_source_skips_root_markdown(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    write(hermes_home / "private_notes.md", "# Private Notes\n\nRoot Markdown should not be indexed implicitly.\n")
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    cfg = plugin._runtime_config()
+    payload = json.loads(plugin._handle_search({"query": "private notes", "rebuild": True}))
+
+    assert cfg.source_root == hermes_home.resolve()
+    assert cfg.index_settings.include_markdown_docs is False
+    assert payload["success"] is True
+    assert payload["results"] == []
+    assert (hermes_home / "local_knowledge" / "index.sqlite").exists()
 
 
 def test_missing_artifact_returns_tool_error(tmp_path, monkeypatch):

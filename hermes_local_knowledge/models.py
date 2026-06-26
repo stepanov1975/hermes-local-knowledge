@@ -38,5 +38,6 @@ class IndexSettings:
     custom_skill_dirs: tuple[str, ...] = ("custom_skills",)
     script_dirs: tuple[str, ...] = ("scripts", "hermes_home/scripts")
     memory_dirs: tuple[str, ...] = ("memory",)
-    runbook_dirs: tuple[str, ...] = ("docs", "main_docker_server")
+    runbook_dirs: tuple[str, ...] = ("docs",)
     known_entities: tuple[str, ...] = tuple(DEFAULT_KNOWN_ENTITIES)
+    include_markdown_docs: bool = True

@@ -67,12 +67,12 @@ metadata:
         "# Paperless review flow\n\nDocuments move through OCR quality guards before metadata updates.\n",
     )
     write(
-        root / "main_docker_server" / "update_progress.md",
-        """# Main Docker Server Update Progress
+        root / "docs" / "update-progress.md",
+        """# Service Update Progress
 
-Purpose: track rolling application-update campaigns across the main Docker host
-and other self-hosted applications with runbooks/update notes, so a new Hermes
-session can resume without re-checking every app from scratch.
+Purpose: track rolling application-update campaigns across services with
+runbooks/update notes, so a new Hermes session can resume without re-checking
+every app from scratch.
 
 For apps that need an app-specific artifact, dry-run the manifest-backed backup
 first before mutating services. Create a verified pre-update backup during the
@@ -120,7 +120,7 @@ def test_build_index_writes_searchable_artifacts_and_edges(tmp_path: Path) -> No
     assert "script:scripts-paperless-review-run-reviewer-py" in artifact_ids
     assert "memory_doc:memory-paperless-memory" in artifact_ids
     assert "runbook:docs-paperless-review-flow" in artifact_ids
-    assert "runbook:main-docker-server-update-progress" in artifact_ids
+    assert "runbook:docs-update-progress" in artifact_ids
     assert "cron:paperless-reviewer" in artifact_ids
     assert "mcp:siyuan" in artifact_ids
     assert output_dir.joinpath("index.sqlite").exists()
@@ -138,10 +138,10 @@ def test_build_index_writes_searchable_artifacts_and_edges(tmp_path: Path) -> No
         "self hosted application updates backup flow update markdown",
         limit=10,
     )
-    assert update_results[0]["id"] == "runbook:main-docker-server-update-progress"
+    assert update_results[0]["id"] == "runbook:docs-update-progress"
 
     manifest_results = lci.search_index(output_dir / "index.sqlite", "manifest-backed backup", limit=10)
-    assert "runbook:main-docker-server-update-progress" in {row["id"] for row in manifest_results}
+    assert "runbook:docs-update-progress" in {row["id"] for row in manifest_results}
 
     siyuan_results = lci.search_index(output_dir / "index.sqlite", "siyuan mcp", limit=10)
     assert {row["id"] for row in siyuan_results} >= {"mcp:siyuan", "script:scripts-siyuan-mcp-run-sh"}
@@ -210,6 +210,10 @@ def test_default_known_entities_are_portable() -> None:
     assert len(lci.DEFAULT_KNOWN_ENTITIES) == len(set(lci.DEFAULT_KNOWN_ENTITIES))
 
 
+def test_default_runbook_dirs_are_portable() -> None:
+    assert lci.IndexSettings().runbook_dirs == ("docs",)
+
+
 def test_get_artifact_decodes_json_fields(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"
@@ -252,6 +256,21 @@ tags: [AcmeCloud]
     assert "skill:backup-flow" in by_id
     assert "AcmeCloud" in by_id["skill:backup-flow"].entities
     assert "runbook:runbooks-acme" in by_id
+
+
+def test_extra_runbook_dirs_are_configurable(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(root / "ops_runbooks" / "update_progress.md", "# Update Progress\n\nManifest-backed backup flow.\n")
+
+    artifacts, _edges = lci.build_index(
+        root,
+        tmp_path / "state",
+        hermes_home,
+        lci.IndexSettings(runbook_dirs=("docs", "ops_runbooks")),
+    )
+
+    assert "runbook:ops-runbooks-update-progress" in {artifact.id for artifact in artifacts}
 
 
 def test_configured_markdown_dirs_support_knowledge_and_nested_paths(tmp_path: Path) -> None:
