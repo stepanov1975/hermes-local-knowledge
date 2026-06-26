@@ -147,6 +147,13 @@ python -m pip install -e '.[test]'
 python -m pytest
 ```
 
+Module layout:
+
+- `indexer.py` and `plugin.py` are compatibility wrappers/public entry points.
+- `scanners.py`, `storage.py`, `search.py`, and `cli.py` implement index collection, persistence, lookup, and CLI behavior.
+- `schemas.py`, `runtime.py`, `telemetry.py`, and `handlers.py` implement Hermes plugin schemas, configuration, usage tracking, and tool handlers.
+- `models.py`, `constants.py`, `paths.py`, `text_utils.py`, and `tooling.py` hold shared data structures/helpers.
+
 The full test suite includes a Hermes plugin install smoke test. Install Hermes Agent first if `hermes` is not already on `PATH`:
 
 ```bash

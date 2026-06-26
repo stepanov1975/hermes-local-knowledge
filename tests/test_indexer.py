@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from hermes_local_knowledge import indexer as lci
+from hermes_local_knowledge import scanners as lci_scanners
+from hermes_local_knowledge import storage as lci_storage
 
 
 def write(path: Path, content: str) -> None:
@@ -244,7 +246,7 @@ def test_build_sqlite_preserves_existing_db_when_rebuild_fails(tmp_path: Path, m
     def fail_connect(_path: str) -> sqlite3.Connection:
         raise RuntimeError("simulated sqlite failure")
 
-    monkeypatch.setattr(lci.sqlite3, "connect", fail_connect)
+    monkeypatch.setattr(lci_storage.sqlite3, "connect", fail_connect)
 
     with pytest.raises(RuntimeError, match="simulated sqlite failure"):
         lci.build_sqlite(db_path, [], [])
@@ -279,7 +281,7 @@ def test_scan_mcp_servers_fallback_supports_native_top_level_config(tmp_path: Pa
     command: uvx
 """,
     )
-    monkeypatch.setattr(lci, "load_yaml_if_available", lambda _path: None)
+    monkeypatch.setattr(lci_scanners, "load_yaml_if_available", lambda _path: None)
 
     artifacts = lci.scan_mcp_servers(root, hermes_home)
 
