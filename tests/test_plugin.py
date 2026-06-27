@@ -477,6 +477,34 @@ def test_usage_report_recent_builds_exclude_failed_build_attempts(tmp_path, monk
     assert all(row["index_artifact_count"] != 999 for row in report["recent_builds"])
 
 
+def test_usage_report_persists_index_metadata_errors(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+
+    event_id = plugin._record_usage(
+        repo,
+        tool="knowledge_search",
+        success=True,
+        query="corrupt index probe",
+        result_count=0,
+        db_path=state_dir / "index.sqlite",
+        index_metadata={
+            "plugin_version": hermes_local_knowledge.__version__,
+            "source_root_source": "env",
+            "state_dir_source": "env",
+            "index_exists": True,
+            "index_mtime": "2026-01-01T00:00:00Z",
+            "index_metadata_error": "sqlite stats failed: DatabaseError: malformed database",
+        },
+    )
+    assert isinstance(event_id, int)
+
+    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+
+    assert report["latest_index_metadata"]["index_exists"] == 1
+    assert "malformed database" in report["latest_index_metadata"]["index_metadata_error"]
+
+
 def test_usage_db_migrates_preserved_legacy_schema(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
     repo, hermes_home, state_dir = make_temp_repo(tmp_path)
     configure_env(monkeypatch, repo, hermes_home, state_dir)
@@ -516,6 +544,8 @@ def test_usage_db_migrates_preserved_legacy_schema(tmp_path, monkeypatch):  # ty
         "source_root_source",
         "index_artifact_count",
         "index_artifact_counts_json",
+        "index_exists",
+        "index_metadata_error",
         "build_duration_ms",
     } <= usage_columns
     assert {"event_id", "artifact_id", "session_id", "root"} <= feedback_columns

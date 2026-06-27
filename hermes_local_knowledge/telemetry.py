@@ -57,11 +57,13 @@ USAGE_EVENT_COLUMNS: dict[str, str] = {
     "source_root_source": "TEXT",
     "state_dir_source": "TEXT",
     "include_markdown_docs_source": "TEXT",
+    "index_exists": "INTEGER",
     "index_mtime": "TEXT",
     "index_age_seconds": "INTEGER",
     "index_artifact_count": "INTEGER",
     "index_edge_count": "INTEGER",
     "index_artifact_counts_json": "TEXT NOT NULL DEFAULT '{}'",
+    "index_metadata_error": "TEXT",
     "build_duration_ms": "INTEGER",
     "root": "TEXT",
     "db_path": "TEXT",
@@ -119,11 +121,13 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             source_root_source TEXT,
             state_dir_source TEXT,
             include_markdown_docs_source TEXT,
+            index_exists INTEGER,
             index_mtime TEXT,
             index_age_seconds INTEGER,
             index_artifact_count INTEGER,
             index_edge_count INTEGER,
             index_artifact_counts_json TEXT NOT NULL DEFAULT '{}',
+            index_metadata_error TEXT,
             build_duration_ms INTEGER,
             root TEXT,
             db_path TEXT
@@ -163,8 +167,9 @@ def _usage_connect(root: Path | None, usage_db_path: Path | None = None) -> sqli
     else:
         resolved_usage_db = usage_db_path
     resolved_usage_db.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(resolved_usage_db))
+    conn = sqlite3.connect(str(resolved_usage_db), timeout=10.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000")
     _init_usage_db(conn)
     return conn
 
@@ -205,10 +210,11 @@ def _record_usage(
                     artifact_id, artifact_type, limit_value, rebuild_requested,
                     rebuilt, success, error, result_count, top_ids_json,
                     top_types_json, latency_ms, plugin_version, source_root_source,
-                    state_dir_source, include_markdown_docs_source, index_mtime,
-                    index_age_seconds, index_artifact_count, index_edge_count,
-                    index_artifact_counts_json, build_duration_ms, root, db_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    state_dir_source, include_markdown_docs_source, index_exists,
+                    index_mtime, index_age_seconds, index_artifact_count,
+                    index_edge_count, index_artifact_counts_json,
+                    index_metadata_error, build_duration_ms, root, db_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now(),
@@ -233,11 +239,13 @@ def _record_usage(
                     _clean_text(index_metadata.get("source_root_source"), limit=80) or None,
                     _clean_text(index_metadata.get("state_dir_source"), limit=80) or None,
                     _clean_text(index_metadata.get("include_markdown_docs_source"), limit=80) or None,
+                    None if "index_exists" not in index_metadata else (1 if index_metadata.get("index_exists") else 0),
                     _clean_text(index_metadata.get("index_mtime"), limit=80) or None,
                     _int_or_none(index_metadata.get("index_age_seconds")),
                     _int_or_none(index_metadata.get("artifact_count")),
                     _int_or_none(index_metadata.get("edge_count")),
                     _json_object(artifact_counts),
+                    _clean_text(index_metadata.get("index_metadata_error"), limit=1000) or None,
                     _int_or_none(index_metadata.get("build_duration_ms")),
                     str(root)
                     if root is not None
@@ -439,12 +447,12 @@ def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
                 """
                 SELECT id, ts, client, tool, plugin_version, root, db_path,
                        source_root_source, state_dir_source,
-                       include_markdown_docs_source, index_mtime,
+                       include_markdown_docs_source, index_exists, index_mtime,
                        index_age_seconds, index_artifact_count,
                        index_edge_count, index_artifact_counts_json,
-                       build_duration_ms, rebuilt
+                       index_metadata_error, build_duration_ms, rebuilt
                 FROM usage_events
-                WHERE ts >= ? AND (index_mtime IS NOT NULL OR index_artifact_count IS NOT NULL)
+                WHERE ts >= ? AND (index_exists IS NOT NULL OR index_mtime IS NOT NULL OR index_artifact_count IS NOT NULL)
                 ORDER BY ts DESC, id DESC
                 LIMIT 1
                 """,
