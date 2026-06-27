@@ -6,6 +6,7 @@ import tomllib
 from pathlib import Path
 
 import hermes_local_knowledge
+from hermes_local_knowledge import handlers as lci_handlers
 from hermes_local_knowledge import plugin
 
 
@@ -233,6 +234,51 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
     assert cfg.index_settings.include_markdown_docs is True
 
 
+def test_runtime_config_can_use_configured_hermes_home(tmp_path, monkeypatch):
+    base_home = tmp_path / "base_home"
+    configured_home = tmp_path / "configured_home"
+    repo, _hermes_home, state_dir = make_temp_repo(tmp_path)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(base_home))
+    write(
+        base_home / "config.yaml",
+        f"""local_knowledge:
+  hermes_home: {configured_home}
+  source_root: {repo}
+  state_dir: {state_dir}
+""",
+    )
+
+    cfg = plugin._runtime_config()
+
+    assert cfg.hermes_home == configured_home.resolve()
+    assert cfg.source_root == repo.resolve()
+    assert cfg.state_dir == state_dir.resolve()
+
+
+def test_runtime_config_explicit_hermes_home_overrides_configured_hermes_home(tmp_path, monkeypatch):
+    base_home = tmp_path / "base_home"
+    configured_home = tmp_path / "configured_home"
+    repo, _hermes_home, state_dir = make_temp_repo(tmp_path)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        base_home / "config.yaml",
+        f"""local_knowledge:
+  hermes_home: {configured_home}
+  source_root: {repo}
+  state_dir: {state_dir}
+""",
+    )
+
+    cfg = plugin._runtime_config(hermes_home=base_home)
+
+    assert cfg.hermes_home == base_home.resolve()
+    assert cfg.source_root == repo.resolve()
+    assert cfg.state_dir == state_dir.resolve()
+
+
 def test_runtime_env_overrides_hermes_config_yaml(tmp_path, monkeypatch):
     repo, hermes_home, state_dir = make_temp_repo(tmp_path)
     env_repo = tmp_path / "env_repo"
@@ -253,6 +299,49 @@ def test_runtime_env_overrides_hermes_config_yaml(tmp_path, monkeypatch):
     assert payload["root"] == str(env_repo.resolve())
     assert payload["state_dir"] == str(env_state.resolve())
     assert [row["id"] for row in payload["results"]] == ["script:scripts-env-helper-py"]
+
+
+def test_handle_search_records_usage_context(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    db_path = tmp_path / "state" / "index.sqlite"
+    captured: dict[str, object] = {}
+
+    def fake_usage_context(kwargs):  # type: ignore[no-untyped-def]
+        captured["usage_context_kwargs"] = kwargs
+        return {"session_id": kwargs["session_id"]}
+
+    def fake_record_usage(root_arg: Path, **kwargs):  # type: ignore[no-untyped-def]
+        captured["record_root"] = root_arg
+        captured["record_usage_kwargs"] = kwargs
+        return 123
+
+    deps = plugin.HandlerDeps(
+        repo_root=lambda: root,
+        ensure_index=lambda _root, *, rebuild=False: (db_path, {"rebuilt": rebuild, "index_exists": True}),
+        search_index=lambda _db_path, query, limit=8: [
+            {"id": "skill:demo", "type": "skill", "title": query}
+        ],
+        record_usage=fake_record_usage,
+        usage_context=fake_usage_context,
+    )
+
+    payload = json.loads(
+        lci_handlers._handle_search(
+            {"query": "demo", "limit": 2, "rebuild": True},
+            deps=deps,
+            session_id="session-123",
+        )
+    )
+
+    assert payload["success"] is True
+    assert payload["usage_event_id"] == 123
+    assert captured["usage_context_kwargs"] == {"session_id": "session-123"}
+    usage_kwargs = captured["record_usage_kwargs"]
+    assert isinstance(usage_kwargs, dict)
+    assert usage_kwargs["context"] == {"session_id": "session-123"}
+    assert usage_kwargs["query"] == "demo"
+    assert usage_kwargs["db_path"] == db_path
+    assert captured["record_root"] == root
 
 
 def test_tuple_value_accepts_common_cli_list_strings():

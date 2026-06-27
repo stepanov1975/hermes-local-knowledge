@@ -350,6 +350,30 @@ def test_build_sqlite_preserves_existing_db_when_rebuild_fails(tmp_path: Path, m
     assert db_path.read_bytes() == before
 
 
+def test_build_sqlite_creates_nested_parent_directories(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing" / "nested" / "state" / "index.sqlite"
+    artifact = lci.Artifact(
+        id="skill:alpha",
+        type="skill",
+        title="Alpha",
+        path="custom_skills/alpha",
+        summary="Alpha summary",
+        triggers=["alpha"],
+        entities=["Hermes"],
+        related=[],
+        source="test",
+        search_text="Alpha summary",
+    )
+
+    lci.build_sqlite(db_path, [artifact], [])
+
+    assert db_path.exists()
+    fetched = lci.get_artifact(db_path, "skill:alpha")
+    assert fetched is not None
+    assert fetched["title"] == "Alpha"
+    assert fetched["triggers"] == ["alpha"]
+
+
 def test_scan_mcp_servers_supports_native_top_level_config(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
@@ -365,6 +389,55 @@ def test_scan_mcp_servers_supports_native_top_level_config(tmp_path: Path) -> No
 
     assert [artifact.id for artifact in artifacts] == ["mcp:siyuan"]
     assert artifacts[0].path.endswith("#mcp_servers.siyuan")
+
+
+def test_scan_mcp_servers_reads_config_with_size_bound(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    max_chars_seen: list[int | None] = []
+
+    def fake_safe_read_text(path: Path, *, max_chars: int | None = None) -> str:
+        max_chars_seen.append(max_chars)
+        assert path == hermes_home / "config.yaml"
+        return "mcp_servers:\n  github:\n    command: uvx\n"
+
+    monkeypatch.setattr(lci_scanners, "safe_read_text", fake_safe_read_text)
+    monkeypatch.setattr(
+        lci_scanners,
+        "load_yaml_if_available",
+        lambda _path: {"mcp_servers": {"github": {"command": "uvx"}}},
+    )
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert max_chars_seen == [200_000]
+    assert [artifact.id for artifact in artifacts] == ["mcp:github"]
+
+
+def test_scan_mcp_servers_preserves_legacy_yaml_path_and_base_url(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp:
+  servers:
+    github:
+      command: uvx
+      base_url: http://localhost:9000
+      args: [github-mcp-server, stdio]
+      env:
+        GITHUB_TOKEN: secret-name
+""",
+    )
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:github"]
+    artifact = artifacts[0]
+    assert artifact.path.endswith("#mcp.servers.github")
+    assert "url http://localhost:9000" in artifact.summary
+    assert "github-mcp-server stdio" in artifact.summary
+    assert "github_token" in artifact.triggers
 
 
 def test_scan_mcp_servers_fallback_supports_native_top_level_config(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -404,6 +477,14 @@ def test_scan_mcp_servers_fallback_supports_legacy_mcp_servers_config(tmp_path: 
     assert artifacts[0].path.endswith("#mcp.servers.github")
 
 
+def test_scan_cron_jobs_handles_empty_registry_dict(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(hermes_home / "cron" / "jobs.json", json.dumps({}))
+
+    assert lci.scan_cron_jobs(root, hermes_home) == []
+
+
 def test_scan_cron_jobs_supports_legacy_list_payload(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
@@ -428,6 +509,45 @@ def test_scan_cron_jobs_supports_legacy_list_payload(tmp_path: Path) -> None:
 
     assert [artifact.id for artifact in artifacts] == ["cron:nightly-backup"]
     assert artifacts[0].related == ["skill:backup-flow", "scripts/backup.py"]
+
+
+def test_scan_cron_jobs_uses_id_when_name_missing_and_preserves_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "cron" / "jobs.json",
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "daily-review",
+                        "prompt": "Run ~/bin/review.py and summarize changed artifacts.",
+                        "schedule_display": "every 2h",
+                        "schedule": "0 */2 * * *",
+                        "script": "~/bin/review.py",
+                        "skills": ["review-flow"],
+                        "enabled_toolsets": ["terminal"],
+                        "state": "scheduled",
+                        "last_status": "ok",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            }
+        ),
+    )
+
+    artifacts = lci.scan_cron_jobs(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["cron:daily-review"]
+    artifact = artifacts[0]
+    assert artifact.title == "daily-review"
+    assert artifact.path.endswith("#daily-review")
+    assert "Schedule: every 2h" in artifact.summary
+    assert "State: scheduled" in artifact.summary
+    assert "Last status: ok" in artifact.summary
+    assert artifact.related == ["skill:review-flow", "~/bin/review.py"]
+    assert artifact.updated_at == "2026-01-01T00:00:00Z"
+    assert "terminal" in artifact.triggers
 
 
 def test_cli_build_default_output_dir_uses_hermes_home_not_source_root(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -780,6 +900,41 @@ def test_cli_doctor_preserves_context_when_smoke_search_fails(tmp_path: Path, ca
 
 def test_fts_query_splits_hyphenated_human_terms() -> None:
     assert lci.fts_query("manifest-backed backup") == "manifest* backed* backup*"
+    assert lci.fts_query("paperless review", operator="OR") == "paperless* OR review*"
     assert lci.fts_query("self hosted application updates backup flow update markdown") == (
         "self* hosted* application* update* backup*"
     )
+
+
+def test_search_sort_key_scores_each_ranking_tier() -> None:
+    row = {
+        "id": "skill:paperless-review",
+        "title": "Paperless Review",
+        "path": "custom_skills/paperless-review",
+        "triggers": ["paperless", "review", "automation"],
+        "summary": "Paperless review automation helper.",
+        "type": "skill",
+        "rank": 7.5,
+    }
+
+    assert lci.search_sort_key(row, ["paperless", "review"]) == (
+        0,
+        -2,
+        -2,
+        -2,
+        -2,
+        0,
+        7.5,
+        "Paperless Review",
+    )
+
+    id_weight_row = {
+        "id": "skill:paperless",
+        "title": "Review",
+        "path": "custom_skills/paperless",
+        "triggers": [],
+        "summary": "",
+        "type": "skill",
+        "rank": 0,
+    }
+    assert lci.search_sort_key(id_weight_row, ["paperless", "review"])[:2] == (0, -2)
