@@ -6,25 +6,37 @@ Enable the plugin if you did not pass `--enable`:
 hermes plugins enable local_knowledge
 ```
 
+Recommended pattern: set `source_root` to a high-signal local operational/customization repo (runbooks, helper scripts, custom skills). The plugin still indexes runtime `$HERMES_HOME/skills`, cron jobs, and MCP config separately, so `source_root` does not need to be the whole Hermes home.
+
 Recommended config in `~/.hermes/config.yaml`:
 
 ```yaml
 local_knowledge:
-  source_root: ~/repos/<your-local-docs-or-customizations>  # directory to index
+  source_root: ~/repos/<your-local-docs-or-customizations>  # high-signal directory to index
   state_dir: ~/.hermes/local_knowledge                      # generated sqlite/jsonl/usage state
-  custom_skill_dirs: [skills]                               # optional; defaults to custom_skills
+  custom_skill_dirs: [custom_skills]                         # YAML list
+  script_dirs: [scripts, hermes_home/scripts]                # YAML list
+  include_markdown_docs: true
 ```
 
-CLI-safe equivalent:
+CLI-safe equivalent. `hermes config set` stores scalar strings; the plugin accepts comma-separated values for list-like settings:
 
 ```bash
 hermes config set local_knowledge.source_root "$HOME/repos/your-local-docs-or-customizations"
 hermes config set local_knowledge.state_dir "$HOME/.hermes/local_knowledge"
-hermes config set local_knowledge.custom_skill_dirs skills
+hermes config set local_knowledge.custom_skill_dirs custom_skills
+hermes config set local_knowledge.script_dirs scripts,hermes_home/scripts
 hermes config set local_knowledge.include_markdown_docs true
 ```
 
-You can omit `source_root` to index only this Hermes profile's runtime artifacts under `$HERMES_HOME`.
+You can omit `source_root` to index only this Hermes profile's runtime artifacts under `$HERMES_HOME`. If `$HERMES_HOME/hermes-agent` exists, the plugin warns because broad Hermes-home indexing can be noisy.
+
+Smoke check the install/config:
+
+```bash
+python -m hermes_local_knowledge.cli doctor
+python -m hermes_local_knowledge.cli doctor --rebuild --query "backup runbook"
+```
 
 Restart the gateway or start a new Hermes session for the tools to appear.
 If you are already talking to Hermes through the gateway, use `/restart`; from a separate shell, run:

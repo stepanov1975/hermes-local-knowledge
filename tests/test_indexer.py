@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_local_knowledge import cli as lci_cli
 from hermes_local_knowledge import indexer as lci
 from hermes_local_knowledge import scanners as lci_scanners
 from hermes_local_knowledge import storage as lci_storage
@@ -408,6 +409,138 @@ def test_cli_build_and_search_json(tmp_path: Path, capsys) -> None:  # type: ign
     search_out = capsys.readouterr().out
     rows = json.loads(search_out)
     assert any(row["id"] == "skill:paperless-review-automation" for row in rows)
+
+
+def test_cli_build_from_hermes_config_uses_configured_layout(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+  custom_skill_dirs:
+    - custom_skills
+  script_dirs:
+    - scripts
+  include_markdown_docs: true
+""",
+    )
+
+    assert lci.main(["build", "--from-hermes-config", "--hermes-home", str(hermes_home)]) == 0
+    build_out = capsys.readouterr().out
+
+    assert str(state_dir / "index.sqlite") in build_out
+    assert (state_dir / "index.sqlite").exists()
+    assert not (hermes_home / "local_knowledge" / "index.sqlite").exists()
+
+
+def test_cli_root_override_enables_markdown_docs_when_config_root_is_unset(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = tmp_path / "source_root"
+    hermes_home = tmp_path / "hermes_home"
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(root / "docs" / "backup.md", "# Backup Runbook\n\nUse this backup runbook before service updates.\n")
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  state_dir: {state_dir}
+""",
+    )
+
+    assert lci.main(["build", "--from-hermes-config", "--hermes-home", str(hermes_home), "--root", str(root)]) == 0
+    build_out = capsys.readouterr().out
+
+    assert "runbook: 1" in build_out
+    assert (state_dir / "index.sqlite").exists()
+
+
+def test_cli_search_from_hermes_config_uses_configured_state_dir(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+""",
+    )
+    assert lci.main(["build", "--from-hermes-config", "--hermes-home", str(hermes_home)]) == 0
+    capsys.readouterr()
+
+    assert lci.main(["search", "paperless review", "--from-hermes-config", "--hermes-home", str(hermes_home), "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+
+    assert any(row["id"] == "skill:paperless-review-automation" for row in rows)
+
+
+def test_cli_doctor_warns_when_defaulting_to_broad_hermes_home(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    hermes_home = tmp_path / "hermes_home"
+    (hermes_home / "hermes-agent").mkdir(parents=True)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+
+    assert lci.main(["doctor", "--hermes-home", str(hermes_home)]) == 0
+    captured = capsys.readouterr()
+
+    assert "local_knowledge.source_root is unset" in captured.err
+    assert str(hermes_home) in captured.out
+
+
+def test_cli_doctor_can_rebuild_and_smoke_search_from_config(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+""",
+    )
+
+    assert lci.main(["doctor", "--hermes-home", str(hermes_home), "--rebuild", "--query", "paperless review"]) == 0
+    doctor_out = capsys.readouterr().out
+
+    assert "Built" in doctor_out
+    assert "Smoke query 'paperless review':" in doctor_out
+    assert (state_dir / "index.sqlite").exists()
+
+
+def test_cli_doctor_preserves_context_when_smoke_search_fails(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+""",
+    )
+    state_dir.mkdir(parents=True)
+    (state_dir / "index.sqlite").write_text("not a real sqlite db", encoding="utf-8")
+
+    def raising_search(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    status = lci_cli.main(
+        ["doctor", "--hermes-home", str(hermes_home), "--query", "paperless review", "--json"],
+        search_index_fn=raising_search,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status == 1
+    assert payload["hermes_home"] == str(hermes_home.resolve())
+    assert payload["source_root"] == str(root.resolve())
+    assert any(check["name"] == "smoke_search_failed" for check in payload["checks"])
 
 
 def test_fts_query_splits_hyphenated_human_terms() -> None:

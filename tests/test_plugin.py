@@ -261,6 +261,19 @@ def test_implicit_hermes_home_source_skips_root_markdown(tmp_path, monkeypatch):
     assert (hermes_home / "local_knowledge" / "index.sqlite").exists()
 
 
+def test_implicit_hermes_home_source_warns_when_source_checkout_exists(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    (hermes_home / "hermes-agent").mkdir(parents=True)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    payload = json.loads(plugin._handle_search({"query": "anything", "rebuild": True}))
+
+    assert payload["success"] is True
+    assert any("local_knowledge.source_root is unset" in warning for warning in payload["warnings"])
+
+
 def test_missing_artifact_returns_tool_error(tmp_path, monkeypatch):
     repo, hermes_home, state_dir = make_temp_repo(tmp_path)
     configure_env(monkeypatch, repo, hermes_home, state_dir)

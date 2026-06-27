@@ -32,12 +32,13 @@ For private GitHub repositories, prefer the SSH form above. HTTPS clones may
 fail in non-interactive Hermes sessions if GitHub credentials are not already
 available to `git`.
 
-Configure the source tree to index:
+Configure a high-signal source tree to index. Prefer a local operational/customization repo that contains your runbooks, helper scripts, and custom skills; the plugin still indexes runtime skills, cron jobs, and MCP config from `$HERMES_HOME` separately.
 
 ```bash
 hermes config set local_knowledge.source_root "$HOME/repos/your-local-docs-or-customizations"
 hermes config set local_knowledge.state_dir "$HOME/.hermes/local_knowledge"
-hermes config set local_knowledge.custom_skill_dirs skills
+hermes config set local_knowledge.custom_skill_dirs custom_skills
+hermes config set local_knowledge.script_dirs scripts,hermes_home/scripts
 hermes config set local_knowledge.include_markdown_docs true
 ```
 
@@ -68,7 +69,7 @@ local_knowledge:
   state_dir: ~/.hermes/local_knowledge
 ```
 
-`source_root` is the directory being indexed. `state_dir` is generated local state and should not be committed.
+`source_root` is the high-signal directory being indexed. `state_dir` is generated local state and should not be committed. Use YAML lists in `config.yaml`; when using `hermes config set` from the shell, comma-separated strings or bracket-list strings are accepted and normalized by the plugin.
 
 Environment variables are supported for development and tests:
 
@@ -78,7 +79,13 @@ Environment variables are supported for development and tests:
 | `LOCAL_KNOWLEDGE_STATE_DIR` | Overrides `local_knowledge.state_dir`. |
 | `HERMES_HOME` | Selects the Hermes profile/runtime home to inspect. |
 
-If no `source_root` is configured, the plugin defaults to `HERMES_HOME` and indexes runtime skills, cron, and MCP config, but it does **not** scan arbitrary root-level Markdown notes unless `include_markdown_docs: true` is set explicitly. For a useful router, point `source_root` at a repo or directory containing your local docs/scripts/skills.
+If no `source_root` is configured, the plugin defaults to `HERMES_HOME` and indexes runtime skills, cron, and MCP config, but it does **not** scan arbitrary root-level Markdown notes unless `include_markdown_docs: true` is set explicitly. If `$HERMES_HOME/hermes-agent` exists, the tools and CLI warn because the broad runtime tree is usually noisier than a curated operational repo.
+
+Recommended pattern:
+
+- set `local_knowledge.source_root` to your high-signal docs/customizations repo, for example `~/repos/hermes-customizations`;
+- keep `local_knowledge.state_dir` under `~/.hermes/local_knowledge` or another local-only state directory;
+- rely on the plugin's separate runtime scan for `$HERMES_HOME/skills`, `$HERMES_HOME/cron/jobs.json`, and `$HERMES_HOME/config.yaml` MCP entries.
 
 ## Preserving existing history
 
@@ -151,6 +158,20 @@ python -m hermes_local_knowledge.indexer build \
 python -m hermes_local_knowledge.indexer search 'backup runbook' \
   --db ~/.hermes/local_knowledge/index.sqlite \
   --limit 8
+```
+
+To match native plugin behavior, read `local_knowledge` settings from Hermes config instead of repeating flags:
+
+```bash
+python -m hermes_local_knowledge.indexer build --from-hermes-config
+python -m hermes_local_knowledge.indexer search 'backup runbook' --from-hermes-config --limit 8
+```
+
+The CLI also has an install/config smoke check:
+
+```bash
+python -m hermes_local_knowledge.cli doctor
+python -m hermes_local_knowledge.cli doctor --rebuild --query 'backup runbook'
 ```
 
 ## Development
