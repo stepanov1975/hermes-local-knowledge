@@ -2,14 +2,29 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tomllib
 from pathlib import Path
 
+import hermes_local_knowledge
 from hermes_local_knowledge import plugin
 
 
 def write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def test_version_metadata_stays_in_sync():
+    repo_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    plugin_version = next(
+        line.partition(":")[2].strip()
+        for line in (repo_root / "plugin.yaml").read_text(encoding="utf-8").splitlines()
+        if line.startswith("version:")
+    )
+
+    assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
+    assert hermes_local_knowledge.__version__ == plugin_version
 
 
 def make_temp_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
