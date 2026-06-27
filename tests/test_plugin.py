@@ -2,14 +2,29 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tomllib
 from pathlib import Path
 
+import hermes_local_knowledge
 from hermes_local_knowledge import plugin
 
 
 def write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def test_version_metadata_stays_in_sync():
+    repo_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    plugin_version = next(
+        line.partition(":")[2].strip()
+        for line in (repo_root / "plugin.yaml").read_text(encoding="utf-8").splitlines()
+        if line.startswith("version:")
+    )
+
+    assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
+    assert hermes_local_knowledge.__version__ == plugin_version
 
 
 def make_temp_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -193,8 +208,9 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
         f"""local_knowledge:
   source_root: {repo}
   state_dir: {state_dir}
-  known_entities:
-    - Paperless
+  custom_skill_dirs: '[custom_skills]'
+  script_dirs: '[scripts]'
+  known_entities: '[Paperless]'
 """,
     )
 
@@ -202,8 +218,29 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
 
     assert cfg.source_root == repo.resolve()
     assert cfg.state_dir == state_dir.resolve()
+    assert cfg.index_settings.custom_skill_dirs == ("custom_skills",)
+    assert cfg.index_settings.script_dirs == ("scripts",)
     assert cfg.index_settings.known_entities == ("Paperless",)
     assert cfg.index_settings.include_markdown_docs is True
+
+
+def test_tuple_value_accepts_common_cli_list_strings():
+    default = ("default",)
+
+    assert plugin._tuple_value("skills", default) == ("skills",)
+    assert plugin._tuple_value("skills, custom_skills", default) == (
+        "skills",
+        "custom_skills",
+    )
+    assert plugin._tuple_value("[skills]", default) == ("skills",)
+    assert plugin._tuple_value("['skills', 'custom_skills']", default) == (
+        "skills",
+        "custom_skills",
+    )
+    assert plugin._tuple_value('["skills", "custom_skills"]', default) == (
+        "skills",
+        "custom_skills",
+    )
 
 
 def test_implicit_hermes_home_source_skips_root_markdown(tmp_path, monkeypatch):
