@@ -182,6 +182,16 @@ python -m pip install -e '.[test]'
 python -m pytest
 ```
 
+For optional mutation testing, install the mutation extra and run `mutmut` locally:
+
+```bash
+python -m pip install -e '.[test,mutation]'
+python -m mutmut run
+python -m mutmut results
+```
+
+`mutmut` is configured in `pyproject.toml` to mutate only `hermes_local_knowledge`, copy `plugin.yaml` into the mutant workspace for metadata tests, and skip the Hermes plugin install smoke test. Treat the full run as a slower local/scheduled quality check rather than a default fast-test gate; use `--max-children` or targeted mutant names when iterating locally.
+
 Module layout:
 
 - `indexer.py` and `plugin.py` are compatibility wrappers/public entry points.

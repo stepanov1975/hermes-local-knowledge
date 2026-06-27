@@ -26,6 +26,9 @@ test = [
     "pytest>=8,<10",
     "PyYAML>=6,<7",
 ]
+mutation = [
+    "mutmut>=3,<4",
+]
 
 [project.urls]
 Repository = "https://github.com/stepanov1975/hermes-local-knowledge"
@@ -33,6 +36,11 @@ Issues = "https://github.com/stepanov1975/hermes-local-knowledge/issues"
 
 [project.entry-points."hermes_agent.plugins"]
 local_knowledge = "hermes_local_knowledge.plugin"
+
+[tool.mutmut]
+source_paths = ["hermes_local_knowledge"]
+also_copy = ["plugin.yaml"]
+pytest_add_cli_args_test_selection = ["-k", "not install_smoke"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
