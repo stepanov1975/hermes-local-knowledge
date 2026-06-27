@@ -384,6 +384,51 @@ def test_scan_mcp_servers_fallback_supports_native_top_level_config(tmp_path: Pa
     assert artifacts[0].path.endswith("#mcp_servers.github")
 
 
+def test_scan_mcp_servers_fallback_supports_legacy_mcp_servers_config(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp:
+  servers:
+    github:
+      command: uvx
+""",
+    )
+    monkeypatch.setattr(lci_scanners, "load_yaml_if_available", lambda _path: None)
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:github"]
+    assert artifacts[0].path.endswith("#mcp.servers.github")
+
+
+def test_scan_cron_jobs_supports_legacy_list_payload(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "cron" / "jobs.json",
+        json.dumps(
+            [
+                "ignored",
+                {
+                    "id": "job1",
+                    "name": "nightly-backup",
+                    "prompt": "Run scripts/backup.py before updates.",
+                    "schedule": "0 3 * * *",
+                    "script": "scripts/backup.py",
+                    "skills": ["backup-flow"],
+                },
+            ]
+        ),
+    )
+
+    artifacts = lci.scan_cron_jobs(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["cron:nightly-backup"]
+    assert artifacts[0].related == ["skill:backup-flow", "scripts/backup.py"]
+
+
 def test_cli_build_default_output_dir_uses_hermes_home_not_source_root(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
     root, hermes_home = build_fixture(tmp_path)
     default_state_dir = hermes_home / "local_knowledge"
@@ -411,6 +456,48 @@ def test_cli_build_and_search_json(tmp_path: Path, capsys) -> None:  # type: ign
     assert any(row["id"] == "skill:paperless-review-automation" for row in rows)
 
 
+def test_cli_build_search_get_and_neighbors_e2e_human_output(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    db_path = output_dir / "index.sqlite"
+
+    assert lci.main(["build", "--root", str(root), "--hermes-home", str(hermes_home), "--output-dir", str(output_dir)]) == 0
+    capsys.readouterr()
+
+    assert lci.main(["search", "paperless review", "--db", str(db_path), "--limit", "2"]) == 0
+    search_out = capsys.readouterr().out
+    assert "skill:paperless-review-automation [skill]" in search_out
+    assert "triggers:" in search_out
+
+    assert lci.main(["get", "skill:paperless-review-automation", "--db", str(db_path)]) == 0
+    get_out = capsys.readouterr().out
+    assert "summary: Operate the local Paperless review automation" in get_out
+
+    assert lci.main(["get", "skill:paperless-review-automation", "--db", str(db_path), "--json"]) == 0
+    get_payload = json.loads(capsys.readouterr().out)
+    assert get_payload["id"] == "skill:paperless-review-automation"
+
+    assert lci.main(["neighbors", "cron:paperless-reviewer", "--db", str(db_path)]) == 0
+    neighbors_out = capsys.readouterr().out
+    assert "skill:paperless-review-automation [skill]" in neighbors_out
+    assert "edge: related_to" in neighbors_out
+
+    assert lci.main(["neighbors", "cron:paperless-reviewer", "--db", str(db_path), "--json"]) == 0
+    neighbors_payload = json.loads(capsys.readouterr().out)
+    assert any(row["id"] == "skill:paperless-review-automation" for row in neighbors_payload)
+
+
+def test_cli_get_missing_artifact_exits_nonzero(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    assert lci.main(["build", "--root", str(root), "--hermes-home", str(hermes_home), "--output-dir", str(output_dir)]) == 0
+    capsys.readouterr()
+
+    assert lci.main(["get", "skill:nope", "--db", str(output_dir / "index.sqlite")]) == 1
+    captured = capsys.readouterr()
+    assert "Artifact not found: skill:nope" in captured.err
+
+
 def test_cli_build_from_hermes_config_uses_configured_layout(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     root, hermes_home = build_fixture(tmp_path)
     state_dir = tmp_path / "configured_state"
@@ -435,6 +522,28 @@ def test_cli_build_from_hermes_config_uses_configured_layout(tmp_path: Path, cap
     assert str(state_dir / "index.sqlite") in build_out
     assert (state_dir / "index.sqlite").exists()
     assert not (hermes_home / "local_knowledge" / "index.sqlite").exists()
+
+
+def test_cli_build_from_hermes_config_honors_output_dir_override(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    configured_state = tmp_path / "configured_state"
+    override_state = tmp_path / "override_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {configured_state}
+""",
+    )
+
+    assert lci.main(["build", "--from-hermes-config", "--hermes-home", str(hermes_home), "--output-dir", str(override_state)]) == 0
+    build_out = capsys.readouterr().out
+
+    assert str(override_state / "index.sqlite") in build_out
+    assert (override_state / "index.sqlite").exists()
+    assert not (configured_state / "index.sqlite").exists()
 
 
 def test_cli_root_override_enables_markdown_docs_when_config_root_is_unset(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -511,6 +620,80 @@ def test_cli_doctor_can_rebuild_and_smoke_search_from_config(tmp_path: Path, cap
     assert "Built" in doctor_out
     assert "Smoke query 'paperless review':" in doctor_out
     assert (state_dir / "index.sqlite").exists()
+
+
+def test_cli_doctor_reports_rebuild_failure_with_context(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+""",
+    )
+
+    def raising_build(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    status = lci_cli.main(
+        ["doctor", "--hermes-home", str(hermes_home), "--rebuild", "--json"],
+        build_index_fn=raising_build,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status == 1
+    assert payload["source_root"] == str(root.resolve())
+    rebuild_checks = [check for check in payload["checks"] if check["name"] == "rebuild_failed"]
+    assert rebuild_checks
+    assert rebuild_checks[0]["ok"] is False
+    assert rebuild_checks[0]["fatal"] is True
+    assert "RuntimeError: boom" in rebuild_checks[0]["detail"]
+
+
+def test_cli_doctor_skips_smoke_query_after_fatal_path_check(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    missing_root = tmp_path / "missing-root"
+    hermes_home = tmp_path / "hermes_home"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {missing_root}
+""",
+    )
+
+    status = lci.main(["doctor", "--hermes-home", str(hermes_home), "--query", "anything", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status == 1
+    assert any(check["name"] == "source_root_exists" and check["ok"] is False for check in payload["checks"])
+    assert "smoke query skipped because an earlier doctor check failed" in payload["warnings"]
+
+
+def test_cli_doctor_reports_missing_index_for_smoke_query(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    state_dir = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+""",
+    )
+
+    status = lci.main(["doctor", "--hermes-home", str(hermes_home), "--query", "anything", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status == 1
+    assert any(check["name"] == "smoke_query_index_exists" and check["ok"] is False for check in payload["checks"])
+    assert any("rerun with --rebuild" in warning for warning in payload["warnings"])
 
 
 def test_cli_doctor_preserves_context_when_smoke_search_fails(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]

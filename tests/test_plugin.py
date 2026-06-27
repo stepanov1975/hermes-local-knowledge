@@ -179,6 +179,15 @@ def test_search_get_and_neighbors_build_missing_index_in_state_dir(tmp_path, mon
     assert (state_dir / "usage.sqlite").exists()
     assert not (repo / "knowledge" / "index.sqlite").exists()
 
+    script_search = json.loads(
+        plugin._handle_search(
+            {"query": "paperless review automation", "limit": 5, "artifact_type": "script"}
+        )
+    )
+    assert script_search["success"] is True
+    assert {row["type"] for row in script_search["results"]} == {"script"}
+    assert [row["id"] for row in script_search["results"]] == ["script:scripts-paperless-review-helper-py"]
+
     fetched = json.loads(
         plugin._handle_get(
             {"artifact_id": "skill:paperless-review-automation", "include_neighbors": True}
@@ -224,6 +233,28 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
     assert cfg.index_settings.include_markdown_docs is True
 
 
+def test_runtime_env_overrides_hermes_config_yaml(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    env_repo = tmp_path / "env_repo"
+    env_state = tmp_path / "env_state"
+    write(env_repo / "scripts" / "env_helper.py", '"""Environment selected helper."""\n')
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {repo}
+  state_dir: {state_dir}
+""",
+    )
+    configure_env(monkeypatch, env_repo, hermes_home, env_state)
+
+    payload = json.loads(plugin._handle_search({"query": "environment selected", "rebuild": True}))
+
+    assert payload["success"] is True
+    assert payload["root"] == str(env_repo.resolve())
+    assert payload["state_dir"] == str(env_state.resolve())
+    assert [row["id"] for row in payload["results"]] == ["script:scripts-env-helper-py"]
+
+
 def test_tuple_value_accepts_common_cli_list_strings():
     default = ("default",)
 
@@ -261,6 +292,28 @@ def test_implicit_hermes_home_source_skips_root_markdown(tmp_path, monkeypatch):
     assert (hermes_home / "local_knowledge" / "index.sqlite").exists()
 
 
+def test_explicit_source_root_can_disable_markdown_docs(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    write(repo / "docs" / "private.md", "# Private Markdown\n\nShould be skipped when markdown docs are disabled.\n")
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {repo}
+  state_dir: {state_dir}
+  include_markdown_docs: false
+""",
+    )
+
+    payload = json.loads(plugin._handle_search({"query": "private markdown", "rebuild": True}))
+
+    assert payload["success"] is True
+    assert payload["results"] == []
+    assert payload["include_markdown_docs_source"] == "config"
+
+
 def test_implicit_hermes_home_source_warns_when_source_checkout_exists(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_home"
     (hermes_home / "hermes-agent").mkdir(parents=True)
@@ -283,6 +336,71 @@ def test_missing_artifact_returns_tool_error(tmp_path, monkeypatch):
     assert payload["success"] is False
     assert "Artifact not found" in payload["error"]
     assert isinstance(payload["usage_event_id"], int)
+
+
+def test_lookup_handlers_validate_required_fields():
+    search = json.loads(plugin._handle_search({"query": ""}))
+    fetched = json.loads(plugin._handle_get({"artifact_id": ""}))
+    neighbors = json.loads(plugin._handle_neighbors({"artifact_id": ""}))
+
+    assert search["success"] is False
+    assert search["error"] == "query is required"
+    assert fetched["success"] is False
+    assert fetched["error"] == "artifact_id is required"
+    assert neighbors["success"] is False
+    assert neighbors["error"] == "artifact_id is required"
+
+
+def test_neighbors_missing_artifact_returns_tool_error(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+
+    payload = json.loads(plugin._handle_neighbors({"artifact_id": "skill:nope", "rebuild": True}))
+
+    assert payload["success"] is False
+    assert "Artifact not found" in payload["error"]
+    assert isinstance(payload["usage_event_id"], int)
+
+
+def test_empty_usage_report_before_any_lookup_returns_zero_counts(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+
+    payload = json.loads(plugin._handle_usage_report({"days": 7, "limit": 5}))
+
+    assert payload["success"] is True
+    assert payload["total_events"] == 0
+    assert payload["feedback_count"] == 0
+    assert payload["improvement_candidates"] == []
+    assert (state_dir / "usage.sqlite").exists()
+
+
+def test_feedback_rejects_invalid_rating_and_event_id():
+    invalid_rating = json.loads(plugin._handle_feedback({"rating": "great"}))
+    invalid_event_id = json.loads(plugin._handle_feedback({"rating": "useful", "event_id": "abc"}))
+
+    assert invalid_rating["success"] is False
+    assert "rating must be one of" in invalid_rating["error"]
+    assert invalid_event_id["success"] is False
+    assert invalid_event_id["error"] == "event_id must be an integer when provided"
+
+
+def test_lookup_handlers_return_json_errors_for_corrupt_existing_index(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True)
+    (state_dir / "index.sqlite").write_text("not a sqlite db", encoding="utf-8")
+
+    search = json.loads(plugin._handle_search({"query": "paperless"}))
+    fetched = json.loads(plugin._handle_get({"artifact_id": "skill:paperless-review-automation"}))
+    neighbors = json.loads(plugin._handle_neighbors({"artifact_id": "skill:paperless-review-automation"}))
+
+    assert search["success"] is False
+    assert "knowledge_search failed" in search["error"]
+    assert fetched["success"] is False
+    assert "knowledge_get failed" in fetched["error"]
+    assert neighbors["success"] is False
+    assert "knowledge_neighbors failed" in neighbors["error"]
 
 
 def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):
