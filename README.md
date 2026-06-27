@@ -143,7 +143,8 @@ This standalone shape keeps the lessons from the initial deployment:
 - hyphenated human queries such as `manifest-backed backup` are split into safe SQLite FTS prefix terms;
 - search ranking prefers exact/title/trigger hits so specific skills outrank generic helpers;
 - operations/update wording is covered by artifact-level runbook search, not just script search;
-- feedback and zero-result telemetry stays local and is summarized by `knowledge_usage_report` before changing ranking or source coverage.
+- feedback and zero-result telemetry stays local and is summarized by `knowledge_usage_report` before changing ranking or source coverage;
+- both native tools and standalone CLI lookups write local usage events with plugin version, config source, index age/mtime, artifact counts by type, and build duration when a build occurs.
 
 ## CLI use
 

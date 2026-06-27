@@ -437,6 +437,44 @@ def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):
     assert any(row["rating"] == "wrong_artifact" for row in report["recent_negative_feedback"])
     assert any(item["type"] == "zero_result_query" for item in report["improvement_candidates"])
     assert any(item["type"] == "feedback_wrong_artifact" for item in report["improvement_candidates"])
+    assert report["latest_index_metadata"]["plugin_version"] == hermes_local_knowledge.__version__
+    assert report["latest_index_metadata"]["source_root_source"] == "env"
+    assert report["latest_index_metadata"]["index_artifact_count"] >= 3
+    assert report["latest_index_metadata"]["index_artifact_counts"]["skill"] == 2
+    assert report["recent_builds"]
+    assert report["recent_builds"][0]["index_artifact_counts"]["script"] == 1
+
+
+def test_usage_report_recent_builds_exclude_failed_build_attempts(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+
+    search = json.loads(plugin._handle_search({"query": "paperless review automation", "rebuild": True}))
+    assert search["success"] is True
+    plugin._record_usage(
+        repo,
+        tool="cli_build",
+        client="cli",
+        success=False,
+        rebuilt=False,
+        error="simulated failed build",
+        db_path=state_dir / "index.sqlite",
+        usage_db_path=state_dir / "usage.sqlite",
+        index_metadata={
+            "plugin_version": hermes_local_knowledge.__version__,
+            "source_root_source": "config",
+            "artifact_count": 999,
+            "artifact_counts_by_type": {"skill": 999},
+            "edge_count": 999,
+            "build_duration_ms": 12,
+        },
+    )
+
+    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+
+    assert report["recent_builds"]
+    assert all(row["rebuilt"] == 1 for row in report["recent_builds"])
+    assert all(row["index_artifact_count"] != 999 for row in report["recent_builds"])
 
 
 def test_usage_db_migrates_preserved_legacy_schema(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
@@ -472,4 +510,12 @@ def test_usage_db_migrates_preserved_legacy_schema(tmp_path, monkeypatch):  # ty
     finally:
         conn.close()
     assert {"success", "latency_ms", "db_path", "top_ids_json"} <= usage_columns
+    assert {
+        "client",
+        "plugin_version",
+        "source_root_source",
+        "index_artifact_count",
+        "index_artifact_counts_json",
+        "build_duration_ms",
+    } <= usage_columns
     assert {"event_id", "artifact_id", "session_id", "root"} <= feedback_columns

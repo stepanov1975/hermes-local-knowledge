@@ -31,7 +31,7 @@ hermes config set local_knowledge.include_markdown_docs true
 
 You can omit `source_root` to index only this Hermes profile's runtime artifacts under `$HERMES_HOME`. If `$HERMES_HOME/hermes-agent` exists, the plugin warns because broad Hermes-home indexing can be noisy.
 
-Smoke check the install/config:
+Smoke check the install/config. CLI commands write to the same local `usage.sqlite` telemetry store, so smoke checks show up in `knowledge_usage_report` alongside native tool calls:
 
 ```bash
 python -m hermes_local_knowledge.cli doctor

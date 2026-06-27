@@ -65,6 +65,7 @@ def _handle_search(args: dict[str, Any], *, deps: HandlerDeps | None = None, **k
     rebuild = deps.coerce_bool(args.get("rebuild"), default=False)
     root: Path | None = None
     db_path: Path | None = None
+    meta: dict[str, Any] = {}
 
     try:
         root = deps.repo_root()
@@ -89,6 +90,7 @@ def _handle_search(args: dict[str, Any], *, deps: HandlerDeps | None = None, **k
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             context=context,
+            index_metadata=meta,
         )
         return deps.tool_result(
             {
@@ -115,6 +117,7 @@ def _handle_search(args: dict[str, Any], *, deps: HandlerDeps | None = None, **k
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             context=context,
+            index_metadata=meta,
         )
         return deps.tool_error(message, success=False, usage_event_id=event_id)
 
@@ -132,6 +135,7 @@ def _handle_get(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwar
     include_neighbors = deps.coerce_bool(args.get("include_neighbors"), default=False)
     root: Path | None = None
     db_path: Path | None = None
+    meta: dict[str, Any] = {}
 
     try:
         root = deps.repo_root()
@@ -150,6 +154,7 @@ def _handle_get(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwar
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
                 context=context,
+                index_metadata=meta,
             )
             return deps.tool_error(
                 message,
@@ -170,6 +175,7 @@ def _handle_get(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwar
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             context=context,
+            index_metadata=meta,
         )
         payload: dict[str, Any] = {
             "success": True,
@@ -192,6 +198,7 @@ def _handle_get(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwar
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             context=context,
+            index_metadata=meta,
         )
         return deps.tool_error(message, success=False, usage_event_id=event_id)
 
@@ -209,6 +216,7 @@ def _handle_neighbors(args: dict[str, Any], *, deps: HandlerDeps | None = None, 
     rebuild = deps.coerce_bool(args.get("rebuild"), default=False)
     root: Path | None = None
     db_path: Path | None = None
+    meta: dict[str, Any] = {}
 
     try:
         root = deps.repo_root()
@@ -228,6 +236,7 @@ def _handle_neighbors(args: dict[str, Any], *, deps: HandlerDeps | None = None, 
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
                 context=context,
+                index_metadata=meta,
             )
             return deps.tool_error(
                 message,
@@ -251,6 +260,7 @@ def _handle_neighbors(args: dict[str, Any], *, deps: HandlerDeps | None = None, 
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             context=context,
+            index_metadata=meta,
         )
         return deps.tool_result(
             {
@@ -275,6 +285,7 @@ def _handle_neighbors(args: dict[str, Any], *, deps: HandlerDeps | None = None, 
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             context=context,
+            index_metadata=meta,
         )
         return deps.tool_error(message, success=False, usage_event_id=event_id)
 

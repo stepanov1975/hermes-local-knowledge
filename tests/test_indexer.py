@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_local_knowledge
 from hermes_local_knowledge import cli as lci_cli
 from hermes_local_knowledge import indexer as lci
 from hermes_local_knowledge import scanners as lci_scanners
@@ -586,6 +587,57 @@ def test_cli_search_from_hermes_config_uses_configured_state_dir(tmp_path: Path,
     rows = json.loads(capsys.readouterr().out)
 
     assert any(row["id"] == "skill:paperless-review-automation" for row in rows)
+
+
+def test_cli_commands_record_usage_telemetry_from_config(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+""",
+    )
+
+    assert lci.main(["build", "--from-hermes-config", "--hermes-home", str(hermes_home)]) == 0
+    capsys.readouterr()
+    assert lci.main(["search", "paperless review", "--from-hermes-config", "--hermes-home", str(hermes_home)]) == 0
+    capsys.readouterr()
+    assert lci.main(["get", "skill:paperless-review-automation", "--from-hermes-config", "--hermes-home", str(hermes_home)]) == 0
+    capsys.readouterr()
+    assert lci.main(["neighbors", "cron:paperless-reviewer", "--from-hermes-config", "--hermes-home", str(hermes_home)]) == 0
+    capsys.readouterr()
+    assert lci.main(["doctor", "--hermes-home", str(hermes_home), "--query", "paperless review"]) == 0
+    capsys.readouterr()
+
+    conn = sqlite3.connect(state_dir / "usage.sqlite")
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(row) for row in conn.execute("SELECT * FROM usage_events ORDER BY id").fetchall()]
+    finally:
+        conn.close()
+
+    tools = [row["tool"] for row in rows]
+    assert tools == ["cli_build", "knowledge_search", "knowledge_get", "knowledge_neighbors", "cli_doctor"]
+    assert {row["client"] for row in rows} == {"cli"}
+    build_row = rows[0]
+    assert build_row["plugin_version"] == hermes_local_knowledge.__version__
+    assert build_row["source_root_source"] == "config"
+    assert build_row["state_dir_source"] == "config"
+    assert build_row["rebuilt"] == 1
+    assert build_row["index_artifact_count"] >= 7
+    assert json.loads(build_row["index_artifact_counts_json"])["skill"] == 2
+    assert build_row["build_duration_ms"] is not None
+    search_row = rows[1]
+    assert search_row["query"] == "paperless review"
+    assert search_row["result_count"] > 0
+    assert search_row["index_mtime"] is not None
+    doctor_row = rows[-1]
+    assert doctor_row["tool"] == "cli_doctor"
+    assert doctor_row["result_count"] > 0
 
 
 def test_cli_doctor_warns_when_defaulting_to_broad_hermes_home(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]

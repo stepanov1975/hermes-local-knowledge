@@ -4,16 +4,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
+from . import __version__
 from .constants import DEFAULT_ROOT
 from .models import IndexSettings
 from .paths import default_output_dir, hermes_home_from_env
 from .runtime import RuntimeConfig, _runtime_config
 from .search import search_index
-from .storage import build_index, get_artifact, get_neighbors
+from .storage import artifact_type_counts, build_index, get_artifact, get_neighbors, index_metadata
+from .telemetry import _record_usage
 
 
 def print_results(rows: Sequence[dict[str, Any]]) -> None:
@@ -35,6 +38,73 @@ def _resolved(path: Path) -> Path:
 def _print_warnings(warnings: Sequence[str]) -> None:
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
+
+
+def _cfg_metadata(cfg: RuntimeConfig, db_path: Path | None = None) -> dict[str, Any]:
+    return {
+        "plugin_version": __version__,
+        "root": str(cfg.source_root),
+        "source_root_source": cfg.source_root_source,
+        "state_dir": str(cfg.state_dir),
+        "state_dir_source": cfg.state_dir_source,
+        "include_markdown_docs_source": cfg.include_markdown_docs_source,
+        "db_path": str(db_path or (cfg.state_dir / "index.sqlite")),
+        "warnings": list(cfg.warnings),
+    }
+
+
+def _usage_db_for_state_dir(state_dir: Path) -> Path:
+    return state_dir / "usage.sqlite"
+
+
+def _record_cli_usage(
+    cfg: RuntimeConfig | None,
+    *,
+    tool: str,
+    success: bool,
+    query: str = "",
+    artifact_id: str = "",
+    artifact_type: str = "",
+    limit_value: int | None = None,
+    rebuild_requested: bool = False,
+    rebuilt: bool | None = None,
+    error: str = "",
+    result_count: int | None = None,
+    top_ids: list[str] | None = None,
+    top_types: list[str] | None = None,
+    latency_ms: int | None = None,
+    db_path: Path | None = None,
+    index_meta: dict[str, Any] | None = None,
+    usage_db_path: Path | None = None,
+) -> int | None:
+    root = cfg.source_root if cfg is not None else None
+    metadata = _cfg_metadata(cfg, db_path) if cfg is not None else {"plugin_version": __version__}
+    metadata.update(index_meta or {})
+    if usage_db_path is None:
+        if cfg is None:
+            usage_db_path = (db_path.parent / "usage.sqlite") if db_path is not None else None
+        else:
+            usage_db_path = _usage_db_for_state_dir(cfg.state_dir)
+    return _record_usage(
+        root,
+        tool=tool,
+        success=success,
+        query=query,
+        artifact_id=artifact_id,
+        artifact_type=artifact_type,
+        limit_value=limit_value,
+        rebuild_requested=rebuild_requested,
+        rebuilt=rebuilt,
+        error=error,
+        result_count=result_count,
+        top_ids=top_ids,
+        top_types=top_types,
+        latency_ms=latency_ms,
+        db_path=db_path,
+        client="cli",
+        index_metadata=metadata,
+        usage_db_path=usage_db_path,
+    )
 
 
 def add_common_db_arg(parser: argparse.ArgumentParser) -> None:
@@ -124,14 +194,24 @@ def _build_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
     )
 
 
-def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...]]:
+def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], RuntimeConfig]:
     if args.from_hermes_config:
         cfg = _runtime_config(args.hermes_home)
         db_path = _resolved(args.db) if args.db is not None else cfg.state_dir / "index.sqlite"
-        return db_path, cfg.warnings
+        if args.db is not None:
+            cfg = replace(cfg, state_dir=db_path.parent, state_dir_source="cli")
+        return db_path, cfg.warnings, cfg
     hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env())
     db_path = _resolved(args.db) if args.db is not None else default_output_dir(hermes_home) / "index.sqlite"
-    return db_path, ()
+    cfg = RuntimeConfig(
+        _resolved(DEFAULT_ROOT),
+        hermes_home,
+        db_path.parent,
+        IndexSettings(),
+        source_root_source="cwd",
+        state_dir_source="cli" if args.db is not None else "default",
+    )
+    return db_path, (), cfg
 
 
 def _doctor_payload(
@@ -144,11 +224,13 @@ def _doctor_payload(
     db_path = cfg.state_dir / "index.sqlite"
     payload: dict[str, Any] = {
         "success": True,
+        "plugin_version": __version__,
         "hermes_home": str(cfg.hermes_home),
         "source_root": str(cfg.source_root),
         "source_root_source": cfg.source_root_source,
         "state_dir": str(cfg.state_dir),
         "state_dir_source": cfg.state_dir_source,
+        "include_markdown_docs_source": cfg.include_markdown_docs_source,
         "db_path": str(db_path),
         "warnings": list(cfg.warnings),
         "checks": [],
@@ -167,13 +249,16 @@ def _doctor_payload(
 
     if args.rebuild and not errors:
         try:
+            build_started = time.perf_counter()
             artifacts, edges = build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
         except Exception as exc:
             payload["rebuilt"] = False
             check("rebuild_failed", False, f"{type(exc).__name__}: {exc}", fatal=True)
         else:
             payload["rebuilt"] = True
+            payload["build_duration_ms"] = int((time.perf_counter() - build_started) * 1000)
             payload["artifact_count"] = len(artifacts)
+            payload["artifact_counts_by_type"] = artifact_type_counts(artifacts)
             payload["edge_count"] = len(edges)
             check("index_exists_after_rebuild", db_path.exists(), str(db_path), fatal=True)
     else:
@@ -201,6 +286,7 @@ def _doctor_payload(
     if errors:
         payload["success"] = False
         payload["errors"] = errors
+    payload.update(index_metadata(db_path))
     return payload, 0 if payload["success"] else 1
 
 
@@ -236,11 +322,45 @@ def main(
     args = parse_args(argv)
     if args.command == "build":
         cfg = _build_config_from_args(args)
+        db_path = cfg.state_dir / "index.sqlite"
+        started = time.perf_counter()
         _print_warnings(cfg.warnings)
-        artifacts, edges = build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
-        counts: dict[str, int] = {}
-        for artifact in artifacts:
-            counts[artifact.type] = counts.get(artifact.type, 0) + 1
+        try:
+            artifacts, edges = build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
+        except Exception as exc:
+            message = f"cli_build failed: {type(exc).__name__}: {exc}"
+            _record_cli_usage(
+                cfg,
+                tool="cli_build",
+                success=False,
+                rebuild_requested=True,
+                rebuilt=False,
+                error=message,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                db_path=db_path,
+                index_meta=index_metadata(db_path),
+            )
+            raise
+        build_duration_ms = int((time.perf_counter() - started) * 1000)
+        counts = artifact_type_counts(artifacts)
+        meta = {
+            **index_metadata(db_path),
+            "artifact_count": len(artifacts),
+            "artifact_counts_by_type": counts,
+            "edge_count": len(edges),
+            "build_duration_ms": build_duration_ms,
+        }
+        _record_cli_usage(
+            cfg,
+            tool="cli_build",
+            success=True,
+            rebuild_requested=True,
+            rebuilt=True,
+            result_count=len(artifacts),
+            latency_ms=build_duration_ms,
+            db_path=db_path,
+            index_meta=meta,
+        )
         print(f"Built {len(artifacts)} artifacts and {len(edges)} edges")
         for artifact_type, count in sorted(counts.items()):
             print(f"  {artifact_type}: {count}")
@@ -249,9 +369,38 @@ def main(
         return 0
 
     if args.command == "search":
-        db_path, warnings = _db_from_args(args)
+        db_path, warnings, cfg = _db_from_args(args)
+        started = time.perf_counter()
         _print_warnings(warnings)
-        rows = search_index_fn(db_path, args.query, limit=args.limit)
+        try:
+            rows = search_index_fn(db_path, args.query, limit=args.limit)
+        except Exception as exc:
+            message = f"cli_search failed: {type(exc).__name__}: {exc}"
+            _record_cli_usage(
+                cfg,
+                tool="knowledge_search",
+                success=False,
+                query=args.query,
+                limit_value=args.limit,
+                error=message,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                db_path=db_path,
+                index_meta=index_metadata(db_path),
+            )
+            raise
+        _record_cli_usage(
+            cfg,
+            tool="knowledge_search",
+            success=True,
+            query=args.query,
+            limit_value=args.limit,
+            result_count=len(rows),
+            top_ids=[str(row.get("id")) for row in rows[:5]],
+            top_types=[str(row.get("type")) for row in rows[:5]],
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            db_path=db_path,
+            index_meta=index_metadata(db_path),
+        )
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
         else:
@@ -259,12 +408,47 @@ def main(
         return 0
 
     if args.command == "get":
-        db_path, warnings = _db_from_args(args)
+        db_path, warnings, cfg = _db_from_args(args)
+        started = time.perf_counter()
         _print_warnings(warnings)
-        row = get_artifact_fn(db_path, args.artifact_id)
+        try:
+            row = get_artifact_fn(db_path, args.artifact_id)
+        except Exception as exc:
+            message = f"cli_get failed: {type(exc).__name__}: {exc}"
+            _record_cli_usage(
+                cfg,
+                tool="knowledge_get",
+                success=False,
+                artifact_id=args.artifact_id,
+                error=message,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                db_path=db_path,
+                index_meta=index_metadata(db_path),
+            )
+            raise
         if row is None:
+            _record_cli_usage(
+                cfg,
+                tool="knowledge_get",
+                success=False,
+                artifact_id=args.artifact_id,
+                error=f"Artifact not found: {args.artifact_id}",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                db_path=db_path,
+                index_meta=index_metadata(db_path),
+            )
             print(f"Artifact not found: {args.artifact_id}", file=sys.stderr)
             return 1
+        _record_cli_usage(
+            cfg,
+            tool="knowledge_get",
+            success=True,
+            artifact_id=args.artifact_id,
+            result_count=1,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            db_path=db_path,
+            index_meta=index_metadata(db_path),
+        )
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2, sort_keys=True))
         else:
@@ -272,9 +456,36 @@ def main(
         return 0
 
     if args.command == "neighbors":
-        db_path, warnings = _db_from_args(args)
+        db_path, warnings, cfg = _db_from_args(args)
+        started = time.perf_counter()
         _print_warnings(warnings)
-        rows = get_neighbors_fn(db_path, args.artifact_id)
+        try:
+            rows = get_neighbors_fn(db_path, args.artifact_id)
+        except Exception as exc:
+            message = f"cli_neighbors failed: {type(exc).__name__}: {exc}"
+            _record_cli_usage(
+                cfg,
+                tool="knowledge_neighbors",
+                success=False,
+                artifact_id=args.artifact_id,
+                error=message,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                db_path=db_path,
+                index_meta=index_metadata(db_path),
+            )
+            raise
+        _record_cli_usage(
+            cfg,
+            tool="knowledge_neighbors",
+            success=True,
+            artifact_id=args.artifact_id,
+            result_count=len(rows),
+            top_ids=[str(row.get("id")) for row in rows[:5]],
+            top_types=[str(row.get("type")) for row in rows[:5]],
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            db_path=db_path,
+            index_meta=index_metadata(db_path),
+        )
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
         else:
@@ -282,6 +493,7 @@ def main(
         return 0
 
     if args.command in {"doctor", "smoke"}:
+        started = time.perf_counter()
         try:
             payload, status = _doctor_payload(
                 args,
@@ -296,6 +508,23 @@ def main(
                 "checks": [],
             }
             status = 1
+        db_path = Path(str(payload["db_path"])) if payload.get("db_path") else None
+        usage_db_path = Path(str(payload["state_dir"])) / "usage.sqlite" if payload.get("state_dir") else None
+        _record_cli_usage(
+            None,
+            tool="cli_doctor",
+            success=status == 0,
+            query=str(args.query or ""),
+            rebuild_requested=bool(args.rebuild),
+            rebuilt=bool(payload.get("rebuilt")) if "rebuilt" in payload else None,
+            error="; ".join(str(item) for item in payload.get("errors", [])),
+            result_count=payload.get("smoke_result_count"),
+            top_ids=[str(item) for item in payload.get("smoke_top_ids", [])],
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            db_path=db_path,
+            index_meta=payload,
+            usage_db_path=usage_db_path,
+        )
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         elif "hermes_home" in payload:

@@ -5,7 +5,9 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -149,6 +151,65 @@ def build_index(
     write_jsonl(output_dir / "index.jsonl", artifacts)
     build_sqlite(output_dir / "index.sqlite", artifacts, edges)
     return artifacts, edges
+
+
+def artifact_type_counts(artifacts: Sequence[Artifact]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for artifact in artifacts:
+        counts[artifact.type] = counts.get(artifact.type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _utc_from_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def index_metadata(db_path: Path) -> dict[str, Any]:
+    """Return safe, best-effort metadata for an index database.
+
+    Metadata collection is diagnostic only. It should never prevent the caller
+    from attempting the real lookup path.
+    """
+
+    metadata: dict[str, Any] = {"index_exists": db_path.exists()}
+    if not db_path.exists():
+        return metadata
+
+    try:
+        stat = db_path.stat()
+        metadata.update(
+            {
+                "index_mtime": _utc_from_timestamp(stat.st_mtime),
+                "index_age_seconds": max(0, int(time.time() - stat.st_mtime)),
+            }
+        )
+    except OSError as exc:
+        metadata["index_metadata_error"] = f"stat failed: {type(exc).__name__}: {exc}"
+        return metadata
+
+    try:
+        conn = connect_readonly(db_path)
+        try:
+            counts = {
+                str(row[0]): int(row[1])
+                for row in conn.execute("SELECT type, COUNT(*) FROM artifacts GROUP BY type").fetchall()
+            }
+            artifact_count = sum(counts.values())
+            edge_count = int(conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0])
+        finally:
+            conn.close()
+    except Exception as exc:
+        metadata["index_metadata_error"] = f"sqlite stats failed: {type(exc).__name__}: {exc}"
+    else:
+        metadata.update(
+            {
+                "artifact_count": artifact_count,
+                "artifact_counts_by_type": dict(sorted(counts.items())),
+                "edge_count": edge_count,
+            }
+        )
+    return metadata
+
 
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)

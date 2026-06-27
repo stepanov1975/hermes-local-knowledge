@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .runtime import _usage_db_path
 from .schemas import NEGATIVE_FEEDBACK_RATINGS
 
@@ -24,7 +25,19 @@ def _clean_text(value: Any, *, limit: int = 1000) -> str:
 def _json_list(values: list[str] | None) -> str:
     return json.dumps(values or [], ensure_ascii=False)
 
+
+def _json_object(value: Any) -> str:
+    return json.dumps(value if isinstance(value, dict) else {}, ensure_ascii=False, sort_keys=True)
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
 USAGE_EVENT_COLUMNS: dict[str, str] = {
+    "client": "TEXT NOT NULL DEFAULT 'native'",
     "session_id": "TEXT",
     "task_id": "TEXT",
     "tool_call_id": "TEXT",
@@ -40,6 +53,16 @@ USAGE_EVENT_COLUMNS: dict[str, str] = {
     "top_ids_json": "TEXT NOT NULL DEFAULT '[]'",
     "top_types_json": "TEXT NOT NULL DEFAULT '[]'",
     "latency_ms": "INTEGER",
+    "plugin_version": "TEXT",
+    "source_root_source": "TEXT",
+    "state_dir_source": "TEXT",
+    "include_markdown_docs_source": "TEXT",
+    "index_mtime": "TEXT",
+    "index_age_seconds": "INTEGER",
+    "index_artifact_count": "INTEGER",
+    "index_edge_count": "INTEGER",
+    "index_artifact_counts_json": "TEXT NOT NULL DEFAULT '{}'",
+    "build_duration_ms": "INTEGER",
     "root": "TEXT",
     "db_path": "TEXT",
 }
@@ -76,6 +99,7 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
             tool TEXT NOT NULL,
+            client TEXT NOT NULL DEFAULT 'native',
             session_id TEXT,
             task_id TEXT,
             tool_call_id TEXT,
@@ -91,6 +115,16 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             top_ids_json TEXT NOT NULL DEFAULT '[]',
             top_types_json TEXT NOT NULL DEFAULT '[]',
             latency_ms INTEGER,
+            plugin_version TEXT,
+            source_root_source TEXT,
+            state_dir_source TEXT,
+            include_markdown_docs_source TEXT,
+            index_mtime TEXT,
+            index_age_seconds INTEGER,
+            index_artifact_count INTEGER,
+            index_edge_count INTEGER,
+            index_artifact_counts_json TEXT NOT NULL DEFAULT '{}',
+            build_duration_ms INTEGER,
             root TEXT,
             db_path TEXT
         )
@@ -121,10 +155,15 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating)")
 
-def _usage_connect(root: Path) -> sqlite3.Connection:
-    usage_db = _usage_db_path(root)
-    usage_db.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(usage_db))
+def _usage_connect(root: Path | None, usage_db_path: Path | None = None) -> sqlite3.Connection:
+    if usage_db_path is None:
+        if root is None:
+            raise ValueError("root or usage_db_path is required")
+        resolved_usage_db = _usage_db_path(root)
+    else:
+        resolved_usage_db = usage_db_path
+    resolved_usage_db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(resolved_usage_db))
     conn.row_factory = sqlite3.Row
     _init_usage_db(conn)
     return conn
@@ -147,25 +186,34 @@ def _record_usage(
     latency_ms: int | None = None,
     db_path: Path | None = None,
     context: dict[str, str] | None = None,
+    client: str = "native",
+    index_metadata: dict[str, Any] | None = None,
+    usage_db_path: Path | None = None,
 ) -> int | None:
-    if root is None:
+    if root is None and usage_db_path is None:
         return None
     try:
         context = context or {}
-        conn = _usage_connect(root)
+        index_metadata = index_metadata or {}
+        artifact_counts = index_metadata.get("artifact_counts_by_type")
+        conn = _usage_connect(root, usage_db_path)
         try:
             cur = conn.execute(
                 """
                 INSERT INTO usage_events (
-                    ts, tool, session_id, task_id, tool_call_id, query,
+                    ts, tool, client, session_id, task_id, tool_call_id, query,
                     artifact_id, artifact_type, limit_value, rebuild_requested,
                     rebuilt, success, error, result_count, top_ids_json,
-                    top_types_json, latency_ms, root, db_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    top_types_json, latency_ms, plugin_version, source_root_source,
+                    state_dir_source, include_markdown_docs_source, index_mtime,
+                    index_age_seconds, index_artifact_count, index_edge_count,
+                    index_artifact_counts_json, build_duration_ms, root, db_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now(),
                     tool,
+                    _clean_text(client, limit=40) or "native",
                     context.get("session_id") or None,
                     context.get("task_id") or None,
                     context.get("tool_call_id") or None,
@@ -181,7 +229,19 @@ def _record_usage(
                     _json_list(top_ids),
                     _json_list(top_types),
                     latency_ms,
-                    str(root),
+                    _clean_text(index_metadata.get("plugin_version") or __version__, limit=80) or None,
+                    _clean_text(index_metadata.get("source_root_source"), limit=80) or None,
+                    _clean_text(index_metadata.get("state_dir_source"), limit=80) or None,
+                    _clean_text(index_metadata.get("include_markdown_docs_source"), limit=80) or None,
+                    _clean_text(index_metadata.get("index_mtime"), limit=80) or None,
+                    _int_or_none(index_metadata.get("index_age_seconds")),
+                    _int_or_none(index_metadata.get("artifact_count")),
+                    _int_or_none(index_metadata.get("edge_count")),
+                    _json_object(artifact_counts),
+                    _int_or_none(index_metadata.get("build_duration_ms")),
+                    str(root)
+                    if root is not None
+                    else (_clean_text(index_metadata.get("root") or index_metadata.get("source_root"), limit=1000) or None),
                     str(db_path) if db_path else None,
                 ),
             )
@@ -233,6 +293,21 @@ def _record_feedback(
 def _rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
+
+def _decode_json_object(text: Any) -> dict[str, Any]:
+    try:
+        value = json.loads(str(text or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_index_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for row in rows:
+        row["index_artifact_counts"] = _decode_json_object(row.pop("index_artifact_counts_json", None))
+    return rows
+
+
 def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
     usage_db = _usage_db_path(root)
     since_dt = datetime.now(timezone.utc) - timedelta(days=days)
@@ -252,6 +327,8 @@ def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
             "errors": [],
             "feedback_by_rating": [],
             "recent_negative_feedback": [],
+            "latest_index_metadata": None,
+            "recent_builds": [],
             "improvement_candidates": [],
         }
 
@@ -272,13 +349,13 @@ def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
         top_tools = _rows(
             conn,
             """
-            SELECT tool, COUNT(*) AS count, SUM(success) AS successes,
+            SELECT client, tool, COUNT(*) AS count, SUM(success) AS successes,
                    COUNT(*) - SUM(success) AS errors,
                    ROUND(AVG(latency_ms), 1) AS avg_latency_ms
             FROM usage_events
             WHERE ts >= ?
-            GROUP BY tool
-            ORDER BY count DESC, tool
+            GROUP BY client, tool
+            ORDER BY count DESC, client, tool
             LIMIT ?
             """,
             (since, limit),
@@ -324,10 +401,10 @@ def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
         errors = _rows(
             conn,
             """
-            SELECT tool, error, COUNT(*) AS count, MAX(ts) AS last_seen
+            SELECT client, tool, error, COUNT(*) AS count, MAX(ts) AS last_seen
             FROM usage_events
             WHERE ts >= ? AND success = 0 AND error IS NOT NULL
-            GROUP BY tool, error
+            GROUP BY client, tool, error
             ORDER BY count DESC, last_seen DESC
             LIMIT ?
             """,
@@ -356,6 +433,40 @@ def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
             """,
             (since, *sorted(NEGATIVE_FEEDBACK_RATINGS), limit),
         )
+        latest_index_rows = _normalize_index_rows(
+            _rows(
+                conn,
+                """
+                SELECT id, ts, client, tool, plugin_version, root, db_path,
+                       source_root_source, state_dir_source,
+                       include_markdown_docs_source, index_mtime,
+                       index_age_seconds, index_artifact_count,
+                       index_edge_count, index_artifact_counts_json,
+                       build_duration_ms, rebuilt
+                FROM usage_events
+                WHERE ts >= ? AND (index_mtime IS NOT NULL OR index_artifact_count IS NOT NULL)
+                ORDER BY ts DESC, id DESC
+                LIMIT 1
+                """,
+                (since,),
+            )
+        )
+        recent_builds = _normalize_index_rows(
+            _rows(
+                conn,
+                """
+                SELECT id, ts, client, tool, plugin_version, root, db_path,
+                       source_root_source, state_dir_source, index_mtime,
+                       index_artifact_count, index_edge_count,
+                       index_artifact_counts_json, build_duration_ms, rebuilt
+                FROM usage_events
+                WHERE ts >= ? AND success = 1 AND rebuilt = 1
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (since, limit),
+            )
+        )
     finally:
         conn.close()
 
@@ -382,5 +493,7 @@ def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
         "errors": errors,
         "feedback_by_rating": feedback_by_rating,
         "recent_negative_feedback": recent_negative_feedback,
+        "latest_index_metadata": latest_index_rows[0] if latest_index_rows else None,
+        "recent_builds": recent_builds,
         "improvement_candidates": improvement_candidates[:limit],
     }

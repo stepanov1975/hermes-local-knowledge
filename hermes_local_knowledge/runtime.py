@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from . import __version__
 from .models import IndexSettings
 from .scanners import load_yaml_if_available
 from .schemas import CONFIG_SECTION, ROOT_ENV, STATE_ENV
-from .storage import build_index
+from .storage import artifact_type_counts, build_index, index_metadata
 
 BuildIndexFn = Callable[[Path, Path, Path, IndexSettings], tuple[list[Any], list[Any]]]
 
@@ -233,6 +235,7 @@ def _ensure_index(
     cfg = _runtime_config()
     db_path = cfg.state_dir / "index.sqlite"
     metadata: dict[str, Any] = {
+        "plugin_version": __version__,
         "root": str(cfg.source_root),
         "source_root_source": cfg.source_root_source,
         "state_dir": str(cfg.state_dir),
@@ -244,6 +247,7 @@ def _ensure_index(
     }
     if rebuild or not db_path.exists():
         build = build_index_fn or build_index
+        build_started = time.perf_counter()
         artifacts, edges = build(
             cfg.source_root,
             cfg.state_dir,
@@ -253,10 +257,13 @@ def _ensure_index(
         metadata.update(
             {
                 "rebuilt": True,
+                "build_duration_ms": int((time.perf_counter() - build_started) * 1000),
                 "artifact_count": len(artifacts),
+                "artifact_counts_by_type": artifact_type_counts(artifacts),
                 "edge_count": len(edges),
             }
         )
+    metadata.update(index_metadata(db_path))
     return db_path, metadata
 
 
