@@ -55,6 +55,61 @@ from .telemetry import (
 )
 from .tooling import tool_error, tool_result
 
+# Keep wrapper-level names explicit for legacy callers/tests that monkeypatch
+# hermes_local_knowledge.plugin after the internal module split.
+__all__ = [
+    "CONFIG_SECTION",
+    "FEEDBACK_COLUMNS",
+    "FEEDBACK_RATINGS",
+    "KNOWLEDGE_FEEDBACK_SCHEMA",
+    "KNOWLEDGE_GET_SCHEMA",
+    "KNOWLEDGE_NEIGHBORS_SCHEMA",
+    "KNOWLEDGE_SEARCH_SCHEMA",
+    "KNOWLEDGE_USAGE_REPORT_SCHEMA",
+    "NEGATIVE_FEEDBACK_RATINGS",
+    "ROOT_ENV",
+    "RuntimeConfig",
+    "STATE_ENV",
+    "TOOLSET",
+    "USAGE_EVENT_COLUMNS",
+    "_clean_text",
+    "_coerce_bool",
+    "_coerce_int",
+    "_config_value",
+    "_db_path",
+    "_ensure_columns",
+    "_ensure_index",
+    "_get_hermes_home",
+    "_handle_feedback",
+    "_handle_get",
+    "_handle_neighbors",
+    "_handle_search",
+    "_handle_usage_report",
+    "_index_module",
+    "_init_usage_db",
+    "_json_list",
+    "_load_hermes_config",
+    "_output_dir",
+    "_path_value",
+    "_record_feedback",
+    "_record_usage",
+    "_repo_root",
+    "_rows",
+    "_runtime_config",
+    "_section_config",
+    "_tuple_value",
+    "_usage_connect",
+    "_usage_context",
+    "_usage_db_path",
+    "_usage_report",
+    "_utc_now",
+    "check_knowledge_available",
+    "indexer",
+    "register",
+    "tool_error",
+    "tool_result",
+]
+
 
 def _ensure_index(root: Path, *, rebuild: bool = False):
     """Build through this compatibility module's index-module seam."""
