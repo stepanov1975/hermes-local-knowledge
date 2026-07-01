@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import tomllib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import hermes_local_knowledge
 from hermes_local_knowledge import handlers as lci_handlers
 from hermes_local_knowledge import plugin
+from hermes_local_knowledge import telemetry as lci_telemetry
 
 
 def write(path: Path, content: str) -> None:
@@ -522,8 +524,12 @@ def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):
     assert report["success"] is True
     assert report["total_events"] >= 3
     assert report["feedback_count"] == 1
+    assert report["live_total_events"] == report["total_events"]
+    assert report["root_breakdown"][0]["root_scope"] == "live"
     assert any(row["query"] == "zzzzzzzz unlikely" for row in report["zero_result_queries"])
+    assert any(row["query"] == "zzzzzzzz unlikely" for row in report["unresolved_zero_result_queries"])
     assert any(row["rating"] == "wrong_artifact" for row in report["recent_negative_feedback"])
+    assert any(row["rating"] == "wrong_artifact" for row in report["live_recent_negative_feedback"])
     assert any(item["type"] == "zero_result_query" for item in report["improvement_candidates"])
     assert any(item["type"] == "feedback_wrong_artifact" for item in report["improvement_candidates"])
     assert report["latest_index_metadata"]["plugin_version"] == hermes_local_knowledge.__version__
@@ -532,6 +538,154 @@ def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):
     assert report["latest_index_metadata"]["index_artifact_counts"]["skill"] == 2
     assert report["recent_builds"]
     assert report["recent_builds"][0]["index_artifact_counts"]["script"] == 1
+
+
+def test_usage_report_separates_roots_and_suppresses_resolved_zero_results(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    now = datetime.now(timezone.utc)
+
+    def ts(delta: timedelta) -> str:
+        return (now + delta).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    stamps = iter(
+        [
+            ts(timedelta(days=-6)),
+            ts(timedelta(days=-5)),
+            ts(timedelta(days=-2)),
+            ts(timedelta(days=-4)),
+            ts(timedelta(days=-1, hours=-1)),
+            ts(timedelta(hours=-3)),
+            ts(timedelta(hours=-2)),
+            ts(timedelta(hours=-1)),
+            ts(timedelta()),
+        ]
+    )
+    monkeypatch.setattr(lci_telemetry, "_utc_now", lambda: next(stamps))
+    usage_db_path = state_dir / "usage.sqlite"
+
+    plugin._record_usage(repo, tool="knowledge_search", success=True, query="fixed query", result_count=0)
+    plugin._record_usage(repo, tool="knowledge_search", success=True, query="fixed query", result_count=2)
+    plugin._record_usage(repo, tool="knowledge_search", success=True, query="still missing", result_count=0)
+    plugin._record_usage(repo, tool="knowledge_search", success=False, query="old live", error="old live error")
+    plugin._record_usage(repo, tool="knowledge_search", success=False, query="recent live", error="recent live error")
+    plugin._record_usage(repo, tool="knowledge_search", success=True, query="XXXX", result_count=0)
+    plugin._record_usage(
+        Path("/tmp/pytest-of-alex/router-test/repo"),
+        tool="knowledge_search",
+        success=False,
+        query="test failure",
+        error="test root error",
+        usage_db_path=usage_db_path,
+    )
+    plugin._record_usage(
+        Path("/tmp/pytest-of-alex/router-test/repo"),
+        tool="knowledge_search",
+        success=True,
+        query="test zero",
+        result_count=0,
+        usage_db_path=usage_db_path,
+    )
+
+    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+
+    scopes = {row["root_scope"]: row for row in report["root_breakdown"]}
+    assert scopes["live"]["count"] == 6
+    assert scopes["test_tmp"]["count"] == 2
+    assert report["live_total_events"] == 6
+    assert report["total_events"] == 8
+    assert [row["query"] for row in report["resolved_zero_result_queries"]] == ["fixed query"]
+    assert {row["query"] for row in report["unresolved_zero_result_queries"]} == {"still missing", "XXXX"}
+    assert [row["query"] for row in report["active_zero_result_queries"]] == ["still missing"]
+    assert [row["query"] for row in report["probe_zero_result_queries"]] == ["XXXX"]
+    assert all(row["query"] != "test zero" for row in report["unresolved_zero_result_queries"])
+    assert {row["error"] for row in report["live_errors"]} == {"old live error", "recent live error"}
+    assert [row["error"] for row in report["recent_live_errors"]] == ["recent live error"]
+    candidate_queries = {row.get("query") for row in report["improvement_candidates"]}
+    candidate_errors = {row.get("error") for row in report["improvement_candidates"] if row.get("error")}
+    assert "still missing" in candidate_queries
+    assert "fixed query" not in candidate_queries
+    assert "XXXX" not in candidate_queries
+    assert "test zero" not in candidate_queries
+    assert candidate_errors == {"recent live error"}
+
+
+def test_usage_report_buckets_unknown_feedback_ratings(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+
+    plugin._record_feedback(repo, rating="great", event_id=None, query="", artifact_id="", note="legacy", context={})
+    plugin._record_feedback(repo, rating="other", event_id=None, query="", artifact_id="", note="current", context={})
+
+    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+
+    raw_ratings = {row["rating"]: row["count"] for row in report["feedback_by_rating"]}
+    bucketed_ratings = {row["rating"]: row["count"] for row in report["feedback_rating_buckets"]}
+    assert raw_ratings["great"] == 1
+    assert bucketed_ratings["other"] == 2
+    assert len(report["unknown_feedback_ratings"]) == 1
+    assert report["unknown_feedback_ratings"][0]["rating"] == "great"
+    assert report["unknown_feedback_ratings"][0]["count"] == 1
+
+
+def test_usage_report_suppresses_negative_feedback_after_later_useful_feedback(tmp_path, monkeypatch):
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    now = datetime.now(timezone.utc)
+
+    def ts(delta: timedelta) -> str:
+        return (now + delta).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    stamps = iter(
+        [
+            ts(timedelta(days=-4)),
+            ts(timedelta(days=-4, seconds=1)),
+            ts(timedelta(days=-1)),
+            ts(timedelta(days=-1, seconds=1)),
+            ts(timedelta()),
+        ]
+    )
+    monkeypatch.setattr(lci_telemetry, "_utc_now", lambda: next(stamps))
+
+    old_event = plugin._record_usage(
+        repo,
+        tool="knowledge_search",
+        success=True,
+        query="stale feedback query",
+        result_count=2,
+    )
+    plugin._record_feedback(
+        repo,
+        rating="noisy",
+        event_id=old_event,
+        query="",
+        artifact_id="",
+        note="old ranking was noisy",
+        context={},
+    )
+    useful_event = plugin._record_usage(
+        repo,
+        tool="knowledge_search",
+        success=True,
+        query="stale feedback query",
+        result_count=2,
+    )
+    plugin._record_feedback(
+        repo,
+        rating="useful",
+        event_id=useful_event,
+        query="",
+        artifact_id="",
+        note="later check was useful",
+        context={},
+    )
+
+    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+
+    assert report["live_recent_negative_feedback"][0]["effective_query"] == "stale feedback query"
+    assert report["resolved_negative_feedback"][0]["effective_query"] == "stale feedback query"
+    assert report["unresolved_negative_feedback"] == []
+    assert all(item["type"] != "feedback_noisy" for item in report["improvement_candidates"])
 
 
 def test_usage_report_recent_builds_exclude_failed_build_attempts(tmp_path, monkeypatch):
