@@ -30,6 +30,15 @@ def test_version_metadata_stays_in_sync():
     assert hermes_local_knowledge.__version__ == plugin_version
 
 
+def test_packaging_discovery_excludes_mutation_workspace():
+    repo_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    find_config = pyproject["tool"]["setuptools"]["packages"]["find"]
+
+    assert find_config["include"] == ["hermes_local_knowledge*"]
+    assert "mutants*" in find_config["exclude"]
+
+
 def make_temp_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
     repo = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
