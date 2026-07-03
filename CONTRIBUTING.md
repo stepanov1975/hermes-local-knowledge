@@ -17,6 +17,7 @@ python -m pip install -e '.[test]'
 python -m pytest -q
 python -m ruff check .
 python -m mypy
+python scripts/check_version_policy.py --base-ref origin/main
 git diff --check
 ```
 
@@ -28,8 +29,15 @@ A good pull request includes:
 
 - a short explanation of the user-facing behavior change;
 - tests or a clear reason tests are not needed;
+- a synchronized plugin version bump when release-relevant files change;
 - documentation updates when install, configuration, or public behavior changes;
 - local verification output in the PR checklist.
+
+The version policy is checked in CI. Keep `plugin.yaml`, `pyproject.toml`, and
+`hermes_local_knowledge/__init__.py` synchronized. If a change touches runtime
+or package/plugin surfaces such as `hermes_local_knowledge/**`, `plugin.yaml`,
+`pyproject.toml`, `after-install.md`, or `examples/**`, bump the version in all
+three locations compared with the target branch.
 
 Generated or local-only files must stay out of commits, including:
 

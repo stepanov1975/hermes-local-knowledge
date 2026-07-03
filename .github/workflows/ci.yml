@@ -23,6 +23,7 @@ jobs:
         # actions/checkout v7.0.0
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
@@ -38,6 +39,11 @@ jobs:
           python -m pip install hermes-agent
           python -m pip install -e '.[test]'
           hermes --version
+
+      - name: Check version policy
+        env:
+          VERSION_POLICY_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/check_version_policy.py
 
       - name: Run tests
         run: python -m pytest -q

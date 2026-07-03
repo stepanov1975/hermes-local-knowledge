@@ -215,7 +215,12 @@ python -m pip install -e '.[test]'
 python -m pytest
 python -m ruff check .
 python -m mypy
+python scripts/check_version_policy.py --base-ref origin/main
 ```
+
+The version policy check keeps `plugin.yaml`, `pyproject.toml`, and
+`hermes_local_knowledge/__init__.py` synchronized. CI also requires a version
+bump when release-relevant plugin/package files change.
 
 For optional mutation testing, install the mutation extra and run `mutmut` locally:
 
