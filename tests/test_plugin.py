@@ -34,9 +34,11 @@ def test_packaging_discovery_excludes_mutation_workspace():
     repo_root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
     find_config = pyproject["tool"]["setuptools"]["packages"]["find"]
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
 
     assert find_config["include"] == ["hermes_local_knowledge*"]
     assert "mutants*" in find_config["exclude"]
+    assert package_data["hermes_local_knowledge"] == ["skills/*/SKILL.md"]
 
 
 def make_temp_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -88,25 +90,42 @@ def configure_env(monkeypatch, repo: Path, hermes_home: Path, state_dir: Path) -
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
 
-def test_register_exposes_native_tools():
-    calls = []
+def test_register_exposes_native_tools_and_bundled_skill():
+    tool_calls = []
+    skill_calls = []
 
     class Ctx:
         def register_tool(self, **kwargs):
-            calls.append(kwargs)
+            tool_calls.append(kwargs)
+
+        def register_skill(self, name, skill_md):  # type: ignore[no-untyped-def]
+            skill_calls.append((name, Path(skill_md)))
 
     plugin.register(Ctx())
 
-    assert [call["name"] for call in calls] == [
+    assert [call["name"] for call in tool_calls] == [
         "knowledge_search",
         "knowledge_get",
         "knowledge_neighbors",
         "knowledge_feedback",
         "knowledge_usage_report",
     ]
-    assert {call["toolset"] for call in calls} == {"local_knowledge"}
-    assert all(call["schema"]["parameters"]["type"] == "object" for call in calls)
-    assert all(call["check_fn"] is plugin.check_knowledge_available for call in calls)
+    assert {call["toolset"] for call in tool_calls} == {"local_knowledge"}
+    assert all(call["schema"]["parameters"]["type"] == "object" for call in tool_calls)
+    assert all(call["check_fn"] is plugin.check_knowledge_available for call in tool_calls)
+    expected_skill = Path(__file__).resolve().parents[1] / "skills" / "local-knowledge-router" / "SKILL.md"
+    assert skill_calls == [("local-knowledge-router", expected_skill)]
+    assert skill_calls[0][1].is_file()
+
+
+def test_bundled_router_skill_matches_install_example() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    bundled = repo_root / "skills" / "local-knowledge-router" / "SKILL.md"
+    packaged = repo_root / "hermes_local_knowledge" / "skills" / "local-knowledge-router" / "SKILL.md"
+    example = repo_root / "examples" / "local-knowledge-router-skill" / "SKILL.md"
+
+    assert bundled.read_text(encoding="utf-8") == example.read_text(encoding="utf-8")
+    assert packaged.read_text(encoding="utf-8") == bundled.read_text(encoding="utf-8")
 
 
 def test_plugin_handlers_honor_compatibility_module_monkeypatches(monkeypatch) -> None:  # type: ignore[no-untyped-def]

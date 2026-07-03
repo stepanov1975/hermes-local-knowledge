@@ -158,8 +158,29 @@ def _handle_usage_report(args, **kwargs) -> str:
     return _handlers._handle_usage_report(args, deps=_handler_deps(), **kwargs)
 
 
+def _bundled_router_skill() -> Path:
+    """Return the plugin-local router skill path.
+
+    Directory-plugin installs keep skills at the plugin root. Wheel installs use
+    package data because top-level repo files are not import-addressable.
+    """
+    root_skill = Path(__file__).resolve().parents[1] / "skills" / "local-knowledge-router" / "SKILL.md"
+    if root_skill.exists():
+        return root_skill
+    return Path(__file__).resolve().parent / "skills" / "local-knowledge-router" / "SKILL.md"
+
+
+def _register_bundled_skills(ctx) -> None:
+    register_skill = getattr(ctx, "register_skill", None)
+    if register_skill is None:
+        return
+    skill_md = _bundled_router_skill()
+    if skill_md.exists():
+        register_skill("local-knowledge-router", skill_md)
+
+
 def register(ctx) -> None:
-    """Register native tools for the local knowledge index."""
+    """Register native tools and bundled skills for the local knowledge index."""
     for name, schema, handler, emoji in (
         ("knowledge_search", KNOWLEDGE_SEARCH_SCHEMA, _handle_search, "🗺️"),
         ("knowledge_get", KNOWLEDGE_GET_SCHEMA, _handle_get, "📄"),
@@ -175,3 +196,4 @@ def register(ctx) -> None:
             check_fn=check_knowledge_available,
             emoji=emoji,
         )
+    _register_bundled_skills(ctx)

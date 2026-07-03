@@ -33,6 +33,7 @@ RELEASE_RELEVANT_FILES = {
 RELEASE_RELEVANT_PREFIXES = (
     "hermes_local_knowledge/",
     "examples/",
+    "skills/",
 )
 _VERSION_RE = re.compile(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
 _SIMPLE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")

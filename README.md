@@ -38,28 +38,36 @@ hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --
 
 The plugin registers tools, but a skill tells Hermes **when** to use them. Without the routing skill, Hermes can still call `knowledge_search` when explicitly asked, but it is much less likely to use the router proactively for local runbooks, scripts, cron jobs, MCP wrappers, or custom skills.
 
-Install the bundled example skill into the target Hermes home/profile:
+Install the bundled skill into the target Hermes home/profile for proactive routing:
 
 ```bash
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/skills/local-knowledge-router"
-cp "$HERMES_HOME/plugins/local_knowledge/examples/local-knowledge-router-skill/SKILL.md" \
+cp "$HERMES_HOME/plugins/local_knowledge/skills/local-knowledge-router/SKILL.md" \
   "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
 ```
+
+The plugin also registers this same skill as a read-only, namespaced plugin skill for explicit loads:
+
+```text
+skill_view("local_knowledge:local-knowledge-router")
+```
+
+That namespaced skill is useful as a versioned fallback/reference, but it does **not** appear in Hermes' normal available-skill index. Install the normal skill above when you want Hermes to use local knowledge proactively.
 
 If you are working from a source checkout instead of the installed plugin directory:
 
 ```bash
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/skills/local-knowledge-router"
-cp examples/local-knowledge-router-skill/SKILL.md \
+cp skills/local-knowledge-router/SKILL.md \
   "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
 ```
 
-You can also install the example skill directly from GitHub:
+You can also install the skill directly from GitHub:
 
 ```bash
-hermes skills install https://raw.githubusercontent.com/stepanov1975/hermes-local-knowledge/main/examples/local-knowledge-router-skill/SKILL.md --name local-knowledge-router
+hermes skills install https://raw.githubusercontent.com/stepanov1975/hermes-local-knowledge/main/skills/local-knowledge-router/SKILL.md --name local-knowledge-router
 ```
 
 After adding the skill, start a fresh Hermes session or run `/reload-skills` and then `/new`/`/reset` so the router instructions enter the prompt.

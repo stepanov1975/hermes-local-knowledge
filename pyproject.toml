@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-local-knowledge"
-version = "0.2.8"
+version = "0.2.9"
 description = "Reusable Hermes Agent plugin for local capability indexing"
 requires-python = ">=3.11"
 readme = "README.md"
@@ -41,6 +41,9 @@ local_knowledge = "hermes_local_knowledge.plugin"
 [tool.setuptools.packages.find]
 include = ["hermes_local_knowledge*"]
 exclude = ["tests*", "mutants*"]
+
+[tool.setuptools.package-data]
+hermes_local_knowledge = ["skills/*/SKILL.md"]
 
 [tool.mutmut]
 source_paths = ["hermes_local_knowledge"]

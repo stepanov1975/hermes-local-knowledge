@@ -46,6 +46,7 @@ def make_repo(tmp_path: Path, version: str = "0.1.0") -> Path:
 def test_release_relevant_path_classification() -> None:
     assert version_policy.is_release_relevant_path("hermes_local_knowledge/runtime.py")
     assert version_policy.is_release_relevant_path("examples/local-knowledge-router-skill/SKILL.md")
+    assert version_policy.is_release_relevant_path("skills/local-knowledge-router/SKILL.md")
     assert version_policy.is_release_relevant_path("plugin.yaml")
     assert version_policy.is_release_relevant_path("pyproject.toml")
     assert not version_policy.is_release_relevant_path("tests/test_plugin.py")
