@@ -54,11 +54,13 @@ cp examples/local-knowledge-router-skill/SKILL.md \
   "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
 ```
 
-Alternatively, install the example skill directly from GitHub:
+If the example skill is reachable over a public or otherwise authenticated raw URL, you can also install it directly:
 
 ```bash
 hermes skills install https://raw.githubusercontent.com/stepanov1975/hermes-local-knowledge/main/examples/local-knowledge-router-skill/SKILL.md --name local-knowledge-router
 ```
+
+For private repositories, prefer the copy commands above; unauthenticated `raw.githubusercontent.com` URLs usually return 404.
 
 After adding the skill, start a fresh Hermes session or run `/reload-skills` and then `/new`/`/reset` so the router instructions enter the prompt.
 
