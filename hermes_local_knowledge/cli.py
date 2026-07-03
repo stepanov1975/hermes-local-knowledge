@@ -509,7 +509,9 @@ def main(
             }
             status = 1
         doctor_db_path = Path(str(payload["db_path"])) if payload.get("db_path") else None
-        usage_db_path = Path(str(payload["state_dir"])) / "usage.sqlite" if payload.get("state_dir") else None
+        doctor_usage_db_path = (
+            Path(str(payload["state_dir"])) / "usage.sqlite" if payload.get("state_dir") else None
+        )
         _record_cli_usage(
             None,
             tool="cli_doctor",
@@ -523,7 +525,7 @@ def main(
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=doctor_db_path,
             index_meta=payload,
-            usage_db_path=usage_db_path,
+            usage_db_path=doctor_usage_db_path,
         )
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
