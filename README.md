@@ -32,6 +32,36 @@ For private GitHub repositories, prefer the SSH form above. HTTPS clones may
 fail in non-interactive Hermes sessions if GitHub credentials are not already
 available to `git`.
 
+### Install the routing skill
+
+The plugin registers tools, but a skill tells Hermes **when** to use them. Without the routing skill, Hermes can still call `knowledge_search` when explicitly asked, but it is much less likely to use the router proactively for local runbooks, scripts, cron jobs, MCP wrappers, or custom skills.
+
+Install the bundled example skill into the target Hermes home/profile:
+
+```bash
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/skills/local-knowledge-router"
+cp "$HERMES_HOME/plugins/local_knowledge/examples/local-knowledge-router-skill/SKILL.md" \
+  "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
+```
+
+If you are working from a source checkout instead of the installed plugin directory:
+
+```bash
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/skills/local-knowledge-router"
+cp examples/local-knowledge-router-skill/SKILL.md \
+  "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
+```
+
+Alternatively, install the example skill directly from GitHub:
+
+```bash
+hermes skills install https://raw.githubusercontent.com/stepanov1975/hermes-local-knowledge/main/examples/local-knowledge-router-skill/SKILL.md --name local-knowledge-router
+```
+
+After adding the skill, start a fresh Hermes session or run `/reload-skills` and then `/new`/`/reset` so the router instructions enter the prompt.
+
 Configure a high-signal source tree to index. Prefer a local operational/customization repo that contains your runbooks, helper scripts, and custom skills; the plugin still indexes runtime skills, cron jobs, and MCP config from `$HERMES_HOME` separately.
 
 ```bash

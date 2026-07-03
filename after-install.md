@@ -6,6 +6,17 @@ Enable the plugin if you did not pass `--enable`:
 hermes plugins enable local_knowledge
 ```
 
+Install the routing skill too. The plugin registers the `knowledge_*` tools, but a skill tells Hermes when to use them proactively for local runbooks, scripts, cron jobs, MCP wrappers, and custom skills:
+
+```bash
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/skills/local-knowledge-router"
+cp "$HERMES_HOME/plugins/local_knowledge/examples/local-knowledge-router-skill/SKILL.md" \
+  "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
+```
+
+After adding the skill, start a fresh Hermes session or run `/reload-skills` and then `/new`/`/reset` so the router instructions enter the prompt.
+
 Recommended pattern: set `source_root` to a high-signal local operational/customization repo (runbooks, helper scripts, custom skills). The plugin still indexes runtime `$HERMES_HOME/skills`, cron jobs, and MCP config separately, so `source_root` does not need to be the whole Hermes home.
 
 Recommended config in `~/.hermes/config.yaml`:
