@@ -49,11 +49,13 @@ The local knowledge plugin indexes whole artifacts. Its purpose is to identify t
    - `cron_job` → verify the live cron registry before mutating jobs.
    - `mcp_server` → inspect the wrapper/config before troubleshooting MCP behavior.
 
-4. Use `rebuild=true` when relevant files changed recently or the index looks stale:
+4. Do not assume the index is fresh. The plugin auto-builds only when the database is missing; normal lookups reuse the existing index unless you pass `rebuild=true`. Use `rebuild=true` when relevant files changed recently or the index looks stale:
 
    ```text
    knowledge_search(query="new helper script", limit=8, rebuild=true)
    ```
+
+   During installation, set up the `local_knowledge index rebuild` cron job from the plugin README/after-install notes so future agents route from current skills, scripts, runbooks, cron jobs, and MCP config.
 
 5. Record lookup quality when it is clear:
 

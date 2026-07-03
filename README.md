@@ -82,6 +82,33 @@ hermes config set local_knowledge.script_dirs scripts,hermes_home/scripts
 hermes config set local_knowledge.include_markdown_docs true
 ```
 
+### Keep the index fresh
+
+The native tools auto-build the index when it is missing, and every lookup accepts `rebuild=true`, but normal searches reuse the existing `index.sqlite`. For a real install, schedule a rebuild cron job. This matters because skills, scripts, runbooks, cron jobs, and MCP config can change outside the current session; without a scheduled rebuild, agents may route from stale metadata unless they remember to request `rebuild=true`.
+
+For a directory plugin install, create a silent no-agent rebuild job:
+
+```bash
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/scripts"
+cat > "$HERMES_HOME/scripts/rebuild_local_knowledge_index.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+cd "$HERMES_HOME/plugins/local_knowledge"
+python -m hermes_local_knowledge.cli build --from-hermes-config --hermes-home "$HERMES_HOME" >/dev/null
+EOF
+chmod +x "$HERMES_HOME/scripts/rebuild_local_knowledge_index.sh"
+hermes cron create \
+  --name 'local_knowledge index rebuild' \
+  --script rebuild_local_knowledge_index.sh \
+  --no-agent \
+  --deliver local \
+  '0 * * * *'
+```
+
+Empty stdout keeps successful runs silent; non-zero exits still alert. Hourly is a reasonable default for active setups. Daily is fine for rarely changed docs.
+
 Then restart the gateway from outside the running gateway process, or send
 `/restart` from a gateway chat such as Telegram:
 

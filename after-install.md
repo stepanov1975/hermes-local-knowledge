@@ -44,6 +44,29 @@ hermes config set local_knowledge.include_markdown_docs true
 
 You can omit `source_root` to index only this Hermes profile's runtime artifacts under `$HERMES_HOME`. If `$HERMES_HOME/hermes-agent` exists, the plugin warns because broad Hermes-home indexing can be noisy.
 
+Create a scheduled rebuild for the index. The tools rebuild automatically only when the database is missing or a lookup uses `rebuild=true`; normal searches reuse the existing index. A cron rebuild keeps local skills, scripts, runbooks, cron jobs, and MCP config fresh for agents that do not know the source tree changed.
+
+```bash
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/scripts"
+cat > "$HERMES_HOME/scripts/rebuild_local_knowledge_index.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+cd "$HERMES_HOME/plugins/local_knowledge"
+python -m hermes_local_knowledge.cli build --from-hermes-config --hermes-home "$HERMES_HOME" >/dev/null
+EOF
+chmod +x "$HERMES_HOME/scripts/rebuild_local_knowledge_index.sh"
+hermes cron create \
+  --name 'local_knowledge index rebuild' \
+  --script rebuild_local_knowledge_index.sh \
+  --no-agent \
+  --deliver local \
+  '0 * * * *'
+```
+
+Successful runs are silent because the script prints nothing; failures still produce a cron alert.
+
 Smoke check the install/config. CLI commands write to the same local `usage.sqlite` telemetry store, so smoke checks show up in `knowledge_usage_report` alongside native tool calls:
 
 ```bash
