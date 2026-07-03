@@ -1,0 +1,38 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 4 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: CodeQL Python
+    # Code scanning upload is available for public repositories. Keep this
+    # skipped while the repository is still private on a plan without GHAS.
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        # actions/checkout v7.0.0
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        # github/codeql-action v4.31.7
+        uses: github/codeql-action/init@cf1bb45a277cb3c205638b2cd5c984db1c46a412
+        with:
+          languages: python
+
+      - name: Perform CodeQL analysis
+        # github/codeql-action v4.31.7
+        uses: github/codeql-action/analyze@cf1bb45a277cb3c205638b2cd5c984db1c46a412

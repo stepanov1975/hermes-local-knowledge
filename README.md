@@ -22,15 +22,17 @@ Native Hermes tools under the `local_knowledge` toolset:
 
 ## Install
 
-From a git repo:
+From the public git repo:
+
+```bash
+hermes plugins install https://github.com/stepanov1975/hermes-local-knowledge.git --enable
+```
+
+SSH also works when your host has GitHub SSH keys configured:
 
 ```bash
 hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --enable
 ```
-
-For private GitHub repositories, prefer the SSH form above. HTTPS clones may
-fail in non-interactive Hermes sessions if GitHub credentials are not already
-available to `git`.
 
 ### Install the routing skill
 
@@ -54,13 +56,11 @@ cp examples/local-knowledge-router-skill/SKILL.md \
   "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
 ```
 
-If the example skill is reachable over a public or otherwise authenticated raw URL, you can also install it directly:
+You can also install the example skill directly from GitHub:
 
 ```bash
 hermes skills install https://raw.githubusercontent.com/stepanov1975/hermes-local-knowledge/main/examples/local-knowledge-router-skill/SKILL.md --name local-knowledge-router
 ```
-
-For private repositories, prefer the copy commands above; unauthenticated `raw.githubusercontent.com` URLs usually return 404.
 
 After adding the skill, start a fresh Hermes session or run `/reload-skills` and then `/new`/`/reset` so the router instructions enter the prompt.
 
@@ -249,12 +249,13 @@ The tests verify:
 
 ## Repository hygiene and security
 
-This repo includes baseline GitHub hygiene for a private reusable plugin:
+This repo includes baseline GitHub hygiene for a public reusable plugin:
 
 - `LICENSE` with MIT terms;
+- contributor guidance and a code of conduct;
 - CI on Python 3.11 and 3.12;
-- Dependabot config for GitHub Actions and Python packaging metadata;
-- security scans for Gitleaks, actionlint, Semgrep, zizmor, ShellCheck, and gated pip-audit;
+- Dependabot config for GitHub Actions and Python packaging metadata, with update cooldowns;
+- security scans for Gitleaks, actionlint, Semgrep, zizmor, ShellCheck, gated pip-audit, and CodeQL for public-repo code scanning;
 - issue/PR templates and CODEOWNERS.
 
-See [`SECURITY.md`](SECURITY.md) and [`docs/github-security.md`](docs/github-security.md) for reporting, local validation, and manual GitHub settings.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and [`docs/github-security.md`](docs/github-security.md) for contribution expectations, vulnerability reporting, local validation, and manual GitHub settings.

@@ -56,7 +56,13 @@ If you are already talking to Hermes through the gateway, use `/restart`; from a
 hermes gateway restart
 ```
 
-For private GitHub repos, install with SSH, for example:
+For public installs, HTTPS does not require GitHub SSH keys:
+
+```bash
+hermes plugins install https://github.com/stepanov1975/hermes-local-knowledge.git --enable
+```
+
+SSH also works when your host has GitHub SSH keys configured:
 
 ```bash
 hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --enable

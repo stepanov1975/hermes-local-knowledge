@@ -5,6 +5,7 @@
 ## Verification
 
 - [ ] `python -m pytest -q`
+- [ ] `python -m ruff check .`
 - [ ] `git diff --check`
 - [ ] Install/register/search smoke tested if plugin packaging changed
 

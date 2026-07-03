@@ -8,6 +8,8 @@ updates:
       time: "04:17"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     labels:
       - "dependencies"
       - "github-actions"
@@ -20,6 +22,8 @@ updates:
       time: "04:37"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     labels:
       - "dependencies"
       - "python"

@@ -41,3 +41,6 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+      - name: Run Ruff
+        run: python -m ruff check .
