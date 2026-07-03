@@ -23,6 +23,7 @@ Run before pushing security-related changes:
 ```bash
 python -m pytest -q
 python -m ruff check .
+python -m mypy
 git diff --check
 
 # Workflow syntax/security checks, when Docker and uvx are available:

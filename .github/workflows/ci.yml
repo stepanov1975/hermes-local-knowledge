@@ -44,3 +44,6 @@ jobs:
 
       - name: Run Ruff
         run: python -m ruff check .
+
+      - name: Run mypy
+        run: python -m mypy

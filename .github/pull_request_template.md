@@ -6,6 +6,7 @@
 
 - [ ] `python -m pytest -q`
 - [ ] `python -m ruff check .`
+- [ ] `python -m mypy`
 - [ ] `git diff --check`
 - [ ] Install/register/search smoke tested if plugin packaging changed
 

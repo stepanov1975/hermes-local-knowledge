@@ -16,6 +16,7 @@ This is a small Hermes Agent plugin, so the best contributions are focused, test
 python -m pip install -e '.[test]'
 python -m pytest -q
 python -m ruff check .
+python -m mypy
 git diff --check
 ```
 

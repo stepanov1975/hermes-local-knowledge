@@ -213,6 +213,8 @@ python -m hermes_local_knowledge.cli doctor --rebuild --query 'backup runbook'
 ```bash
 python -m pip install -e '.[test]'
 python -m pytest
+python -m ruff check .
+python -m mypy
 ```
 
 For optional mutation testing, install the mutation extra and run `mutmut` locally:
