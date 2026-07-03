@@ -508,8 +508,8 @@ def main(
                 "checks": [],
             }
             status = 1
-        db_path = Path(str(payload["db_path"])) if payload.get("db_path") else None
-        usage_db_path = Path(str(payload["state_dir"])) / "usage.sqlite" if payload.get("state_dir") else None
+        doctor_db_path = Path(str(payload["db_path"])) if payload.get("db_path") else None
+        doctor_usage_db_path = Path(str(payload["state_dir"])) / "usage.sqlite" if payload.get("state_dir") else None
         _record_cli_usage(
             None,
             tool="cli_doctor",
@@ -521,9 +521,9 @@ def main(
             result_count=payload.get("smoke_result_count"),
             top_ids=[str(item) for item in payload.get("smoke_top_ids", [])],
             latency_ms=int((time.perf_counter() - started) * 1000),
-            db_path=db_path,
+            db_path=doctor_db_path,
             index_meta=payload,
-            usage_db_path=usage_db_path,
+            usage_db_path=doctor_usage_db_path,
         )
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))

@@ -25,6 +25,7 @@ test = [
     "pytest>=8,<10",
     "PyYAML>=6,<7",
     "ruff>=0.15,<0.16",
+    "mypy>=1.11",
 ]
 mutation = [
     "mutmut>=3,<4",
@@ -50,3 +51,7 @@ pytest_add_cli_args_test_selection = ["-k", "not install_smoke"]
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.mypy]
+explicit_package_bases = true
+python_version = "3.11"

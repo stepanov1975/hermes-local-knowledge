@@ -15,6 +15,6 @@ def tool_result(data=None, **kwargs) -> str:
 
 
 try:  # Hermes runtime path
-    from tools.registry import tool_error as tool_error, tool_result as tool_result  # type: ignore[no-redef]
+    from tools.registry import tool_error as tool_error, tool_result as tool_result  # type: ignore[import-not-found,no-redef]
 except Exception:  # pragma: no cover - lets direct tests run outside Hermes
     pass
