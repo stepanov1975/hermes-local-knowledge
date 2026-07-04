@@ -129,8 +129,6 @@ def iter_files_followlinks(
 
         for file_name in sorted(filenames):
             path = Path(dirpath) / file_name
-            if should_skip_path(path, excluded_dir_names):
-                continue
             if not is_within_allowed_roots(path, resolved_allowed_roots):
                 continue
             if has_excluded_part_within_allowed_roots(path, resolved_allowed_roots, excluded_dir_names):

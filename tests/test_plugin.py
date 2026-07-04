@@ -251,6 +251,7 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
   custom_skill_dirs: '[custom_skills]'
   script_dirs: '[scripts]'
   known_entities: '[Paperless]'
+  exclude_dir_names: '[build, dist]'
 """,
     )
 
@@ -261,6 +262,7 @@ def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
     assert cfg.index_settings.custom_skill_dirs == ("custom_skills",)
     assert cfg.index_settings.script_dirs == ("scripts",)
     assert cfg.index_settings.known_entities == ("Paperless",)
+    assert cfg.index_settings.exclude_dir_names == ("build", "dist")
     assert cfg.index_settings.include_markdown_docs is True
 
 

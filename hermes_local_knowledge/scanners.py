@@ -31,7 +31,7 @@ def skill_support_file_names(skill_dir: Path, excluded_dir_names: Sequence[str] 
         if not root.exists():
             continue
         for child in sorted(root.rglob("*")):
-            if child.is_file() and not should_skip_path(child, excluded_dir_names):
+            if child.is_file() and not should_skip_path(child.relative_to(skill_dir), excluded_dir_names):
                 names.append(child.relative_to(skill_dir).as_posix())
     return names[:50]
 
