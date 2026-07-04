@@ -191,6 +191,10 @@ def _runtime_config(hermes_home: Path | str | None = None) -> RuntimeConfig:
             include_markdown_docs_value,
             default=configured_root not in (None, ""),
         ),
+        exclude_dir_names=_tuple_value(
+            _first_config_value(section, "exclude_dir_names"),
+            defaults.exclude_dir_names,
+        ),
     )
     return RuntimeConfig(
         source_root,

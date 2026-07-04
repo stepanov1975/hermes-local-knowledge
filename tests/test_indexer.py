@@ -332,6 +332,31 @@ def test_markdown_scanner_prunes_cycles_and_external_targets(tmp_path: Path) -> 
     assert [artifact.id for artifact in artifacts] == ["runbook:docs-inside"]
 
 
+def test_exclude_dir_names_skips_configured_directories(tmp_path: Path) -> None:
+    """User-supplied exclude_dir_names in IndexSettings skip matching directories."""
+    root = tmp_path / "repo"
+    write(root / "docs" / "visible.md", "# Visible\n\nIndexed normally.\n")
+    write(root / "worktrees" / "feature-x" / "duplicated.md", "# Duplicated\n\nShould be skipped.\n")
+    write(root / "build" / "output.md", "# Build Output\n\nShould be skipped.\n")
+
+    settings = lci.IndexSettings(exclude_dir_names=("build",))
+    artifacts = lci.scan_markdown_docs(root, settings)
+    ids = [artifact.id for artifact in artifacts]
+
+    # "worktrees" is excluded by the built-in defaults now
+    assert "runbook:docs-visible" in ids
+    assert not any("worktrees" in a.path for a in artifacts)
+    assert not any("build" in a.path for a in artifacts)
+
+
+def test_default_excluded_dir_names_includes_worktrees() -> None:
+    """The built-in EXCLUDED_DIR_NAMES must include worktrees and .worktrees."""
+    from hermes_local_knowledge.constants import EXCLUDED_DIR_NAMES
+
+    assert "worktrees" in EXCLUDED_DIR_NAMES
+    assert ".worktrees" in EXCLUDED_DIR_NAMES
+
+
 def test_build_sqlite_preserves_existing_db_when_rebuild_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"

@@ -134,9 +134,10 @@ Put non-secret settings in `~/.hermes/config.yaml`:
 local_knowledge:
   source_root: ~/repos/<your-local-docs-or-customizations>
   state_dir: ~/.hermes/local_knowledge
+  exclude_dir_names: [build, dist]
 ```
 
-`source_root` is the high-signal directory being indexed. `state_dir` is generated local state and should not be committed. Use YAML lists in `config.yaml`; when using `hermes config set` from the shell, comma-separated strings or bracket-list strings are accepted and normalized by the plugin.
+`source_root` is the high-signal directory being indexed. `state_dir` is generated local state and should not be committed. `exclude_dir_names` adds extra directory names to the built-in skip list (`worktrees`, `.worktrees`, `.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.mypy_cache`, `.pytest_cache`, `htmlcov`, `logs`). Use YAML lists in `config.yaml`; when using `hermes config set` from the shell, comma-separated strings or bracket-list strings are accepted and normalized by the plugin.
 
 Environment variables are supported for development and tests:
 
@@ -173,11 +174,14 @@ local_knowledge:
   memory_dirs: [memory]
   runbook_dirs: [docs]
   include_markdown_docs: true
+  exclude_dir_names: [build, dist]
   known_entities:
     - Hermes
     - AcmeCloud
     - InternalAPI
 ```
+
+The built-in excluded directory names are: `worktrees`, `.worktrees`, `.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.mypy_cache`, `.pytest_cache`, `htmlcov`, `logs`. Use `exclude_dir_names` to add more without patching the code.
 
 Indexed artifact types:
 

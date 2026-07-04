@@ -30,6 +30,7 @@ local_knowledge:
   custom_skill_dirs: [custom_skills]                         # YAML list
   script_dirs: [scripts, hermes_home/scripts]                # YAML list
   include_markdown_docs: true
+  exclude_dir_names: [build, dist]                            # extra dirs to skip (merged with built-in defaults)
 ```
 
 CLI-safe equivalent. `hermes config set` stores scalar strings; the plugin accepts comma-separated values for list-like settings:
