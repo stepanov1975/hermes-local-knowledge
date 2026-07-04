@@ -24,14 +24,14 @@ from .text_utils import (
 )
 
 
-def skill_support_file_names(skill_dir: Path) -> list[str]:
+def skill_support_file_names(skill_dir: Path, excluded_dir_names: Sequence[str] | None = None) -> list[str]:
     names: list[str] = []
     for subdir in ("references", "templates", "scripts", "assets"):
         root = skill_dir / subdir
         if not root.exists():
             continue
         for child in sorted(root.rglob("*")):
-            if child.is_file() and not should_skip_path(child):
+            if child.is_file() and not should_skip_path(child, excluded_dir_names):
                 names.append(child.relative_to(skill_dir).as_posix())
     return names[:50]
 
@@ -43,14 +43,14 @@ def scan_skills(root: Path, hermes_home: Path, settings: IndexSettings | None = 
         (hermes_home / "skills", "runtime_skill", (root, hermes_home)),
     ]
     for skill_root, source, allowed_roots in sources:
-        for skill_md in iter_files_followlinks(skill_root, filename="SKILL.md", allowed_roots=allowed_roots) or []:
+        for skill_md in iter_files_followlinks(skill_root, filename="SKILL.md", allowed_roots=allowed_roots, excluded_dir_names=settings.exclude_dir_names) or []:
             text = safe_read_text(skill_md)
             fm = parse_frontmatter(text)
             name = str(fm.get("name") or skill_md.parent.name).strip()
             description = str(fm.get("description") or first_heading_or_paragraph(text)).strip()
             tags = fm.get("tags") if isinstance(fm.get("tags"), list) else regex_list_after_key(text, "tags")
             related_names = regex_list_after_key(text, "related_skills")
-            support_files = skill_support_file_names(skill_md.parent)
+            support_files = skill_support_file_names(skill_md.parent, settings.exclude_dir_names)
             skill_id = f"skill:{slugify(name)}"
             category_parts: list[str] = []
             try:
@@ -102,7 +102,7 @@ def scan_scripts(root: Path, settings: IndexSettings | None = None) -> list[Arti
     artifacts: list[Artifact] = []
     script_roots = [root / rel for rel in settings.script_dirs]
     for script_root in script_roots:
-        for path in iter_files_followlinks(script_root, suffixes=SCRIPT_SUFFIXES, allowed_roots=(root,)) or []:
+        for path in iter_files_followlinks(script_root, suffixes=SCRIPT_SUFFIXES, allowed_roots=(root,), excluded_dir_names=settings.exclude_dir_names) or []:
             text = safe_read_text(path, max_chars=50_000)
             rel = path.relative_to(root)
             title = rel.as_posix()
@@ -139,7 +139,7 @@ def doc_type_for_path(root: Path, path: Path, settings: IndexSettings | None = N
 def scan_markdown_docs(root: Path, settings: IndexSettings | None = None) -> list[Artifact]:
     settings = settings or IndexSettings()
     artifacts: list[Artifact] = []
-    for path in iter_files_followlinks(root, suffixes={".md"}, allowed_roots=(root,), followlinks=False) or []:
+    for path in iter_files_followlinks(root, suffixes={".md"}, allowed_roots=(root,), followlinks=False, excluded_dir_names=settings.exclude_dir_names) or []:
         rel = path.relative_to(root)
         if rel.name == "SKILL.md":
             continue

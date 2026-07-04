@@ -41,3 +41,10 @@ class IndexSettings:
     runbook_dirs: tuple[str, ...] = ("docs",)
     known_entities: tuple[str, ...] = tuple(DEFAULT_KNOWN_ENTITIES)
     include_markdown_docs: bool = True
+    exclude_dir_names: tuple[str, ...] = ()
+    """Extra directory names to exclude from indexing, on top of the built-in defaults.
+
+    These are merged with ``EXCLUDED_DIR_NAMES`` at scan time so users can skip
+    worktree directories, build outputs, or other generated trees without patching
+    the code. Configured via ``local_knowledge.exclude_dir_names`` in config.yaml.
+    """

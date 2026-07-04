@@ -18,7 +18,15 @@ EXCLUDED_DIR_NAMES = {
     "node_modules",
     "venv",
     ".venv",
+    "worktrees",
+    ".worktrees",
 }
+"""Default directory names excluded from indexing.
+
+Users can extend this set at runtime via the ``exclude_dir_names`` config key
+(see ``local_knowledge.exclude_dir_names`` in config.yaml). The effective
+excluded set is the union of these defaults and any user-supplied names.
+"""
 DEFAULT_KNOWN_ENTITIES = ["Hermes", "GitHub", "MCP", "Cron"]
 
 def _runtime_stopwords() -> set[str]:
