@@ -349,6 +349,41 @@ def test_exclude_dir_names_skips_configured_directories(tmp_path: Path) -> None:
     assert not any("build" in a.path for a in artifacts)
 
 
+def test_exclude_dir_names_do_not_skip_source_root_ancestors(tmp_path: Path) -> None:
+    """Excluded names apply within the source root, not to its parent path."""
+    root = tmp_path / "build" / "repo"
+    write(root / "docs" / "visible.md", "# Visible\n\nIndexed even though an ancestor is named build.\n")
+
+    artifacts = lci.scan_markdown_docs(root, lci.IndexSettings(exclude_dir_names=("build",)))
+
+    assert [(artifact.id, artifact.path) for artifact in artifacts] == [
+        ("runbook:docs-visible", "docs/visible.md")
+    ]
+
+
+def test_default_worktree_excludes_do_not_skip_explicit_worktree_source_root(tmp_path: Path) -> None:
+    """A configured source root under worktrees/ should still be indexable."""
+    root = tmp_path / "worktrees" / "feature-repo"
+    write(root / "docs" / "intentional.md", "# Intentional Source Root\n\nThis checkout was configured directly.\n")
+
+    artifacts = lci.scan_markdown_docs(root)
+
+    assert [(artifact.id, artifact.path) for artifact in artifacts] == [
+        ("runbook:docs-intentional", "docs/intentional.md")
+    ]
+
+
+def test_skill_support_file_excludes_are_relative_to_skill_dir(tmp_path: Path) -> None:
+    """Support-file exclusions should not match source-root ancestor names."""
+    skill_dir = tmp_path / "worktrees" / "feature-repo" / "custom_skills" / "demo"
+    write(skill_dir / "references" / "guide.md", "# Guide\n")
+    write(skill_dir / "references" / "build" / "ignored.md", "# Build output\n")
+
+    names = lci.skill_support_file_names(skill_dir, excluded_dir_names=("build",))
+
+    assert names == ["references/guide.md"]
+
+
 def test_default_excluded_dir_names_includes_worktrees() -> None:
     """The built-in EXCLUDED_DIR_NAMES must include worktrees and .worktrees."""
     from hermes_local_knowledge.constants import EXCLUDED_DIR_NAMES

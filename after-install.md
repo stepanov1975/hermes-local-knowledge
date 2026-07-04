@@ -41,6 +41,7 @@ hermes config set local_knowledge.state_dir "$HOME/.hermes/local_knowledge"
 hermes config set local_knowledge.custom_skill_dirs custom_skills
 hermes config set local_knowledge.script_dirs scripts,hermes_home/scripts
 hermes config set local_knowledge.include_markdown_docs true
+hermes config set local_knowledge.exclude_dir_names build,dist
 ```
 
 You can omit `source_root` to index only this Hermes profile's runtime artifacts under `$HERMES_HOME`. If `$HERMES_HOME/hermes-agent` exists, the plugin warns because broad Hermes-home indexing can be noisy.
