@@ -8,7 +8,7 @@ from typing import Any, Iterable, Sequence
 
 from .constants import SCRIPT_SUFFIXES, STOPWORDS
 from .models import Artifact, Edge, IndexSettings
-from .paths import display_path, iter_files_followlinks
+from .paths import display_path, iter_files_followlinks, path_is_relative_to
 from .text_utils import (
     extract_entities,
     extract_paths,
@@ -83,6 +83,67 @@ def scan_skills(root: Path, hermes_home: Path, settings: IndexSettings | None = 
             if skill_id not in artifacts or artifacts[skill_id].source != "custom_skill_source":
                 artifacts[skill_id] = artifact
     return sorted(artifacts.values(), key=lambda item: item.id)
+
+def scan_runtime_skill_support_docs(root: Path, hermes_home: Path, settings: IndexSettings | None = None) -> list[Artifact]:
+    """Index Markdown support docs for runtime skills that are not from source_root.
+
+    Custom skills under ``source_root`` are already covered by ``scan_markdown_docs``.
+    Runtime/bundled skill references live under ``$HERMES_HOME/skills`` and often
+    contain the exact operational phrase an agent searches for.
+    """
+
+    settings = settings or IndexSettings()
+    skill_root = hermes_home / "skills"
+    artifacts: list[Artifact] = []
+    resolved_root = root.expanduser().resolve()
+    for skill_md in iter_files_followlinks(
+        skill_root,
+        filename="SKILL.md",
+        allowed_roots=(root, hermes_home),
+        excluded_dir_names=settings.exclude_dir_names,
+    ) or []:
+        try:
+            if path_is_relative_to(skill_md.resolve(strict=True), resolved_root):
+                continue
+        except OSError:
+            continue
+        text = safe_read_text(skill_md)
+        fm = parse_frontmatter(text)
+        skill_name = str(fm.get("name") or skill_md.parent.name).strip()
+        skill_id = f"skill:{slugify(skill_name)}"
+        for subdir in ("references", "templates", "scripts", "assets"):
+            support_root = skill_md.parent / subdir
+            for path in iter_files_followlinks(
+                support_root,
+                suffixes={".md"},
+                allowed_roots=(skill_md.parent,),
+                followlinks=False,
+                excluded_dir_names=settings.exclude_dir_names,
+            ) or []:
+                doc_text = safe_read_text(path)
+                rel = path.relative_to(skill_md.parent)
+                title = f"runtime_skills/{skill_name}/{rel.with_suffix('').as_posix()}"
+                summary = first_heading_or_paragraph(doc_text) or f"Runtime skill support document {rel.as_posix()}"
+                artifact_id = f"skill_support_doc:{slugify(title)}"
+                triggers = significant_words(skill_name, title, summary, " ".join(rel.parts), doc_text[:4_000])
+                entities = extract_entities(
+                    skill_name, title, summary, doc_text[:20_000], path.as_posix(), known_entities=settings.known_entities
+                )
+                artifacts.append(
+                    Artifact(
+                        id=artifact_id,
+                        type="skill_support_doc",
+                        title=title,
+                        path=display_path(path),
+                        summary=summary,
+                        triggers=triggers,
+                        entities=entities,
+                        related=[skill_id],
+                        source="runtime_skill_support_doc",
+                        search_text=doc_text[:20_000],
+                    )
+                )
+    return sorted(artifacts, key=lambda item: item.id)
 
 def script_summary(path: Path, text: str) -> str:
     docstring = re.search(r'^[ruRUfbFB]*(["\']{3})(.*?)\1', text, re.DOTALL | re.MULTILINE)
@@ -326,6 +387,7 @@ def collect_artifacts(root: Path, hermes_home: Path, settings: IndexSettings | N
     hermes_home = hermes_home.expanduser().resolve()
     artifacts = [
         *scan_skills(root, hermes_home, settings),
+        *scan_runtime_skill_support_docs(root, hermes_home, settings),
         *scan_scripts(root, settings),
         *(scan_markdown_docs(root, settings) if settings.include_markdown_docs else []),
         *scan_cron_jobs(root, hermes_home, settings),

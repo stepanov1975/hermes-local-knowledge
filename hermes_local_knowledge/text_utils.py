@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .constants import DEFAULT_KNOWN_ENTITIES, QUERY_STOPWORDS, STOPWORDS
+from .constants import DEFAULT_KNOWN_ENTITIES, QUERY_STOPWORDS, ROUTING_HINT_TERMS, STOPWORDS
 
 
 def slugify(value: str) -> str:
@@ -169,6 +169,12 @@ def token_hits(tokens: set[str], terms: Sequence[str]) -> int:
             hits += 1
     return hits
 
+def high_signal_terms(terms: Sequence[str]) -> list[str]:
+    """Return query terms that are likely domain intent rather than routing hints."""
+
+    specific = [term for term in terms if term not in ROUTING_HINT_TERMS]
+    return specific or list(terms)
+
 def type_priority(artifact_type: str) -> int:
     return {
         "skill": 0,
@@ -180,23 +186,35 @@ def type_priority(artifact_type: str) -> int:
     }.get(artifact_type, 6)
 
 def search_sort_key(row: dict[str, Any], terms: Sequence[str]) -> tuple[Any, ...]:
+    specific_terms = high_signal_terms(terms)
     title_source = " ".join([str(row.get("id") or ""), str(row.get("title") or "")])
     title_tokens = set(query_terms(title_source, drop_stopwords=False))
     path_tokens = set(query_terms(str(row.get("path") or ""), drop_stopwords=False))
     trigger_source = " ".join(row.get("triggers") or [])
     trigger_tokens = set(query_terms(trigger_source, drop_stopwords=False))
     summary_tokens = set(query_terms(str(row.get("summary") or ""), drop_stopwords=False))
+    entity_tokens = set(query_terms(" ".join(row.get("entities") or []), drop_stopwords=False))
+    specific_title_hits = token_hits(title_tokens, specific_terms)
+    specific_path_hits = token_hits(path_tokens, specific_terms)
+    specific_trigger_hits = token_hits(trigger_tokens, specific_terms)
+    specific_summary_hits = token_hits(summary_tokens, specific_terms)
     title_hits = token_hits(title_tokens, terms)
     path_hits = token_hits(path_tokens, terms)
     trigger_hits = token_hits(trigger_tokens, terms)
     summary_hits = token_hits(summary_tokens, terms)
+    entity_hits = token_hits(entity_tokens, terms)
     full_title_match = 0 if terms and title_hits == len(terms) else 1
     return (
         full_title_match,
+        -specific_title_hits,
+        -specific_path_hits,
+        -specific_trigger_hits,
+        -specific_summary_hits,
         -title_hits,
         -path_hits,
         -trigger_hits,
         -summary_hits,
+        -entity_hits,
         type_priority(str(row.get("type") or "")),
         float(row.get("rank") or 0.0),
         str(row.get("title") or ""),

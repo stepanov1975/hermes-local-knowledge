@@ -158,6 +158,104 @@ def test_build_index_writes_searchable_artifacts_and_edges(tmp_path: Path) -> No
     assert any(edge.source == "cron:paperless-reviewer" and edge.target == "skill:paperless-review-automation" for edge in edges)
 
 
+def test_runtime_skill_support_docs_are_searchable_and_linked(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "skills" / "github" / "github-workflows" / "SKILL.md",
+        """---
+name: github-workflows
+description: Work with GitHub pull requests and review workflows.
+---
+# GitHub Workflows
+""",
+    )
+    write(
+        hermes_home
+        / "skills"
+        / "github"
+        / "github-workflows"
+        / "references"
+        / "replacement-pr-after-stale-contributor.md",
+        """# Replacement PR after stale contributor branch
+
+Author did not reply after 24h; use this GitHub review reminder cron workflow when a replacement PR is needed.
+""",
+    )
+    output_dir = tmp_path / "state"
+
+    artifacts, edges = lci.build_index(
+        root,
+        output_dir,
+        hermes_home,
+        lci.IndexSettings(known_entities=("Hermes", "GitHub", "Cron")),
+    )
+
+    support_id = "skill_support_doc:runtime-skills-github-workflows-references-replacement-pr-after-stale-contributor"
+    assert support_id in {artifact.id for artifact in artifacts}
+    assert any(edge.source == support_id and edge.target == "skill:github-workflows" for edge in edges)
+    support_doc = lci.get_artifact(output_dir / "index.sqlite", support_id)
+    assert support_doc is not None
+    assert support_doc["source"] == "runtime_skill_support_doc"
+
+    results = lci.search_index(
+        output_dir / "index.sqlite",
+        '"Author did not reply after 24h" github author reply timeout review reminder cron',
+        limit=5,
+    )
+
+    assert results[0]["id"] == support_id
+
+
+def test_sparse_strict_search_backfills_relaxed_cron_and_script_hits(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        root / "docs" / "paperless-review-flow.md",
+        "# Paperless review flow\n\nBroad paperless reviewer cron automation script runbook documentation.\n",
+    )
+    write(
+        root / "scripts" / "paperless_review" / "run_reviewer_cron_no_agent.sh",
+        "#!/usr/bin/env bash\n# Paperless reviewer cron no_agent script wrapper.\n",
+    )
+    write(
+        hermes_home / "cron" / "jobs.json",
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "job123",
+                        "name": "paperless-reviewer",
+                        "prompt": f"Run {root / 'scripts' / 'paperless_review' / 'run_reviewer_cron_no_agent.sh'} and report Paperless reviewer results.",
+                        "script": "run_reviewer_cron_no_agent.sh",
+                        "schedule_display": "every 120m",
+                        "state": "scheduled",
+                        "last_status": "ok",
+                    }
+                ]
+            }
+        ),
+    )
+    output_dir = tmp_path / "state"
+    lci.build_index(
+        root,
+        output_dir,
+        hermes_home,
+        lci.IndexSettings(known_entities=("Hermes", "Paperless", "Cron")),
+    )
+
+    results = lci.search_index(output_dir / "index.sqlite", "paperless reviewer cron automation script runbook", limit=5)
+    result_ids = [row["id"] for row in results]
+    broad_doc_id = "runbook:docs-paperless-review-flow"
+
+    assert "script:scripts-paperless-review-run-reviewer-cron-no-agent-sh" in result_ids[:3]
+    assert "cron:paperless-reviewer" in result_ids[:3]
+    assert result_ids.index("script:scripts-paperless-review-run-reviewer-cron-no-agent-sh") < result_ids.index(
+        broad_doc_id
+    )
+    assert result_ids.index("cron:paperless-reviewer") < result_ids.index(broad_doc_id)
+
+
 def test_indexer_build_index_honors_compatibility_monkeypatches(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls: list[str] = []
 
@@ -1027,10 +1125,15 @@ def test_search_sort_key_scores_each_ranking_tier() -> None:
 
     assert lci.search_sort_key(row, ["paperless", "review"]) == (
         0,
+        -1,
+        -1,
+        -1,
+        -1,
         -2,
         -2,
         -2,
         -2,
+        0,
         0,
         7.5,
         "Paperless Review",
@@ -1045,4 +1148,4 @@ def test_search_sort_key_scores_each_ranking_tier() -> None:
         "type": "skill",
         "rank": 0,
     }
-    assert lci.search_sort_key(id_weight_row, ["paperless", "review"])[:2] == (0, -2)
+    assert lci.search_sort_key(id_weight_row, ["paperless", "review"])[:2] == (0, -1)

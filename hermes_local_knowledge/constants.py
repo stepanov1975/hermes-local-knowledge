@@ -96,3 +96,17 @@ QUERY_STOPWORDS = {
     "where",
     "which",
 }
+
+ROUTING_HINT_TERMS = STOPWORDS | {
+    "automation",
+    "cron",
+    "job",
+    "runbook",
+    "workflow",
+}
+"""Low-signal query terms that describe artifact shape more than domain intent.
+
+These terms are still searchable. Ranking just gives matches on more specific
+terms (for example ``github`` or ``paperless``) a chance to beat broad docs or
+scripts that merely contain generic routing vocabulary such as ``cron``.
+"""
