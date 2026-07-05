@@ -8,7 +8,7 @@ from typing import Any, Iterable, Sequence
 
 from .constants import SCRIPT_SUFFIXES, STOPWORDS
 from .models import Artifact, Edge, IndexSettings
-from .paths import display_path, iter_files_followlinks, should_skip_path
+from .paths import display_path, iter_files_followlinks
 from .text_utils import (
     extract_entities,
     extract_paths,
@@ -30,9 +30,13 @@ def skill_support_file_names(skill_dir: Path, excluded_dir_names: Sequence[str] 
         root = skill_dir / subdir
         if not root.exists():
             continue
-        for child in sorted(root.rglob("*")):
-            if child.is_file() and not should_skip_path(child.relative_to(skill_dir), excluded_dir_names):
-                names.append(child.relative_to(skill_dir).as_posix())
+        for child in iter_files_followlinks(
+            root,
+            allowed_roots=(skill_dir,),
+            followlinks=False,
+            excluded_dir_names=excluded_dir_names,
+        ) or []:
+            names.append(child.relative_to(skill_dir).as_posix())
     return names[:50]
 
 def scan_skills(root: Path, hermes_home: Path, settings: IndexSettings | None = None) -> list[Artifact]:
