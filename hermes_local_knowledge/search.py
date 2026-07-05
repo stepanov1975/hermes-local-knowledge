@@ -1,11 +1,12 @@
 """Search helpers for the SQLite-backed local knowledge index."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from .storage import connect_readonly, decode_artifact_row
-from .text_utils import fts_query, query_terms, search_sort_key
+from .text_utils import fts_query, high_signal_terms, query_terms, search_sort_key, token_hits
 
 
 def _query_rows(conn: Any, match: str, candidate_limit: int) -> list[Any]:
@@ -24,11 +25,87 @@ def _query_rows(conn: Any, match: str, candidate_limit: int) -> list[Any]:
         FROM artifact_fts
         JOIN artifacts a ON a.id = artifact_fts.id
         WHERE artifact_fts MATCH ?
-        ORDER BY type_priority, rank, a.title
+        ORDER BY rank, type_priority, a.title
         LIMIT ?
         """,
         (match, candidate_limit),
     ).fetchall()
+
+
+def _type_priority_sql(alias: str = "a") -> str:
+    return f"""
+               CASE {alias}.type
+                 WHEN 'skill' THEN 0
+                 WHEN 'script' THEN 1
+                 WHEN 'cron_job' THEN 2
+                 WHEN 'mcp_server' THEN 3
+                 WHEN 'memory_doc' THEN 4
+                 WHEN 'runbook' THEN 5
+                 ELSE 6
+               END AS type_priority
+    """
+
+
+def _metadata_rows(conn: Any, terms: list[str], candidate_limit: int) -> list[Any]:
+    """Return artifacts matching query terms in structured metadata fields.
+
+    FTS is still the primary retrieval path. This secondary path catches rows
+    whose strong routing evidence is in normalized artifact metadata and keeps
+    SQL's pre-limit step from becoming the only ranking decision.
+    """
+
+    candidate_terms = [term for term in high_signal_terms(terms) if term][:8]
+    if not candidate_terms:
+        return []
+
+    fields = ("a.id", "a.title", "a.path", "a.summary", "a.triggers_json", "a.entities_json")
+    term_clauses: list[str] = []
+    params: list[str] = []
+    score_parts: list[str] = []
+    score_params: list[str] = []
+    for term in candidate_terms:
+        like = f"%{term.lower()}%"
+        term_clauses.append("(" + " OR ".join(f"lower({field}) LIKE ?" for field in fields) + ")")
+        params.extend([like] * len(fields))
+        score_parts.append("CASE WHEN " + " OR ".join(f"lower({field}) LIKE ?" for field in fields) + " THEN 1 ELSE 0 END")
+        score_params.extend([like] * len(fields))
+
+    rows = conn.execute(
+        f"""
+        SELECT a.*, 0.0 AS rank, {_type_priority_sql("a")},
+               ({" + ".join(score_parts)}) AS metadata_score
+        FROM artifacts a
+        WHERE {" OR ".join(term_clauses)}
+        ORDER BY metadata_score DESC, type_priority, a.title
+        LIMIT ?
+        """,
+        [*score_params, *params, candidate_limit],
+    ).fetchall()
+    return rows
+
+
+def _merge_candidate_rows(*row_groups: list[Any]) -> list[Any]:
+    rows: list[Any] = []
+    seen: set[str] = set()
+    for group in row_groups:
+        for row in group:
+            artifact_id = str(row["id"])
+            if artifact_id in seen:
+                continue
+            seen.add(artifact_id)
+            rows.append(row)
+    return rows
+
+
+def _fetch_artifacts(conn: Any, artifact_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not artifact_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in artifact_ids)
+    rows = conn.execute(
+        f"SELECT a.*, 0.0 AS rank FROM artifacts a WHERE a.id IN ({placeholders})",
+        artifact_ids,
+    ).fetchall()
+    return {str(row["id"]): decode_artifact_row(row) for row in rows}
 
 
 def _support_doc_parent(row: dict[str, Any]) -> str | None:
@@ -40,7 +117,7 @@ def _support_doc_parent(row: dict[str, Any]) -> str | None:
     return None
 
 
-def _diversify_support_docs(rows: list[dict[str, Any]], *, per_parent_limit: int = 3) -> list[dict[str, Any]]:
+def _diversify_support_docs(rows: list[dict[str, Any]], *, per_parent_limit: int = 1) -> list[dict[str, Any]]:
     """Avoid flooding top results with many support docs from one parent skill.
 
     Support docs are excellent long-tail hits, but artifact routing is less useful
@@ -63,6 +140,188 @@ def _diversify_support_docs(rows: list[dict[str, Any]], *, per_parent_limit: int
     return selected
 
 
+def _lift_support_doc_parents(conn: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Place owning skills next to matching support docs.
+
+    A support doc hit is strong evidence for its parent skill. For routing, the
+    parent is usually the artifact to load first, while the support doc remains
+    adjacent as the specific evidence trail.
+    """
+
+    existing = {str(row.get("id")): row for row in rows}
+    missing_parent_ids = []
+    seen_missing: set[str] = set()
+    for row in rows:
+        parent = _support_doc_parent(row)
+        if parent and parent not in existing and parent not in seen_missing:
+            missing_parent_ids.append(parent)
+            seen_missing.add(parent)
+    parents = _fetch_artifacts(conn, missing_parent_ids)
+
+    output: list[dict[str, Any]] = []
+    emitted: set[str] = set()
+    for row in rows:
+        parent = _support_doc_parent(row)
+        if parent and parent not in emitted:
+            parent_row = existing.get(parent) or parents.get(parent)
+            if parent_row is not None:
+                output.append(parent_row)
+                emitted.add(parent)
+        artifact_id = str(row.get("id"))
+        if artifact_id not in emitted:
+            output.append(row)
+            emitted.add(artifact_id)
+    return output
+
+
+def _requested_operational_types(terms: list[str]) -> set[str]:
+    requested: set[str] = set()
+    term_set = set(terms)
+    if "script" in term_set:
+        requested.add("script")
+    if "cron" in term_set or "job" in term_set or "jobs" in term_set:
+        requested.add("cron_job")
+    if "mcp" in term_set or "wrapper" in term_set:
+        requested.add("mcp_server")
+        requested.add("script")
+    return requested
+
+
+OPERATIONAL_INTENT_TERMS = {"script", "cron", "job", "jobs", "mcp", "wrapper"}
+PROSE_ARTIFACT_TYPES = {"doc", "runbook", "memory_doc"}
+STRICT_REFERENCE_TYPES = {"skill", "skill_support_doc"}
+
+
+def _operational_specific_terms(terms: list[str]) -> list[str]:
+    """Return query terms that distinguish *which* operational artifact is wanted."""
+
+    return [term for term in high_signal_terms(terms) if term not in OPERATIONAL_INTENT_TERMS]
+
+
+def _specific_term_hit_count(row: dict[str, Any], specific_terms: list[str]) -> int:
+    source = " ".join(
+        [
+            str(row.get("id") or ""),
+            str(row.get("title") or ""),
+            str(row.get("path") or ""),
+            str(row.get("summary") or ""),
+            " ".join(row.get("triggers") or []),
+            " ".join(row.get("entities") or []),
+        ]
+    )
+    tokens = set(query_terms(source, drop_stopwords=False))
+    return token_hits(tokens, specific_terms)
+
+
+def _row_matches_specific_terms(row: dict[str, Any], specific_terms: list[str]) -> bool:
+    if not specific_terms:
+        return True
+    return _specific_term_hit_count(row, specific_terms) == len(specific_terms)
+
+
+def _row_matches_any_specific_term(row: dict[str, Any], specific_terms: list[str]) -> bool:
+    if not specific_terms:
+        return True
+    return _specific_term_hit_count(row, specific_terms) > 0
+
+
+def _final_operational_sort_key(
+    row: dict[str, Any],
+    requested_types: set[str],
+    strict_ids: set[str],
+    specific_terms: list[str],
+    original_position: int,
+) -> tuple[int, int, int]:
+    """Sort only the final mixed strict/fallback set for operational intent.
+
+    Script-only queries keep strict skill/support-doc hits protected because many
+    reusable skills are legitimately about helper scripts. Script rows still need
+    at least one domain-specific term when such terms exist, so a generic script
+    hit does not leapfrog stricter prose. Cron/MCP intent is more specific and
+    should route to relevant operational artifacts first, while still keeping
+    strict same-domain reference skills/docs above broad prose. In all cases,
+    fallback skills/support docs do not leapfrog stricter prose rows merely
+    because the query contains an operational word.
+    """
+
+    if not requested_types:
+        return (0, 0, original_position)
+    artifact_id = str(row.get("id") or "")
+    artifact_type = str(row.get("type") or "")
+    protect_strict_reference = requested_types == {"script"}
+    if protect_strict_reference and artifact_id in strict_ids and artifact_type in STRICT_REFERENCE_TYPES:
+        return (0, 0, original_position)
+    if artifact_type in requested_types:
+        if protect_strict_reference and _row_matches_any_specific_term(row, specific_terms):
+            return (1, 0, original_position)
+        if not protect_strict_reference and _row_matches_specific_terms(row, specific_terms):
+            return (1, 0, original_position)
+    if artifact_id in strict_ids and artifact_type in STRICT_REFERENCE_TYPES and _row_matches_specific_terms(
+        row,
+        specific_terms,
+    ):
+        return (2, 0, original_position)
+    if artifact_type in PROSE_ARTIFACT_TYPES:
+        return (3, 0, original_position)
+    return (4, 0, original_position)
+
+
+def _dedupe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        artifact_id = str(row.get("id"))
+        if artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        output.append(row)
+    return output
+
+
+def _rank_rows(
+    conn: Any,
+    rows: list[Any],
+    terms: list[str],
+    *,
+    lift_parents: bool = True,
+) -> list[dict[str, Any]]:
+    decoded = [decode_artifact_row(row) for row in rows]
+    decoded.sort(key=lambda row: search_sort_key(row, terms))
+    lifted = _lift_support_doc_parents(conn, decoded) if lift_parents else decoded
+    return _diversify_support_docs(_dedupe_rows(lifted))
+
+
+def _finalize_results(
+    rows: list[dict[str, Any]],
+    output_limit: int,
+    terms: list[str],
+    *,
+    requested_operational_types: set[str] | None = None,
+    strict_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    selected = _diversify_support_docs(_dedupe_rows(rows))
+    requested_types = requested_operational_types or set()
+    strict_id_set = strict_ids or set()
+    specific_terms = _operational_specific_terms(terms) if requested_types else []
+    position_by_id = {str(row.get("id") or ""): index for index, row in enumerate(selected)}
+    selected.sort(
+        key=lambda row: _final_operational_sort_key(
+            row,
+            requested_types,
+            strict_id_set,
+            specific_terms,
+            position_by_id.get(str(row.get("id") or ""), 0),
+        )
+    )
+    return selected[:output_limit]
+
+
+def _has_quoted_phrase(query: str) -> bool:
+    """Return true only for balanced quoted phrases, not apostrophes."""
+
+    return bool(re.search(r'(?<!\w)"[^"\n]+"(?!\w)|(?<!\w)\'[^\'\n]+\'(?!\w)', query))
+
+
 def search_index(db_path: Path, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
     terms = query_terms(query)
     match = fts_query(query)
@@ -70,15 +329,45 @@ def search_index(db_path: Path, query: str, *, limit: int = 10) -> list[dict[str
         return []
     conn = connect_readonly(db_path)
     try:
-        candidate_limit = max(int(limit) * 10, 50)
-        rows = _query_rows(conn, match, candidate_limit)
-        if len(terms) > 1 and len(rows) < int(limit):
-            relaxed_rows = _query_rows(conn, fts_query(query, operator="OR"), candidate_limit)
-            seen_ids = {str(row["id"]) for row in rows}
-            rows = [*rows, *(row for row in relaxed_rows if str(row["id"]) not in seen_ids)]
-        decoded = [decode_artifact_row(row) for row in rows]
-        decoded.sort(key=lambda row: search_sort_key(row, terms))
-        decoded = _diversify_support_docs(decoded)
-        return decoded[: int(limit)]
+        output_limit = int(limit)
+        candidate_limit = max(output_limit * 20, 100)
+        exact_query = _has_quoted_phrase(query)
+        lift_parents = not exact_query
+        requested_operational_types = set() if exact_query else _requested_operational_types(terms)
+        strict_rows = _query_rows(conn, match, candidate_limit)
+        strict = _rank_rows(
+            conn,
+            strict_rows,
+            terms,
+            lift_parents=lift_parents,
+        )
+        strict_ids = {str(row["id"]) for row in strict}
+        if len(strict) >= output_limit and not requested_operational_types:
+            return _finalize_results(
+                strict,
+                output_limit,
+                terms,
+                requested_operational_types=requested_operational_types,
+                strict_ids=strict_ids,
+            )
+
+        fallback_rows = _merge_candidate_rows(
+            _query_rows(conn, fts_query(query, operator="OR"), candidate_limit) if len(terms) > 1 else [],
+            _metadata_rows(conn, terms, candidate_limit),
+        )
+        fallback = _rank_rows(
+            conn,
+            [row for row in fallback_rows if str(row["id"]) not in strict_ids],
+            terms,
+            lift_parents=lift_parents,
+        )
+        fallback = [row for row in fallback if str(row["id"]) not in strict_ids]
+        return _finalize_results(
+            [*strict, *fallback],
+            output_limit,
+            terms,
+            requested_operational_types=requested_operational_types,
+            strict_ids=strict_ids,
+        )
     finally:
         conn.close()

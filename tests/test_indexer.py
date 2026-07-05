@@ -463,10 +463,380 @@ def test_sparse_strict_search_backfills_relaxed_cron_and_script_hits(tmp_path: P
 
     assert "script:scripts-paperless-review-run-reviewer-cron-no-agent-sh" in result_ids[:3]
     assert "cron:paperless-reviewer" in result_ids[:3]
+    assert broad_doc_id in result_ids
     assert result_ids.index("script:scripts-paperless-review-run-reviewer-cron-no-agent-sh") < result_ids.index(
         broad_doc_id
     )
     assert result_ids.index("cron:paperless-reviewer") < result_ids.index(broad_doc_id)
+
+
+def test_operational_fallback_still_runs_when_strict_results_fill_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    strict_runbooks = [
+        lci.Artifact(
+            id=f"runbook:paperless-cron-guide-{index}",
+            type="runbook",
+            title=f"paperless cron guide {index}",
+            path=f"docs/paperless-cron-guide-{index}.md",
+            summary="Broad Paperless reviewer cron automation script runbook documentation.",
+            triggers=["paperless", "reviewer", "cron", "automation", "script", "runbook"],
+            search_text="paperless reviewer cron automation script runbook documentation",
+        )
+        for index in range(5)
+    ]
+    fallback_script = lci.Artifact(
+        id="script:paperless-reviewer-wrapper",
+        type="script",
+        title="paperless reviewer wrapper",
+        path="scripts/paperless_review/run_reviewer.sh",
+        summary="Paperless reviewer cron wrapper script.",
+        triggers=["paperless", "reviewer", "cron", "script"],
+        search_text="paperless reviewer cron wrapper script",
+    )
+    fallback_cron = lci.Artifact(
+        id="cron:paperless-reviewer",
+        type="cron_job",
+        title="paperless reviewer",
+        path="cron/paperless-reviewer",
+        summary="Scheduled Paperless reviewer job.",
+        triggers=["paperless", "reviewer", "cron"],
+        search_text="paperless reviewer cron scheduled job",
+    )
+    lci.build_sqlite(db_path, [*strict_runbooks, fallback_script, fallback_cron], [])
+
+    results = lci.search_index(db_path, "paperless reviewer cron automation script runbook", limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert {"script:paperless-reviewer-wrapper", "cron:paperless-reviewer"} <= set(result_ids[:2])
+    assert all(result_ids.index(artifact_id) < result_ids.index("runbook:paperless-cron-guide-0") for artifact_id in result_ids[:2])
+
+
+def test_operational_priority_does_not_promote_generic_fallback_skill(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    strict_runbook = lci.Artifact(
+        id="runbook:paperless-cron-guide",
+        type="runbook",
+        title="paperless cron guide",
+        path="docs/paperless-cron-guide.md",
+        summary="Guide for Paperless cron operations.",
+        triggers=["paperless", "cron"],
+        search_text="paperless cron guide",
+    )
+    fallback_skill = lci.Artifact(
+        id="skill:paperless-generic",
+        type="skill",
+        title="paperless generic",
+        path="skills/paperless-generic",
+        summary="Generic Paperless helper.",
+        triggers=["paperless"],
+        search_text="paperless generic helper",
+    )
+    lci.build_sqlite(db_path, [strict_runbook, fallback_skill], [])
+
+    results = lci.search_index(db_path, "paperless cron", limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert result_ids[:2] == ["runbook:paperless-cron-guide", "skill:paperless-generic"]
+
+
+def test_script_priority_does_not_promote_domainless_fallback_script(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    strict_runbook = lci.Artifact(
+        id="runbook:paperless-invoice-script-guide",
+        type="runbook",
+        title="paperless invoice script guide",
+        path="docs/paperless-invoice-script-guide.md",
+        summary="Paperless invoice script documentation.",
+        triggers=["paperless", "invoice", "script"],
+        search_text="paperless invoice script guide",
+    )
+    generic_script = lci.Artifact(
+        id="script:generic-helper-sh",
+        type="script",
+        title="generic helper.sh",
+        path="scripts/generic_helper.sh",
+        summary="Generic helper script.",
+        triggers=["script", "helper"],
+        search_text="generic helper script",
+    )
+    lci.build_sqlite(db_path, [strict_runbook, generic_script], [])
+
+    results = lci.search_index(db_path, "paperless invoice script", limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert result_ids[:2] == ["runbook:paperless-invoice-script-guide", "script:generic-helper-sh"]
+
+
+def test_operational_priority_does_not_demote_strict_skill_hits(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    strict_skill = lci.Artifact(
+        id="skill:session-retrospective-skill-hardening",
+        type="skill",
+        title="session retrospective skill hardening",
+        path="skills/session-retrospective-skill-hardening",
+        summary="Find helper scripts for raw Python recent session work.",
+        triggers=["helper", "scripts", "raw", "python", "recent", "sessions", "hermes", "customizations"],
+        search_text="helper scripts raw python recent sessions hermes customizations scripts",
+    )
+    fallback_script = lci.Artifact(
+        id="script:scripts-hermes-session-tools-py",
+        type="script",
+        title="scripts/hermes_session_tools.py",
+        path="scripts/hermes_session_tools.py",
+        summary="Helper script for Hermes sessions.",
+        triggers=["helper", "scripts", "hermes", "sessions"],
+        search_text="helper scripts hermes sessions",
+    )
+    broad_doc = lci.Artifact(
+        id="doc:scripts-readme",
+        type="doc",
+        title="scripts README",
+        path="scripts/README.md",
+        summary="Broad helper scripts documentation for recent raw Python sessions.",
+        triggers=["helper", "scripts", "raw", "python", "recent", "sessions"],
+        search_text="helper scripts raw python recent sessions documentation",
+    )
+    lci.build_sqlite(db_path, [strict_skill, fallback_script, broad_doc], [])
+
+    results = lci.search_index(db_path, "helper scripts raw python recent sessions hermes customizations scripts", limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert result_ids[:2] == ["skill:session-retrospective-skill-hardening", "script:scripts-hermes-session-tools-py"]
+    assert result_ids.index("script:scripts-hermes-session-tools-py") < result_ids.index("doc:scripts-readme")
+
+
+def test_plural_jobs_requests_cron_operational_priority(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    broad_runbook = lci.Artifact(
+        id="runbook:paperless-jobs-guide",
+        type="runbook",
+        title="paperless jobs guide",
+        path="docs/paperless-jobs-guide.md",
+        summary="Broad Paperless scheduled jobs documentation.",
+        triggers=["paperless", "jobs"],
+        search_text="paperless jobs guide",
+    )
+    cron_job = lci.Artifact(
+        id="cron:paperless-reviewer",
+        type="cron_job",
+        title="paperless reviewer",
+        path="cron/paperless-reviewer",
+        summary="Scheduled Paperless reviewer automation.",
+        triggers=["paperless", "reviewer"],
+        search_text="paperless reviewer schedule",
+    )
+    lci.build_sqlite(db_path, [broad_runbook, cron_job], [])
+
+    results = lci.search_index(db_path, "paperless jobs", limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert result_ids[:2] == ["cron:paperless-reviewer", "runbook:paperless-jobs-guide"]
+
+
+def test_mcp_intent_prioritizes_mcp_server_over_reference_skill(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    reference_skill = lci.Artifact(
+        id="skill:operational-artifact-routing",
+        type="skill",
+        title="operational artifact routing",
+        path="skills/operational-artifact-routing",
+        summary="Improve routing for text-poor MCP wrappers and Home Assistant artifacts.",
+        triggers=["home", "assistant", "mcp", "routing"],
+        search_text="home assistant mcp routing reference",
+    )
+    mcp_server = lci.Artifact(
+        id="mcp:ha-mcp",
+        type="mcp_server",
+        title="home assistant mcp",
+        path="config.yaml#mcp_servers.ha_mcp",
+        summary="Home Assistant MCP server wrapper.",
+        triggers=["home", "assistant", "homeassistant", "mcp", "ha_mcp"],
+        search_text="home assistant mcp ha_mcp wrapper",
+    )
+    wrapper_script = lci.Artifact(
+        id="script:scripts-ha-mcp-run-sh",
+        type="script",
+        title="scripts/ha_mcp/run.sh",
+        path="scripts/ha_mcp/run.sh",
+        summary="Home Assistant MCP wrapper script.",
+        triggers=["home", "assistant", "homeassistant", "mcp", "ha_mcp"],
+        search_text="home assistant mcp wrapper script",
+    )
+    lci.build_sqlite(db_path, [reference_skill, mcp_server, wrapper_script], [])
+
+    results = lci.search_index(db_path, "home assistant mcp", limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert result_ids[:2] == ["mcp:ha-mcp", "script:scripts-ha-mcp-run-sh"]
+
+
+def test_support_doc_hits_lift_parent_skill_for_routing(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    parent = lci.Artifact(
+        id="skill:local-knowledge-router",
+        type="skill",
+        title="local-knowledge-router",
+        path="custom_skills/local-knowledge-router",
+        summary="Route local Hermes artifact lookups.",
+        triggers=["local", "knowledge", "router"],
+        search_text="local knowledge router",
+    )
+    support_doc = lci.Artifact(
+        id="skill_support_doc:local-knowledge-router-reference",
+        type="skill_support_doc",
+        title="local knowledge router compatibility fixes",
+        path="custom_skills/local-knowledge-router/references/compatibility-fixes.md",
+        summary="Module split compatibility fixes for the local knowledge plugin.",
+        triggers=["local", "knowledge", "router", "compatibility", "fixes"],
+        related=["skill:local-knowledge-router"],
+        search_text="local knowledge router compatibility fixes module split",
+    )
+    lci.build_sqlite(db_path, [parent, support_doc], [])
+
+    results = lci.search_index(db_path, "local knowledge router compatibility fixes", limit=5)
+
+    assert [row["id"] for row in results[:2]] == [
+        "skill:local-knowledge-router",
+        "skill_support_doc:local-knowledge-router-reference",
+    ]
+
+    possessive_results = lci.search_index(db_path, "Alex's local knowledge router compatibility fixes", limit=5)
+    possessive_ids = [row["id"] for row in possessive_results]
+    assert possessive_ids[:2] == [
+        "skill:local-knowledge-router",
+        "skill_support_doc:local-knowledge-router-reference",
+    ]
+    assert len(possessive_ids) == len(set(possessive_ids))
+
+    quoted_results = lci.search_index(db_path, '"local knowledge router compatibility fixes"', limit=5)
+    assert quoted_results[0]["id"] == "skill_support_doc:local-knowledge-router-reference"
+
+
+def test_fallback_parent_lifting_does_not_duplicate_strict_parent(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    parent = lci.Artifact(
+        id="skill:local-knowledge-router",
+        type="skill",
+        title="local-knowledge-router",
+        path="custom_skills/local-knowledge-router",
+        summary="Route local router compatibility work.",
+        triggers=["local", "router", "compatibility"],
+        search_text="local router compatibility",
+    )
+    fallback_support_doc = lci.Artifact(
+        id="skill_support_doc:local-knowledge-router-reference",
+        type="skill_support_doc",
+        title="local router reference",
+        path="custom_skills/local-knowledge-router/references/reference.md",
+        summary="Reference notes for local router work.",
+        triggers=["local", "router", "reference"],
+        related=["skill:local-knowledge-router"],
+        search_text="local router reference",
+    )
+    lci.build_sqlite(db_path, [parent, fallback_support_doc], [])
+
+    results = lci.search_index(db_path, "local router compatibility", limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert result_ids == [
+        "skill:local-knowledge-router",
+        "skill_support_doc:local-knowledge-router-reference",
+    ]
+
+
+def test_final_results_apply_support_doc_diversity_across_strict_and_fallback(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    parent = lci.Artifact(
+        id="skill:local-knowledge-router",
+        type="skill",
+        title="local-knowledge-router",
+        path="custom_skills/local-knowledge-router",
+        summary="Route local router compatibility work.",
+        triggers=["local", "router", "compatibility"],
+        search_text="local router compatibility",
+    )
+    strict_support_doc = lci.Artifact(
+        id="skill_support_doc:local-knowledge-router-strict",
+        type="skill_support_doc",
+        title="local router compatibility reference",
+        path="custom_skills/local-knowledge-router/references/compatibility.md",
+        summary="Compatibility notes for local router work.",
+        triggers=["local", "router", "compatibility"],
+        related=["skill:local-knowledge-router"],
+        search_text="local router compatibility reference",
+    )
+    fallback_support_doc = lci.Artifact(
+        id="skill_support_doc:local-knowledge-router-fallback",
+        type="skill_support_doc",
+        title="local router fallback reference",
+        path="custom_skills/local-knowledge-router/references/fallback.md",
+        summary="Fallback reference notes for local router work.",
+        triggers=["local", "router", "fallback"],
+        related=["skill:local-knowledge-router"],
+        search_text="local router fallback reference",
+    )
+    lci.build_sqlite(db_path, [parent, strict_support_doc, fallback_support_doc], [])
+
+    results = lci.search_index(db_path, "local router compatibility", limit=5)
+    support_docs = [row for row in results if row["type"] == "skill_support_doc"]
+
+    assert [row["id"] for row in results] == [
+        "skill:local-knowledge-router",
+        "skill_support_doc:local-knowledge-router-strict",
+    ]
+    assert len(support_docs) == 1
+
+
+def test_search_candidate_collection_keeps_later_type_ranked_support_doc_hits(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    query = "paperless reviewer visual fallback good ocr first page date"
+    noise = [
+        lci.Artifact(
+            id=f"skill:noise-{index:03d}",
+            type="skill",
+            title=f"noise {index}",
+            path=f"skills/noise-{index}",
+            summary="generic helper",
+            triggers=["noise"],
+            search_text=query,
+        )
+        for index in range(130)
+    ]
+    target = lci.Artifact(
+        id="skill_support_doc:paperless-visual-fallback",
+        type="skill_support_doc",
+        title="paperless visual fallback good ocr first page date",
+        path="skills/paperless/references/visual-fallback.md",
+        summary="paperless reviewer visual fallback good ocr first page date correspondent",
+        triggers=[*query.split(), "correspondent"],
+        related=["skill:paperless-review-automation"],
+        search_text=(f"{query} correspondent ") * 5,
+    )
+    lci.build_sqlite(db_path, [*noise, target], [])
+
+    results = lci.search_index(db_path, query, limit=5)
+
+    assert results[0]["id"] == "skill_support_doc:paperless-visual-fallback"
+    assert "metadata_score" not in results[0]
+
+
+def test_metadata_fallback_matches_unindexed_id_without_schema_leak(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    target = lci.Artifact(
+        id="script:ha-mcp-wrapper",
+        type="script",
+        title="generic wrapper",
+        path="scripts/generic/run.sh",
+        summary="generic wrapper",
+        triggers=["generic", "wrapper"],
+        search_text="generic wrapper",
+    )
+    lci.build_sqlite(db_path, [target], [])
+
+    results = lci.search_index(db_path, "ha mcp", limit=5)
+
+    assert results[0]["id"] == "script:ha-mcp-wrapper"
+    assert "metadata_score" not in results[0]
 
 
 def test_identifier_metadata_expands_text_poor_home_assistant_artifacts(tmp_path: Path) -> None:

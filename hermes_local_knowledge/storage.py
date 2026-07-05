@@ -219,6 +219,7 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
 def decode_artifact_row(row: sqlite3.Row) -> dict[str, Any]:
     output = dict(row)
     output.pop("type_priority", None)
+    output.pop("metadata_score", None)
     for field_name in ("triggers_json", "entities_json", "related_json"):
         new_name = field_name.removesuffix("_json")
         try:
