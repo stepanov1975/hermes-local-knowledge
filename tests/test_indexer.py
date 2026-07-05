@@ -54,7 +54,7 @@ metadata:
     )
     write(
         root / "scripts" / "paperless_review" / "run_reviewer.py",
-        '"""Run staged Paperless inbox review and write audit logs."""\nprint("ok")\n',
+        '"""Run staged Paperless inbox review, audit document date checks, and human-review escalation."""\nprint("ok")\n',
     )
     write(
         root / "scripts" / "siyuan_mcp" / "run.sh",
@@ -108,6 +108,27 @@ maintenance window.
       command: {root / 'scripts' / 'siyuan_mcp' / 'run.sh'}
 """,
     )
+    write(
+        hermes_home / "skills" / "github" / "github-workflows" / "SKILL.md",
+        """---
+name: github-workflows
+description: Work with GitHub pull requests and review workflows.
+---
+# GitHub Workflows
+""",
+    )
+    write(
+        hermes_home
+        / "skills"
+        / "github"
+        / "github-workflows"
+        / "references"
+        / "replacement-pr-after-stale-contributor.md",
+        """# Replacement PR after stale contributor branch
+
+Author did not reply after 24h; use this GitHub review reminder cron workflow when a replacement PR is needed.
+""",
+    )
     return root, hermes_home
 
 
@@ -156,6 +177,59 @@ def test_build_index_writes_searchable_artifacts_and_edges(tmp_path: Path) -> No
     assert "skill:paperless-review-automation" in neighbor_ids
     assert "script:scripts-paperless-review-run-reviewer-py" in neighbor_ids
     assert any(edge.source == "cron:paperless-reviewer" and edge.target == "skill:paperless-review-automation" for edge in edges)
+
+
+def test_curated_successful_search_regressions(tmp_path: Path) -> None:
+    """Protect historically good searches from becoming noisy after ranking changes."""
+
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    lci.build_index(root, output_dir, hermes_home)
+    db_path = output_dir / "index.sqlite"
+    cases = json.loads(Path(__file__).with_name("search_regression_cases.json").read_text(encoding="utf-8"))
+
+    for case in cases:
+        results = lci.search_index(db_path, case["query"], limit=int(case.get("limit", 10)))
+        result_ids = [row["id"] for row in results]
+        case_name = str(case["name"])
+
+        for expected_id in case.get("expected_top", []):
+            assert result_ids[:1] == [expected_id], f"{case_name}: expected {expected_id} first, got {result_ids}"
+        for expected_id in case.get("expected_anywhere", []):
+            assert expected_id in result_ids, f"{case_name}: expected {expected_id} in results, got {result_ids}"
+
+
+def test_support_doc_flood_keeps_parent_skill_visible(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    skill_dir = root / "custom_skills" / "note-taking" / "local-knowledge-router"
+    write(
+        skill_dir / "SKILL.md",
+        """---
+name: local-knowledge-router
+description: Route local knowledge and capability index lookups.
+---
+# Local Knowledge Router
+""",
+    )
+    for index in range(6):
+        write(
+            skill_dir / "references" / f"session-{index}.md",
+            f"# Local knowledge router session {index}\n\nLocal knowledge router routing notes and telemetry.\n",
+        )
+    output_dir = tmp_path / "state"
+
+    lci.build_index(root, output_dir, hermes_home)
+
+    support_id = "skill_support_doc:custom-skills-note-taking-local-knowledge-router-references-session-0"
+    support_doc = lci.get_artifact(output_dir / "index.sqlite", support_id)
+    assert support_doc is not None
+    assert support_doc["related"] == ["skill:local-knowledge-router"]
+
+    results = lci.search_index(output_dir / "index.sqlite", "local knowledge router", limit=5)
+    result_ids = [row["id"] for row in results]
+    assert "skill:local-knowledge-router" in result_ids
+    assert sum(1 for row in results if row["type"] == "skill_support_doc") <= 3
 
 
 def test_runtime_skill_support_docs_are_searchable_and_linked(tmp_path: Path) -> None:
@@ -955,7 +1029,7 @@ def test_cli_commands_record_usage_telemetry_from_config(tmp_path: Path, capsys,
     assert build_row["state_dir_source"] == "config"
     assert build_row["rebuilt"] == 1
     assert build_row["index_artifact_count"] >= 7
-    assert json.loads(build_row["index_artifact_counts_json"])["skill"] == 2
+    assert json.loads(build_row["index_artifact_counts_json"])["skill"] == 3
     assert build_row["build_duration_ms"] is not None
     search_row = rows[1]
     assert search_row["query"] == "paperless review"

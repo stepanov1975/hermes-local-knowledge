@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-local-knowledge"
-version = "0.2.13"
+version = "0.2.14"
 description = "Reusable Hermes Agent plugin for local capability indexing"
 requires-python = ">=3.11"
 readme = "README.md"

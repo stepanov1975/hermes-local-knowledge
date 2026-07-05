@@ -1,0 +1,52 @@
+[
+  {
+    "name": "paperless_review_prefers_specific_skill",
+    "source": "positive feedback: query 'paperless review' should prefer paperless-review-automation over generic Paperless MCP artifacts",
+    "query": "paperless review",
+    "limit": 10,
+    "expected_top": ["skill:paperless-review-automation"],
+    "expected_anywhere": ["script:scripts-paperless-review-run-reviewer-py"]
+  },
+  {
+    "name": "paperless_reviewer_audit_finds_reviewer_script",
+    "source": "positive feedback: paperless reviewer audit/date/human-review query routed to run_reviewer.py",
+    "query": "paperless reviewer audit document date check date needs human review",
+    "limit": 10,
+    "expected_anywhere": ["script:scripts-paperless-review-run-reviewer-py"]
+  },
+  {
+    "name": "paperless_reviewer_cron_keeps_cron_and_script_visible",
+    "source": "resolved negative feedback: broad Paperless cron query must not bury cron/script artifacts under a broad runbook",
+    "query": "paperless reviewer cron automation script runbook",
+    "limit": 10,
+    "expected_anywhere": ["cron:paperless-reviewer", "script:scripts-paperless-review-run-reviewer-py"]
+  },
+  {
+    "name": "siyuan_mcp_finds_server_and_wrapper",
+    "source": "positive feedback: query 'siyuan mcp' routed to the MCP wrapper hardening path",
+    "query": "siyuan mcp",
+    "limit": 10,
+    "expected_anywhere": ["mcp:siyuan", "script:scripts-siyuan-mcp-run-sh"]
+  },
+  {
+    "name": "manifest_backed_backup_finds_update_progress_doc",
+    "source": "positive feedback: manifest-backed backup query routed to update/backup operational docs",
+    "query": "manifest-backed backup",
+    "limit": 10,
+    "expected_anywhere": ["runbook:docs-update-progress"]
+  },
+  {
+    "name": "self_hosted_update_flow_keeps_update_progress_first",
+    "source": "resolved zero-result/missing feedback: self-hosted update flow query should route to update progress artifacts",
+    "query": "self hosted application updates backup flow update markdown",
+    "limit": 10,
+    "expected_top": ["runbook:docs-update-progress"]
+  },
+  {
+    "name": "github_stale_author_phrase_finds_runtime_reference",
+    "source": "resolved negative feedback: GitHub PR-triage phrase should not be drowned by Paperless cron/script hits",
+    "query": "\"Author did not reply after 24h\" github author reply timeout review reminder cron",
+    "limit": 10,
+    "expected_top": ["skill_support_doc:runtime-skills-github-workflows-references-replacement-pr-after-stale-contributor"]
+  }
+]

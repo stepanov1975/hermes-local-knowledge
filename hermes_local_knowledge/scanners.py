@@ -213,6 +213,18 @@ def scan_markdown_docs(root: Path, settings: IndexSettings | None = None) -> lis
         title = rel.with_suffix("").as_posix()
         artifact_type = doc_type_for_path(root, path, settings)
         artifact_id = f"{artifact_type}:{slugify(rel.with_suffix('').as_posix())}"
+        related: list[str] = []
+        if artifact_type == "skill_support_doc":
+            for parent in path.parents:
+                if parent == root:
+                    break
+                skill_md = parent / "SKILL.md"
+                if skill_md.exists():
+                    skill_text = safe_read_text(skill_md)
+                    fm = parse_frontmatter(skill_text)
+                    skill_name = str(fm.get("name") or parent.name).strip()
+                    related = [f"skill:{slugify(skill_name)}"]
+                    break
         triggers = significant_words(title, summary, " ".join(rel.parts), text[:4_000])
         entities = extract_entities(title, summary, text[:20_000], path.as_posix(), known_entities=settings.known_entities)
         artifacts.append(
@@ -224,6 +236,7 @@ def scan_markdown_docs(root: Path, settings: IndexSettings | None = None) -> lis
                 summary=summary,
                 triggers=triggers,
                 entities=entities,
+                related=related,
                 source="repo_markdown",
                 search_text=text[:20_000],
             )
