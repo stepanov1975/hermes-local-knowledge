@@ -66,12 +66,10 @@ def has_excluded_part_within_allowed_roots(
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError):
         return True
-    for allowed_root in allowed_roots:
-        try:
-            rel = resolved.relative_to(allowed_root)
-        except ValueError:
-            continue
-        return should_skip_path(rel, excluded_dir_names)
+    matching_roots = [allowed_root for allowed_root in allowed_roots if path_is_relative_to(resolved, allowed_root)]
+    if matching_roots:
+        nearest_root = max(matching_roots, key=lambda root: len(root.parts))
+        return should_skip_path(resolved.relative_to(nearest_root), excluded_dir_names)
     return True
 
 def stat_key(path: Path) -> tuple[int, int] | None:

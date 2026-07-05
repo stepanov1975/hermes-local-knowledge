@@ -384,6 +384,54 @@ def test_skill_support_file_excludes_are_relative_to_skill_dir(tmp_path: Path) -
     assert names == ["references/guide.md"]
 
 
+def test_runtime_skills_under_excluded_source_root_segment_are_indexed(tmp_path: Path) -> None:
+    """The narrower HERMES_HOME allowed root should win over a broader source root."""
+    root = tmp_path / "repo"
+    hermes_home = root / "worktrees" / "profile"
+    write(
+        hermes_home / "skills" / "runtime-demo" / "SKILL.md",
+        """---
+name: runtime-demo
+description: Runtime demo skill.
+---
+# Runtime demo
+""",
+    )
+
+    artifacts = lci.scan_skills(root, hermes_home)
+
+    assert [(artifact.id, artifact.source, artifact.path) for artifact in artifacts] == [
+        ("skill:runtime-demo", "runtime_skill", "worktrees/profile/skills/runtime-demo")
+    ]
+
+
+def test_skill_support_file_names_uses_pruned_walker(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Support-file enumeration should prune excluded dirs before descent."""
+    skill_dir = tmp_path / "skill"
+    write(skill_dir / "references" / "guide.md", "# Guide\n")
+    calls: list[tuple[Path, tuple[Path, ...], bool, tuple[str, ...] | None]] = []
+
+    def fake_iter_files_followlinks(
+        root: Path,
+        *,
+        allowed_roots: tuple[Path, ...],
+        followlinks: bool,
+        excluded_dir_names: tuple[str, ...] | None,
+        **_kwargs: object,
+    ):
+        calls.append((root, allowed_roots, followlinks, excluded_dir_names))
+        return [skill_dir / "references" / "guide.md"] if root.name == "references" else []
+
+    monkeypatch.setattr(lci_scanners, "iter_files_followlinks", fake_iter_files_followlinks)
+
+    names = lci.skill_support_file_names(skill_dir, excluded_dir_names=("build",))
+
+    assert names == ["references/guide.md"]
+    assert calls == [
+        (skill_dir / "references", (skill_dir,), False, ("build",)),
+    ]
+
+
 def test_default_excluded_dir_names_includes_worktrees() -> None:
     """The built-in EXCLUDED_DIR_NAMES must include worktrees and .worktrees."""
     from hermes_local_knowledge.constants import EXCLUDED_DIR_NAMES
