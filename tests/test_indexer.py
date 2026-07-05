@@ -469,6 +469,81 @@ def test_sparse_strict_search_backfills_relaxed_cron_and_script_hits(tmp_path: P
     assert result_ids.index("cron:paperless-reviewer") < result_ids.index(broad_doc_id)
 
 
+def test_identifier_metadata_expands_text_poor_home_assistant_artifacts(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    script_path = root / "scripts" / "ha_mcp" / "run.sh"
+    write(
+        script_path,
+        """#!/usr/bin/env bash
+set -euo pipefail
+HOMEASSISTANT_TOKEN=SUPERSECRET
+: "${HOMEASSISTANT_URL:?missing}"
+exec "$HA_MCP_BIN"
+""",
+    )
+    write(root / "scripts" / "generic" / "plain.py", "ha = object()\nprint(ha)\n")
+    write(
+        hermes_home / "config.yaml",
+        f"""mcp:
+  servers:
+    ha_mcp:
+      command: {script_path}
+""",
+    )
+    write(
+        hermes_home / "cron" / "jobs.json",
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "job-ha",
+                        "name": "ha-mcp-health",
+                        "prompt": f"Run {script_path} and report status.",
+                        "script": "run.sh",
+                        "schedule_display": "every 30m",
+                    }
+                ]
+            }
+        ),
+    )
+    settings = lci.IndexSettings(known_entities=("Home Assistant", "MCP", "Cron"))
+    output_dir = tmp_path / "state"
+
+    lci.build_index(root, output_dir, hermes_home, settings)
+
+    assert lci.identifier_terms("HOMEASSISTANT_URL ha_mcp", known_entities=settings.known_entities)[:4] == [
+        "homeassistant",
+        "home",
+        "assistant",
+        "home assistant",
+    ]
+    assert set(
+        lci.extract_env_names('ha = object()\nurl = os.environ["HOMEASSISTANT_URL"]\nexport HA_MCP_BIN=/tmp/bin\n')
+    ) == {"HOMEASSISTANT_URL", "HA_MCP_BIN"}
+    assert lci.identifier_terms(" ".join(lci.extract_env_names("ha = object()")), known_entities=settings.known_entities) == []
+    unrelated_path_terms = lci.identifier_terms("/home/alex/repos/github_mcp/run.sh", known_entities=settings.known_entities)
+    assert "home" in unrelated_path_terms
+    assert "assistant" not in unrelated_path_terms
+    assert "homeassistant" not in unrelated_path_terms
+    script = lci.get_artifact(output_dir / "index.sqlite", "script:scripts-ha-mcp-run-sh")
+    assert script is not None
+    assert {"home", "assistant", "homeassistant", "mcp"} <= set(script["triggers"])
+    assert "supersecret" not in script["triggers"]
+    plain_script = lci.get_artifact(output_dir / "index.sqlite", "script:scripts-generic-plain-py")
+    assert plain_script is not None
+    assert "assistant" not in plain_script["triggers"]
+    assert "homeassistant" not in plain_script["triggers"]
+
+    script_results = lci.search_index(output_dir / "index.sqlite", "home assistant mcp", limit=5)
+    mcp_results = lci.search_index(output_dir / "index.sqlite", "home assistant mcp server", limit=5)
+    cron_results = lci.search_index(output_dir / "index.sqlite", "home assistant cron", limit=5)
+
+    assert "script:scripts-ha-mcp-run-sh" in [row["id"] for row in script_results]
+    assert "mcp:ha-mcp" in [row["id"] for row in mcp_results]
+    assert "cron:ha-mcp-health" in [row["id"] for row in cron_results]
+
+
 def test_indexer_build_index_honors_compatibility_monkeypatches(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls: list[str] = []
 

@@ -53,6 +53,83 @@ def significant_words(*parts: str, limit: int = 30) -> list[str]:
             words.append(lowered)
     return unique_preserve_order(words)[:limit]
 
+
+def _split_identifier(value: str) -> list[str]:
+    pieces: list[str] = []
+    for segment in re.split(r"[^A-Za-z0-9]+", value):
+        if not segment:
+            continue
+        spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", segment)
+        spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", spaced)
+        pieces.extend(part.lower() for part in spaced.split() if part)
+    return pieces
+
+
+def _known_entity_aliases(known_entities: Sequence[str] | None) -> dict[str, list[str]]:
+    aliases: dict[str, list[str]] = {}
+    for entity in known_entities or ():
+        words = _split_identifier(entity)
+        if not words:
+            continue
+        expansions = unique_preserve_order([*words, "".join(words), entity.lower()])
+        keys: set[str] = set()
+        compact = "".join(words)
+        if compact:
+            keys.add(compact)
+        if len(words) == 1:
+            keys.add(words[0])
+        if len(words) > 1:
+            acronym = "".join(word[0] for word in words if word)
+            if len(acronym) >= 2:
+                keys.add(acronym)
+        keys.add(entity.lower().replace(" ", ""))
+        for key in keys:
+            aliases.setdefault(key, [])
+            aliases[key].extend(expansions)
+    return {key: unique_preserve_order(values) for key, values in aliases.items()}
+
+
+def identifier_terms(*parts: str, known_entities: Sequence[str] | None = None, limit: int = 80) -> list[str]:
+    """Expand path/code identifiers into searchable words without LLMs.
+
+    This bridges text-poor operational artifacts whose only useful clues are
+    names like ``ha_mcp`` or ``HOMEASSISTANT_URL``. Known multi-word entities
+    also provide deterministic acronym/compact aliases: if ``Home Assistant``
+    is configured as a known entity, ``ha`` and ``homeassistant`` expand to
+    ``home assistant homeassistant``.
+    """
+
+    aliases = _known_entity_aliases(known_entities)
+    terms: list[str] = []
+    for part in parts:
+        for raw in re.findall(r"[A-Za-z][A-Za-z0-9_./:+-]*", part):
+            for token in _split_identifier(raw):
+                if not token:
+                    continue
+                terms.append(token)
+                terms.extend(aliases.get(token, []))
+    return unique_preserve_order(term for term in terms if term and term not in STOPWORDS)[:limit]
+
+
+def extract_env_names(text: str, *, limit: int = 80) -> list[str]:
+    """Extract environment/config variable names without capturing values."""
+
+    names: list[str] = []
+    env_name = r"[A-Z_][A-Z0-9_]{2,}"
+    string_name = r"[A-Za-z_][A-Za-z0-9_]*"
+    patterns = [
+        rf"(?:^|[\s;&])(?:export\s+)?({env_name})\s*=",
+        rf"\$\{{?({env_name})",
+        rf"os\.environ\s*\[\s*[\"']({string_name})[\"']\s*\]",
+        rf"os\.(?:environ(?:\.get)?|getenv)\s*\(\s*[\"']({string_name})[\"']",
+        rf"process\.env\.({string_name})",
+        rf"process\.env\s*\[\s*[\"']({string_name})[\"']\s*\]",
+    ]
+    for pattern in patterns:
+        names.extend(match.group(1) for match in re.finditer(pattern, text, re.MULTILINE))
+    return unique_preserve_order(names)[:limit]
+
+
 def extract_entities(*parts: str, known_entities: Sequence[str] | None = None) -> list[str]:
     haystack = "\n".join(parts).lower()
     entities_source = known_entities if known_entities is not None else DEFAULT_KNOWN_ENTITIES

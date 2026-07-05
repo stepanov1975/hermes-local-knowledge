@@ -11,9 +11,11 @@ from .models import Artifact, Edge, IndexSettings
 from .paths import display_path, iter_files_followlinks, path_is_relative_to
 from .text_utils import (
     extract_entities,
+    extract_env_names,
     extract_paths,
     first_heading_or_paragraph,
     first_sentence,
+    identifier_terms,
     parse_frontmatter,
     regex_list_after_key,
     relpath_matches_config_dir,
@@ -173,8 +175,16 @@ def scan_scripts(root: Path, settings: IndexSettings | None = None) -> list[Arti
             title = rel.as_posix()
             summary = script_summary(path, text)
             artifact_id = f"script:{slugify(rel.as_posix())}"
-            triggers = significant_words(title, summary, " ".join(rel.parts))
-            entities = extract_entities(title, summary, path.as_posix(), known_entities=settings.known_entities)
+            env_names = extract_env_names(text)
+            metadata_terms = identifier_terms(title, summary, " ".join(rel.parts), " ".join(env_names), known_entities=settings.known_entities)
+            triggers = significant_words(title, summary, " ".join(rel.parts), " ".join(metadata_terms))
+            entities = extract_entities(
+                title,
+                summary,
+                path.as_posix(),
+                " ".join(metadata_terms),
+                known_entities=settings.known_entities,
+            )
             artifacts.append(
                 Artifact(
                     id=artifact_id,
@@ -185,7 +195,7 @@ def scan_scripts(root: Path, settings: IndexSettings | None = None) -> list[Arti
                     triggers=triggers,
                     entities=entities,
                     source="repo_script",
-                    search_text=text[:20_000],
+                    search_text="\n".join([text[:20_000], " ".join(metadata_terms)]),
                 )
             )
     return sorted(artifacts, key=lambda item: item.id)
@@ -277,8 +287,33 @@ def scan_cron_jobs(root: Path, hermes_home: Path, settings: IndexSettings | None
             related.append(script)
         related.extend(extract_paths(prompt))
         artifact_id = f"cron:{slugify(name or job_id)}"
-        triggers = significant_words(name, summary, schedule, script, " ".join(skills), " ".join(enabled_toolsets), prompt[:4_000])
-        entities = extract_entities(name, summary, prompt[:20_000], script, known_entities=settings.known_entities)
+        metadata_terms = identifier_terms(
+            name,
+            schedule,
+            script,
+            " ".join(skills),
+            " ".join(enabled_toolsets),
+            prompt[:4_000],
+            known_entities=settings.known_entities,
+        )
+        triggers = significant_words(
+            name,
+            summary,
+            schedule,
+            script,
+            " ".join(skills),
+            " ".join(enabled_toolsets),
+            prompt[:4_000],
+            " ".join(metadata_terms),
+        )
+        entities = extract_entities(
+            name,
+            summary,
+            prompt[:20_000],
+            script,
+            " ".join(metadata_terms),
+            known_entities=settings.known_entities,
+        )
         artifacts.append(
             Artifact(
                 id=artifact_id,
@@ -291,7 +326,14 @@ def scan_cron_jobs(root: Path, hermes_home: Path, settings: IndexSettings | None
                 related=unique_preserve_order(related),
                 updated_at=str(job.get("updated_at") or job.get("created_at") or "") or None,
                 source="hermes_cron_registry",
-                search_text="\n".join([prompt, schedule, script, " ".join(skills), " ".join(enabled_toolsets)]),
+                search_text="\n".join([
+                    prompt,
+                    schedule,
+                    script,
+                    " ".join(skills),
+                    " ".join(enabled_toolsets),
+                    " ".join(metadata_terms),
+                ]),
             )
         )
     return sorted(artifacts, key=lambda item: item.id)
@@ -376,8 +418,18 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
         summary = f"Hermes MCP server {name}: " + ("; ".join(summary_bits) if summary_bits else "configured in Hermes config")
         related = extract_paths(" ".join([command, args_text, json.dumps(env, sort_keys=True, default=str)]))
         artifact_id = f"mcp:{slugify(name)}"
-        triggers = significant_words(name, summary, command, url, args_text, env_text)
-        entities = extract_entities(name, summary, command, url, args_text, env_text, known_entities=settings.known_entities)
+        metadata_terms = identifier_terms(name, summary, command, url, args_text, env_text, known_entities=settings.known_entities)
+        triggers = significant_words(name, summary, command, url, args_text, env_text, " ".join(metadata_terms))
+        entities = extract_entities(
+            name,
+            summary,
+            command,
+            url,
+            args_text,
+            env_text,
+            " ".join(metadata_terms),
+            known_entities=settings.known_entities,
+        )
         artifacts.append(
             Artifact(
                 id=artifact_id,
@@ -389,7 +441,7 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
                 entities=entities,
                 related=related,
                 source="hermes_config",
-                search_text="\n".join([summary, command, url, args_text, env_text]),
+                search_text="\n".join([summary, command, url, args_text, env_text, " ".join(metadata_terms)]),
             )
         )
     return artifacts
