@@ -31,6 +31,14 @@ from .constants import (
     STOPWORDS,
 )
 from .models import Artifact, Edge, IndexSettings
+from .evaluation import (
+    SearchMetrics,
+    artifact_ids,
+    artifact_parent_equivalence_map,
+    evaluate_index_against_feedback,
+    evaluate_search_labels,
+    load_positive_feedback_labels,
+)
 from .paths import (
     default_output_dir,
     display_path,
@@ -142,7 +150,10 @@ __all__ = [
     "ROUTING_HINT_TERMS",
     "SCRIPT_SUFFIXES",
     "STOPWORDS",
+    "SearchMetrics",
     "add_common_db_arg",
+    "artifact_ids",
+    "artifact_parent_equivalence_map",
     "build_edges",
     "build_index",
     "build_sqlite",
@@ -155,6 +166,8 @@ __all__ = [
     "doc_type_for_path",
     "extract_entities",
     "extract_paths",
+    "evaluate_index_against_feedback",
+    "evaluate_search_labels",
     "first_heading_or_paragraph",
     "first_sentence",
     "fts_query",
@@ -165,6 +178,7 @@ __all__ = [
     "is_within_allowed_roots",
     "iter_files_followlinks",
     "load_json",
+    "load_positive_feedback_labels",
     "load_yaml_if_available",
     "main",
     "normalize_query_term",

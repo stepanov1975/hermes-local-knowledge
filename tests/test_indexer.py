@@ -19,6 +19,43 @@ def write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def create_usage_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY,
+                query TEXT
+            );
+            CREATE TABLE feedback (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER,
+                rating TEXT NOT NULL,
+                query TEXT,
+                artifact_id TEXT
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO usage_events (id, query) VALUES (?, ?)",
+            [(1, "paperless review"), (2, "siyuan mcp")],
+        )
+        conn.executemany(
+            "INSERT INTO feedback (id, event_id, rating, query, artifact_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, 1, "useful", None, "skill:paperless-review-automation"),
+                (2, 2, "great", None, "mcp:siyuan"),
+                (3, None, "useful", "paperless reviewer script", "script:scripts-paperless-review-run-reviewer-py"),
+                (4, None, "useful", "stale artifact", "script:missing"),
+                (5, None, "noisy", "paperless review", "skill:paperless-mcp-server"),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def build_fixture(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
@@ -177,6 +214,108 @@ def test_build_index_writes_searchable_artifacts_and_edges(tmp_path: Path) -> No
     assert "skill:paperless-review-automation" in neighbor_ids
     assert "script:scripts-paperless-review-run-reviewer-py" in neighbor_ids
     assert any(edge.source == "cron:paperless-reviewer" and edge.target == "skill:paperless-review-automation" for edge in edges)
+
+
+def test_feedback_evaluation_replays_positive_labels(tmp_path: Path) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    lci.build_index(root, output_dir, hermes_home)
+    usage_db = tmp_path / "usage.sqlite"
+    create_usage_db(usage_db)
+
+    valid_ids = lci.artifact_ids(output_dir / "index.sqlite")
+    labels = lci.load_positive_feedback_labels(usage_db, valid_artifact_ids=valid_ids)
+
+    assert labels == {
+        "paperless review": {"skill:paperless-review-automation"},
+        "siyuan mcp": {"mcp:siyuan"},
+        "paperless reviewer script": {"script:scripts-paperless-review-run-reviewer-py"},
+    }
+
+    metrics = lci.evaluate_index_against_feedback(output_dir / "index.sqlite", usage_db)
+    assert metrics.query_count == 3
+    assert metrics.label_count == 3
+    assert metrics.hit_at_10 == 1.0
+    assert metrics.parent_equiv_hit_at_10 == 1.0
+
+
+def test_artifact_parent_equivalence_map_is_type_aware(tmp_path: Path) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    lci.build_index(root, output_dir, hermes_home)
+
+    equivalents = lci.artifact_parent_equivalence_map(output_dir / "index.sqlite")
+    support_id = "skill_support_doc:runtime-skills-github-workflows-references-replacement-pr-after-stale-contributor"
+
+    assert equivalents[support_id] == {"skill:github-workflows"}
+    assert support_id in equivalents["skill:github-workflows"]
+    assert "skill:paperless-mcp-server" not in equivalents.get("skill:paperless-review-automation", set())
+
+
+def test_parent_equivalent_metrics_only_count_support_doc_parent_pairs() -> None:
+    parent_equivalents = {
+        "skill:parent": {"skill_support_doc:parent-reference"},
+        "skill_support_doc:parent-reference": {"skill:parent"},
+    }
+
+    support_doc_for_parent = lci.evaluate_search_labels(
+        {"query": {"skill:parent"}},
+        lambda _query, _limit: ["skill_support_doc:parent-reference"],
+        parent_equivalents=parent_equivalents,
+    )
+    assert support_doc_for_parent.hit_at_1 == 0.0
+    assert support_doc_for_parent.parent_equiv_hit_at_1 == 1.0
+    assert support_doc_for_parent.parent_equiv_mrr_at_10 == 1.0
+
+    parent_for_support_doc = lci.evaluate_search_labels(
+        {"query": {"skill_support_doc:parent-reference"}},
+        lambda _query, _limit: ["skill:parent"],
+        parent_equivalents=parent_equivalents,
+    )
+    assert parent_for_support_doc.hit_at_1 == 0.0
+    assert parent_for_support_doc.parent_equiv_hit_at_1 == 1.0
+
+    peer_skill = lci.evaluate_search_labels(
+        {"query": {"skill:parent"}},
+        lambda _query, _limit: ["skill:peer"],
+        parent_equivalents=parent_equivalents,
+    )
+    assert peer_skill.hit_at_1 == 0.0
+    assert peer_skill.parent_equiv_hit_at_1 == 0.0
+
+
+def test_cli_evaluate_does_not_write_usage_db(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    lci.build_index(root, output_dir, hermes_home)
+    usage_db = tmp_path / "usage.sqlite"
+    create_usage_db(usage_db)
+
+    def counts() -> tuple[int, int]:
+        conn = sqlite3.connect(usage_db)
+        try:
+            feedback_count = int(conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0])
+            event_count = int(conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0])
+        finally:
+            conn.close()
+        return feedback_count, event_count
+
+    before = counts()
+    rc = lci.main(
+        [
+            "evaluate",
+            "--db",
+            str(output_dir / "index.sqlite"),
+            "--usage-db",
+            str(usage_db),
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["query_count"] == 3
+    assert counts() == before
 
 
 def test_curated_successful_search_regressions(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ from typing import Any, Sequence
 
 from . import __version__
 from .constants import DEFAULT_ROOT
+from .evaluation import evaluate_index_against_feedback
 from .models import IndexSettings
 from .paths import default_output_dir, hermes_home_from_env
 from .runtime import RuntimeConfig, _runtime_config
@@ -151,6 +152,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     neighbors_parser.add_argument("artifact_id")
     neighbors_parser.add_argument("--json", action="store_true", help="emit JSON")
     add_common_db_arg(neighbors_parser)
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate",
+        help="replay positive feedback labels against the current search index",
+    )
+    evaluate_parser.add_argument("--usage-db", type=Path, default=None, help="usage.sqlite path (default: index directory)")
+    evaluate_parser.add_argument("--json", action="store_true", help="emit JSON")
+    add_common_db_arg(evaluate_parser)
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -490,6 +499,24 @@ def main(
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             print_results(rows)
+        return 0
+
+    if args.command == "evaluate":
+        db_path, warnings, _cfg = _db_from_args(args)
+        _print_warnings(warnings)
+        usage_db_path = _resolved(args.usage_db) if args.usage_db is not None else db_path.parent / "usage.sqlite"
+        metrics = evaluate_index_against_feedback(db_path, usage_db_path).as_dict()
+        if args.json:
+            print(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print("local_knowledge evaluation")
+            print(f"  Index DB: {db_path}")
+            print(f"  Usage DB: {usage_db_path}")
+            for key, value in metrics.items():
+                if isinstance(value, float):
+                    print(f"  {key}: {value:.3f}")
+                else:
+                    print(f"  {key}: {value}")
         return 0
 
     if args.command in {"doctor", "smoke"}:
