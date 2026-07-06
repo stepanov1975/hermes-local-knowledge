@@ -11,6 +11,7 @@ import hermes_local_knowledge
 from hermes_local_knowledge import cli as lci_cli
 from hermes_local_knowledge import indexer as lci
 from hermes_local_knowledge import scanners as lci_scanners
+from hermes_local_knowledge import search as lci_search
 from hermes_local_knowledge import storage as lci_storage
 
 
@@ -842,6 +843,240 @@ def test_search_candidate_collection_keeps_later_type_ranked_support_doc_hits(tm
 
     assert results[0]["id"] == "skill_support_doc:paperless-visual-fallback"
     assert "metadata_score" not in results[0]
+
+
+def test_filename_identity_match_outranks_body_only_content_hits_when_strict_pool_is_full(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    query = "cleanup update backups"
+    body_only_noise = [
+        lci.Artifact(
+            id=f"runbook:backup-prose-{index:03d}",
+            type="runbook",
+            title=f"backup prose {index}",
+            path=f"docs/backup-prose-{index}.md",
+            summary="Broad operational notes.",
+            triggers=["operations"],
+            search_text=(f"{query} " * 20).strip(),
+        )
+        for index in range(300)
+    ]
+    named_script = lci.Artifact(
+        id="script:cleanup-update-backups-py",
+        type="script",
+        title="scripts/cleanup_update_backups.py",
+        path="scripts/cleanup_update_backups.py",
+        summary="Maintenance helper.",
+        triggers=["maintenance"],
+        search_text="maintenance helper",
+    )
+    lci.build_sqlite(db_path, [*body_only_noise, named_script], [])
+
+    results = lci.search_index(db_path, query, limit=5)
+
+    assert results[0]["id"] == named_script.id
+
+
+def test_metadata_identity_candidate_enters_full_strict_result_page(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    query = "identity recovery"
+    body_only_noise = [
+        lci.Artifact(
+            id=f"runbook:prose-{index:03d}",
+            type="runbook",
+            title=f"prose note {index}",
+            path=f"docs/prose-note-{index}.md",
+            summary="Broad operational notes.",
+            triggers=["operations"],
+            search_text=(f"{query} " * 20).strip(),
+        )
+        for index in range(300)
+    ]
+    one_term_metadata_distractors = [
+        lci.Artifact(
+            id=f"script:identity-distractor-{index:03d}",
+            type="script",
+            title="generic helper",
+            path=f"scripts/generic/helper-{index}.sh",
+            summary="Generic helper.",
+            triggers=["generic"],
+            search_text="generic helper",
+        )
+        for index in range(150)
+    ]
+    id_only_target = lci.Artifact(
+        id="script:identity-recovery-wrapper",
+        type="script",
+        title="generic wrapper",
+        path="scripts/generic/run.sh",
+        summary="Generic wrapper.",
+        triggers=["generic", "wrapper"],
+        search_text="generic wrapper",
+    )
+    lci.build_sqlite(db_path, [*body_only_noise, *one_term_metadata_distractors, id_only_target], [])
+
+    assert lci_search._requested_operational_types(lci.query_terms(query)) == set()
+    conn = lci_storage.connect_readonly(db_path)
+    try:
+        strict_ids = {row["id"] for row in lci_search._query_rows(conn, lci.fts_query(query), 100)}
+    finally:
+        conn.close()
+
+    assert id_only_target.id not in strict_ids
+    results = lci.search_index(db_path, query, limit=5)
+
+    assert results[0]["id"] == id_only_target.id
+
+
+def test_metadata_identity_requires_all_non_routing_terms(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    query = "alpha bravo charlie delta echo foxtrot golf hotel india"
+    strict_runbooks = [
+        lci.Artifact(
+            id=f"runbook:long-query-prose-{index}",
+            type="runbook",
+            title=f"long query prose {index}",
+            path=f"docs/long-query-prose-{index}.md",
+            summary="Broad notes that fully match the long query.",
+            triggers=["operations"],
+            search_text=query,
+        )
+        for index in range(5)
+    ]
+    partial_identity = lci.Artifact(
+        id="script:alpha-bravo-charlie-delta-echo-foxtrot-golf-hotel-wrapper",
+        type="script",
+        title="generic wrapper",
+        path="scripts/generic/run.sh",
+        summary="Generic wrapper.",
+        triggers=["generic", "wrapper"],
+        search_text="generic wrapper",
+    )
+    lci.build_sqlite(db_path, [*strict_runbooks, partial_identity], [])
+
+    results = lci.search_index(db_path, query, limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert partial_identity.id not in result_ids
+    assert result_ids == [artifact.id for artifact in strict_runbooks]
+
+
+def test_metadata_identity_candidate_enters_underfilled_strict_results(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    query = "alpha bravo charlie delta echo foxtrot golf hotel india"
+    strict_runbook = lci.Artifact(
+        id="runbook:long-query-prose",
+        type="runbook",
+        title="long query prose",
+        path="docs/long-query-prose.md",
+        summary="Broad notes that fully match the long query.",
+        triggers=["operations"],
+        search_text=query,
+    )
+    partial_identity_distractors = [
+        lci.Artifact(
+            id=f"script:alpha-bravo-charlie-delta-echo-foxtrot-golf-hotel-distractor-{index:03d}",
+            type="script",
+            title="generic helper",
+            path=f"scripts/generic/helper-{index}.sh",
+            summary="Generic helper.",
+            triggers=["generic"],
+            search_text="generic helper",
+        )
+        for index in range(150)
+    ]
+    full_identity_target = lci.Artifact(
+        id="script:alpha-bravo-charlie-delta-echo-foxtrot-golf-hotel-india-wrapper",
+        type="script",
+        title="generic wrapper",
+        path="scripts/generic/run.sh",
+        summary="Generic wrapper.",
+        triggers=["generic", "wrapper"],
+        search_text="generic wrapper",
+    )
+    lci.build_sqlite(db_path, [strict_runbook, *partial_identity_distractors, full_identity_target], [])
+
+    results = lci.search_index(db_path, query, limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert result_ids[:2] == [full_identity_target.id, strict_runbook.id]
+    assert not set(result_ids).intersection({artifact.id for artifact in partial_identity_distractors})
+
+
+def test_metadata_identity_support_doc_keeps_parent_when_strict_pool_is_full(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    query = "identity recovery"
+    body_only_noise = [
+        lci.Artifact(
+            id=f"runbook:prose-{index:03d}",
+            type="runbook",
+            title=f"prose note {index}",
+            path=f"docs/prose-note-{index}.md",
+            summary="Broad operational notes.",
+            triggers=["operations"],
+            search_text=(f"{query} " * 20).strip(),
+        )
+        for index in range(300)
+    ]
+    parent = lci.Artifact(
+        id="skill:parent-router",
+        type="skill",
+        title="parent router",
+        path="skills/parent-router",
+        summary="Parent skill for reference routing.",
+        triggers=["parent", "router"],
+        search_text="parent router",
+    )
+    support_doc = lci.Artifact(
+        id="skill_support_doc:identity-recovery-reference",
+        type="skill_support_doc",
+        title="generic reference",
+        path="skills/parent-router/references/reference.md",
+        summary="Generic reference.",
+        triggers=["generic", "reference"],
+        related=[parent.id],
+        search_text="generic reference",
+    )
+    lci.build_sqlite(db_path, [*body_only_noise, parent, support_doc], [])
+
+    conn = lci_storage.connect_readonly(db_path)
+    try:
+        strict_ids = {row["id"] for row in lci_search._query_rows(conn, lci.fts_query(query), 100)}
+    finally:
+        conn.close()
+
+    assert support_doc.id not in strict_ids
+    results = lci.search_index(db_path, query, limit=5)
+
+    assert [row["id"] for row in results[:2]] == [parent.id, support_doc.id]
+
+
+def test_partial_filename_match_does_not_outrank_full_content_match(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    strategy_runbook = lci.Artifact(
+        id="runbook:resilience-plan",
+        type="runbook",
+        title="resilience plan",
+        path="docs/resilience-plan.md",
+        summary="Backup strategy and recovery planning for local services.",
+        triggers=["backup", "strategy", "recovery"],
+        search_text="Backup strategy and recovery planning for local services.",
+    )
+    backup_script = lci.Artifact(
+        id="script:backup-sh",
+        type="script",
+        title="scripts/backup.sh",
+        path="scripts/backup.sh",
+        summary="Generic maintenance helper.",
+        triggers=["maintenance"],
+        search_text="Generic maintenance helper.",
+    )
+    lci.build_sqlite(db_path, [strategy_runbook, backup_script], [])
+
+    results = lci.search_index(db_path, "backup strategy", limit=5)
+    result_ids = [row["id"] for row in results]
+
+    assert result_ids[0] == strategy_runbook.id
+    assert result_ids.index(strategy_runbook.id) < result_ids.index(backup_script.id)
 
 
 def test_metadata_fallback_matches_unindexed_id_without_schema_leak(tmp_path: Path) -> None:
@@ -1909,6 +2144,7 @@ def test_search_sort_key_scores_each_ranking_tier() -> None:
 
     assert lci.search_sort_key(row, ["paperless", "review"]) == (
         0,
+        0,
         -1,
         -1,
         -1,
@@ -1932,4 +2168,4 @@ def test_search_sort_key_scores_each_ranking_tier() -> None:
         "type": "skill",
         "rank": 0,
     }
-    assert lci.search_sort_key(id_weight_row, ["paperless", "review"])[:2] == (0, -1)
+    assert lci.search_sort_key(id_weight_row, ["paperless", "review"])[1:3] == (0, -1)

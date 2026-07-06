@@ -5,8 +5,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .constants import ROUTING_HINT_TERMS
 from .storage import connect_readonly, decode_artifact_row
 from .text_utils import fts_query, high_signal_terms, query_terms, search_sort_key, token_hits
+
+
+FTS_BM25_WEIGHTS = "0.0, 0.2, 6.0, 1.0, 3.0, 2.0, 5.0, 0.4"
 
 
 def _query_rows(conn: Any, match: str, candidate_limit: int, artifact_type: str = "") -> list[Any]:
@@ -18,7 +22,7 @@ def _query_rows(conn: Any, match: str, candidate_limit: int, artifact_type: str 
     params.append(candidate_limit)
     return conn.execute(
         f"""
-        SELECT a.*, bm25(artifact_fts) AS rank,
+        SELECT a.*, bm25(artifact_fts, {FTS_BM25_WEIGHTS}) AS rank,
                CASE a.type
                  WHEN 'skill' THEN 0
                  WHEN 'script' THEN 1
@@ -64,7 +68,15 @@ def _metadata_rows(conn: Any, terms: list[str], candidate_limit: int, artifact_t
     if not candidate_terms:
         return []
 
-    fields = ("a.id", "a.title", "a.path", "a.summary", "a.triggers_json", "a.entities_json")
+    field_weights = (
+        ("a.id", 5),
+        ("a.title", 5),
+        ("a.path", 4),
+        ("a.triggers_json", 2),
+        ("a.entities_json", 2),
+        ("a.summary", 1),
+    )
+    fields = tuple(field for field, _weight in field_weights)
     term_clauses: list[str] = []
     params: list[str] = []
     score_parts: list[str] = []
@@ -73,8 +85,9 @@ def _metadata_rows(conn: Any, terms: list[str], candidate_limit: int, artifact_t
         like = f"%{term.lower()}%"
         term_clauses.append("(" + " OR ".join(f"lower({field}) LIKE ?" for field in fields) + ")")
         params.extend([like] * len(fields))
-        score_parts.append("CASE WHEN " + " OR ".join(f"lower({field}) LIKE ?" for field in fields) + " THEN 1 ELSE 0 END")
-        score_params.extend([like] * len(fields))
+        for field, weight in field_weights:
+            score_parts.append(f"CASE WHEN lower({field}) LIKE ? THEN {weight} ELSE 0 END")
+            score_params.append(like)
 
     where_sql = "(" + " OR ".join(term_clauses) + ")"
     if artifact_type:
@@ -93,6 +106,44 @@ def _metadata_rows(conn: Any, terms: list[str], candidate_limit: int, artifact_t
         [*score_params, *params, candidate_limit],
     ).fetchall()
     return rows
+
+
+def _identity_metadata_rows(conn: Any, terms: list[str], candidate_limit: int, artifact_type: str = "") -> list[Any]:
+    """Return rows whose artifact identity matches all non-routing query terms."""
+
+    identity_terms = [term for term in terms if term not in ROUTING_HINT_TERMS]
+    if len(identity_terms) < 2:
+        return []
+
+    fields = ("a.id", "a.title", "a.path")
+    term_clauses: list[str] = []
+    params: list[str] = []
+    score_parts: list[str] = []
+    score_params: list[str] = []
+    for term in identity_terms:
+        like = f"%{term.lower()}%"
+        term_clauses.append("(" + " OR ".join(f"lower({field}) LIKE ?" for field in fields) + ")")
+        params.extend([like] * len(fields))
+        for field, weight in (("a.id", 5), ("a.title", 5), ("a.path", 4)):
+            score_parts.append(f"CASE WHEN lower({field}) LIKE ? THEN {weight} ELSE 0 END")
+            score_params.append(like)
+
+    where_sql = " AND ".join(term_clauses)
+    if artifact_type:
+        where_sql += " AND a.type = ?"
+        params.append(artifact_type)
+
+    return conn.execute(
+        f"""
+        SELECT a.*, 0.0 AS rank, {_type_priority_sql("a")},
+               ({" + ".join(score_parts)}) AS metadata_score
+        FROM artifacts a
+        WHERE {where_sql}
+        ORDER BY metadata_score DESC, type_priority, a.title
+        LIMIT ?
+        """,
+        [*score_params, *params, candidate_limit],
+    ).fetchall()
 
 
 def _merge_candidate_rows(*row_groups: list[Any]) -> list[Any]:
@@ -362,15 +413,6 @@ def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: s
             lift_parents=lift_parents,
         )
         strict_ids = {str(row["id"]) for row in strict}
-        if len(strict) >= output_limit and not requested_operational_types:
-            return _finalize_results(
-                strict,
-                output_limit,
-                terms,
-                requested_operational_types=requested_operational_types,
-                strict_ids=strict_ids,
-            )
-
         if quoted_only_query:
             return _finalize_results(
                 strict,
@@ -380,19 +422,51 @@ def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: s
                 strict_ids=strict_ids,
             )
 
+        metadata_identity: list[dict[str, Any]] = []
+        if not requested_operational_types:
+            metadata_identity = _rank_rows(
+                conn,
+                [row for row in _identity_metadata_rows(conn, terms, candidate_limit, type_filter) if str(row["id"]) not in strict_ids],
+                terms,
+                lift_parents=lift_parents,
+            )
+        if len(strict) >= output_limit and not requested_operational_types and not metadata_identity:
+            return _finalize_results(
+                strict,
+                output_limit,
+                terms,
+                requested_operational_types=requested_operational_types,
+                strict_ids=strict_ids,
+            )
+        if len(strict) >= output_limit and not requested_operational_types and metadata_identity:
+            return _finalize_results(
+                [*metadata_identity, *strict],
+                output_limit,
+                terms,
+                requested_operational_types=requested_operational_types,
+                strict_ids=strict_ids,
+            )
+
+        metadata_identity_ids = {str(row["id"]) for row in metadata_identity}
         fallback_rows = _merge_candidate_rows(
             _query_rows(conn, fts_query(query, operator="OR"), candidate_limit, type_filter) if len(terms) > 1 else [],
-            _metadata_rows(conn, terms, candidate_limit, type_filter),
+            [] if metadata_identity else _metadata_rows(conn, terms, candidate_limit, type_filter),
         )
         fallback = _rank_rows(
             conn,
-            [row for row in fallback_rows if str(row["id"]) not in strict_ids],
+            [
+                row
+                for row in fallback_rows
+                if str(row["id"]) not in strict_ids and str(row["id"]) not in metadata_identity_ids
+            ],
             terms,
             lift_parents=lift_parents,
         )
-        fallback = [row for row in fallback if str(row["id"]) not in strict_ids]
+        fallback = [
+            row for row in fallback if str(row["id"]) not in strict_ids and str(row["id"]) not in metadata_identity_ids
+        ]
         return _finalize_results(
-            [*strict, *fallback],
+            [*metadata_identity, *strict, *fallback] if metadata_identity else [*strict, *fallback],
             output_limit,
             terms,
             requested_operational_types=requested_operational_types,

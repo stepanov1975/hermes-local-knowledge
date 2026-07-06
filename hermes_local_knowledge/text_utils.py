@@ -268,6 +268,46 @@ def high_signal_terms(terms: Sequence[str]) -> list[str]:
     specific = [term for term in terms if term not in ROUTING_HINT_TERMS]
     return specific or list(terms)
 
+def identity_match_tier(row: dict[str, Any], terms: Sequence[str]) -> int:
+    """Return a bounded priority tier for artifact identity matches.
+
+    Local knowledge routes to whole artifacts. When a query clearly names an
+    artifact, matches in identifiers, titles, and filenames should beat prose
+    mentions. Keep the boost narrow: single-token or generic path overlap is not
+    enough, otherwise broad queries such as ``backup strategy`` would be hijacked
+    by a file merely named ``backup.sh``.
+    """
+
+    if not terms:
+        return 3
+
+    artifact_id = str(row.get("id") or "")
+    title = str(row.get("title") or "")
+    path = str(row.get("path") or "")
+    path_name = Path(path).name
+    path_stem = Path(path).stem
+    query_compact = "".join(terms)
+
+    if len(terms) >= 2 and query_compact:
+        for value in (artifact_id, title, path_name, path_stem):
+            if "".join(query_terms(value, drop_stopwords=False)) == query_compact:
+                return 0
+
+    identity_terms = [term for term in terms if term not in ROUTING_HINT_TERMS]
+    if len(identity_terms) < 2:
+        return 3
+
+    title_tokens = set(query_terms(" ".join([artifact_id, title]), drop_stopwords=False))
+    basename_tokens = set(query_terms(" ".join([path_name, path_stem]), drop_stopwords=False))
+    path_tokens = set(query_terms(path, drop_stopwords=False))
+    if token_hits(title_tokens, identity_terms) == len(identity_terms):
+        return 1
+    if token_hits(basename_tokens, identity_terms) == len(identity_terms):
+        return 1
+    if token_hits(path_tokens, identity_terms) == len(identity_terms):
+        return 2
+    return 3
+
 def type_priority(artifact_type: str) -> int:
     return {
         "skill": 0,
@@ -280,6 +320,7 @@ def type_priority(artifact_type: str) -> int:
 
 def search_sort_key(row: dict[str, Any], terms: Sequence[str]) -> tuple[Any, ...]:
     specific_terms = high_signal_terms(terms)
+    identity_tier = identity_match_tier(row, terms)
     title_source = " ".join([str(row.get("id") or ""), str(row.get("title") or "")])
     title_tokens = set(query_terms(title_source, drop_stopwords=False))
     path_tokens = set(query_terms(str(row.get("path") or ""), drop_stopwords=False))
@@ -298,15 +339,16 @@ def search_sort_key(row: dict[str, Any], terms: Sequence[str]) -> tuple[Any, ...
     entity_hits = token_hits(entity_tokens, terms)
     full_title_match = 0 if terms and title_hits == len(terms) else 1
     return (
+        identity_tier,
         full_title_match,
         -specific_title_hits,
-        -specific_path_hits,
         -specific_trigger_hits,
         -specific_summary_hits,
+        -specific_path_hits,
         -title_hits,
-        -path_hits,
         -trigger_hits,
         -summary_hits,
+        -path_hits,
         -entity_hits,
         type_priority(str(row.get("type") or "")),
         float(row.get("rank") or 0.0),
