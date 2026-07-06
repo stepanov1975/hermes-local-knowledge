@@ -246,11 +246,27 @@ To match native plugin behavior, read `local_knowledge` settings from Hermes con
 python -m hermes_local_knowledge.indexer build --from-hermes-config
 python -m hermes_local_knowledge.indexer search 'backup runbook' --from-hermes-config --limit 8
 python -m hermes_local_knowledge.indexer evaluate --from-hermes-config --json
+python -m hermes_local_knowledge.indexer evaluate --from-hermes-config --json --details
 ```
 
 `evaluate` replays positive `usage.sqlite` feedback labels against the current
 index and reports exact plus parent-equivalent top-k metrics. Parent-equivalent
-metrics only relax `skill_support_doc` hits to their owning parent skill.
+metrics only relax `skill_support_doc` hits to their owning parent skill. Add
+`--details` when you need per-query expected IDs, ranks, and top result IDs.
+
+To compare search quality across historical git refs, use the development helper
+from a source checkout:
+
+```bash
+python scripts/compare_historical_query_versions.py \
+  --usage-db ~/.hermes/local_knowledge/usage.sqlite \
+  v0.2.14 v0.2.18 WORKTREE
+```
+
+Use `WORKTREE` to evaluate the current working tree, including uncommitted code.
+The helper builds an isolated index per ref, replays the supplied historical
+feedback DB, and prints a metrics table by default. Use `--json --details` for
+per-query output.
 
 The CLI also has an install/config smoke check:
 

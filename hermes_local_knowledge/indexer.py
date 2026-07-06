@@ -32,11 +32,15 @@ from .constants import (
 )
 from .models import Artifact, Edge, IndexSettings
 from .evaluation import (
+    SearchEvaluationReport,
+    SearchLabelResult,
     SearchMetrics,
     artifact_ids,
     artifact_parent_equivalence_map,
     evaluate_index_against_feedback,
+    evaluate_index_against_feedback_report,
     evaluate_search_labels,
+    evaluate_search_labels_report,
     load_positive_feedback_labels,
 )
 from .paths import (
@@ -153,6 +157,8 @@ __all__ = [
     "ROUTING_HINT_TERMS",
     "SCRIPT_SUFFIXES",
     "STOPWORDS",
+    "SearchEvaluationReport",
+    "SearchLabelResult",
     "SearchMetrics",
     "add_common_db_arg",
     "artifact_ids",
@@ -172,7 +178,9 @@ __all__ = [
     "extract_env_names",
     "extract_paths",
     "evaluate_index_against_feedback",
+    "evaluate_index_against_feedback_report",
     "evaluate_search_labels",
+    "evaluate_search_labels_report",
     "first_heading_or_paragraph",
     "first_sentence",
     "fts_query",

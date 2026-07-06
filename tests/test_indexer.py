@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -239,6 +243,16 @@ def test_feedback_evaluation_replays_positive_labels(tmp_path: Path) -> None:
     assert metrics.hit_at_10 == 1.0
     assert metrics.parent_equiv_hit_at_10 == 1.0
 
+    report = lci.evaluate_index_against_feedback_report(output_dir / "index.sqlite", usage_db)
+    assert report.metrics == metrics
+    assert len(report.cases) == 3
+    paperless_case = next(case for case in report.cases if case.query == "paperless review")
+    assert paperless_case.expected_ids == ("skill:paperless-review-automation",)
+    assert paperless_case.exact_rank == 1
+    assert paperless_case.parent_equiv_rank == 1
+    assert paperless_case.top_ids[0] == "skill:paperless-review-automation"
+    assert report.as_dict()["cases"][0]["top_ids"]
+
 
 def test_artifact_parent_equivalence_map_is_type_aware(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
@@ -339,7 +353,139 @@ def test_cli_evaluate_does_not_write_usage_db(tmp_path: Path, capsys) -> None:  
 
     assert rc == 0
     assert payload["query_count"] == 3
+    assert "cases" not in payload
     assert counts() == before
+
+    rc = lci.main(
+        [
+            "evaluate",
+            "--db",
+            str(output_dir / "index.sqlite"),
+            "--usage-db",
+            str(usage_db),
+            "--json",
+            "--details",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["query_count"] == 3
+    assert len(payload["cases"]) == 3
+    assert payload["cases"][0]["top_ids"]
+    assert counts() == before
+
+
+def load_compare_helper() -> Any:
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "compare_historical_query_versions.py"
+    spec = importlib.util.spec_from_file_location("compare_historical_query_versions", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_compare_helper_ref_names_are_collision_resistant() -> None:
+    helper = load_compare_helper()
+
+    assert helper.safe_ref_name("feature/a") != helper.safe_ref_name("feature-a")
+
+
+def test_compare_helper_build_uses_explicit_state_guards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    helper = load_compare_helper()
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def fake_run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
+        calls.append((command, env))
+        return ""
+
+    monkeypatch.setattr(helper, "run", fake_run)
+    source_root = tmp_path / "source"
+    state_dir = tmp_path / "state"
+    hermes_home = tmp_path / "hermes"
+    args = SimpleNamespace(root=source_root, hermes_home=hermes_home)
+
+    helper.build_index_for_ref(tmp_path, state_dir, args)
+
+    command, env = calls[0]
+    assert "hermes_local_knowledge.indexer" in command
+    assert "--from-hermes-config" in command
+    assert command[command.index("--hermes-home") + 1] == str(hermes_home.resolve())
+    assert command[command.index("--output-dir") + 1] == str(state_dir)
+    assert command[command.index("--root") + 1] == str(source_root.resolve())
+    assert env is not None
+    assert env["LOCAL_KNOWLEDGE_ROOT"] == str(source_root.resolve())
+    assert env["LOCAL_KNOWLEDGE_STATE_DIR"] == str(state_dir)
+    assert env["HERMES_HOME"] == str(hermes_home.resolve())
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_compare_helper_preserves_config_default_root_semantics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    helper = load_compare_helper()
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def fake_run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
+        calls.append((command, env))
+        return ""
+
+    monkeypatch.setattr(helper, "run", fake_run)
+    monkeypatch.setenv("LOCAL_KNOWLEDGE_ROOT", str(tmp_path / "ambient-root"))
+    state_dir = tmp_path / "state"
+    hermes_home = tmp_path / "hermes"
+    args = SimpleNamespace(root=None, hermes_home=hermes_home)
+
+    helper.build_index_for_ref(tmp_path, state_dir, args)
+
+    command, env = calls[0]
+    assert "--root" not in command
+    assert env is not None
+    assert "LOCAL_KNOWLEDGE_ROOT" not in env
+    assert env["LOCAL_KNOWLEDGE_STATE_DIR"] == str(state_dir)
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_compare_helper_evaluator_disables_bytecode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    helper = load_compare_helper()
+    calls: list[dict[str, str] | None] = []
+
+    def fake_run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
+        calls.append(env)
+        return "{}"
+
+    monkeypatch.setattr(helper, "run", fake_run)
+
+    helper.evaluate_ref(tmp_path, tmp_path / "state", tmp_path / "usage.sqlite", tmp_path / "runner.py")
+
+    env = calls[0]
+    assert env is not None
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert str(tmp_path) in env["PYTHONPATH"]
+
+
+def test_compare_helper_cleanup_is_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    helper = load_compare_helper()
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
+        calls.append(command)
+        if command[:3] == ["git", "worktree", "remove"] and command[-1].endswith("bad"):
+            raise RuntimeError("remove failed")
+        return ""
+
+    monkeypatch.setattr(helper, "run", fake_run)
+    created = [tmp_path / "good", tmp_path / "bad"]
+
+    helper.cleanup_worktrees(created, keep=True)
+    assert calls == []
+
+    helper.cleanup_worktrees(created, keep=False)
+
+    assert ["git", "worktree", "remove", "--force", str(tmp_path / "bad")] in calls
+    assert ["git", "worktree", "remove", "--force", str(tmp_path / "good")] in calls
+    assert ["git", "worktree", "prune"] in calls
+    assert "cleanup failed" in capsys.readouterr().err
 
 
 def test_curated_successful_search_regressions(tmp_path: Path) -> None:

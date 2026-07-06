@@ -41,6 +41,7 @@ Do not replace this with a neural or LLM ranker unless the labeled data grows su
 - Track both exact metrics and parent-equivalent metrics.
 - Keep `evaluate` read-only. It must not write usage/feedback telemetry.
 - Use curated regression cases in `tests/search_regression_cases.json` to protect historically good queries and resolved negative feedback.
+- Use `evaluate --details` or `scripts/compare_historical_query_versions.py` when comparing search changes across historical git refs; do not rely on one-off temp helpers for reusable ranking evidence.
 - Always run live configured smokes after ranking/index changes, not only unit tests.
 
 ### Parent-equivalence trap

@@ -48,6 +48,39 @@ class SearchMetrics:
         }
 
 
+@dataclass(frozen=True)
+class SearchLabelResult:
+    """Per-query replay result for historical search labels."""
+
+    query: str
+    expected_ids: tuple[str, ...]
+    exact_rank: int | None
+    parent_equiv_rank: int | None
+    top_ids: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "query": self.query,
+            "expected_ids": list(self.expected_ids),
+            "exact_rank": self.exact_rank,
+            "parent_equiv_rank": self.parent_equiv_rank,
+            "top_ids": list(self.top_ids),
+        }
+
+
+@dataclass(frozen=True)
+class SearchEvaluationReport:
+    """Aggregate metrics plus per-query replay details."""
+
+    metrics: SearchMetrics
+    cases: tuple[SearchLabelResult, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = self.metrics.as_dict()
+        payload["cases"] = [case.as_dict() for case in self.cases]
+        return payload
+
+
 def _clean_label_value(value: Any) -> str:
     text = str(value or "").strip()
     return "" if text.lower() in IGNORED_LABEL_VALUES else text
@@ -153,6 +186,23 @@ def evaluate_search_labels(
 ) -> SearchMetrics:
     """Replay labeled queries and compute exact and parent-equivalent metrics."""
 
+    return evaluate_search_labels_report(
+        labels,
+        search_fn,
+        parent_equivalents=parent_equivalents,
+        max_k=max_k,
+    ).metrics
+
+
+def evaluate_search_labels_report(
+    labels: Mapping[str, set[str]],
+    search_fn: Callable[[str, int], Sequence[str]],
+    *,
+    parent_equivalents: Mapping[str, set[str]] | None = None,
+    max_k: int = 10,
+) -> SearchEvaluationReport:
+    """Replay labeled queries and include per-query ranks/top results."""
+
     parent_equivalents = parent_equivalents or {}
     metric_limit = 10
     search_limit = max(metric_limit, int(max_k))
@@ -162,6 +212,7 @@ def evaluate_search_labels(
     parent_reciprocal_rank = 0.0
     query_count = 0
     label_count = 0
+    cases: list[SearchLabelResult] = []
 
     for query, expected_ids in labels.items():
         expected = {item for item in expected_ids if item}
@@ -186,9 +237,18 @@ def evaluate_search_labels(
             reciprocal_rank += 1 / exact_rank
         if parent_rank is not None:
             parent_reciprocal_rank += 1 / parent_rank
+        cases.append(
+            SearchLabelResult(
+                query=query,
+                expected_ids=tuple(sorted(expected)),
+                exact_rank=exact_rank,
+                parent_equiv_rank=parent_rank,
+                top_ids=tuple(result_ids[:metric_limit]),
+            )
+        )
 
     denominator = query_count or 1
-    return SearchMetrics(
+    metrics = SearchMetrics(
         query_count=query_count,
         label_count=label_count,
         hit_at_1=counters[1] / denominator,
@@ -202,9 +262,14 @@ def evaluate_search_labels(
         parent_equiv_hit_at_10=parent_counters[10] / denominator,
         parent_equiv_mrr_at_10=parent_reciprocal_rank / denominator,
     )
+    return SearchEvaluationReport(metrics=metrics, cases=tuple(cases))
 
 
 def evaluate_index_against_feedback(db_path: Path, usage_db_path: Path) -> SearchMetrics:
+    return evaluate_index_against_feedback_report(db_path, usage_db_path).metrics
+
+
+def evaluate_index_against_feedback_report(db_path: Path, usage_db_path: Path) -> SearchEvaluationReport:
     valid_ids = artifact_ids(db_path)
     labels = load_positive_feedback_labels(usage_db_path, valid_artifact_ids=valid_ids)
     parent_equivalents = artifact_parent_equivalence_map(db_path)
@@ -212,4 +277,4 @@ def evaluate_index_against_feedback(db_path: Path, usage_db_path: Path) -> Searc
     def search_ids(query: str, limit: int) -> list[str]:
         return [str(row["id"]) for row in search_index(db_path, query, limit=limit)]
 
-    return evaluate_search_labels(labels, search_ids, parent_equivalents=parent_equivalents)
+    return evaluate_search_labels_report(labels, search_ids, parent_equivalents=parent_equivalents)

@@ -11,7 +11,7 @@ from typing import Any, Sequence
 
 from . import __version__
 from .constants import DEFAULT_ROOT
-from .evaluation import evaluate_index_against_feedback
+from .evaluation import evaluate_index_against_feedback_report
 from .models import IndexSettings
 from .paths import default_output_dir, hermes_home_from_env
 from .runtime import RuntimeConfig, _runtime_config
@@ -159,6 +159,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     evaluate_parser.add_argument("--usage-db", type=Path, default=None, help="usage.sqlite path (default: index directory)")
     evaluate_parser.add_argument("--json", action="store_true", help="emit JSON")
+    evaluate_parser.add_argument("--details", action="store_true", help="include per-query ranks and top result IDs")
     add_common_db_arg(evaluate_parser)
 
     doctor_parser = subparsers.add_parser(
@@ -505,18 +506,29 @@ def main(
         db_path, warnings, _cfg = _db_from_args(args)
         _print_warnings(warnings)
         usage_db_path = _resolved(args.usage_db) if args.usage_db is not None else db_path.parent / "usage.sqlite"
-        metrics = evaluate_index_against_feedback(db_path, usage_db_path).as_dict()
+        report = evaluate_index_against_feedback_report(db_path, usage_db_path)
+        metrics = report.as_dict() if args.details else report.metrics.as_dict()
         if args.json:
             print(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             print("local_knowledge evaluation")
             print(f"  Index DB: {db_path}")
             print(f"  Usage DB: {usage_db_path}")
-            for key, value in metrics.items():
+            for key, value in report.metrics.as_dict().items():
                 if isinstance(value, float):
                     print(f"  {key}: {value:.3f}")
                 else:
                     print(f"  {key}: {value}")
+            if args.details:
+                print("  cases:")
+                for case in report.cases:
+                    exact = case.exact_rank if case.exact_rank is not None else "miss"
+                    parent = case.parent_equiv_rank if case.parent_equiv_rank is not None else "miss"
+                    expected = ", ".join(case.expected_ids)
+                    top_ids = ", ".join(case.top_ids)
+                    print(
+                        f"    - {case.query}: expected=[{expected}], exact={exact}, parent={parent}, top_ids=[{top_ids}]"
+                    )
         return 0
 
     if args.command in {"doctor", "smoke"}:
