@@ -284,6 +284,29 @@ def test_parent_equivalent_metrics_only_count_support_doc_parent_pairs() -> None
     assert peer_skill.parent_equiv_hit_at_1 == 0.0
 
 
+def test_evaluation_metrics_are_capped_to_top_ten() -> None:
+    rank_eleven = lci.evaluate_search_labels(
+        {"query": {"target"}},
+        lambda _query, _limit: [*(f"noise-{index}" for index in range(10)), "target"],
+        max_k=11,
+    )
+    assert rank_eleven.hit_at_10 == 0.0
+    assert rank_eleven.mrr_at_10 == 0.0
+
+    captured_limits: list[int] = []
+
+    def search_with_rank_ten_hit(_query: str, limit: int) -> list[str]:
+        captured_limits.append(limit)
+        return [*(f"noise-{index}" for index in range(9)), "target"]
+
+    rank_ten = lci.evaluate_search_labels({"query": {"target"}}, search_with_rank_ten_hit, max_k=5)
+
+    assert captured_limits == [10]
+    assert rank_ten.hit_at_5 == 0.0
+    assert rank_ten.hit_at_10 == 1.0
+    assert rank_ten.mrr_at_10 == 0.1
+
+
 def test_cli_evaluate_does_not_write_usage_db(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"
@@ -507,6 +530,7 @@ def test_operational_fallback_still_runs_when_strict_results_fill_limit(tmp_path
     results = lci.search_index(db_path, "paperless reviewer cron automation script runbook", limit=5)
     result_ids = [row["id"] for row in results]
 
+    assert len(results) == 5
     assert {"script:paperless-reviewer-wrapper", "cron:paperless-reviewer"} <= set(result_ids[:2])
     assert all(result_ids.index(artifact_id) < result_ids.index("runbook:paperless-cron-guide-0") for artifact_id in result_ids[:2])
 
@@ -869,6 +893,62 @@ def test_artifact_type_filter_applies_before_output_limit(tmp_path: Path) -> Non
 
     assert target.id not in unfiltered_ids
     assert [row["id"] for row in filtered] == [target.id]
+
+
+def test_artifact_type_filter_does_not_lift_support_doc_parent(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    parent = lci.Artifact(
+        id="skill:local-knowledge-router",
+        type="skill",
+        title="local knowledge router",
+        path="skills/local-knowledge-router",
+        summary="Route local knowledge requests.",
+        triggers=["local", "knowledge", "router"],
+        search_text="local knowledge router",
+    )
+    support_doc = lci.Artifact(
+        id="skill_support_doc:local-ref",
+        type="skill_support_doc",
+        title="local knowledge router reference",
+        path="skills/local-knowledge-router/references/local-ref.md",
+        summary="Reference for local knowledge router behavior.",
+        triggers=["local", "knowledge", "router", "reference"],
+        related=[parent.id],
+        search_text="local knowledge router reference",
+    )
+    lci.build_sqlite(db_path, [parent, support_doc], [])
+
+    filtered = lci.search_index(db_path, "local knowledge router reference", limit=5, artifact_type="skill_support_doc")
+
+    assert [row["id"] for row in filtered] == [support_doc.id]
+    assert {row["type"] for row in filtered} == {"skill_support_doc"}
+
+
+def test_quoted_query_does_not_backfill_relaxed_fallback_results(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    exact = lci.Artifact(
+        id="skill_support_doc:exact-ref",
+        type="skill_support_doc",
+        title="unique exact phrase reference",
+        path="skills/demo/references/exact-ref.md",
+        summary="A unique exact phrase appears here.",
+        triggers=["unique", "exact", "phrase"],
+        search_text="unique exact phrase reference",
+    )
+    relaxed_noise = lci.Artifact(
+        id="runbook:noise",
+        type="runbook",
+        title="unique phrase runbook",
+        path="docs/noise.md",
+        summary="Shares only unique phrase tokens.",
+        triggers=["unique", "phrase"],
+        search_text="unique phrase runbook",
+    )
+    lci.build_sqlite(db_path, [exact, relaxed_noise], [])
+
+    results = lci.search_index(db_path, '"unique exact phrase"', limit=5)
+
+    assert [row["id"] for row in results] == [exact.id]
 
 
 def test_identifier_metadata_expands_text_poor_home_assistant_artifacts(tmp_path: Path) -> None:
@@ -1332,6 +1412,7 @@ def test_scan_mcp_servers_preserves_legacy_yaml_path_and_base_url(tmp_path: Path
       args: [github-mcp-server, stdio]
       env:
         GITHUB_TOKEN: secret-name
+        SECRET_PATH: /home/alex/sentinelcredential
 """,
     )
 
@@ -1343,6 +1424,10 @@ def test_scan_mcp_servers_preserves_legacy_yaml_path_and_base_url(tmp_path: Path
     assert "url http://localhost:9000" in artifact.summary
     assert "github-mcp-server stdio" in artifact.summary
     assert "github_token" in artifact.triggers
+    serialized = json.dumps(artifact.__dict__, default=str).lower()
+    assert "sentinelcredential" not in serialized
+    lci.build_sqlite(tmp_path / "index.sqlite", artifacts, [])
+    assert lci.search_index(tmp_path / "index.sqlite", "sentinelcredential", limit=5) == []
 
 
 def test_scan_mcp_servers_fallback_supports_native_top_level_config(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

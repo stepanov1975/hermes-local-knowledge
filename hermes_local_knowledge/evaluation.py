@@ -154,6 +154,8 @@ def evaluate_search_labels(
     """Replay labeled queries and compute exact and parent-equivalent metrics."""
 
     parent_equivalents = parent_equivalents or {}
+    metric_limit = 10
+    search_limit = max(metric_limit, int(max_k))
     counters = {1: 0, 3: 0, 5: 0, 10: 0}
     parent_counters = {1: 0, 3: 0, 5: 0, 10: 0}
     reciprocal_rank = 0.0
@@ -167,10 +169,10 @@ def evaluate_search_labels(
             continue
         query_count += 1
         label_count += len(expected)
-        result_ids = [str(item) for item in search_fn(query, max_k)]
+        result_ids = [str(item) for item in search_fn(query, search_limit)]
         exact_rank: int | None = None
         parent_rank: int | None = None
-        for rank, result_id in enumerate(result_ids[:max_k], start=1):
+        for rank, result_id in enumerate(result_ids[:metric_limit], start=1):
             if exact_rank is None and result_id in expected:
                 exact_rank = rank
             if parent_rank is None and _matches_with_parent_equivalence(result_id, expected, parent_equivalents):

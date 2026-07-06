@@ -434,7 +434,7 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
         env_text = " ".join(str(key) for key in env.keys()) if isinstance(env, dict) else ""
         summary_bits = [bit for bit in [f"command {command}" if command else "", f"url {url}" if url else "", args_text] if bit]
         summary = f"Hermes MCP server {name}: " + ("; ".join(summary_bits) if summary_bits else "configured in Hermes config")
-        related = extract_paths(" ".join([command, args_text, json.dumps(env, sort_keys=True, default=str)]))
+        related = extract_paths(" ".join([command, args_text, url]))
         artifact_id = f"mcp:{slugify(name)}"
         metadata_terms = identifier_terms(name, summary, command, url, args_text, env_text, known_entities=settings.known_entities)
         triggers = significant_words(name, summary, command, url, args_text, env_text, " ".join(metadata_terms))

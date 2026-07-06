@@ -333,6 +333,13 @@ def _has_quoted_phrase(query: str) -> bool:
     return bool(re.search(r'(?<!\w)"[^"\n]+"(?!\w)|(?<!\w)\'[^\'\n]+\'(?!\w)', query))
 
 
+def _is_quoted_only_query(query: str) -> bool:
+    """Return true when the query contains quoted phrase(s) and no extra terms."""
+
+    without_quoted = re.sub(r'(?<!\w)"[^"\n]+"(?!\w)|(?<!\w)\'[^\'\n]+\'(?!\w)', " ", query)
+    return _has_quoted_phrase(query) and not query_terms(without_quoted)
+
+
 def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: str | None = None) -> list[dict[str, Any]]:
     terms = query_terms(query)
     match = fts_query(query)
@@ -344,7 +351,8 @@ def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: s
         output_limit = int(limit)
         candidate_limit = max(output_limit * 20, 100)
         exact_query = _has_quoted_phrase(query)
-        lift_parents = not exact_query
+        quoted_only_query = _is_quoted_only_query(query)
+        lift_parents = not exact_query and not type_filter
         requested_operational_types = set() if exact_query else _requested_operational_types(terms)
         strict_rows = _query_rows(conn, match, candidate_limit, type_filter)
         strict = _rank_rows(
@@ -355,6 +363,15 @@ def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: s
         )
         strict_ids = {str(row["id"]) for row in strict}
         if len(strict) >= output_limit and not requested_operational_types:
+            return _finalize_results(
+                strict,
+                output_limit,
+                terms,
+                requested_operational_types=requested_operational_types,
+                strict_ids=strict_ids,
+            )
+
+        if quoted_only_query:
             return _finalize_results(
                 strict,
                 output_limit,
