@@ -9,9 +9,15 @@ from .storage import connect_readonly, decode_artifact_row
 from .text_utils import fts_query, high_signal_terms, query_terms, search_sort_key, token_hits
 
 
-def _query_rows(conn: Any, match: str, candidate_limit: int) -> list[Any]:
+def _query_rows(conn: Any, match: str, candidate_limit: int, artifact_type: str = "") -> list[Any]:
+    where = "artifact_fts MATCH ?"
+    params: list[Any] = [match]
+    if artifact_type:
+        where += " AND a.type = ?"
+        params.append(artifact_type)
+    params.append(candidate_limit)
     return conn.execute(
-        """
+        f"""
         SELECT a.*, bm25(artifact_fts) AS rank,
                CASE a.type
                  WHEN 'skill' THEN 0
@@ -24,11 +30,11 @@ def _query_rows(conn: Any, match: str, candidate_limit: int) -> list[Any]:
                END AS type_priority
         FROM artifact_fts
         JOIN artifacts a ON a.id = artifact_fts.id
-        WHERE artifact_fts MATCH ?
+        WHERE {where}
         ORDER BY rank, type_priority, a.title
         LIMIT ?
         """,
-        (match, candidate_limit),
+        params,
     ).fetchall()
 
 
@@ -46,7 +52,7 @@ def _type_priority_sql(alias: str = "a") -> str:
     """
 
 
-def _metadata_rows(conn: Any, terms: list[str], candidate_limit: int) -> list[Any]:
+def _metadata_rows(conn: Any, terms: list[str], candidate_limit: int, artifact_type: str = "") -> list[Any]:
     """Return artifacts matching query terms in structured metadata fields.
 
     FTS is still the primary retrieval path. This secondary path catches rows
@@ -70,12 +76,17 @@ def _metadata_rows(conn: Any, terms: list[str], candidate_limit: int) -> list[An
         score_parts.append("CASE WHEN " + " OR ".join(f"lower({field}) LIKE ?" for field in fields) + " THEN 1 ELSE 0 END")
         score_params.extend([like] * len(fields))
 
+    where_sql = "(" + " OR ".join(term_clauses) + ")"
+    if artifact_type:
+        where_sql += " AND a.type = ?"
+        params.append(artifact_type)
+
     rows = conn.execute(
         f"""
         SELECT a.*, 0.0 AS rank, {_type_priority_sql("a")},
                ({" + ".join(score_parts)}) AS metadata_score
         FROM artifacts a
-        WHERE {" OR ".join(term_clauses)}
+        WHERE {where_sql}
         ORDER BY metadata_score DESC, type_priority, a.title
         LIMIT ?
         """,
@@ -322,11 +333,12 @@ def _has_quoted_phrase(query: str) -> bool:
     return bool(re.search(r'(?<!\w)"[^"\n]+"(?!\w)|(?<!\w)\'[^\'\n]+\'(?!\w)', query))
 
 
-def search_index(db_path: Path, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: str | None = None) -> list[dict[str, Any]]:
     terms = query_terms(query)
     match = fts_query(query)
     if not match:
         return []
+    type_filter = str(artifact_type or "").strip()
     conn = connect_readonly(db_path)
     try:
         output_limit = int(limit)
@@ -334,7 +346,7 @@ def search_index(db_path: Path, query: str, *, limit: int = 10) -> list[dict[str
         exact_query = _has_quoted_phrase(query)
         lift_parents = not exact_query
         requested_operational_types = set() if exact_query else _requested_operational_types(terms)
-        strict_rows = _query_rows(conn, match, candidate_limit)
+        strict_rows = _query_rows(conn, match, candidate_limit, type_filter)
         strict = _rank_rows(
             conn,
             strict_rows,
@@ -352,8 +364,8 @@ def search_index(db_path: Path, query: str, *, limit: int = 10) -> list[dict[str
             )
 
         fallback_rows = _merge_candidate_rows(
-            _query_rows(conn, fts_query(query, operator="OR"), candidate_limit) if len(terms) > 1 else [],
-            _metadata_rows(conn, terms, candidate_limit),
+            _query_rows(conn, fts_query(query, operator="OR"), candidate_limit, type_filter) if len(terms) > 1 else [],
+            _metadata_rows(conn, terms, candidate_limit, type_filter),
         )
         fallback = _rank_rows(
             conn,

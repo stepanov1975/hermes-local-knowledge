@@ -161,8 +161,8 @@ def test_plugin_rebuild_uses_compatibility_index_module(tmp_path, monkeypatch) -
             calls.append(f"build:{root}:{output_dir}:{home}:{settings is not None}")
             return [], []
 
-        def search_index(self, db_path: Path, query: str, limit: int = 8):  # type: ignore[no-untyped-def]
-            calls.append(f"search:{db_path}:{query}:{limit}")
+        def search_index(self, db_path: Path, query: str, limit: int = 8, artifact_type=None):  # type: ignore[no-untyped-def]
+            calls.append(f"search:{db_path}:{query}:{limit}:{artifact_type}")
             return []
 
     monkeypatch.setattr(plugin, "_index_module", lambda _root: FakeIndex())
@@ -173,7 +173,7 @@ def test_plugin_rebuild_uses_compatibility_index_module(tmp_path, monkeypatch) -
     assert payload["rebuilt"] is True
     assert calls == [
         f"build:{repo.resolve()}:{state_dir.resolve()}:{hermes_home.resolve()}:True",
-        f"search:{state_dir.resolve() / 'index.sqlite'}:demo:8",
+        f"search:{state_dir.resolve() / 'index.sqlite'}:demo:8:None",
     ]
 
 
@@ -347,19 +347,21 @@ def test_handle_search_records_usage_context(tmp_path: Path) -> None:
         captured["record_usage_kwargs"] = kwargs
         return 123
 
+    def fake_search(_db_path: Path, query: str, limit: int = 8, artifact_type=None):  # type: ignore[no-untyped-def]
+        captured["search_artifact_type"] = artifact_type
+        return [{"id": "skill:demo", "type": "skill", "title": query}]
+
     deps = plugin.HandlerDeps(
         repo_root=lambda: root,
         ensure_index=lambda _root, *, rebuild=False: (db_path, {"rebuilt": rebuild, "index_exists": True}),
-        search_index=lambda _db_path, query, limit=8: [
-            {"id": "skill:demo", "type": "skill", "title": query}
-        ],
+        search_index=fake_search,
         record_usage=fake_record_usage,
         usage_context=fake_usage_context,
     )
 
     payload = json.loads(
         lci_handlers._handle_search(
-            {"query": "demo", "limit": 2, "rebuild": True},
+            {"query": "demo", "limit": 2, "rebuild": True, "artifact_type": "script"},
             deps=deps,
             session_id="session-123",
         )
@@ -372,7 +374,9 @@ def test_handle_search_records_usage_context(tmp_path: Path) -> None:
     assert isinstance(usage_kwargs, dict)
     assert usage_kwargs["context"] == {"session_id": "session-123"}
     assert usage_kwargs["query"] == "demo"
+    assert usage_kwargs["artifact_type"] == "script"
     assert usage_kwargs["db_path"] == db_path
+    assert captured["search_artifact_type"] == "script"
     assert captured["record_root"] == root
 
 

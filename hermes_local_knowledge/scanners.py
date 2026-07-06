@@ -10,6 +10,7 @@ from .constants import SCRIPT_SUFFIXES, STOPWORDS
 from .models import Artifact, Edge, IndexSettings
 from .paths import display_path, iter_files_followlinks, path_is_relative_to
 from .text_utils import (
+    extract_code_identifiers,
     extract_entities,
     extract_env_names,
     extract_paths,
@@ -176,7 +177,15 @@ def scan_scripts(root: Path, settings: IndexSettings | None = None) -> list[Arti
             summary = script_summary(path, text)
             artifact_id = f"script:{slugify(rel.as_posix())}"
             env_names = extract_env_names(text)
-            metadata_terms = identifier_terms(title, summary, " ".join(rel.parts), " ".join(env_names), known_entities=settings.known_entities)
+            code_identifiers = extract_code_identifiers(text)
+            metadata_terms = identifier_terms(
+                title,
+                summary,
+                " ".join(rel.parts),
+                " ".join(env_names),
+                " ".join(code_identifiers),
+                known_entities=settings.known_entities,
+            )
             triggers = significant_words(title, summary, " ".join(rel.parts), " ".join(metadata_terms))
             entities = extract_entities(
                 title,
@@ -195,7 +204,16 @@ def scan_scripts(root: Path, settings: IndexSettings | None = None) -> list[Arti
                     triggers=triggers,
                     entities=entities,
                     source="repo_script",
-                    search_text="\n".join([text[:20_000], " ".join(metadata_terms)]),
+                    search_text="\n".join(
+                        [
+                            title,
+                            summary,
+                            " ".join(rel.parts),
+                            " ".join(env_names),
+                            " ".join(code_identifiers),
+                            " ".join(metadata_terms),
+                        ]
+                    ),
                 )
             )
     return sorted(artifacts, key=lambda item: item.id)

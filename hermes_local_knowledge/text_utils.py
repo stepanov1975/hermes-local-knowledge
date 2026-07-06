@@ -130,6 +130,22 @@ def extract_env_names(text: str, *, limit: int = 80) -> list[str]:
     return unique_preserve_order(names)[:limit]
 
 
+def extract_code_identifiers(text: str, *, limit: int = 80) -> list[str]:
+    """Extract safe code symbols for routing without indexing literal values."""
+
+    names: list[str] = []
+    patterns = [
+        r"^\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)",
+        r"^\s*from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\s+([A-Za-z_][A-Za-z0-9_.*]*)",
+        r"--([A-Za-z][A-Za-z0-9_-]{2,})",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.MULTILINE):
+            names.extend(group for group in match.groups() if group)
+    return unique_preserve_order(names)[:limit]
+
+
 def extract_entities(*parts: str, known_entities: Sequence[str] | None = None) -> list[str]:
     haystack = "\n".join(parts).lower()
     entities_source = known_entities if known_entities is not None else DEFAULT_KNOWN_ENTITIES

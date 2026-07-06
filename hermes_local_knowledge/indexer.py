@@ -78,6 +78,7 @@ from .storage import (
     write_jsonl,
 )
 from .text_utils import (
+    extract_code_identifiers,
     extract_entities,
     extract_env_names,
     extract_paths,
@@ -165,6 +166,7 @@ __all__ = [
     "dedupe_edges",
     "default_output_dir",
     "display_path",
+    "extract_code_identifiers",
     "doc_type_for_path",
     "extract_entities",
     "extract_env_names",

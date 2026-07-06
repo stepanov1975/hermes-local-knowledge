@@ -839,6 +839,38 @@ def test_metadata_fallback_matches_unindexed_id_without_schema_leak(tmp_path: Pa
     assert "metadata_score" not in results[0]
 
 
+def test_artifact_type_filter_applies_before_output_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    noise = [
+        lci.Artifact(
+            id=f"skill:paperless-review-automation-noise-{index}",
+            type="skill",
+            title=f"paperless review automation {index}",
+            path=f"skills/noise-{index}",
+            summary="paperless review automation",
+            triggers=["paperless", "review", "automation"],
+            search_text="paperless review automation",
+        )
+        for index in range(120)
+    ]
+    target = lci.Artifact(
+        id="script:paperless-review-helper",
+        type="script",
+        title="paperless review helper",
+        path="scripts/paperless_review_helper.py",
+        summary="paperless review automation script",
+        triggers=["paperless", "review", "automation", "script"],
+        search_text="paperless review automation script",
+    )
+    lci.build_sqlite(db_path, [*noise, target], [])
+
+    unfiltered_ids = [row["id"] for row in lci.search_index(db_path, "paperless review automation", limit=30)]
+    filtered = lci.search_index(db_path, "paperless review automation", limit=5, artifact_type="script")
+
+    assert target.id not in unfiltered_ids
+    assert [row["id"] for row in filtered] == [target.id]
+
+
 def test_identifier_metadata_expands_text_poor_home_assistant_artifacts(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
@@ -904,6 +936,15 @@ exec "$HA_MCP_BIN"
     assert plain_script is not None
     assert "assistant" not in plain_script["triggers"]
     assert "homeassistant" not in plain_script["triggers"]
+    conn = sqlite3.connect(output_dir / "index.sqlite")
+    try:
+        script_search_text = conn.execute(
+            "SELECT search_text FROM artifact_fts WHERE id = 'script:scripts-ha-mcp-run-sh'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert "supersecret" not in script_search_text.lower()
+    assert lci.search_index(output_dir / "index.sqlite", "supersecret", limit=5) == []
 
     script_results = lci.search_index(output_dir / "index.sqlite", "home assistant mcp", limit=5)
     mcp_results = lci.search_index(output_dir / "index.sqlite", "home assistant mcp server", limit=5)

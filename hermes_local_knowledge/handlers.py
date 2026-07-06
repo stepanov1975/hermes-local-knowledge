@@ -70,10 +70,12 @@ def _handle_search(args: dict[str, Any], *, deps: HandlerDeps | None = None, **k
     try:
         root = deps.repo_root()
         db_path, meta = deps.ensure_index(root, rebuild=rebuild)
-        fetch_limit = limit * 3 if artifact_type else limit
-        rows = _index_attr(deps, root, "search_index", deps.search_index)(db_path, query, limit=fetch_limit)
-        if artifact_type:
-            rows = [row for row in rows if row.get("type") == artifact_type]
+        rows = _index_attr(deps, root, "search_index", deps.search_index)(
+            db_path,
+            query,
+            limit=limit,
+            artifact_type=artifact_type or None,
+        )
         rows = rows[:limit]
         event_id = deps.record_usage(
             root,
