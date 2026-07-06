@@ -192,7 +192,7 @@ Indexed artifact types:
 | `script` | `<source_root>/scripts/**`, `<source_root>/hermes_home/scripts/**` |
 | `memory_doc` | `<source_root>/memory/*.md` |
 | `runbook` | `<source_root>/docs/**`, plus `app_*.md` files under the source root |
-| `skill_support_doc` | Markdown support docs under configured custom skill dirs |
+| `skill_support_doc` | Markdown support docs under configured custom skill dirs, plus runtime `$HERMES_HOME/skills/**/{references,templates,scripts,assets}` docs that are not already under `source_root` |
 | `cron_job` | `$HERMES_HOME/cron/jobs.json` |
 | `mcp_server` | `$HERMES_HOME/config.yaml` `mcp_servers` entries, plus legacy `mcp.servers` entries |
 
@@ -232,6 +232,12 @@ python -m hermes_local_knowledge.indexer build \
 python -m hermes_local_knowledge.indexer search 'backup runbook' \
   --db ~/.hermes/local_knowledge/index.sqlite \
   --limit 8
+
+python -m hermes_local_knowledge.indexer get skill:backup-runbook \
+  --db ~/.hermes/local_knowledge/index.sqlite
+
+python -m hermes_local_knowledge.indexer neighbors skill:backup-runbook \
+  --db ~/.hermes/local_knowledge/index.sqlite
 ```
 
 To match native plugin behavior, read `local_knowledge` settings from Hermes config instead of repeating flags:
@@ -239,7 +245,12 @@ To match native plugin behavior, read `local_knowledge` settings from Hermes con
 ```bash
 python -m hermes_local_knowledge.indexer build --from-hermes-config
 python -m hermes_local_knowledge.indexer search 'backup runbook' --from-hermes-config --limit 8
+python -m hermes_local_knowledge.indexer evaluate --from-hermes-config --json
 ```
+
+`evaluate` replays positive `usage.sqlite` feedback labels against the current
+index and reports exact plus parent-equivalent top-k metrics. Parent-equivalent
+metrics only relax `skill_support_doc` hits to their owning parent skill.
 
 The CLI also has an install/config smoke check:
 
