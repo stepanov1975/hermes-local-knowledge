@@ -10,6 +10,7 @@ DEFAULT_STATE_DIR_NAME = "local_knowledge"
 SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".cjs", ".mjs", ".js"}
 EXCLUDED_DIR_NAMES = {
     ".git",
+    ".archive",
     ".mypy_cache",
     ".pytest_cache",
     "__pycache__",

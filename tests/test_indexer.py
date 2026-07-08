@@ -221,6 +221,46 @@ def test_build_index_writes_searchable_artifacts_and_edges(tmp_path: Path) -> No
     assert any(edge.source == "cron:paperless-reviewer" and edge.target == "skill:paperless-review-automation" for edge in edges)
 
 
+def test_archived_runtime_skills_are_not_indexed(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "skills" / ".archive" / "old-live-update" / "SKILL.md",
+        """---
+name: old-live-update
+description: Archived live Hermes update skill that should not be routed as active.
+---
+# Old Live Update
+""",
+    )
+    write(
+        hermes_home
+        / "skills"
+        / ".archive"
+        / "old-live-update"
+        / "references"
+        / "runbook.md",
+        "# Archived support doc\n\nLive update gateway cron MCP local carry details.\n",
+    )
+    write(
+        hermes_home / "skills" / "hermes" / "hermes-agent" / "SKILL.md",
+        """---
+name: hermes-agent
+description: Active Hermes operations skill.
+---
+# Hermes Agent
+""",
+    )
+
+    artifacts, edges = lci.build_index(root, tmp_path / "state", hermes_home)
+    artifact_ids = {artifact.id for artifact in artifacts}
+
+    assert "skill:old-live-update" not in artifact_ids
+    assert not any(artifact_id.startswith("skill_support_doc:runtime-skills-old-live-update") for artifact_id in artifact_ids)
+    assert "skill:hermes-agent" in artifact_ids
+    assert not any(edge.source == "skill:old-live-update" or edge.target == "skill:old-live-update" for edge in edges)
+
+
 def test_feedback_evaluation_replays_positive_labels(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"
