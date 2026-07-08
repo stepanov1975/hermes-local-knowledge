@@ -138,7 +138,7 @@ local_knowledge:
   exclude_dir_names: [build, dist]
 ```
 
-`source_root` is the high-signal directory being indexed. `state_dir` is generated local state and should not be committed. `exclude_dir_names` adds extra directory names to the built-in skip list (`worktrees`, `.worktrees`, `.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.mypy_cache`, `.pytest_cache`, `htmlcov`, `logs`). Use YAML lists in `config.yaml`; when using `hermes config set` from the shell, comma-separated strings or bracket-list strings are accepted and normalized by the plugin.
+`source_root` is the high-signal directory being indexed. `state_dir` is generated local state and should not be committed. `exclude_dir_names` adds extra directory names to the built-in skip list (`.archive`, `worktrees`, `.worktrees`, `.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.mypy_cache`, `.pytest_cache`, `htmlcov`, `logs`). Use YAML lists in `config.yaml`; when using `hermes config set` from the shell, comma-separated strings or bracket-list strings are accepted and normalized by the plugin.
 
 Environment variables are supported for development and tests:
 

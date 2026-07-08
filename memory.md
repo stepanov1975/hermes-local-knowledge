@@ -114,6 +114,10 @@ Current invariant:
 - MCP artifacts must not persist env **values** into summary, related paths, search text, or JSON output.
 - Extract related paths only from command/args/url-like fields, not from env values.
 
+### Runtime archive exclusion
+
+Archived Hermes skills under `$HERMES_HOME/skills/.archive/` are recovery material, not active routing targets. The default excluded directory set includes `.archive` so archived/consolidated skills do not reappear in `knowledge_search` after a cleanup. Preserve this behavior with scanner tests whenever changing excluded-directory handling.
+
 ## Search/ranking lessons
 
 ### Strict-first early-return trap
