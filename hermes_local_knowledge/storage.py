@@ -145,7 +145,7 @@ def build_index(
 ) -> tuple[list[Artifact], list[Edge]]:
     from .scanners import build_edges, collect_artifacts
 
-    artifacts = collect_artifacts(root, hermes_home, settings)
+    artifacts = collect_artifacts(root, hermes_home, settings, okf_root=output_dir / "okfs")
     edges = build_edges(artifacts)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_jsonl(output_dir / "index.jsonl", artifacts)

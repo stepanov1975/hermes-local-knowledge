@@ -229,10 +229,18 @@ def doc_type_for_path(root: Path, path: Path, settings: IndexSettings | None = N
         return "skill_support_doc"
     return "doc"
 
-def scan_markdown_docs(root: Path, settings: IndexSettings | None = None) -> list[Artifact]:
+def scan_markdown_docs(
+    root: Path,
+    settings: IndexSettings | None = None,
+    *,
+    excluded_roots: Sequence[Path] = (),
+) -> list[Artifact]:
     settings = settings or IndexSettings()
     artifacts: list[Artifact] = []
+    resolved_excluded_roots = tuple(path.expanduser().resolve() for path in excluded_roots if path.exists())
     for path in iter_files_followlinks(root, suffixes={".md"}, allowed_roots=(root,), followlinks=False, excluded_dir_names=settings.exclude_dir_names) or []:
+        if any(path_is_relative_to(path.resolve(), excluded_root) for excluded_root in resolved_excluded_roots):
+            continue
         rel = path.relative_to(root)
         if rel.name == "SKILL.md":
             continue
@@ -464,7 +472,117 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
         )
     return artifacts
 
-def collect_artifacts(root: Path, hermes_home: Path, settings: IndexSettings | None = None) -> list[Artifact]:
+
+def _frontmatter_list(fm: dict[str, Any], key: str) -> list[str]:
+    value = fm.get(key)
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def scan_tool_okfs(
+    okf_root: Path | None,
+    root: Path,
+    settings: IndexSettings | None = None,
+) -> list[Artifact]:
+    """Index generated, state-local tool OKF Markdown files."""
+
+    if okf_root is None or not okf_root.exists():
+        return []
+    settings = settings or IndexSettings()
+    artifacts: list[Artifact] = []
+    for path in iter_files_followlinks(
+        okf_root,
+        suffixes={".md"},
+        allowed_roots=(okf_root,),
+        followlinks=False,
+        excluded_dir_names=settings.exclude_dir_names,
+    ) or []:
+        text = safe_read_text(path)
+        fm = parse_frontmatter(text)
+        artifact_type = str(fm.get("artifact_type") or "tool_okf").strip()
+        if artifact_type != "tool_okf":
+            continue
+        tool = str(fm.get("tool") or "").strip()
+        schema_digest = str(fm.get("schema_hash") or "").strip()
+        if not tool or not schema_digest:
+            continue
+        toolset = str(fm.get("toolset") or "").strip()
+        aliases = _frontmatter_list(fm, "aliases")
+        frontmatter_triggers = _frontmatter_list(fm, "triggers")
+        when_not_to_use = _frontmatter_list(fm, "when_not_to_use")
+        related_tools = _frontmatter_list(fm, "related_tools")
+        title = str(fm.get("title") or f"Tool OKF: {tool}").strip()
+        summary = first_heading_or_paragraph(text) or f"Generated OKF for Hermes tool {tool}"
+        metadata_terms = identifier_terms(
+            tool,
+            toolset,
+            title,
+            " ".join(aliases),
+            " ".join(frontmatter_triggers),
+            known_entities=settings.known_entities,
+        )
+        triggers = significant_words(
+            tool,
+            toolset,
+            title,
+            summary,
+            " ".join(aliases),
+            " ".join(frontmatter_triggers),
+            " ".join(when_not_to_use),
+            " ".join(metadata_terms),
+        )
+        entities = extract_entities(
+            tool,
+            toolset,
+            title,
+            summary,
+            " ".join(aliases),
+            " ".join(frontmatter_triggers),
+            text[:20_000],
+            known_entities=settings.known_entities,
+        )
+        related = [f"tool_okf:{slugify(item)}" for item in related_tools]
+        artifacts.append(
+            Artifact(
+                id=f"tool_okf:{slugify(tool)}",
+                type="tool_okf",
+                title=title,
+                path=display_path(path, root=root),
+                summary=summary,
+                triggers=unique_preserve_order([*aliases, *frontmatter_triggers, *triggers]),
+                entities=entities,
+                related=unique_preserve_order(related),
+                updated_at=str(fm.get("generated_at") or "") or None,
+                source="generated_tool_okf",
+                search_text="\n".join(
+                    [
+                        tool,
+                        toolset,
+                        title,
+                        summary,
+                        " ".join(aliases),
+                        " ".join(frontmatter_triggers),
+                        " ".join(when_not_to_use),
+                        " ".join(related_tools),
+                        " ".join(metadata_terms),
+                        text[:20_000],
+                    ]
+                ),
+            )
+        )
+    return sorted(artifacts, key=lambda item: item.id)
+
+
+def collect_artifacts(
+    root: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None = None,
+    *,
+    okf_root: Path | None = None,
+) -> list[Artifact]:
     settings = settings or IndexSettings()
     root = root.expanduser().resolve()
     hermes_home = hermes_home.expanduser().resolve()
@@ -472,9 +590,10 @@ def collect_artifacts(root: Path, hermes_home: Path, settings: IndexSettings | N
         *scan_skills(root, hermes_home, settings),
         *scan_runtime_skill_support_docs(root, hermes_home, settings),
         *scan_scripts(root, settings),
-        *(scan_markdown_docs(root, settings) if settings.include_markdown_docs else []),
+        *(scan_markdown_docs(root, settings, excluded_roots=(okf_root,) if okf_root else ()) if settings.include_markdown_docs else []),
         *scan_cron_jobs(root, hermes_home, settings),
         *scan_mcp_servers(root, hermes_home, settings),
+        *scan_tool_okfs(okf_root, root, settings),
     ]
     deduped: dict[str, Artifact] = {}
     for artifact in artifacts:

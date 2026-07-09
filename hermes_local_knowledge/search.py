@@ -30,7 +30,8 @@ def _query_rows(conn: Any, match: str, candidate_limit: int, artifact_type: str 
                  WHEN 'mcp_server' THEN 3
                  WHEN 'memory_doc' THEN 4
                  WHEN 'runbook' THEN 5
-                 ELSE 6
+                 WHEN 'tool_okf' THEN 6
+                 ELSE 7
                END AS type_priority
         FROM artifact_fts
         JOIN artifacts a ON a.id = artifact_fts.id
@@ -51,7 +52,8 @@ def _type_priority_sql(alias: str = "a") -> str:
                  WHEN 'mcp_server' THEN 3
                  WHEN 'memory_doc' THEN 4
                  WHEN 'runbook' THEN 5
-                 ELSE 6
+                 WHEN 'tool_okf' THEN 6
+                 ELSE 7
                END AS type_priority
     """
 

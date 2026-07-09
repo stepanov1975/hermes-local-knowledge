@@ -12,6 +12,7 @@ implementation lives in focused submodules.
 from __future__ import annotations
 
 from pathlib import Path
+import inspect
 
 if __package__ in (None, ""):  # pragma: no cover - direct script execution compatibility
     import sys as _sys
@@ -69,6 +70,7 @@ from .scanners import (
     scan_runtime_skill_support_docs,
     scan_scripts,
     scan_skills,
+    scan_tool_okfs,
     script_summary,
     skill_support_file_names,
 )
@@ -112,6 +114,24 @@ KNOWN_ENTITIES = DEFAULT_KNOWN_ENTITIES
 DEFAULT_OUTPUT_DIR = DEFAULT_ROOT / DEFAULT_STATE_DIR_NAME
 
 
+def _collect_artifacts_compat(
+    root: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None,
+    okf_root: Path,
+) -> list[Artifact]:
+    """Call the monkeypatchable collect seam while preserving old fake signatures."""
+
+    signature = inspect.signature(collect_artifacts)
+    parameters = signature.parameters
+    accepts_okf_root = "okf_root" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+    if accepts_okf_root:
+        return collect_artifacts(root, hermes_home, settings, okf_root=okf_root)
+    return collect_artifacts(root, hermes_home, settings)
+
+
 def build_index(
     root: Path,
     output_dir: Path,
@@ -125,7 +145,7 @@ def build_index(
     tests/tools that monkeypatch ``indexer.collect_artifacts`` or
     ``indexer.build_edges`` keep working after the module split.
     """
-    artifacts = collect_artifacts(root, hermes_home, settings)
+    artifacts = _collect_artifacts_compat(root, hermes_home, settings, output_dir / "okfs")
     edges = build_edges(artifacts)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_jsonl(output_dir / "index.jsonl", artifacts)
@@ -215,6 +235,7 @@ __all__ = [
     "scan_runtime_skill_support_docs",
     "scan_scripts",
     "scan_skills",
+    "scan_tool_okfs",
     "script_summary",
     "search_index",
     "search_sort_key",

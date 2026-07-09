@@ -1456,6 +1456,117 @@ exec "$HA_MCP_BIN"
     assert "cron:ha-mcp-health" in [row["id"] for row in cron_results]
 
 
+def test_build_index_includes_tool_okf_from_state_dir(tmp_path: Path) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    okf_path = output_dir / "okfs" / "tools" / "mcp-paperless-find-latest-document.md"
+    write(
+        okf_path,
+        """---
+artifact_type: tool_okf
+tool: mcp__paperless__paperless_find_latest_document
+toolset: paperless
+schema_hash: sha256:abc123
+generated_at: '2026-07-09T18:28:22Z'
+aliases:
+  - find newest paperless document
+  - latest scanned document metadata
+triggers:
+  - User asks for newest/latest matching Paperless document metadata.
+related_tools:
+  - mcp__paperless__paperless_download_latest_document
+when_not_to_use:
+  - Use download_latest_document when the user needs the actual file.
+---
+
+# Tool OKF: paperless_find_latest_document
+
+Route to this Paperless tool when the user needs metadata for the newest matching document.
+""",
+    )
+
+    artifacts, _edges = lci.build_index(root, output_dir, hermes_home)
+    artifact_ids = {artifact.id for artifact in artifacts}
+
+    assert "tool_okf:mcp-paperless-paperless-find-latest-document" in artifact_ids
+    assert not root.joinpath("okfs").exists()
+    artifact = lci.get_artifact(output_dir / "index.sqlite", "tool_okf:mcp-paperless-paperless-find-latest-document")
+    assert artifact is not None
+    assert artifact["type"] == "tool_okf"
+    assert artifact["source"] == "generated_tool_okf"
+    assert artifact["path"] == okf_path.as_posix()
+
+    with (output_dir / "index.jsonl").open(encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle]
+    assert "tool_okf:mcp-paperless-paperless-find-latest-document" in {row["id"] for row in rows}
+
+
+def test_tool_okf_under_source_root_is_not_indexed_as_doc(tmp_path: Path) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = root / "local_knowledge"
+    okf_path = output_dir / "okfs" / "tools" / "mcp-paperless-find-latest-document.md"
+    write(
+        okf_path,
+        """---
+artifact_type: tool_okf
+tool: mcp__paperless__paperless_find_latest_document
+toolset: paperless
+schema_hash: sha256:abc123
+aliases:
+  - latest scanned document metadata
+---
+
+# Tool OKF: paperless_find_latest_document
+
+Find the newest matching Paperless document metadata.
+""",
+    )
+
+    artifacts, _edges = lci.build_index(root, output_dir, hermes_home)
+
+    matching = [artifact for artifact in artifacts if "paperless-find-latest-document" in artifact.id]
+    assert [artifact.type for artifact in matching] == ["tool_okf"]
+    assert not any(artifact.path.startswith("local_knowledge/okfs/") and artifact.type == "doc" for artifact in artifacts)
+
+
+def test_tool_okf_search_matches_aliases_and_triggers(tmp_path: Path) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    write(
+        output_dir / "okfs" / "tools" / "mcp-paperless-find-latest-document.md",
+        """---
+artifact_type: tool_okf
+tool: mcp__paperless__paperless_find_latest_document
+toolset: paperless
+schema_hash: sha256:abc123
+aliases:
+  - latest scanned document metadata
+triggers:
+  - User asks for newest/latest matching Paperless document metadata.
+---
+
+# Tool OKF: paperless_find_latest_document
+
+Find the newest matching Paperless document metadata without downloading the file.
+""",
+    )
+    lci.build_index(root, output_dir, hermes_home)
+
+    results = lci.search_index(output_dir / "index.sqlite", "latest paperless document metadata tool", limit=5)
+
+    assert results[0]["id"] == "tool_okf:mcp-paperless-paperless-find-latest-document"
+
+
+def test_missing_okf_dir_is_noop(tmp_path: Path) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+
+    artifacts, _edges = lci.build_index(root, output_dir, hermes_home)
+
+    assert not output_dir.joinpath("okfs").exists()
+    assert all(artifact.type != "tool_okf" for artifact in artifacts)
+
+
 def test_indexer_build_index_honors_compatibility_monkeypatches(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls: list[str] = []
 

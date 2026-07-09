@@ -316,7 +316,8 @@ def type_priority(artifact_type: str) -> int:
         "mcp_server": 3,
         "memory_doc": 4,
         "runbook": 5,
-    }.get(artifact_type, 6)
+        "tool_okf": 6,
+    }.get(artifact_type, 7)
 
 def search_sort_key(row: dict[str, Any], terms: Sequence[str]) -> tuple[Any, ...]:
     specific_terms = high_signal_terms(terms)
