@@ -1,5 +1,5 @@
 name: local_knowledge
-version: 0.2.21
+version: 0.3.0
 description: "Native Hermes tools for a configurable local capability index: search/get/neighbors plus local usage feedback/reporting."
 author: Alex Stepanov
 kind: standalone

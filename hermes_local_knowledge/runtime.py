@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,11 +37,23 @@ def _coerce_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
 
 
 @dataclass(frozen=True)
+class OKFConfig:
+    enabled: bool = True
+    auto_generate: bool = False
+    max_candidates_per_session: int = 2
+    max_worker_seconds: int = 120
+    min_use_count: int = 1
+    worker_toolsets: tuple[str, ...] = ("terminal", "file")
+    worker_source: str = "local-knowledge-okf-worker"
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     source_root: Path
     hermes_home: Path
     state_dir: Path
     index_settings: IndexSettings
+    okf: OKFConfig = field(default_factory=OKFConfig)
     source_root_source: str = "default"
     state_dir_source: str = "default"
     include_markdown_docs_source: str = "default"
@@ -127,6 +139,44 @@ def _runtime_warnings(source_root_source: str, source_root: Path, hermes_home: P
     return tuple(warnings)
 
 
+def _okf_config(section: dict[str, Any]) -> OKFConfig:
+    defaults = OKFConfig()
+    nested = section.get("okf", {})
+    okf_section = nested if isinstance(nested, dict) else {}
+
+    def value(name: str, *, flat_name: str | None = None, default: Any = None) -> Any:
+        flat = flat_name or f"okf_{name}"
+        return _first_config_value(okf_section, name, default=_first_config_value(section, flat, default=default))
+
+    return OKFConfig(
+        enabled=_coerce_bool(value("enabled", default=defaults.enabled), default=defaults.enabled),
+        auto_generate=_coerce_bool(
+            value("auto_generate", default=defaults.auto_generate),
+            default=defaults.auto_generate,
+        ),
+        max_candidates_per_session=_coerce_int(
+            value("max_candidates_per_session", default=defaults.max_candidates_per_session),
+            default=defaults.max_candidates_per_session,
+            minimum=1,
+            maximum=10,
+        ),
+        max_worker_seconds=_coerce_int(
+            value("max_worker_seconds", default=defaults.max_worker_seconds),
+            default=defaults.max_worker_seconds,
+            minimum=10,
+            maximum=3600,
+        ),
+        min_use_count=_coerce_int(
+            value("min_use_count", default=defaults.min_use_count),
+            default=defaults.min_use_count,
+            minimum=1,
+            maximum=1000,
+        ),
+        worker_toolsets=_tuple_value(value("worker_toolsets", default=defaults.worker_toolsets), defaults.worker_toolsets),
+        worker_source=str(value("worker_source", default=defaults.worker_source) or defaults.worker_source),
+    )
+
+
 def _runtime_config(hermes_home: Path | str | None = None) -> RuntimeConfig:
     base_hermes_home = _get_hermes_home(hermes_home).resolve()
     section = _section_config(base_hermes_home if hermes_home not in (None, "") else None)
@@ -201,6 +251,7 @@ def _runtime_config(hermes_home: Path | str | None = None) -> RuntimeConfig:
         resolved_hermes_home,
         state_dir,
         settings,
+        okf=_okf_config(section),
         source_root_source=source_root_source,
         state_dir_source=state_dir_source,
         include_markdown_docs_source=include_markdown_docs_source,
