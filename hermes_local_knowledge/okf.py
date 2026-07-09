@@ -208,6 +208,18 @@ def safe_arg_shape(value: Any, *, max_items: int = DEFAULT_MAX_ARG_ITEMS, depth:
     return {"type": type(value).__name__}
 
 
+def _safe_arg_shape_from_json_text(arg_shape_json: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(arg_shape_json or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return safe_arg_shape(parsed)
+
+
+def _safe_arg_shape_json_text(arg_shape_json: Any) -> str:
+    return json.dumps(_safe_arg_shape_from_json_text(arg_shape_json), sort_keys=True, separators=(",", ":"))
+
+
 def _sanitize_snippet(value: Any, *, max_chars: int = 240) -> str | None:
     if value in (None, ""):
         return None
@@ -264,6 +276,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE okf_candidates SET schema_json = ? WHERE tool_name = ?",
                 (safe_schema_json, row["tool_name"]),
+            )
+    for row in conn.execute("SELECT tool_name, arg_shape_json FROM okf_candidates WHERE arg_shape_json IS NOT NULL").fetchall():
+        safe_arg_shape_json = _safe_arg_shape_json_text(row["arg_shape_json"])
+        if safe_arg_shape_json != row["arg_shape_json"]:
+            conn.execute(
+                "UPDATE okf_candidates SET arg_shape_json = ? WHERE tool_name = ?",
+                (safe_arg_shape_json, row["tool_name"]),
             )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_okf_candidates_status_seen ON okf_candidates(status, use_count, last_seen)")
     conn.commit()
@@ -467,7 +486,7 @@ def candidate_packet(row: Mapping[str, Any], state_dir: Path) -> dict[str, Any]:
         "toolset": row.get("toolset"),
         "schema_hash": row.get("schema_hash"),
         "schema": _safe_schema_from_json_text(row.get("schema_json")),
-        "arg_shape": _json_field(row, "arg_shape_json"),
+        "arg_shape": _safe_arg_shape_from_json_text(row.get("arg_shape_json")),
         "use_count": int(row.get("use_count") or 0),
         "success_count": int(row.get("success_count") or 0),
         "error_count": int(row.get("error_count") or 0),

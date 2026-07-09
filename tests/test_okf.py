@@ -89,7 +89,7 @@ def test_schema_view_redacts_defaults_examples_and_secret_like_descriptions(tmp_
         assert value not in persisted
 
 
-def test_legacy_raw_schema_json_is_sanitized_on_read_and_migration(tmp_path: Path) -> None:
+def test_legacy_raw_schema_and_arg_json_are_sanitized_on_read_and_migration(tmp_path: Path) -> None:
     okf.upsert_tool_candidate(
         tmp_path,
         tool_name="paperless_find_latest_document",
@@ -100,12 +100,17 @@ def test_legacy_raw_schema_json_is_sanitized_on_read_and_migration(tmp_path: Pat
     legacy_schema = {
         "type": "object",
         "description": "Search customer OCR document text about divorce settlement and medical diagnosis for alice@example.com using token=abc123",
-        "properties": {"query": {"type": "string", "default": "sk-secret-value"}},
+        "properties": {"query": {"type": "string", "default": "«redacted:sk-…»"}},
+    }
+    legacy_args = {
+        "query": "alice private tax document",
+        "path": "/home/alex/private.pdf",
+        "api_key": "sk-secret",
     }
     with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
         conn.execute(
-            "UPDATE okf_candidates SET schema_json = ? WHERE tool_name = ?",
-            (json.dumps(legacy_schema), "paperless_find_latest_document"),
+            "UPDATE okf_candidates SET schema_json = ?, arg_shape_json = ? WHERE tool_name = ?",
+            (json.dumps(legacy_schema), json.dumps(legacy_args), "paperless_find_latest_document"),
         )
 
     rows = okf.pending_candidates(tmp_path, limit=1)
@@ -113,7 +118,16 @@ def test_legacy_raw_schema_json_is_sanitized_on_read_and_migration(tmp_path: Pat
     rendered = json.dumps(packet, sort_keys=True)
     persisted = db_text(tmp_path)
 
-    for value in ["alice@example.com", "token=abc123", "sk-secret-value", "divorce settlement"]:
+    for value in [
+        "alice@example.com",
+        "token=abc123",
+        "«redacted:sk-…»",
+        "divorce settlement",
+        "alice private tax document",
+        "/home/alex/private.pdf",
+        "api_key",
+        "sk-secret",
+    ]:
         assert value not in rendered
         assert value not in persisted
 
