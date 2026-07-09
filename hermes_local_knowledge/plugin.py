@@ -6,6 +6,7 @@ from pathlib import Path
 from . import handlers as _handlers
 from . import indexer
 from .handlers import HandlerDeps
+from .hooks import _on_post_tool_call, _on_session_end
 from .runtime import (
     RuntimeConfig,
     _coerce_bool,
@@ -85,6 +86,8 @@ __all__ = [
     "_handle_neighbors",
     "_handle_search",
     "_handle_usage_report",
+    "_on_post_tool_call",
+    "_on_session_end",
     "_index_module",
     "_init_usage_db",
     "_json_list",
@@ -197,3 +200,7 @@ def register(ctx) -> None:
             emoji=emoji,
         )
     _register_bundled_skills(ctx)
+    register_hook = getattr(ctx, "register_hook", None)
+    if register_hook is not None:
+        register_hook("post_tool_call", _on_post_tool_call)
+        register_hook("on_session_end", _on_session_end)

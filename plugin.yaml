@@ -9,3 +9,6 @@ provides_tools:
   - knowledge_neighbors
   - knowledge_feedback
   - knowledge_usage_report
+provides_hooks:
+  - post_tool_call
+  - on_session_end
