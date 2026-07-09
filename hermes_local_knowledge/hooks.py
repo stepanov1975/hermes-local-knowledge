@@ -130,8 +130,11 @@ Run exactly this protocol and then exit:
 4. Do not inspect raw session transcripts, raw tool outputs, emails, OCR text, or private documents.
 5. Validate each file:
    python -m hermes_local_knowledge.cli okf validate --from-hermes-config --claim-token <token> --path <path> --json
-6. Mark each candidate complete or failed with the OKF CLI.
-7. Stop after at most {limit} candidates. Do not schedule cron jobs or spawn more workers.
+6. If validation passes, mark it complete:
+   python -m hermes_local_knowledge.cli okf complete --from-hermes-config --claim-token <token> --tool <tool> --path <path> --json
+7. If generation or validation fails, mark it failed:
+   python -m hermes_local_knowledge.cli okf fail --from-hermes-config --claim-token <token> --tool <tool> --error <short-redacted-error> --json
+8. Stop after at most {limit} candidates. Do not schedule cron jobs or spawn more workers.
 """.strip()
 
 

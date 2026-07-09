@@ -13,6 +13,7 @@ from . import __version__
 from .constants import DEFAULT_ROOT
 from .evaluation import evaluate_index_against_feedback_report
 from .models import IndexSettings
+from . import okf
 from .paths import default_output_dir, hermes_home_from_env
 from .runtime import RuntimeConfig, _runtime_config
 from .search import search_index
@@ -123,6 +124,53 @@ def add_common_db_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_okf_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--hermes-home", type=Path, default=None, help="Hermes home directory")
+    parser.add_argument(
+        "--from-hermes-config",
+        action="store_true",
+        help="read local_knowledge settings from <hermes-home>/config.yaml like the native plugin does",
+    )
+    parser.add_argument("--state-dir", type=Path, default=None, help="OKF queue/state directory override")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+
+
+def _add_okf_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    okf_parser = subparsers.add_parser("okf", help="manage generated tool OKF candidate queue")
+    okf_subparsers = okf_parser.add_subparsers(dest="okf_command", required=True)
+
+    status_parser = okf_subparsers.add_parser("status", help="show OKF queue status")
+    status_parser.add_argument("--limit", type=int, default=10, help="pending candidate preview limit")
+    add_okf_common_args(status_parser)
+
+    claim_parser = okf_subparsers.add_parser("claim", help="claim pending OKF candidates")
+    claim_parser.add_argument("--limit", type=int, default=1)
+    claim_parser.add_argument("--min-use-count", type=int, default=None)
+    claim_parser.add_argument("--claim-token", default=None)
+    add_okf_common_args(claim_parser)
+
+    validate_parser = okf_subparsers.add_parser("validate", help="validate an authored OKF file")
+    validate_parser.add_argument("--claim-token", required=True)
+    validate_parser.add_argument("--path", type=Path, required=True)
+    add_okf_common_args(validate_parser)
+
+    complete_parser = okf_subparsers.add_parser("complete", help="mark a claimed OKF candidate complete")
+    complete_parser.add_argument("--claim-token", required=True)
+    complete_parser.add_argument("--tool", required=True)
+    complete_parser.add_argument("--path", type=Path, required=True)
+    add_okf_common_args(complete_parser)
+
+    fail_parser = okf_subparsers.add_parser("fail", help="mark a claimed OKF candidate failed")
+    fail_parser.add_argument("--claim-token", required=True)
+    fail_parser.add_argument("--tool", required=True)
+    fail_parser.add_argument("--error", required=True)
+    add_okf_common_args(fail_parser)
+
+    drain_parser = okf_subparsers.add_parser("drain-prompt", help="print the bounded detached-worker prompt")
+    drain_parser.add_argument("--limit", type=int, default=None)
+    add_okf_common_args(drain_parser)
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -172,6 +220,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     doctor_parser.add_argument("--query", default=None, help="optional smoke search query to run against the index")
     doctor_parser.add_argument("--limit", type=int, default=5, help="smoke search result limit")
     doctor_parser.add_argument("--json", action="store_true", help="emit JSON")
+
+    _add_okf_parser(subparsers)
     return parser.parse_args(argv)
 
 
@@ -222,6 +272,104 @@ def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], Runt
         state_dir_source="cli" if args.db is not None else "default",
     )
     return db_path, (), cfg
+
+
+def _okf_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
+    cfg = _runtime_config(args.hermes_home) if args.from_hermes_config else RuntimeConfig(
+        _resolved(DEFAULT_ROOT),
+        _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env()),
+        default_output_dir(_resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env())),
+        IndexSettings(),
+        source_root_source="cwd",
+        state_dir_source="default",
+    )
+    if args.state_dir is not None:
+        cfg = replace(cfg, state_dir=_resolved(args.state_dir), state_dir_source="cli")
+    return cfg
+
+
+def _emit_payload(payload: dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for key, value in payload.items():
+            if isinstance(value, (dict, list)):
+                print(f"{key}: {json.dumps(value, ensure_ascii=False, sort_keys=True)}")
+            else:
+                print(f"{key}: {value}")
+
+
+def _okf_status_payload(cfg: RuntimeConfig, *, limit: int) -> dict[str, Any]:
+    pending = okf.pending_candidates(cfg.state_dir, limit=max(1, limit), min_use_count=cfg.okf.min_use_count)
+    return {
+        "success": True,
+        "state_dir": str(cfg.state_dir),
+        "okf_dir": str(okf.okf_dir(cfg.state_dir)),
+        "queue_db": str(okf.okf_queue_db_path(cfg.state_dir)),
+        "counts": okf.queue_counts(cfg.state_dir),
+        "pending": [okf.candidate_packet(row, cfg.state_dir) for row in pending],
+    }
+
+
+def _handle_okf_command(args: argparse.Namespace) -> int:
+    cfg = _okf_config_from_args(args)
+    _print_warnings(cfg.warnings)
+    if args.okf_command == "status":
+        _emit_payload(_okf_status_payload(cfg, limit=args.limit), json_output=args.json)
+        return 0
+    if args.okf_command == "claim":
+        min_use_count = cfg.okf.min_use_count if args.min_use_count is None else max(1, int(args.min_use_count))
+        claimed = okf.claim_candidates(
+            cfg.state_dir,
+            limit=max(1, int(args.limit)),
+            min_use_count=min_use_count,
+            claim_token=args.claim_token,
+        )
+        packets = [okf.candidate_packet(row, cfg.state_dir) for row in claimed]
+        payload = {
+            "success": True,
+            "state_dir": str(cfg.state_dir),
+            "claim_token": packets[0].get("claim_token") if packets else None,
+            "count": len(packets),
+            "candidates": packets,
+        }
+        _emit_payload(payload, json_output=args.json)
+        return 0
+    if args.okf_command == "validate":
+        payload = okf.validate_okf_file(cfg.state_dir, claim_token=args.claim_token, path=args.path)
+        payload["success"] = bool(payload["valid"])
+        _emit_payload(payload, json_output=args.json)
+        return 0 if payload["valid"] else 1
+    if args.okf_command == "complete":
+        validation = okf.validate_okf_file(cfg.state_dir, claim_token=args.claim_token, path=args.path)
+        if validation.get("tool") != args.tool:
+            validation.setdefault("errors", []).append("--tool does not match OKF frontmatter tool")
+            validation["valid"] = False
+        if not validation["valid"]:
+            validation["success"] = False
+            _emit_payload(validation, json_output=args.json)
+            return 1
+        marked = okf.mark_candidate_done(cfg.state_dir, tool_name=args.tool, claim_token=args.claim_token, okf_path=args.path)
+        payload = {"success": marked, "tool": args.tool, "path": str(args.path), "claim_token": args.claim_token}
+        if not marked:
+            payload["errors"] = ["no claimed candidate was marked done"]
+        _emit_payload(payload, json_output=args.json)
+        return 0 if marked else 1
+    if args.okf_command == "fail":
+        marked = okf.mark_candidate_error(cfg.state_dir, tool_name=args.tool, claim_token=args.claim_token, error=args.error)
+        payload = {"success": marked, "tool": args.tool, "claim_token": args.claim_token}
+        if not marked:
+            payload["errors"] = ["no claimed candidate was marked failed"]
+        _emit_payload(payload, json_output=args.json)
+        return 0 if marked else 1
+    if args.okf_command == "drain-prompt":
+        if args.limit is not None:
+            cfg = replace(cfg, okf=replace(cfg.okf, max_candidates_per_session=max(1, int(args.limit))))
+        from .hooks import build_worker_prompt
+
+        print(build_worker_prompt(cfg))
+        return 0
+    return 1
 
 
 def _doctor_payload(
@@ -330,6 +478,8 @@ def main(
     get_neighbors_fn=get_neighbors,
 ) -> int:
     args = parse_args(argv)
+    if args.command == "okf":
+        return _handle_okf_command(args)
     if args.command == "build":
         cfg = _build_config_from_args(args)
         db_path = cfg.state_dir / "index.sqlite"

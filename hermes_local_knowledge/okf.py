@@ -11,6 +11,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .paths import path_is_relative_to
+from .text_utils import parse_frontmatter, safe_read_text, slugify
+
 QUEUE_DB_NAME = "okf_queue.sqlite"
 OKF_WORKER_ENV = "HERMES_LOCAL_KNOWLEDGE_OKF_WORKER"
 DEFAULT_MAX_ARG_ITEMS = 8
@@ -61,6 +64,20 @@ _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(api[_-]?key|token|secret|password|passwd|authorization|bearer)\b\s*[:=]\s*\S+"
 )
 _SECRET_WORD = re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd|authorization|bearer)\b")
+_EMAIL_ADDRESS = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_SCHEMA_VALUE_KEYS = {
+    "$comment",
+    "const",
+    "default",
+    "description",
+    "enum",
+    "example",
+    "examples",
+    "markdownDescription",
+    "summary",
+    "title",
+}
+_GENERIC_ROUTING_PHRASES = {"okf", "placeholder", "tbd", "todo", "tool", "x"}
 
 
 def utc_now() -> str:
@@ -75,6 +92,10 @@ def okf_dir(state_dir: Path) -> Path:
     return state_dir.expanduser().resolve() / "okfs" / "tools"
 
 
+def okf_file_path(state_dir: Path, tool_name: str) -> Path:
+    return okf_dir(state_dir) / f"{slugify(tool_name)}.md"
+
+
 def worker_lock_path(state_dir: Path) -> Path:
     return state_dir.expanduser().resolve() / "okf_worker.lock"
 
@@ -84,8 +105,63 @@ def schema_hash(schema: Mapping[str, Any] | None) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _schema_string(value: Any, *, max_chars: int = 240) -> str:
+    text = str(value).replace("\x00", "").strip()
+    text = _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=<redacted>", text)
+    text = _EMAIL_ADDRESS.sub("<redacted-email>", text)
+    if _SECRET_WORD.search(text):
+        return "<redacted>"
+    return text[:max_chars]
+
+
+def safe_schema_view(value: Any, *, max_items: int = DEFAULT_MAX_ARG_ITEMS * 2, depth: int = 0) -> Any:
+    """Return schema structure without example/default/private scalar values."""
+
+    if depth >= 8:
+        return {"type": type(value).__name__, "truncated": True}
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        shaped: dict[str, Any] = {}
+        for raw_key, raw_child in items[:max_items]:
+            key = str(raw_key).strip()[:120]
+            if key in _SCHEMA_VALUE_KEYS:
+                entry: dict[str, Any] = {"redacted": True, "type": type(raw_child).__name__}
+                if isinstance(raw_child, Sequence) and not isinstance(raw_child, (str, bytes, bytearray)):
+                    entry["count"] = len(raw_child)
+                shaped[key] = entry
+                continue
+            shaped[key] = safe_schema_view(raw_child, max_items=max_items, depth=depth + 1)
+        if len(items) > max_items:
+            shaped["truncated"] = True
+            shaped["field_count"] = len(items)
+        return shaped
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        values = list(value)
+        shaped_list = [safe_schema_view(item, max_items=max_items, depth=depth + 1) for item in values[:max_items]]
+        if len(values) > max_items:
+            shaped_list.append({"truncated": True, "length": len(values)})
+        return shaped_list
+    if isinstance(value, str):
+        return _schema_string(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return type(value).__name__
+
+
 def canonical_schema_json(schema: Mapping[str, Any] | None) -> str:
-    return json.dumps(schema or {}, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(safe_schema_view(schema or {}), sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _safe_schema_from_json_text(schema_json: Any) -> Any:
+    try:
+        parsed = json.loads(str(schema_json or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return safe_schema_view(parsed)
+
+
+def _safe_schema_json_text(schema_json: Any) -> str:
+    return json.dumps(_safe_schema_from_json_text(schema_json), sort_keys=True, separators=(",", ":"), default=str)
 
 
 def safe_arg_shape(value: Any, *, max_items: int = DEFAULT_MAX_ARG_ITEMS, depth: int = 0) -> dict[str, Any]:
@@ -182,6 +258,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE okf_candidates SET attempt_count = 0 WHERE attempt_count IS NULL")
     conn.execute("UPDATE okf_candidates SET arg_shape_json = '{}' WHERE arg_shape_json IS NULL")
     conn.execute("UPDATE okf_candidates SET status = 'pending' WHERE status IS NULL")
+    for row in conn.execute("SELECT tool_name, schema_json FROM okf_candidates WHERE schema_json IS NOT NULL").fetchall():
+        safe_schema_json = _safe_schema_json_text(row["schema_json"])
+        if safe_schema_json != row["schema_json"]:
+            conn.execute(
+                "UPDATE okf_candidates SET schema_json = ? WHERE tool_name = ?",
+                (safe_schema_json, row["tool_name"]),
+            )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_okf_candidates_status_seen ON okf_candidates(status, use_count, last_seen)")
     conn.commit()
 
@@ -365,3 +448,110 @@ def queue_counts(state_dir: Path) -> dict[str, int]:
     with _connect(state_dir) as conn:
         rows = conn.execute("SELECT status, COUNT(*) AS count FROM okf_candidates GROUP BY status").fetchall()
     return {str(row["status"]): int(row["count"]) for row in rows}
+
+
+def _json_field(row: Mapping[str, Any], field: str) -> Any:
+    try:
+        return json.loads(str(row.get(field) or "{}"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def candidate_packet(row: Mapping[str, Any], state_dir: Path) -> dict[str, Any]:
+    """Return the privacy-safe packet a worker may use to author an OKF."""
+
+    tool_name = str(row.get("tool_name") or "")
+    return {
+        "tool": tool_name,
+        "tool_name": tool_name,
+        "toolset": row.get("toolset"),
+        "schema_hash": row.get("schema_hash"),
+        "schema": _safe_schema_from_json_text(row.get("schema_json")),
+        "arg_shape": _json_field(row, "arg_shape_json"),
+        "use_count": int(row.get("use_count") or 0),
+        "success_count": int(row.get("success_count") or 0),
+        "error_count": int(row.get("error_count") or 0),
+        "last_error_type": row.get("last_error_type"),
+        "last_error_message": row.get("last_error_message"),
+        "claim_token": row.get("claim_token"),
+        "target_path": str(okf_file_path(state_dir, tool_name)),
+    }
+
+
+def claimed_candidate(state_dir: Path, *, tool_name: str, claim_token: str) -> dict[str, Any] | None:
+    with _connect(state_dir) as conn:
+        row = conn.execute(
+            "SELECT * FROM okf_candidates WHERE tool_name = ? AND claim_token = ? AND status = 'claimed'",
+            (tool_name, claim_token),
+        ).fetchone()
+    return _row_dict(row) if row else None
+
+
+def _frontmatter_list(frontmatter: Mapping[str, Any], key: str) -> list[str]:
+    value = frontmatter.get(key)
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _useful_routing_phrase(phrase: str, *, tool_name: str) -> bool:
+    text = phrase.strip().lower()
+    if len(text) < 8 or text in _GENERIC_ROUTING_PHRASES:
+        return False
+    tokens = {token for token in re.findall(r"[a-z0-9]{2,}", text) if token not in _GENERIC_ROUTING_PHRASES}
+    if len(tokens) < 2:
+        return False
+    tool_tokens = {token for token in re.findall(r"[a-z0-9]{2,}", tool_name.lower())}
+    return not tokens.issubset(tool_tokens)
+
+
+def validate_okf_file(state_dir: Path, *, claim_token: str, path: Path) -> dict[str, Any]:
+    """Validate a worker-authored OKF before marking a candidate done."""
+
+    errors: list[str] = []
+    resolved_state_dir = state_dir.expanduser().resolve()
+    allowed_root = okf_dir(resolved_state_dir)
+    resolved_path = path.expanduser().resolve()
+    if not path_is_relative_to(resolved_path, allowed_root):
+        errors.append(f"path must be under {allowed_root}")
+    if resolved_path.suffix != ".md":
+        errors.append("OKF path must use .md suffix")
+    text = safe_read_text(resolved_path, max_chars=80_000)
+    if not text:
+        errors.append("OKF file is missing or empty")
+    if _SECRET_ASSIGNMENT.search(text):
+        errors.append("OKF file contains secret-like assignment text")
+    frontmatter = parse_frontmatter(text)
+    artifact_type = str(frontmatter.get("artifact_type") or "").strip()
+    if artifact_type != "tool_okf":
+        errors.append("frontmatter artifact_type must be tool_okf")
+    tool_name = str(frontmatter.get("tool") or "").strip()
+    if not tool_name:
+        errors.append("frontmatter tool is required")
+    schema_digest = str(frontmatter.get("schema_hash") or "").strip()
+    if not schema_digest:
+        errors.append("frontmatter schema_hash is required")
+    aliases = _frontmatter_list(frontmatter, "aliases")
+    triggers = _frontmatter_list(frontmatter, "triggers")
+    if not any(_useful_routing_phrase(phrase, tool_name=tool_name) for phrase in [*aliases, *triggers]):
+        errors.append("frontmatter aliases or triggers must include at least one specific multi-word routing phrase")
+
+    row = claimed_candidate(resolved_state_dir, tool_name=tool_name, claim_token=claim_token) if tool_name else None
+    if row is None:
+        errors.append("no claimed candidate matches the provided claim token and tool")
+    else:
+        expected_path = okf_file_path(resolved_state_dir, tool_name).resolve()
+        if resolved_path != expected_path:
+            errors.append(f"path must match claimed target path {expected_path}")
+        if schema_digest != str(row.get("schema_hash") or ""):
+            errors.append("frontmatter schema_hash does not match claimed candidate")
+
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "tool": tool_name,
+        "path": str(resolved_path),
+        "claim_token": claim_token,
+    }

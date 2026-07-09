@@ -1,0 +1,309 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from hermes_local_knowledge import cli as lci_cli
+from hermes_local_knowledge import okf
+
+
+def write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def configure_hermes_home(tmp_path: Path) -> tuple[Path, Path]:
+    hermes_home = tmp_path / "hermes_home"
+    state_dir = tmp_path / "state"
+    source_root = tmp_path / "repo"
+    source_root.mkdir()
+    hermes_home.mkdir()
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {source_root}
+  state_dir: {state_dir}
+  okf:
+    enabled: true
+    auto_generate: false
+    max_candidates_per_session: 2
+    min_use_count: 1
+""",
+    )
+    return hermes_home, state_dir
+
+
+def load_stdout_json(capsys) -> dict[str, object]:  # type: ignore[no-untyped-def]
+    return json.loads(capsys.readouterr().out)
+
+
+def seed_candidate(state_dir: Path, *, tool_name: str = "mcp__paperless__paperless_find_latest_document") -> dict[str, object]:
+    schema: dict[str, object] = {
+        "type": "object",
+        "description": "Search customer OCR document text about divorce settlement and medical diagnosis for alice@example.com with token=abc123",
+        "properties": {
+            "query": {
+                "type": "string",
+                "default": "alice@example.com",
+                "examples": ["sk-secret-value"],
+            }
+        },
+        "required": ["query"],
+    }
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=tool_name,
+        toolset="paperless",
+        schema=schema,
+        args={"query": "private document token=secret"},
+    )
+    return schema
+
+
+def okf_markdown(tool_name: str, schema_hash: str) -> str:
+    return f"""---
+artifact_type: tool_okf
+tool: {tool_name}
+toolset: paperless
+schema_hash: {schema_hash}
+aliases:
+  - latest paperless document metadata
+triggers:
+  - User asks for newest matching Paperless document metadata.
+---
+
+# Tool OKF: {tool_name}
+
+Use this when routing requests for latest Paperless document metadata.
+"""
+
+
+def assert_no_private_schema_values(payload: object) -> None:
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert "alice@example.com" not in rendered
+    assert "token=abc123" not in rendered
+    assert "sk-secret-value" not in rendered
+    assert "divorce settlement" not in rendered
+
+
+def test_okf_cli_claim_validate_and_complete_from_hermes_config(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    schema = seed_candidate(state_dir)
+    tool_name = "mcp__paperless__paperless_find_latest_document"
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "claim",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--limit",
+            "1",
+            "--claim-token",
+            "claim-1",
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 0
+    assert payload["success"] is True
+    assert payload["claim_token"] == "claim-1"
+    candidates = payload["candidates"]
+    assert isinstance(candidates, list)
+    candidate = candidates[0]
+    assert candidate["tool"] == tool_name
+    assert candidate["schema_hash"] == okf.schema_hash(schema)
+    assert "private document" not in json.dumps(candidate)
+    assert_no_private_schema_values(payload)
+    target_path = Path(str(candidate["target_path"]))
+    assert target_path == okf.okf_file_path(state_dir, tool_name)
+
+    write(target_path, okf_markdown(tool_name, str(candidate["schema_hash"])))
+
+    validate_status = lci_cli.main(
+        [
+            "okf",
+            "validate",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--claim-token",
+            "claim-1",
+            "--path",
+            str(target_path),
+            "--json",
+        ]
+    )
+    validate_payload = load_stdout_json(capsys)
+    assert validate_status == 0
+    assert validate_payload["valid"] is True
+
+    complete_status = lci_cli.main(
+        [
+            "okf",
+            "complete",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--claim-token",
+            "claim-1",
+            "--tool",
+            tool_name,
+            "--path",
+            str(target_path),
+            "--json",
+        ]
+    )
+    complete_payload = load_stdout_json(capsys)
+
+    assert complete_status == 0
+    assert complete_payload["success"] is True
+    assert okf.queue_counts(state_dir) == {"done": 1}
+
+
+def test_okf_cli_validate_rejects_wrong_path_and_secret_assignment(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    seed_candidate(state_dir)
+    claimed = okf.claim_candidates(state_dir, limit=1, claim_token="claim-2")
+    tool_name = str(claimed[0]["tool_name"])
+    bad_path = tmp_path / "outside.md"
+    write(bad_path, okf_markdown(tool_name, str(claimed[0]["schema_hash"])) + "\napi_key=secret\n")
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "validate",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--claim-token",
+            "claim-2",
+            "--path",
+            str(bad_path),
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 1
+    assert payload["valid"] is False
+    error_list = payload["errors"]
+    assert isinstance(error_list, list)
+    errors = "\n".join(str(error) for error in error_list)
+    assert "path must be under" in errors
+    assert "secret-like" in errors
+
+
+def test_okf_cli_validate_rejects_trivial_routing_phrase(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    seed_candidate(state_dir)
+    claimed = okf.claim_candidates(state_dir, limit=1, claim_token="claim-trivial")
+    tool_name = str(claimed[0]["tool_name"])
+    target_path = okf.okf_file_path(state_dir, tool_name)
+    write(
+        target_path,
+        f"""---
+artifact_type: tool_okf
+tool: {tool_name}
+schema_hash: {claimed[0]["schema_hash"]}
+aliases:
+  - x
+---
+
+# Tool OKF: {tool_name}
+""",
+    )
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "validate",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--claim-token",
+            "claim-trivial",
+            "--path",
+            str(target_path),
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 1
+    assert payload["valid"] is False
+    error_list = payload["errors"]
+    assert isinstance(error_list, list)
+    assert any("specific multi-word routing phrase" in str(error) for error in error_list)
+
+
+def test_okf_cli_fail_requeues_until_max_attempts(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    seed_candidate(state_dir, tool_name="knowledge_search")
+    okf.claim_candidates(state_dir, limit=1, claim_token="claim-3")
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "fail",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--claim-token",
+            "claim-3",
+            "--tool",
+            "knowledge_search",
+            "--error",
+            "document text token=secret should not persist",
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 0
+    assert payload["success"] is True
+    assert okf.queue_counts(state_dir) == {"pending": 1}
+    assert "secret" not in repr(okf.pending_candidates(state_dir, limit=1))
+
+
+def test_okf_cli_status_and_drain_prompt(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    seed_candidate(state_dir)
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "status",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+    assert status == 0
+    assert payload["counts"] == {"pending": 1}
+    assert_no_private_schema_values(payload)
+    pending = payload["pending"]
+    assert isinstance(pending, list)
+    assert len(pending) == 1
+
+    prompt_status = lci_cli.main(
+        [
+            "okf",
+            "drain-prompt",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--limit",
+            "1",
+        ]
+    )
+    prompt = capsys.readouterr().out
+    assert prompt_status == 0
+    assert "okf claim" in prompt
+    assert "okf complete" in prompt
+    assert "okf fail" in prompt
+    assert "Do not schedule cron jobs" in prompt
