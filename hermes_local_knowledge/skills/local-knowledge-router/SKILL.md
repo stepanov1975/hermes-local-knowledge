@@ -17,7 +17,7 @@ metadata:
 Use this skill before guessing paths or doing broad file searches when the user asks about local or private operational knowledge, including:
 
 - installed/custom Hermes skills;
-- runbooks, operational docs, and memory docs;
+- generated tool OKFs, runbooks, operational docs, and memory docs;
 - helper scripts and automation entry points;
 - cron jobs and scheduled maintenance;
 - MCP servers and wrapper scripts;
@@ -45,6 +45,7 @@ The local knowledge plugin indexes whole artifacts. Its purpose is to identify t
 
    - `skill` → load with `skill_view`.
    - `script` → read the script and help text before running it.
+   - `tool_okf` → use it as routing context for when/how to use a tool, then inspect the live tool schema/docs before high-impact calls.
    - `runbook`, `memory_doc`, `doc`, or `skill_support_doc` → read the file before changing systems.
    - `cron_job` → verify the live cron registry before mutating jobs.
    - `mcp_server` → inspect the wrapper/config before troubleshooting MCP behavior.
@@ -55,7 +56,7 @@ The local knowledge plugin indexes whole artifacts. Its purpose is to identify t
    knowledge_search(query="new helper script", limit=8, rebuild=true)
    ```
 
-   During installation, set up the `local_knowledge index rebuild` cron job from the plugin README/after-install notes so future agents route from current skills, scripts, runbooks, cron jobs, and MCP config.
+   During installation, set up the `local_knowledge index rebuild` cron job from the plugin README/after-install notes so future agents route from current skills, scripts, runbooks, cron jobs, MCP config, and completed tool OKFs.
 
 5. Record lookup quality when it is clear:
 
@@ -69,4 +70,5 @@ The local knowledge plugin indexes whole artifacts. Its purpose is to identify t
 - Do not treat search results as proof. They are routing hints; read the artifact before relying on it.
 - If a query returns no results, retry once with broader synonyms before falling back to broad repository search.
 - Do not include secrets in queries or feedback notes; telemetry is stored locally.
+- Treat generated `tool_okf` artifacts as routing hints only. They are compact aliases/triggers/pitfalls, not proof of current tool behavior.
 - After installing this skill or enabling the plugin, restart Hermes or start a fresh session so the toolset and skill instructions enter the prompt.

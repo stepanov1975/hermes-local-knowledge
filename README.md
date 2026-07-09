@@ -20,6 +20,8 @@ Native Hermes tools under the `local_knowledge` toolset:
 | `knowledge_feedback` | Record lookup quality feedback locally. |
 | `knowledge_usage_report` | Summarize usage, zero-result queries, errors, and feedback. |
 
+The plugin also has optional lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The OKF generation path does not require cron: the post-tool hook queues safe structural candidates, and the session-end hook can optionally drain candidates with a bounded worker. Completed OKFs are indexed as whole `tool_okf` artifacts on the next normal index rebuild, scheduled rebuild cron, or lookup with `rebuild=true`.
+
 ## Install
 
 From the public git repo:
@@ -85,7 +87,7 @@ hermes config set local_knowledge.exclude_dir_names build,dist
 
 ### Keep the index fresh
 
-The native tools auto-build the index when it is missing, and every lookup accepts `rebuild=true`, but normal searches reuse the existing `index.sqlite`. For a real install, schedule a rebuild cron job. This matters because skills, scripts, runbooks, cron jobs, and MCP config can change outside the current session; without a scheduled rebuild, agents may route from stale metadata unless they remember to request `rebuild=true`.
+The native tools auto-build the index when it is missing, and every lookup accepts `rebuild=true`, but normal searches reuse the existing `index.sqlite`. For a real install, schedule a rebuild cron job. This matters because skills, scripts, runbooks, cron jobs, MCP config, and completed tool OKFs can change outside the current session; without a scheduled rebuild, agents may route from stale metadata unless they remember to request `rebuild=true`.
 
 For a directory plugin install, create a silent no-agent rebuild job:
 
@@ -136,9 +138,17 @@ local_knowledge:
   source_root: ~/repos/<your-local-docs-or-customizations>
   state_dir: ~/.hermes/local_knowledge
   exclude_dir_names: [build, dist]
+  okf:
+    enabled: true
+    auto_generate: false
+    max_candidates_per_session: 2
+    max_worker_seconds: 120
+    min_use_count: 1
 ```
 
 `source_root` is the high-signal directory being indexed. `state_dir` is generated local state and should not be committed. `exclude_dir_names` adds extra directory names to the built-in skip list (`.archive`, `worktrees`, `.worktrees`, `.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.mypy_cache`, `.pytest_cache`, `htmlcov`, `logs`). Use YAML lists in `config.yaml`; when using `hermes config set` from the shell, comma-separated strings or bracket-list strings are accepted and normalized by the plugin.
+
+`local_knowledge.okf.enabled` controls whether the plugin records safe, structural tool-use candidates. `auto_generate` is intentionally `false` by default because the detached worker consumes model tokens and writes generated Markdown files. When enabled, `on_session_end` starts at most one bounded worker that drains up to `max_candidates_per_session` candidates; it does not create cron jobs. The post-tool hook may inspect tool-call success/error shape, but it does not persist raw session transcripts or raw tool outputs, and it does not pass raw transcripts, tool outputs, emails, OCR text, or private documents to workers.
 
 Environment variables are supported for development and tests:
 
@@ -193,6 +203,7 @@ Indexed artifact types:
 | `memory_doc` | `<source_root>/memory/*.md` |
 | `runbook` | `<source_root>/docs/**`, plus `app_*.md` files under the source root |
 | `skill_support_doc` | Markdown support docs under configured custom skill dirs, plus runtime `$HERMES_HOME/skills/**/{references,templates,scripts,assets}` docs that are not already under `source_root` |
+| `tool_okf` | Generated OKF Markdown files under `<state_dir>/okfs/tools/*.md` |
 | `cron_job` | `$HERMES_HOME/cron/jobs.json` |
 | `mcp_server` | `$HERMES_HOME/config.yaml` `mcp_servers` entries, plus legacy `mcp.servers` entries |
 
@@ -204,9 +215,36 @@ The plugin writes:
 <state_dir>/index.sqlite
 <state_dir>/index.jsonl
 <state_dir>/usage.sqlite
+<state_dir>/okf_queue.sqlite
+<state_dir>/okfs/tools/*.md
+<state_dir>/okf_worker.{lock,log}
 ```
 
 These are generated or local-only state. Do not commit them.
+
+## Tool OKF generation
+
+Tool OKFs are small routing artifacts for tools Hermes has actually used. They are not full skills and are not generated from raw tool output. The queue stores only privacy-safe metadata: tool name, toolset, a sanitized schema view, counters, error class, and argument shape. Schema values such as defaults, examples, descriptions, titles, summaries, `$comment`, and secret-like text are redacted before being stored or emitted to workers.
+
+Manual inspection/drain workflow:
+
+```bash
+python -m hermes_local_knowledge.cli okf status --from-hermes-config --json
+python -m hermes_local_knowledge.cli okf claim --from-hermes-config --limit 1 --json
+python -m hermes_local_knowledge.cli okf validate --from-hermes-config \
+  --claim-token <token> \
+  --path ~/.hermes/local_knowledge/okfs/tools/<tool>.md \
+  --json
+python -m hermes_local_knowledge.cli okf complete --from-hermes-config \
+  --claim-token <token> \
+  --tool <tool> \
+  --path ~/.hermes/local_knowledge/okfs/tools/<tool>.md \
+  --json
+```
+
+Use `python -m hermes_local_knowledge.cli okf fail --from-hermes-config --claim-token <token> --tool <tool> --error <short-redacted-error>` to release a failed claim. `okf drain-prompt --from-hermes-config` prints the exact bounded worker protocol used by the detached session-end worker.
+
+The validator requires generated OKFs to live under `<state_dir>/okfs/tools`, use `.md`, declare `artifact_type: tool_okf`, match the claimed tool/schema hash/target path, contain useful routing aliases or triggers, and avoid obvious secret assignments. After an OKF is complete, rebuild the index or run a search with `rebuild=true` so the new `tool_okf` artifact is searchable.
 
 ## Usage-history-informed behavior
 
@@ -218,6 +256,7 @@ This standalone shape keeps the lessons from the initial deployment:
 - feedback and zero-result telemetry stays local and is summarized by `knowledge_usage_report` before changing ranking or source coverage;
 - `knowledge_usage_report` separates live-root, pytest/probe, and other telemetry, suppresses resolved zero-result/negative-feedback candidates, and buckets legacy feedback ratings;
 - both native tools and standalone CLI lookups write local usage events with plugin version, config source, index age/mtime, artifact counts by type, and build duration when a build occurs.
+- optional OKF hooks record safe structural tool-use candidates and can launch a bounded detached worker at session end when `local_knowledge.okf.auto_generate` is enabled.
 
 ## CLI use
 
@@ -275,6 +314,13 @@ python -m hermes_local_knowledge.cli doctor
 python -m hermes_local_knowledge.cli doctor --rebuild --query 'backup runbook'
 ```
 
+The OKF queue can also be managed from the same CLI:
+
+```bash
+python -m hermes_local_knowledge.cli okf status --from-hermes-config --json
+python -m hermes_local_knowledge.cli okf drain-prompt --from-hermes-config
+```
+
 ## Development
 
 ```bash
@@ -318,6 +364,7 @@ The tests verify:
 - state directory separation from source directory;
 - configurable layout and entity hints;
 - native Hermes plugin registration handlers;
+- tool OKF queueing, privacy redaction, validation, worker protocol, and indexing;
 - feedback/usage-report closed loop;
 - config/env resolution.
 
