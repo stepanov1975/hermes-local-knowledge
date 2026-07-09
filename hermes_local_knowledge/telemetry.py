@@ -323,7 +323,9 @@ def _root_scope_sql() -> str:
     return """
         CASE
             WHEN root = ? THEN 'live'
-            WHEN root LIKE '/tmp/pytest-%' OR root LIKE '%/pytest-%' THEN 'test_tmp'
+            WHEN REPLACE(root, CHAR(92), '/') LIKE '/tmp/pytest-%'
+              OR REPLACE(root, CHAR(92), '/') LIKE '%/pytest-%'
+              THEN 'test_tmp'
             ELSE 'other_or_null'
         END
     """

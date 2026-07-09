@@ -15,7 +15,6 @@ from .paths import path_is_relative_to
 from .text_utils import parse_frontmatter, safe_read_text, slugify
 
 QUEUE_DB_NAME = "okf_queue.sqlite"
-OKF_WORKER_ENV = "HERMES_LOCAL_KNOWLEDGE_OKF_WORKER"
 DEFAULT_MAX_ARG_ITEMS = 8
 DEFAULT_MAX_ATTEMPTS = 3
 
@@ -96,8 +95,14 @@ def okf_file_path(state_dir: Path, tool_name: str) -> Path:
     return okf_dir(state_dir) / f"{slugify(tool_name)}.md"
 
 
+def generation_lock_path(state_dir: Path) -> Path:
+    return state_dir.expanduser().resolve() / "okf_generation.lock"
+
+
 def worker_lock_path(state_dir: Path) -> Path:
-    return state_dir.expanduser().resolve() / "okf_worker.lock"
+    """Compatibility alias for the pre-0.3.1 subprocess implementation."""
+
+    return generation_lock_path(state_dir)
 
 
 def schema_hash(schema: Mapping[str, Any] | None) -> str:
@@ -213,7 +218,66 @@ def _safe_arg_shape_from_json_text(arg_shape_json: Any) -> dict[str, Any]:
         parsed = json.loads(str(arg_shape_json or "{}"))
     except json.JSONDecodeError:
         return {}
+    if _is_canonical_arg_shape(parsed):
+        return parsed
     return safe_arg_shape(parsed)
+
+
+def _is_canonical_arg_shape(value: Any) -> bool:
+    if not isinstance(value, Mapping) or not isinstance(value.get("type"), str):
+        return False
+    shape_type = value["type"]
+    if shape_type == "object":
+        if not set(value).issubset({"type", "field_count", "fields", "truncated"}):
+            return False
+        field_count = value.get("field_count")
+        fields = value.get("fields")
+        if (
+            not isinstance(field_count, int)
+            or isinstance(field_count, bool)
+            or field_count < 0
+            or not isinstance(fields, Mapping)
+            or len(fields) > DEFAULT_MAX_ARG_ITEMS
+        ):
+            return False
+        expected_keys = [f"field_{index}" for index in range(len(fields))]
+        if list(fields) != expected_keys or not all(_is_canonical_arg_shape(child) for child in fields.values()):
+            return False
+        if "truncated" in value:
+            return value.get("truncated") is True and field_count > len(fields)
+        return field_count == len(fields)
+    if shape_type == "array":
+        if not set(value).issubset({"type", "length", "items", "truncated"}):
+            return False
+        length = value.get("length")
+        items = value.get("items")
+        if (
+            not isinstance(length, int)
+            or isinstance(length, bool)
+            or length < 0
+            or not isinstance(items, list)
+            or len(items) > DEFAULT_MAX_ARG_ITEMS
+            or not all(_is_canonical_arg_shape(child) for child in items)
+        ):
+            return False
+        if "truncated" in value:
+            return value.get("truncated") is True and length > len(items)
+        return length == len(items)
+    if not set(value).issubset({"type", "truncated"}):
+        return False
+    if "truncated" not in value:
+        return shape_type in {"null", "bool", "int", "float", "str", "bytes"}
+    return value.get("truncated") is True and shape_type in {
+        "dict",
+        "list",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "NoneType",
+        "bytes",
+        "bytearray",
+    }
 
 
 def _safe_arg_shape_json_text(arg_shape_json: Any) -> str:
@@ -348,6 +412,14 @@ def upsert_tool_candidate(
               okf_path=CASE
                 WHEN okf_candidates.schema_hash != excluded.schema_hash THEN NULL
                 ELSE okf_candidates.okf_path
+              END,
+              attempt_count=CASE
+                WHEN okf_candidates.schema_hash != excluded.schema_hash THEN 0
+                ELSE okf_candidates.attempt_count
+              END,
+              last_attempt_error=CASE
+                WHEN okf_candidates.schema_hash != excluded.schema_hash THEN NULL
+                ELSE okf_candidates.last_attempt_error
               END
             """,
             (
@@ -386,6 +458,7 @@ def claim_candidates(
     limit: int,
     min_use_count: int = 1,
     stale_after_seconds: int = 600,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     claim_token: str | None = None,
     now: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -395,15 +468,26 @@ def claim_candidates(
         datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     with _connect(state_dir) as conn:
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET status = 'error', claim_token = NULL, claimed_at = NULL,
+                last_attempt_error = '<redacted>'
+            WHERE attempt_count >= ?
+              AND (status = 'pending' OR (status = 'claimed' AND claimed_at < ?))
+            """,
+            (max_attempts, cutoff),
+        )
         rows = conn.execute(
             """
             SELECT tool_name FROM okf_candidates
             WHERE use_count >= ?
+              AND attempt_count < ?
               AND (status = 'pending' OR (status = 'claimed' AND claimed_at < ?))
             ORDER BY use_count DESC, last_seen ASC, tool_name ASC
             LIMIT ?
             """,
-            (min_use_count, cutoff, limit),
+            (min_use_count, max_attempts, cutoff, limit),
         ).fetchall()
         names = [str(row["tool_name"]) for row in rows]
         if names:
@@ -423,6 +507,34 @@ def claim_candidates(
             (token, *names) if names else (),
         ).fetchall()
     return [_row_dict(row) for row in claimed]
+
+
+def recover_stale_claims(
+    state_dir: Path,
+    *,
+    stale_after_seconds: int,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    now: str | None = None,
+) -> int:
+    current = (
+        datetime.fromisoformat(now.replace("Z", "+00:00"))
+        if now is not None
+        else datetime.now(timezone.utc)
+    )
+    cutoff = (current - timedelta(seconds=stale_after_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with _connect(state_dir) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE okf_candidates
+            SET status = CASE WHEN attempt_count >= ? THEN 'error' ELSE 'pending' END,
+                claim_token = NULL,
+                claimed_at = NULL,
+                last_attempt_error = '<redacted>'
+            WHERE status = 'claimed' AND claimed_at < ?
+            """,
+            (max_attempts, cutoff),
+        )
+        return cursor.rowcount
 
 
 def mark_candidate_done(state_dir: Path, *, tool_name: str, claim_token: str, okf_path: Path) -> bool:

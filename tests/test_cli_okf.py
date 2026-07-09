@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 from hermes_local_knowledge import cli as lci_cli
@@ -268,7 +269,7 @@ def test_okf_cli_fail_requeues_until_max_attempts(tmp_path: Path, capsys) -> Non
     assert "secret" not in repr(okf.pending_candidates(state_dir, limit=1))
 
 
-def test_okf_cli_status_and_drain_prompt(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+def test_okf_cli_status(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
     hermes_home, state_dir = configure_hermes_home(tmp_path)
     seed_candidate(state_dir)
 
@@ -290,20 +291,48 @@ def test_okf_cli_status_and_drain_prompt(tmp_path: Path, capsys) -> None:  # typ
     assert isinstance(pending, list)
     assert len(pending) == 1
 
-    prompt_status = lci_cli.main(
+
+def test_okf_cli_claim_stops_reclaiming_stale_rows_at_attempt_cap(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    tool_name = "mcp__paperless__paperless_find_latest_document"
+    seed_candidate(state_dir, tool_name=tool_name)
+
+    for attempt in range(okf.DEFAULT_MAX_ATTEMPTS):
+        status = lci_cli.main(
+            [
+                "okf",
+                "claim",
+                "--from-hermes-config",
+                "--hermes-home",
+                str(hermes_home),
+                "--claim-token",
+                f"claim-{attempt}",
+                "--json",
+            ]
+        )
+        payload = load_stdout_json(capsys)
+        assert status == 0
+        assert payload["count"] == 1
+        with sqlite3.connect(okf.okf_queue_db_path(state_dir)) as conn:
+            conn.execute(
+                "UPDATE okf_candidates SET claimed_at = ? WHERE tool_name = ?",
+                ("2000-01-01T00:00:00Z", tool_name),
+            )
+
+    status = lci_cli.main(
         [
             "okf",
-            "drain-prompt",
+            "claim",
             "--from-hermes-config",
             "--hermes-home",
             str(hermes_home),
-            "--limit",
-            "1",
+            "--claim-token",
+            "claim-over-cap",
+            "--json",
         ]
     )
-    prompt = capsys.readouterr().out
-    assert prompt_status == 0
-    assert "okf claim" in prompt
-    assert "okf complete" in prompt
-    assert "okf fail" in prompt
-    assert "Do not schedule cron jobs" in prompt
+    payload = load_stdout_json(capsys)
+
+    assert status == 0
+    assert payload["count"] == 0
+    assert okf.queue_counts(state_dir) == {"error": 1}

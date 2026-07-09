@@ -153,13 +153,12 @@ def extract_entities(*parts: str, known_entities: Sequence[str] | None = None) -
     return unique_preserve_order(entities)
 
 def first_heading_or_paragraph(text: str) -> str:
-    in_frontmatter = False
-    if text.startswith("---"):
-        in_frontmatter = True
-    for raw_line in text.splitlines():
+    lines = text.splitlines()
+    in_frontmatter = bool(lines and lines[0].strip() == "---")
+    for index, raw_line in enumerate(lines):
         line = raw_line.strip()
         if in_frontmatter:
-            if line == "---":
+            if index > 0 and line == "---":
                 in_frontmatter = False
             continue
         if not line or line.startswith("---") or line.startswith("```"):

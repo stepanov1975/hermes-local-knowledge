@@ -166,11 +166,6 @@ def _add_okf_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     fail_parser.add_argument("--error", required=True)
     add_okf_common_args(fail_parser)
 
-    drain_parser = okf_subparsers.add_parser("drain-prompt", help="print the bounded detached-worker prompt")
-    drain_parser.add_argument("--limit", type=int, default=None)
-    add_okf_common_args(drain_parser)
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -362,13 +357,6 @@ def _handle_okf_command(args: argparse.Namespace) -> int:
             payload["errors"] = ["no claimed candidate was marked failed"]
         _emit_payload(payload, json_output=args.json)
         return 0 if marked else 1
-    if args.okf_command == "drain-prompt":
-        if args.limit is not None:
-            cfg = replace(cfg, okf=replace(cfg.okf, max_candidates_per_session=max(1, int(args.limit))))
-        from .hooks import build_worker_prompt
-
-        print(build_worker_prompt(cfg))
-        return 0
     return 1
 
 

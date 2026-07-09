@@ -1,12 +1,13 @@
 """Hermes plugin exposing a local capability index as native tools."""
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 from . import handlers as _handlers
 from . import indexer
 from .handlers import HandlerDeps
-from .hooks import _on_post_tool_call, _on_session_end
+from .hooks import _on_post_tool_call, _on_session_end, _on_session_finalize
 from .runtime import (
     RuntimeConfig,
     _coerce_bool,
@@ -88,6 +89,7 @@ __all__ = [
     "_handle_usage_report",
     "_on_post_tool_call",
     "_on_session_end",
+    "_on_session_finalize",
     "_index_module",
     "_init_usage_db",
     "_json_list",
@@ -203,4 +205,5 @@ def register(ctx) -> None:
     register_hook = getattr(ctx, "register_hook", None)
     if register_hook is not None:
         register_hook("post_tool_call", _on_post_tool_call)
-        register_hook("on_session_end", _on_session_end)
+        llm = getattr(ctx, "llm", None)
+        register_hook("on_session_finalize", partial(_on_session_finalize, llm=llm))
