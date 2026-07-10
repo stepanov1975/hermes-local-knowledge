@@ -234,6 +234,7 @@ The plugin writes:
 <state_dir>/okf_queue.sqlite
 <state_dir>/okfs/tools/*.md
 <state_dir>/okf_generation.lock
+<state_dir>/index_build.lock
 <state_dir>/okf_index_dirty/ (possibly empty)
 ```
 
@@ -268,7 +269,7 @@ python -m hermes_local_knowledge.cli okf retry --from-hermes-config \
 
 `retry` only accepts terminal-error candidates. It clears generation-attempt state but preserves tool usage counters and schema metadata.
 
-The validator requires generated OKFs to live under `<state_dir>/okfs/tools`, use `.md`, declare `artifact_type: tool_okf`, match the claimed tool/schema hash/target path, contain useful routing aliases or triggers, and avoid obvious secret assignments. Completing an OKF adds a token under `okf_index_dirty/`; the next normal lookup rebuilds the index and removes only the tokens covered by that successful build. Tokens added concurrently remain for the following lookup.
+The validator requires generated OKFs to live under `<state_dir>/okfs/tools`, use `.md`, declare `artifact_type: tool_okf`, match the claimed tool/schema hash/target path, contain useful routing aliases or triggers, and avoid obvious secret assignments. Completing an OKF adds a token under `okf_index_dirty/`; the next normal lookup rebuilds the index and removes only the tokens covered by that successful build. Tokens added concurrently remain for the following lookup. Index rebuilds are serialized through a kernel advisory lock on `index_build.lock`, so an older scan cannot overwrite a newer index and consume its dirty tokens. The lock file may remain while idle; the kernel releases ownership automatically if a builder exits.
 
 ## Usage-history-informed behavior
 

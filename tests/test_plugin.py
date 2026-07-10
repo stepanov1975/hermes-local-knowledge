@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
+import threading
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -241,6 +244,90 @@ def test_ensure_index_preserves_dirty_tokens_when_build_fails(tmp_path, monkeypa
         raise AssertionError("expected build failure")
 
     assert len(okf.index_dirty_tokens(state_dir)) == 1
+    assert lci_runtime._index_build_lock_path(state_dir).exists()
+    _lock_path, probe_fd = lci_runtime._acquire_index_build_lock(state_dir)
+    lci_runtime._release_index_build_lock(probe_fd)
+
+
+def test_ensure_index_serializes_concurrent_dirty_rebuilds(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "index.sqlite"
+    db_path.write_text("initial", encoding="utf-8")
+    okf.mark_index_dirty(state_dir)
+    a_started = threading.Event()
+    b_started = threading.Event()
+    errors: list[BaseException] = []
+
+    def coordinated_build(root: Path, output_dir: Path, home: Path, settings):  # type: ignore[no-untyped-def]
+        if threading.current_thread().name == "index-build-a":
+            a_started.set()
+            b_started.wait(timeout=0.2)
+            db_path.write_text("stale-without-new-okf", encoding="utf-8")
+        else:
+            b_started.set()
+            db_path.write_text("fresh-with-new-okf", encoding="utf-8")
+        return [], []
+
+    def ensure_index() -> None:
+        try:
+            lci_runtime._ensure_index(repo, build_index_fn=coordinated_build)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=ensure_index, name="index-build-a")
+    thread_a.start()
+    assert a_started.wait(timeout=2)
+    okf.mark_index_dirty(state_dir)
+    thread_b = threading.Thread(target=ensure_index, name="index-build-b")
+    thread_b.start()
+    thread_a.join(timeout=5)
+    thread_b.join(timeout=5)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert errors == []
+    assert db_path.read_text(encoding="utf-8") == "fresh-with-new-okf"
+    assert not okf.index_dirty_tokens(state_dir)
+    assert lci_runtime._index_build_lock_path(state_dir).exists()
+
+
+def test_index_build_lock_serializes_across_processes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    lock_path, lock_fd = lci_runtime._acquire_index_build_lock(state_dir)
+    probe = """
+import fcntl
+import os
+import sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print('blocked')
+else:
+    print('acquired')
+finally:
+    os.close(fd)
+"""
+    try:
+        blocked = subprocess.run(
+            [sys.executable, "-c", probe, str(lock_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        lci_runtime._release_index_build_lock(lock_fd)
+    acquired = subprocess.run(
+        [sys.executable, "-c", probe, str(lock_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert blocked.stdout.strip() == "blocked"
+    assert acquired.stdout.strip() == "acquired"
 
 
 def test_completed_okf_is_discoverable_on_next_normal_search(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
