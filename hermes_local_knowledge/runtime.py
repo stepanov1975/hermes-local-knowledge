@@ -1,8 +1,6 @@
 """Runtime configuration and index lifecycle for the Hermes plugin."""
 from __future__ import annotations
 
-import fcntl
-import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -14,48 +12,9 @@ from .models import IndexSettings
 from .okf import index_dirty_tokens
 from .scanners import load_yaml_if_available
 from .schemas import CONFIG_SECTION, ROOT_ENV, STATE_ENV
-from .storage import artifact_type_counts, build_index, index_metadata
+from .storage import artifact_type_counts, build_index, index_build_lock, index_metadata
 
 BuildIndexFn = Callable[[Path, Path, Path, IndexSettings], tuple[list[Any], list[Any]]]
-INDEX_BUILD_LOCK_NAME = "index_build.lock"
-INDEX_BUILD_LOCK_WAIT_SECONDS = 120.0
-
-
-def _index_build_lock_path(state_dir: Path) -> Path:
-    return state_dir.expanduser().resolve() / INDEX_BUILD_LOCK_NAME
-
-
-def _acquire_index_build_lock(state_dir: Path) -> tuple[Path, int]:
-    lock_path = _index_build_lock_path(state_dir)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    deadline = time.monotonic() + INDEX_BUILD_LOCK_WAIT_SECONDS
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                os.close(fd)
-                raise TimeoutError(f"timed out waiting for index build lock: {lock_path}")
-            time.sleep(0.05)
-    try:
-        payload = json.dumps({"pid": os.getpid(), "acquired_at": time.time()}).encode("utf-8")
-        os.ftruncate(fd, 0)
-        os.write(fd, payload)
-        os.fsync(fd)
-    except Exception:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-        raise
-    return lock_path, fd
-
-
-def _release_index_build_lock(lock_fd: int) -> None:
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    finally:
-        os.close(lock_fd)
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
@@ -349,12 +308,11 @@ def _ensure_index(
         "rebuilt": False,
     }
     if rebuild or not db_path.exists() or dirty_tokens:
-        _lock_path, lock_fd = _acquire_index_build_lock(cfg.state_dir)
-        try:
+        with index_build_lock(cfg.state_dir):
             dirty_tokens = index_dirty_tokens(cfg.state_dir)
             if rebuild or not db_path.exists() or dirty_tokens:
-                build = build_index_fn or build_index
                 build_started = time.perf_counter()
+                build: Any = build_index_fn or build_index
                 artifacts, edges = build(
                     cfg.source_root,
                     cfg.state_dir,
@@ -372,8 +330,6 @@ def _ensure_index(
                 )
                 for token in dirty_tokens:
                     token.unlink(missing_ok=True)
-        finally:
-            _release_index_build_lock(lock_fd)
     metadata.update(index_metadata(db_path))
     return db_path, metadata
 

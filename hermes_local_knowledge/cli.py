@@ -19,7 +19,14 @@ from . import okf
 from .paths import default_output_dir, hermes_home_from_env
 from .runtime import RuntimeConfig, _runtime_config
 from .search import search_index
-from .storage import artifact_type_counts, build_index, get_artifact, get_neighbors, index_metadata
+from .storage import (
+    artifact_type_counts,
+    build_index,
+    get_artifact,
+    get_neighbors,
+    index_build_lock,
+    index_metadata,
+)
 from .telemetry import _record_usage
 
 
@@ -375,6 +382,32 @@ def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], Runt
     return db_path, (), cfg
 
 
+def _build_index_locked(build_index_fn, cfg: RuntimeConfig):  # type: ignore[no-untyped-def]
+    with index_build_lock(cfg.state_dir):
+        return build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
+
+
+def _refresh_default_index_if_dirty(
+    db_path: Path,
+    cfg: RuntimeConfig,
+    *,
+    build_index_fn,
+    explicit_db: bool,
+) -> bool:  # type: ignore[no-untyped-def]
+    if explicit_db:
+        return False
+    default_db_path = (cfg.state_dir / "index.sqlite").resolve()
+    if db_path.resolve() != default_db_path:
+        return False
+    dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
+    if db_path.exists() and not dirty_tokens:
+        return False
+    _build_index_locked(build_index_fn, cfg)
+    for token in dirty_tokens:
+        token.unlink(missing_ok=True)
+    return True
+
+
 def _okf_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
     cfg = _runtime_config(args.hermes_home) if args.from_hermes_config else RuntimeConfig(
         _resolved(DEFAULT_ROOT),
@@ -638,9 +671,10 @@ def _doctor_payload(
     )
 
     if args.rebuild and not errors:
+        dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
         try:
             build_started = time.perf_counter()
-            artifacts, edges = build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
+            artifacts, edges = _build_index_locked(build_index_fn, cfg)
         except Exception as exc:
             payload["rebuilt"] = False
             check("rebuild_failed", False, f"{type(exc).__name__}: {exc}", fatal=True)
@@ -650,6 +684,8 @@ def _doctor_payload(
             payload["artifact_count"] = len(artifacts)
             payload["artifact_counts_by_type"] = artifact_type_counts(artifacts)
             payload["edge_count"] = len(edges)
+            for token in dirty_tokens:
+                token.unlink(missing_ok=True)
             check("index_exists_after_rebuild", db_path.exists(), str(db_path), fatal=True)
     else:
         payload["rebuilt"] = False
@@ -722,8 +758,9 @@ def main(
         db_path = cfg.state_dir / "index.sqlite"
         started = time.perf_counter()
         _print_warnings(cfg.warnings)
+        dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
         try:
-            artifacts, edges = build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
+            artifacts, edges = _build_index_locked(build_index_fn, cfg)
         except Exception as exc:
             message = f"cli_build failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
@@ -739,6 +776,8 @@ def main(
             )
             raise
         build_duration_ms = int((time.perf_counter() - started) * 1000)
+        for token in dirty_tokens:
+            token.unlink(missing_ok=True)
         counts = artifact_type_counts(artifacts)
         meta = {
             **index_metadata(db_path),
@@ -770,6 +809,12 @@ def main(
         started = time.perf_counter()
         _print_warnings(warnings)
         try:
+            _refresh_default_index_if_dirty(
+                db_path,
+                cfg,
+                build_index_fn=build_index_fn,
+                explicit_db=args.db is not None,
+            )
             rows = search_index_fn(db_path, args.query, limit=args.limit)
         except Exception as exc:
             message = f"cli_search failed: {type(exc).__name__}: {exc}"
@@ -809,6 +854,12 @@ def main(
         started = time.perf_counter()
         _print_warnings(warnings)
         try:
+            _refresh_default_index_if_dirty(
+                db_path,
+                cfg,
+                build_index_fn=build_index_fn,
+                explicit_db=args.db is not None,
+            )
             row = get_artifact_fn(db_path, args.artifact_id)
         except Exception as exc:
             message = f"cli_get failed: {type(exc).__name__}: {exc}"
@@ -857,6 +908,12 @@ def main(
         started = time.perf_counter()
         _print_warnings(warnings)
         try:
+            _refresh_default_index_if_dirty(
+                db_path,
+                cfg,
+                build_index_fn=build_index_fn,
+                explicit_db=args.db is not None,
+            )
             rows = get_neighbors_fn(db_path, args.artifact_id)
         except Exception as exc:
             message = f"cli_neighbors failed: {type(exc).__name__}: {exc}"
