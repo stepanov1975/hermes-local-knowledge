@@ -18,6 +18,7 @@ knowledge/
 state/
 logs/
 tmp/
+docs/superpowers/
 dist/
 build/
 *.egg-info/

@@ -41,10 +41,14 @@ class OKFConfig:
     enabled: bool = True
     auto_generate: bool = False
     max_candidates_per_session: int = 2
-    max_worker_seconds: int = 120
+    max_generation_seconds: int = 120
     min_use_count: int = 1
-    worker_toolsets: tuple[str, ...] = ("terminal", "file")
-    worker_source: str = "local-knowledge-okf-worker"
+
+    @property
+    def max_worker_seconds(self) -> int:
+        """Compatibility alias for pre-0.3.1 configuration readers."""
+
+        return self.max_generation_seconds
 
 
 @dataclass(frozen=True)
@@ -160,9 +164,12 @@ def _okf_config(section: dict[str, Any]) -> OKFConfig:
             minimum=1,
             maximum=10,
         ),
-        max_worker_seconds=_coerce_int(
-            value("max_worker_seconds", default=defaults.max_worker_seconds),
-            default=defaults.max_worker_seconds,
+        max_generation_seconds=_coerce_int(
+            value(
+                "max_generation_seconds",
+                default=value("max_worker_seconds", default=defaults.max_generation_seconds),
+            ),
+            default=defaults.max_generation_seconds,
             minimum=10,
             maximum=3600,
         ),
@@ -172,8 +179,6 @@ def _okf_config(section: dict[str, Any]) -> OKFConfig:
             minimum=1,
             maximum=1000,
         ),
-        worker_toolsets=_tuple_value(value("worker_toolsets", default=defaults.worker_toolsets), defaults.worker_toolsets),
-        worker_source=str(value("worker_source", default=defaults.worker_source) or defaults.worker_source),
     )
 
 

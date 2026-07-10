@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +23,9 @@ from .storage import artifact_type_counts, build_index, get_artifact, get_neighb
 from .telemetry import _record_usage
 
 
+ROUTER_SKILL_RELATIVE_PATH = Path("skills") / "local-knowledge-router" / "SKILL.md"
+
+
 def print_results(rows: Sequence[dict[str, Any]]) -> None:
     for row in rows:
         print(f"{row['id']} [{row['type']}] {row['title']}")
@@ -35,6 +40,45 @@ def print_results(rows: Sequence[dict[str, Any]]) -> None:
 
 def _resolved(path: Path) -> Path:
     return path.expanduser().resolve()
+
+
+def _bundled_router_skill_path() -> Path:
+    return (Path(__file__).resolve().parent / ROUTER_SKILL_RELATIVE_PATH).resolve()
+
+
+def _installed_router_skill_path(hermes_home: Path) -> Path:
+    lexical_home = Path(os.path.abspath(hermes_home.expanduser()))
+    return lexical_home / ROUTER_SKILL_RELATIVE_PATH
+
+
+def _router_target_safety_error(hermes_home: Path, target: Path) -> str | None:
+    if target.is_symlink():
+        return "router skill target is a symbolic link; refusing to follow it"
+    resolved_home = hermes_home.expanduser().resolve()
+    resolved_parent = target.parent.resolve()
+    try:
+        resolved_parent.relative_to(resolved_home)
+    except ValueError:
+        return "router skill target parent resolves outside the Hermes home"
+    return None
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_temp_path = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(raw_temp_path)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _print_warnings(warnings: Sequence[str]) -> None:
@@ -135,6 +179,62 @@ def add_okf_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="emit JSON")
 
 
+def _add_doctor_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--hermes-home", type=Path, default=None, help="Hermes home directory")
+    parser.add_argument("--rebuild", action="store_true", help="build the configured index as part of the check")
+    parser.add_argument("--query", default=None, help="optional smoke search query to run against the index")
+    parser.add_argument("--limit", type=int, default=5, help="smoke search result limit")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+
+
+def _add_install_router_skill_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--hermes-home", type=Path, default=None, help="Hermes home directory")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace a different existing local-knowledge-router skill",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+
+
+def setup_hermes_cli(parser: argparse.ArgumentParser) -> None:
+    """Register the small setup/diagnostic surface under ``hermes local-knowledge``."""
+    subparsers = parser.add_subparsers(dest="local_knowledge_command", required=True)
+    install_parser = subparsers.add_parser(
+        "install-router-skill",
+        help="install the proactive router skill into the active Hermes profile",
+    )
+    _add_install_router_skill_args(install_parser)
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="check plugin configuration and installation health",
+    )
+    _add_doctor_args(doctor_parser)
+
+
+def handle_hermes_cli(args: argparse.Namespace) -> int:
+    """Dispatch the Hermes-native CLI adapter through the standalone CLI."""
+    command = str(args.local_knowledge_command)
+    argv = [command]
+    if args.hermes_home is not None:
+        argv.extend(["--hermes-home", str(args.hermes_home)])
+    if command == "install-router-skill":
+        if args.force:
+            argv.append("--force")
+    elif command == "doctor":
+        if args.rebuild:
+            argv.append("--rebuild")
+        if args.query is not None:
+            argv.extend(["--query", str(args.query)])
+        argv.extend(["--limit", str(args.limit)])
+    if args.json:
+        argv.append("--json")
+    status = main(argv)
+    if status:
+        raise SystemExit(status)
+    return status
+
+
 def _add_okf_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     okf_parser = subparsers.add_parser("okf", help="manage generated tool OKF candidate queue")
     okf_subparsers = okf_parser.add_subparsers(dest="okf_command", required=True)
@@ -165,11 +265,6 @@ def _add_okf_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     fail_parser.add_argument("--tool", required=True)
     fail_parser.add_argument("--error", required=True)
     add_okf_common_args(fail_parser)
-
-    drain_parser = okf_subparsers.add_parser("drain-prompt", help="print the bounded detached-worker prompt")
-    drain_parser.add_argument("--limit", type=int, default=None)
-    add_okf_common_args(drain_parser)
-
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -215,11 +310,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         aliases=["smoke"],
         help="check runtime config, paths, index presence, and optional smoke build/search",
     )
-    doctor_parser.add_argument("--hermes-home", type=Path, default=None, help="Hermes home directory")
-    doctor_parser.add_argument("--rebuild", action="store_true", help="build the configured index as part of the check")
-    doctor_parser.add_argument("--query", default=None, help="optional smoke search query to run against the index")
-    doctor_parser.add_argument("--limit", type=int, default=5, help="smoke search result limit")
-    doctor_parser.add_argument("--json", action="store_true", help="emit JSON")
+    _add_doctor_args(doctor_parser)
+
+    install_skill_parser = subparsers.add_parser(
+        "install-router-skill",
+        help="install the bundled router skill into the active Hermes profile",
+    )
+    _add_install_router_skill_args(install_skill_parser)
 
     _add_okf_parser(subparsers)
     return parser.parse_args(argv)
@@ -299,6 +396,92 @@ def _emit_payload(payload: dict[str, Any], *, json_output: bool) -> None:
                 print(f"{key}: {value}")
 
 
+def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[dict[str, Any], int]:
+    source = _bundled_router_skill_path()
+    target = _installed_router_skill_path(hermes_home)
+    base: dict[str, Any] = {
+        "source": str(source),
+        "target": str(target),
+    }
+    try:
+        if not source.is_file():
+            return {
+                **base,
+                "success": False,
+                "status": "error",
+                "error": "bundled local-knowledge-router skill is missing",
+            }, 1
+        bundled_content = source.read_bytes()
+
+        safety_error = _router_target_safety_error(hermes_home, target)
+        if safety_error is not None:
+            return {
+                **base,
+                "success": False,
+                "status": "conflict",
+                "force_required": False,
+                "error": safety_error,
+            }, 1
+
+        if target.exists():
+            if not target.is_file():
+                return {
+                    **base,
+                    "success": False,
+                    "status": "conflict",
+                    "force_required": False,
+                    "error": "router skill target exists but is not a regular file",
+                }, 1
+            existing_content = target.read_bytes()
+            if existing_content == bundled_content:
+                return {
+                    **base,
+                    "success": True,
+                    "status": "current",
+                    "overwritten": False,
+                    "message": "normal local-knowledge-router skill is already current",
+                }, 0
+            if not force:
+                return {
+                    **base,
+                    "success": False,
+                    "status": "conflict",
+                    "force_required": True,
+                    "error": (
+                        "a different local-knowledge-router skill already exists; "
+                        "review it before rerunning with --force"
+                    ),
+                }, 1
+            overwritten = True
+        else:
+            overwritten = False
+
+        safety_error = _router_target_safety_error(hermes_home, target)
+        if safety_error is not None:
+            return {
+                **base,
+                "success": False,
+                "status": "conflict",
+                "force_required": False,
+                "error": safety_error,
+            }, 1
+        _atomic_write_bytes(target, bundled_content)
+    except OSError as exc:
+        return {
+            **base,
+            "success": False,
+            "status": "error",
+            "error": f"failed to install router skill: {type(exc).__name__}: {exc}",
+        }, 1
+    return {
+        **base,
+        "success": True,
+        "status": "installed",
+        "overwritten": overwritten,
+        "message": "installed normal local-knowledge-router skill",
+    }, 0
+
+
 def _okf_status_payload(cfg: RuntimeConfig, *, limit: int) -> dict[str, Any]:
     pending = okf.pending_candidates(cfg.state_dir, limit=max(1, limit), min_use_count=cfg.okf.min_use_count)
     return {
@@ -362,13 +545,6 @@ def _handle_okf_command(args: argparse.Namespace) -> int:
             payload["errors"] = ["no claimed candidate was marked failed"]
         _emit_payload(payload, json_output=args.json)
         return 0 if marked else 1
-    if args.okf_command == "drain-prompt":
-        if args.limit is not None:
-            cfg = replace(cfg, okf=replace(cfg.okf, max_candidates_per_session=max(1, int(args.limit))))
-        from .hooks import build_worker_prompt
-
-        print(build_worker_prompt(cfg))
-        return 0
     return 1
 
 
@@ -404,6 +580,49 @@ def _doctor_payload(
     check("source_root_exists", cfg.source_root.exists(), str(cfg.source_root), fatal=True)
     check("state_dir_parent_exists", cfg.state_dir.parent.exists(), str(cfg.state_dir.parent), fatal=False)
     check("index_exists", db_path.exists(), str(db_path), fatal=False)
+
+    bundled_router_skill = _bundled_router_skill_path()
+    installed_router_skill = _installed_router_skill_path(cfg.hermes_home)
+    router_skill_installed = installed_router_skill.is_file()
+    install_command = "hermes local-knowledge install-router-skill"
+    check(
+        "router_skill_installed",
+        router_skill_installed,
+        str(installed_router_skill)
+        if router_skill_installed
+        else f"missing {installed_router_skill}; run `{install_command}`",
+        fatal=False,
+    )
+    router_skill_matches = False
+    if router_skill_installed and bundled_router_skill.is_file():
+        try:
+            router_skill_matches = installed_router_skill.read_bytes() == bundled_router_skill.read_bytes()
+        except OSError:
+            router_skill_matches = False
+    check(
+        "router_skill_matches_plugin",
+        router_skill_matches,
+        "normal router skill matches the bundled plugin version"
+        if router_skill_matches
+        else (
+            "normal router skill differs from the bundled plugin version; "
+            f"review it before running `{install_command} --force`"
+            if router_skill_installed
+            else "cannot compare until the normal router skill is installed"
+        ),
+        fatal=False,
+    )
+    check(
+        "okf_auto_generate",
+        cfg.okf.auto_generate,
+        "enabled; automatic OKF generation uses additional model tokens"
+        if cfg.okf.auto_generate
+        else (
+            "disabled; full automatic OKF generation is unavailable. After the user accepts "
+            "additional model tokens, run `hermes config set local_knowledge.okf.auto_generate true`"
+        ),
+        fatal=False,
+    )
 
     if args.rebuild and not errors:
         try:
@@ -478,6 +697,11 @@ def main(
     get_neighbors_fn=get_neighbors,
 ) -> int:
     args = parse_args(argv)
+    if args.command == "install-router-skill":
+        cfg = _runtime_config(args.hermes_home)
+        payload, status = _install_router_skill_payload(cfg.hermes_home, force=bool(args.force))
+        _emit_payload(payload, json_output=bool(args.json))
+        return status
     if args.command == "okf":
         return _handle_okf_command(args)
     if args.command == "build":

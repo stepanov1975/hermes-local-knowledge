@@ -24,6 +24,21 @@ def write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def test_first_heading_or_paragraph_skips_complete_frontmatter() -> None:
+    text = """---
+artifact_type: tool_okf
+tool: knowledge_search
+schema_hash: sha256:abc123
+---
+
+# Tool OKF: knowledge_search
+
+Route local questions to whole artifacts.
+"""
+
+    assert lci.first_heading_or_paragraph(text) == "Tool OKF: knowledge_search"
+
+
 def create_usage_db(path: Path) -> None:
     conn = sqlite3.connect(path)
     try:
@@ -1494,7 +1509,7 @@ Route to this Paperless tool when the user needs metadata for the newest matchin
     assert artifact is not None
     assert artifact["type"] == "tool_okf"
     assert artifact["source"] == "generated_tool_okf"
-    assert artifact["path"] == okf_path.as_posix()
+    assert artifact["path"] == lci.display_path(okf_path, root=root)
 
     with (output_dir / "index.jsonl").open(encoding="utf-8") as handle:
         rows = [json.loads(line) for line in handle]
@@ -1704,6 +1719,7 @@ def test_configured_markdown_dirs_support_knowledge_and_nested_paths(tmp_path: P
     assert by_id["skill_support_doc:nested-skills-demo-guide"].type == "skill_support_doc"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires Windows Developer Mode or elevation")
 def test_followlink_scanner_prunes_cycles_and_external_targets(tmp_path: Path) -> None:
     if not hasattr(os, "symlink"):
         pytest.skip("symlinks are not supported on this platform")
@@ -1720,6 +1736,7 @@ def test_followlink_scanner_prunes_cycles_and_external_targets(tmp_path: Path) -
     assert rel_paths == {"scripts/inside.py"}
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires Windows Developer Mode or elevation")
 def test_markdown_scanner_prunes_cycles_and_external_targets(tmp_path: Path) -> None:
     if not hasattr(os, "symlink"):
         pytest.skip("symlinks are not supported on this platform")
