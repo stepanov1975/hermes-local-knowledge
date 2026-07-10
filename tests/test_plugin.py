@@ -428,6 +428,51 @@ tags:
     assert not okf.index_dirty_tokens(state_dir)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["search", "Paperless review automation", "--json"],
+        ["get", "skill:paperless-review-automation", "--json"],
+        ["neighbors", "skill:paperless-review-automation", "--json"],
+    ],
+)
+def test_cli_unconfigured_default_lookup_never_rebuilds_shared_state(
+    tmp_path: Path, monkeypatch, capsys, command: list[str]
+) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, _state_dir = make_temp_repo(tmp_path)
+    default_state = hermes_home / "local_knowledge"
+    lci_storage.build_index(repo, default_state, hermes_home)
+    okf.mark_index_dirty(default_state)
+    unrelated = tmp_path / "unrelated-cwd"
+    write(
+        unrelated / "custom_skills" / "wrong-source" / "SKILL.md",
+        """---
+name: wrong-source
+description: Artifact from an unrelated current directory.
+---
+# Wrong source
+""",
+    )
+    monkeypatch.chdir(unrelated)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    build_calls: list[str] = []
+
+    def unexpected_build(*_args):  # type: ignore[no-untyped-def]
+        build_calls.append("called")
+        raise AssertionError("unconfigured lookup must not rebuild shared default state")
+
+    status = lci_cli.main(
+        [*command, "--hermes-home", str(hermes_home)],
+        build_index_fn=unexpected_build,
+    )
+    capsys.readouterr()
+
+    assert status == 0
+    assert build_calls == []
+    assert len(okf.index_dirty_tokens(default_state)) == 1
+
+
 def test_cli_explicit_index_sqlite_is_never_auto_rebuilt(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
     repo, hermes_home, _state_dir = make_temp_repo(tmp_path)
     custom_state = tmp_path / "custom-db"

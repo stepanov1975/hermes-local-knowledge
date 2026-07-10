@@ -393,8 +393,9 @@ def _refresh_default_index_if_dirty(
     *,
     build_index_fn,
     explicit_db: bool,
+    configuration_backed: bool,
 ) -> bool:  # type: ignore[no-untyped-def]
-    if explicit_db:
+    if explicit_db or not configuration_backed:
         return False
     default_db_path = (cfg.state_dir / "index.sqlite").resolve()
     if db_path.resolve() != default_db_path:
@@ -814,6 +815,7 @@ def main(
                 cfg,
                 build_index_fn=build_index_fn,
                 explicit_db=args.db is not None,
+                configuration_backed=args.from_hermes_config,
             )
             rows = search_index_fn(db_path, args.query, limit=args.limit)
         except Exception as exc:
@@ -859,6 +861,7 @@ def main(
                 cfg,
                 build_index_fn=build_index_fn,
                 explicit_db=args.db is not None,
+                configuration_backed=args.from_hermes_config,
             )
             row = get_artifact_fn(db_path, args.artifact_id)
         except Exception as exc:
@@ -913,6 +916,7 @@ def main(
                 cfg,
                 build_index_fn=build_index_fn,
                 explicit_db=args.db is not None,
+                configuration_backed=args.from_hermes_config,
             )
             rows = get_neighbors_fn(db_path, args.artifact_id)
         except Exception as exc:
