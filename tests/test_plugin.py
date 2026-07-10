@@ -8,7 +8,9 @@ from pathlib import Path
 
 import hermes_local_knowledge
 from hermes_local_knowledge import handlers as lci_handlers
+from hermes_local_knowledge import okf
 from hermes_local_knowledge import plugin
+from hermes_local_knowledge import runtime as lci_runtime
 from hermes_local_knowledge import telemetry as lci_telemetry
 
 
@@ -183,6 +185,123 @@ def test_plugin_rebuild_uses_compatibility_index_module(tmp_path, monkeypatch) -
         f"build:{repo.resolve()}:{state_dir.resolve()}:{hermes_home.resolve()}:True",
         f"search:{state_dir.resolve() / 'index.sqlite'}:demo:8:None",
     ]
+
+
+def test_ensure_index_rebuilds_and_clears_okf_dirty_marker(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "index.sqlite").touch()
+    okf.mark_index_dirty(state_dir)
+    calls: list[str] = []
+
+    def fake_build(root: Path, output_dir: Path, home: Path, settings):  # type: ignore[no-untyped-def]
+        calls.append(f"build:{root}:{output_dir}:{home}:{settings is not None}")
+        return [], []
+
+    db_path, metadata = lci_runtime._ensure_index(repo, build_index_fn=fake_build)
+
+    assert db_path == state_dir.resolve() / "index.sqlite"
+    assert metadata["rebuilt"] is True
+    assert calls == [f"build:{repo.resolve()}:{state_dir.resolve()}:{hermes_home.resolve()}:True"]
+    assert not okf.index_dirty_tokens(state_dir)
+
+
+def test_ensure_index_preserves_new_dirty_token_created_during_build(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "index.sqlite").touch()
+    okf.mark_index_dirty(state_dir)
+
+    def fake_build(root: Path, output_dir: Path, home: Path, settings):  # type: ignore[no-untyped-def]
+        okf.mark_index_dirty(state_dir)
+        return [], []
+
+    lci_runtime._ensure_index(repo, build_index_fn=fake_build)
+
+    assert len(okf.index_dirty_tokens(state_dir)) == 1
+
+
+def test_ensure_index_preserves_dirty_tokens_when_build_fails(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "index.sqlite").touch()
+    okf.mark_index_dirty(state_dir)
+
+    def failing_build(root: Path, output_dir: Path, home: Path, settings):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated build failure")
+
+    try:
+        lci_runtime._ensure_index(repo, build_index_fn=failing_build)
+    except RuntimeError as exc:
+        assert str(exc) == "simulated build failure"
+    else:
+        raise AssertionError("expected build failure")
+
+    assert len(okf.index_dirty_tokens(state_dir)) == 1
+
+
+def test_completed_okf_is_discoverable_on_next_normal_search(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    initial = json.loads(plugin._handle_search({"query": "paperless", "rebuild": True}))
+    assert initial["success"] is True
+
+    tool_name = "mcp__paperless__paperless_find_latest_document"
+    schema = {"type": "object"}
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=tool_name,
+        toolset="paperless",
+        schema=schema,
+        args={},
+    )
+    claimed = okf.claim_candidates(state_dir, limit=1, claim_token="claim-1")
+    assert [row["tool_name"] for row in claimed] == [tool_name]
+    output = okf.okf_file_path(state_dir, tool_name)
+    write(
+        output,
+        f"""---
+artifact_type: tool_okf
+tool: {tool_name}
+toolset: paperless
+schema_hash: {okf.schema_hash(schema)}
+generated_at: '2026-07-10T12:00:00Z'
+aliases:
+  - find newest paperless document
+triggers:
+  - User asks for the latest matching Paperless document metadata.
+---
+
+# Tool OKF: paperless_find_latest_document
+
+Route to this tool for metadata about the newest matching Paperless document.
+""",
+    )
+    assert okf.mark_candidate_done(
+        state_dir,
+        tool_name=tool_name,
+        claim_token="claim-1",
+        okf_path=output,
+    )
+
+    result = json.loads(
+        plugin._handle_search(
+            {
+                "query": "find newest paperless document",
+                "artifact_type": "tool_okf",
+            }
+        )
+    )
+
+    assert result["success"] is True
+    assert result["rebuilt"] is True
+    assert [row["id"] for row in result["results"]] == [
+        "tool_okf:mcp-paperless-paperless-find-latest-document"
+    ]
+    assert not okf.index_dirty_tokens(state_dir)
 
 
 def test_handlers_return_json_errors_for_malformed_args() -> None:

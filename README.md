@@ -20,7 +20,7 @@ Native Hermes tools under the `local_knowledge` toolset:
 | `knowledge_feedback` | Record lookup quality feedback locally. |
 | `knowledge_usage_report` | Summarize usage, zero-result queries, errors, and feedback. |
 
-The plugin also has lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The post-tool hook queues safe structural candidates, and the session-finalize hook can generate a bounded batch through Hermes' host-owned `ctx.llm` interface. Automatic OKF generation is a vital part of the plugin's intended functionality: without it, search still works, but the plugin cannot automatically create the tool-routing knowledge that lets coverage improve from real usage. Completed OKFs are indexed as whole `tool_okf` artifacts on the next normal index rebuild, scheduled rebuild cron, or lookup with `rebuild=true`.
+The plugin also has lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The post-tool hook queues safe structural candidates, and the session-finalize hook can generate a bounded batch through Hermes' host-owned `ctx.llm` interface. Automatic OKF generation is a vital part of the plugin's intended functionality: without it, search still works, but the plugin cannot automatically create the tool-routing knowledge that lets coverage improve from real usage. Completing an OKF marks the index stale so the next normal lookup rebuilds it and makes the new `tool_okf` searchable.
 
 ## Install
 
@@ -234,6 +234,7 @@ The plugin writes:
 <state_dir>/okf_queue.sqlite
 <state_dir>/okfs/tools/*.md
 <state_dir>/okf_generation.lock
+<state_dir>/okf_index_dirty/ (possibly empty)
 ```
 
 These are generated or local-only state. Do not commit them.
@@ -260,7 +261,7 @@ python -m hermes_local_knowledge.cli okf complete --from-hermes-config \
 
 Use `python -m hermes_local_knowledge.cli okf fail --from-hermes-config --claim-token <token> --tool <tool> --error <short-redacted-error>` to release a failed manual claim.
 
-The validator requires generated OKFs to live under `<state_dir>/okfs/tools`, use `.md`, declare `artifact_type: tool_okf`, match the claimed tool/schema hash/target path, contain useful routing aliases or triggers, and avoid obvious secret assignments. After an OKF is complete, rebuild the index or run a search with `rebuild=true` so the new `tool_okf` artifact is searchable.
+The validator requires generated OKFs to live under `<state_dir>/okfs/tools`, use `.md`, declare `artifact_type: tool_okf`, match the claimed tool/schema hash/target path, contain useful routing aliases or triggers, and avoid obvious secret assignments. Completing an OKF adds a token under `okf_index_dirty/`; the next normal lookup rebuilds the index and removes only the tokens covered by that successful build. Tokens added concurrently remain for the following lookup.
 
 ## Usage-history-informed behavior
 

@@ -15,6 +15,7 @@ from .paths import path_is_relative_to
 from .text_utils import parse_frontmatter, safe_read_text, slugify
 
 QUEUE_DB_NAME = "okf_queue.sqlite"
+INDEX_DIRTY_MARKER_NAME = "okf_index_dirty"
 DEFAULT_MAX_ARG_ITEMS = 8
 DEFAULT_MAX_ATTEMPTS = 3
 
@@ -85,6 +86,23 @@ def utc_now() -> str:
 
 def okf_queue_db_path(state_dir: Path) -> Path:
     return state_dir.expanduser().resolve() / QUEUE_DB_NAME
+
+
+def index_dirty_marker_path(state_dir: Path) -> Path:
+    return state_dir.expanduser().resolve() / INDEX_DIRTY_MARKER_NAME
+
+
+def mark_index_dirty(state_dir: Path) -> None:
+    marker = index_dirty_marker_path(state_dir)
+    marker.mkdir(parents=True, exist_ok=True)
+    (marker / uuid.uuid4().hex).touch(exist_ok=False)
+
+
+def index_dirty_tokens(state_dir: Path) -> tuple[Path, ...]:
+    marker = index_dirty_marker_path(state_dir)
+    if not marker.is_dir():
+        return ()
+    return tuple(path for path in marker.iterdir() if path.is_file())
 
 
 def okf_dir(state_dir: Path) -> Path:
@@ -548,7 +566,10 @@ def mark_candidate_done(state_dir: Path, *, tool_name: str, claim_token: str, ok
             """,
             (str(okf_path), tool_name, claim_token),
         )
-        return cursor.rowcount == 1
+        updated = cursor.rowcount == 1
+        if updated:
+            mark_index_dirty(state_dir)
+    return updated
 
 
 def mark_candidate_error(

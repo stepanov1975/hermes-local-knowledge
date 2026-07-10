@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from . import __version__
 from .models import IndexSettings
+from .okf import index_dirty_tokens
 from .scanners import load_yaml_if_available
 from .schemas import CONFIG_SECTION, ROOT_ENV, STATE_ENV
 from .storage import artifact_type_counts, build_index, index_metadata
@@ -294,6 +295,7 @@ def _ensure_index(
 ) -> tuple[Path, dict[str, Any]]:
     cfg = _runtime_config()
     db_path = cfg.state_dir / "index.sqlite"
+    dirty_tokens = index_dirty_tokens(cfg.state_dir)
     metadata: dict[str, Any] = {
         "plugin_version": __version__,
         "root": str(cfg.source_root),
@@ -305,7 +307,7 @@ def _ensure_index(
         "warnings": list(cfg.warnings),
         "rebuilt": False,
     }
-    if rebuild or not db_path.exists():
+    if rebuild or not db_path.exists() or dirty_tokens:
         build = build_index_fn or build_index
         build_started = time.perf_counter()
         artifacts, edges = build(
@@ -323,6 +325,8 @@ def _ensure_index(
                 "edge_count": len(edges),
             }
         )
+        for token in dirty_tokens:
+            token.unlink(missing_ok=True)
     metadata.update(index_metadata(db_path))
     return db_path, metadata
 

@@ -348,6 +348,27 @@ def test_schema_hash_change_requeues_done_candidate(tmp_path: Path) -> None:
     assert rows[0]["attempt_count"] == 0
 
 
+def test_mark_candidate_done_marks_index_dirty(tmp_path: Path) -> None:
+    okf.upsert_tool_candidate(
+        tmp_path,
+        tool_name="knowledge_search",
+        toolset="local_knowledge",
+        schema={"type": "object"},
+        args={"query": "paperless"},
+    )
+    claimed = okf.claim_candidates(tmp_path, limit=1, claim_token="claim-1")
+    assert len(claimed) == 1
+
+    assert okf.mark_candidate_done(
+        tmp_path,
+        tool_name="knowledge_search",
+        claim_token="claim-1",
+        okf_path=tmp_path / "okfs" / "tools" / "knowledge-search.md",
+    )
+
+    assert len(okf.index_dirty_tokens(tmp_path)) == 1
+
+
 def test_recover_stale_claim_returns_retryable_candidate_to_pending(tmp_path: Path) -> None:
     okf.upsert_tool_candidate(
         tmp_path,
