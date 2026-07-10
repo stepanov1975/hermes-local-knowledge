@@ -93,6 +93,7 @@ def configure_env(monkeypatch, repo: Path, hermes_home: Path, state_dir: Path) -
 def test_register_exposes_native_tools_and_bundled_skill():
     tool_calls = []
     skill_calls = []
+    cli_calls = []
 
     class Ctx:
         def register_tool(self, **kwargs):
@@ -100,6 +101,9 @@ def test_register_exposes_native_tools_and_bundled_skill():
 
         def register_skill(self, name, skill_md):  # type: ignore[no-untyped-def]
             skill_calls.append((name, Path(skill_md)))
+
+        def register_cli_command(self, **kwargs):  # type: ignore[no-untyped-def]
+            cli_calls.append(kwargs)
 
     plugin.register(Ctx())
 
@@ -116,6 +120,10 @@ def test_register_exposes_native_tools_and_bundled_skill():
     expected_skill = Path(__file__).resolve().parents[1] / "skills" / "local-knowledge-router" / "SKILL.md"
     assert skill_calls == [("local-knowledge-router", expected_skill)]
     assert skill_calls[0][1].is_file()
+    assert len(cli_calls) == 1
+    assert cli_calls[0]["name"] == "local-knowledge"
+    assert callable(cli_calls[0]["setup_fn"])
+    assert callable(cli_calls[0]["handler_fn"])
 
 
 def test_bundled_router_skill_matches_install_example() -> None:

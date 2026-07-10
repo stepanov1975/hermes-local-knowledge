@@ -43,11 +43,10 @@ The plugin registers tools, but a skill tells Hermes **when** to use them. Witho
 Install the bundled skill into the target Hermes home/profile for proactive routing:
 
 ```bash
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME/skills/local-knowledge-router"
-cp "$HERMES_HOME/plugins/local_knowledge/skills/local-knowledge-router/SKILL.md" \
-  "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
+hermes local-knowledge install-router-skill
 ```
+
+The command is cross-platform, installs the skill bundled with the current plugin version, and is idempotent. Use `--hermes-home <path>` to target a non-active profile. For machine-readable installer output, add `--json`; `installed` and `current` are successful states. If a different skill already exists, the command stops with `conflict` instead of overwriting user changes. Review the difference before using `--force`.
 
 The plugin also registers this same skill as a read-only, namespaced plugin skill for explicit loads:
 
@@ -57,13 +56,10 @@ skill_view("local_knowledge:local-knowledge-router")
 
 That namespaced skill is useful as a versioned fallback/reference, but it does **not** appear in Hermes' normal available-skill index. Install the normal skill above when you want Hermes to use local knowledge proactively.
 
-If you are working from a source checkout instead of the installed plugin directory:
+From a source checkout before the plugin is enabled, use the standalone fallback:
 
 ```bash
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME/skills/local-knowledge-router"
-cp skills/local-knowledge-router/SKILL.md \
-  "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
+python -m hermes_local_knowledge.cli install-router-skill
 ```
 
 You can also install the skill directly from GitHub:
@@ -140,7 +136,7 @@ local_knowledge:
   exclude_dir_names: [build, dist]
   okf:
     enabled: true
-    auto_generate: false
+    auto_generate: true
     max_candidates_per_session: 2
     max_generation_seconds: 120
     min_use_count: 1
@@ -148,7 +144,9 @@ local_knowledge:
 
 `source_root` is the high-signal directory being indexed. `state_dir` is generated local state and should not be committed. `exclude_dir_names` adds extra directory names to the built-in skip list (`.archive`, `worktrees`, `.worktrees`, `.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.mypy_cache`, `.pytest_cache`, `htmlcov`, `logs`). Use YAML lists in `config.yaml`; when using `hermes config set` from the shell, comma-separated strings or bracket-list strings are accepted and normalized by the plugin.
 
-`local_knowledge.okf.enabled` controls whether the plugin records safe, structural tool-use candidates. `auto_generate` is intentionally `false` by default because generation consumes model tokens and writes generated Markdown files. When enabled, `on_session_finalize` claims at most `max_candidates_per_session` candidates and makes one bounded `ctx.llm.complete_structured` call with `max_generation_seconds` as its timeout. Because Hermes observer hooks are synchronous, an enabled generation call can delay session finalization by up to that timeout. The plugin renders and validates the files itself; the model never receives terminal or file tools. The post-tool hook uses Hermes' canonical outcome fields and does not persist raw session transcripts, raw tool outputs, argument values, emails, OCR text, or private documents.
+`local_knowledge.okf.enabled` controls whether the plugin records safe, structural tool-use candidates. Full functionality, including automatic tool-OKF generation, requires `local_knowledge.okf.auto_generate: true` in Hermes config. The runtime default remains intentionally `false` so installation does not silently consume model tokens. Before enabling automatic generation, an installer—especially an AI agent performing the installation—must warn the user that it invokes the active model at session finalization, consumes additional tokens, and can delay finalization by up to `max_generation_seconds`. If the user does not want that additional usage, leave `auto_generate` disabled; the core knowledge tools and manual OKF workflow remain available, but automatic generation will not run.
+
+When enabled, `on_session_finalize` claims at most `max_candidates_per_session` candidates and makes one bounded `ctx.llm.complete_structured` call with `max_generation_seconds` as its timeout. The plugin renders and validates the files itself; the model never receives terminal or file tools. The post-tool hook uses Hermes' canonical outcome fields and does not persist raw session transcripts, raw tool outputs, argument values, emails, OCR text, or private documents.
 
 For compatibility with v0.3.0 configuration, `max_worker_seconds` is still accepted as a fallback when `max_generation_seconds` is not set.
 
@@ -312,9 +310,14 @@ per-query output.
 The CLI also has an install/config smoke check:
 
 ```bash
-python -m hermes_local_knowledge.cli doctor
-python -m hermes_local_knowledge.cli doctor --rebuild --query 'backup runbook'
+hermes local-knowledge doctor
+hermes local-knowledge doctor --json
+hermes local-knowledge doctor --rebuild --query 'backup runbook'
 ```
+
+`doctor` reports nonfatal warnings when the proactive router skill is missing or differs from the bundled version, and when automatic OKF generation is disabled. This lets an installer agent distinguish a valid minimal installation from the full-function configuration without silently changing user settings.
+
+When running directly from an uninstalled source checkout, replace `hermes local-knowledge` with `python -m hermes_local_knowledge.cli`.
 
 The OKF queue can also be managed from the same CLI:
 

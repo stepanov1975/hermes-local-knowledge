@@ -184,6 +184,21 @@ def _register_bundled_skills(ctx) -> None:
         register_skill("local-knowledge-router", skill_md)
 
 
+def _register_cli(ctx) -> None:
+    register_cli_command = getattr(ctx, "register_cli_command", None)
+    if register_cli_command is None:
+        return
+    from .cli import handle_hermes_cli, setup_hermes_cli
+
+    register_cli_command(
+        name="local-knowledge",
+        help="Install and diagnose the local knowledge plugin",
+        description="Install the proactive router skill or check plugin health.",
+        setup_fn=setup_hermes_cli,
+        handler_fn=handle_hermes_cli,
+    )
+
+
 def register(ctx) -> None:
     """Register native tools and bundled skills for the local knowledge index."""
     for name, schema, handler, emoji in (
@@ -202,6 +217,7 @@ def register(ctx) -> None:
             emoji=emoji,
         )
     _register_bundled_skills(ctx)
+    _register_cli(ctx)
     register_hook = getattr(ctx, "register_hook", None)
     if register_hook is not None:
         register_hook("post_tool_call", _on_post_tool_call)

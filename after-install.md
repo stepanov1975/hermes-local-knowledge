@@ -9,11 +9,10 @@ hermes plugins enable local_knowledge
 Install the routing skill too. The plugin registers the `knowledge_*` tools, but a normal installed skill tells Hermes when to use them proactively for local runbooks, scripts, cron jobs, MCP wrappers, and custom skills:
 
 ```bash
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME/skills/local-knowledge-router"
-cp "$HERMES_HOME/plugins/local_knowledge/skills/local-knowledge-router/SKILL.md" \
-  "$HERMES_HOME/skills/local-knowledge-router/SKILL.md"
+hermes local-knowledge install-router-skill
 ```
+
+The command is cross-platform, installs the skill bundled with this plugin version, and is safe to rerun. An AI installer should add `--json` and treat `installed` or `current` as success. If it reports `conflict`, stop and review the existing skill; do not use `--force` unless replacing that customized file is intentional.
 
 The plugin also registers the same file as the read-only namespaced skill `local_knowledge:local-knowledge-router` for explicit `skill_view(...)` loads. That does not replace installing the normal skill above, because plugin skills are not in the proactive available-skill index.
 
@@ -31,7 +30,12 @@ local_knowledge:
   script_dirs: [scripts, hermes_home/scripts]                # YAML list
   include_markdown_docs: true
   exclude_dir_names: [build, dist]                            # extra dirs to skip (merged with built-in defaults)
+  okf:
+    enabled: true
+    auto_generate: true                                      # full automatic OKF functionality; uses model tokens
 ```
+
+Full functionality includes automatic tool-OKF generation and therefore requires `local_knowledge.okf.auto_generate: true`. The runtime default is intentionally `false` so installation does not silently consume model tokens. Before enabling it, an installer—especially an AI agent performing the installation—must warn the user that automatic generation invokes the active model at session finalization, consumes additional tokens, and can delay finalization by up to the configured generation timeout. If the user does not want that additional usage, leave `auto_generate` disabled; the core knowledge tools and manual OKF workflow remain available, but automatic generation will not run.
 
 CLI-safe equivalent. `hermes config set` stores scalar strings; the plugin accepts comma-separated values for list-like settings:
 
@@ -42,6 +46,8 @@ hermes config set local_knowledge.custom_skill_dirs custom_skills
 hermes config set local_knowledge.script_dirs scripts,hermes_home/scripts
 hermes config set local_knowledge.include_markdown_docs true
 hermes config set local_knowledge.exclude_dir_names build,dist
+hermes config set local_knowledge.okf.enabled true
+hermes config set local_knowledge.okf.auto_generate true
 ```
 
 You can omit `source_root` to index only this Hermes profile's runtime artifacts under `$HERMES_HOME`. If `$HERMES_HOME/hermes-agent` exists, the plugin warns because broad Hermes-home indexing can be noisy.
@@ -72,9 +78,12 @@ Successful runs are silent because the script prints nothing; failures still pro
 Smoke check the install/config. CLI commands write to the same local `usage.sqlite` telemetry store, so smoke checks show up in `knowledge_usage_report` alongside native tool calls:
 
 ```bash
-python -m hermes_local_knowledge.cli doctor
-python -m hermes_local_knowledge.cli doctor --rebuild --query "backup runbook"
+hermes local-knowledge doctor
+hermes local-knowledge doctor --json
+hermes local-knowledge doctor --rebuild --query "backup runbook"
 ```
+
+`doctor` keeps missing/full-function options nonfatal, but reports whether the proactive router skill is installed and current and whether automatic OKF generation is enabled. Installer agents should resolve or explicitly explain these warnings before declaring setup complete.
 
 Restart the gateway or start a new Hermes session for the tools to appear.
 If you are already talking to Hermes through the gateway, use `/restart`; from a separate shell, run:

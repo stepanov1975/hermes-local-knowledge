@@ -96,8 +96,17 @@ tags: [demo, reusable]
     listing = run_command(["hermes", "plugins", "list", "--user", "--json"], env=env)
     plugins = json.loads(listing.stdout)
     assert any(item["name"] == "local_knowledge" and item["status"] == "enabled" for item in plugins)
-    installed_skill = hermes_home / "plugins" / "local_knowledge" / "skills" / "local-knowledge-router" / "SKILL.md"
-    assert installed_skill.exists()
+    installed_plugin = hermes_home / "plugins" / "local_knowledge"
+    bundled_skill = installed_plugin / "skills" / "local-knowledge-router" / "SKILL.md"
+    assert bundled_skill.exists()
+    skill_install = run_command(
+        ["hermes", "local-knowledge", "install-router-skill", "--json"],
+        env=env,
+    )
+    skill_install_payload = json.loads(skill_install.stdout)
+    normal_skill = hermes_home / "skills" / "local-knowledge-router" / "SKILL.md"
+    assert skill_install_payload["status"] == "installed"
+    assert normal_skill.read_bytes() == bundled_skill.read_bytes()
 
     smoke_script = tmp_path / "load_and_search.py"
     write(
