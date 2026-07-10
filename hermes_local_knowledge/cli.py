@@ -240,7 +240,7 @@ def _add_okf_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     okf_subparsers = okf_parser.add_subparsers(dest="okf_command", required=True)
 
     status_parser = okf_subparsers.add_parser("status", help="show OKF queue status")
-    status_parser.add_argument("--limit", type=int, default=10, help="pending candidate preview limit")
+    status_parser.add_argument("--limit", type=int, default=10, help="candidate preview limit per state")
     add_okf_common_args(status_parser)
 
     claim_parser = okf_subparsers.add_parser("claim", help="claim pending OKF candidates")
@@ -265,6 +265,10 @@ def _add_okf_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     fail_parser.add_argument("--tool", required=True)
     fail_parser.add_argument("--error", required=True)
     add_okf_common_args(fail_parser)
+
+    retry_parser = okf_subparsers.add_parser("retry", help="reset an exhausted OKF candidate for retry")
+    retry_parser.add_argument("--tool", required=True)
+    add_okf_common_args(retry_parser)
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -484,6 +488,7 @@ def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[di
 
 def _okf_status_payload(cfg: RuntimeConfig, *, limit: int) -> dict[str, Any]:
     pending = okf.pending_candidates(cfg.state_dir, limit=max(1, limit), min_use_count=cfg.okf.min_use_count)
+    errors = okf.error_candidates(cfg.state_dir, limit=max(1, limit))
     return {
         "success": True,
         "state_dir": str(cfg.state_dir),
@@ -491,6 +496,7 @@ def _okf_status_payload(cfg: RuntimeConfig, *, limit: int) -> dict[str, Any]:
         "queue_db": str(okf.okf_queue_db_path(cfg.state_dir)),
         "counts": okf.queue_counts(cfg.state_dir),
         "pending": [okf.candidate_packet(row, cfg.state_dir) for row in pending],
+        "errors": [okf.candidate_packet(row, cfg.state_dir) for row in errors],
     }
 
 
@@ -545,6 +551,13 @@ def _handle_okf_command(args: argparse.Namespace) -> int:
             payload["errors"] = ["no claimed candidate was marked failed"]
         _emit_payload(payload, json_output=args.json)
         return 0 if marked else 1
+    if args.okf_command == "retry":
+        retried = okf.retry_error_candidate(cfg.state_dir, tool_name=args.tool)
+        payload = {"success": retried, "tool": args.tool}
+        if not retried:
+            payload["errors"] = ["candidate is missing or not in terminal error state"]
+        _emit_payload(payload, json_output=args.json)
+        return 0 if retried else 1
     return 1
 
 

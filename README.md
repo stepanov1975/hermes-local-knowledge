@@ -259,7 +259,14 @@ python -m hermes_local_knowledge.cli okf complete --from-hermes-config \
   --json
 ```
 
-Use `python -m hermes_local_knowledge.cli okf fail --from-hermes-config --claim-token <token> --tool <tool> --error <short-redacted-error>` to release a failed manual claim.
+Use `python -m hermes_local_knowledge.cli okf fail --from-hermes-config --claim-token <token> --tool <tool> --error <short-redacted-error>` to release a failed manual claim. Candidates move to terminal `error` state after the retry cap. `okf status` lists those candidates under `errors`; reset one for another bounded generation attempt with:
+
+```bash
+python -m hermes_local_knowledge.cli okf retry --from-hermes-config \
+  --tool <tool> --json
+```
+
+`retry` only accepts terminal-error candidates. It clears generation-attempt state but preserves tool usage counters and schema metadata.
 
 The validator requires generated OKFs to live under `<state_dir>/okfs/tools`, use `.md`, declare `artifact_type: tool_okf`, match the claimed tool/schema hash/target path, contain useful routing aliases or triggers, and avoid obvious secret assignments. Completing an OKF adds a token under `okf_index_dirty/`; the next normal lookup rebuilds the index and removes only the tokens covered by that successful build. Tokens added concurrently remain for the following lookup.
 

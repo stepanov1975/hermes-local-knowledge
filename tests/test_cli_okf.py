@@ -336,3 +336,138 @@ def test_okf_cli_claim_stops_reclaiming_stale_rows_at_attempt_cap(tmp_path: Path
     assert status == 0
     assert payload["count"] == 0
     assert okf.queue_counts(state_dir) == {"error": 1}
+
+
+def test_okf_cli_status_and_retry_exhausted_candidate(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    tool_name = "mcp__siyuan__get_block_kramdown"
+    seed_candidate(state_dir, tool_name=tool_name)
+
+    for attempt in range(okf.DEFAULT_MAX_ATTEMPTS):
+        claim_token = f"failed-claim-{attempt}"
+        claimed = okf.claim_candidates(state_dir, limit=1, claim_token=claim_token)
+        assert [row["tool_name"] for row in claimed] == [tool_name]
+        assert okf.mark_candidate_error(
+            state_dir,
+            tool_name=tool_name,
+            claim_token=claim_token,
+            error="malformed generated OKF",
+        )
+
+    with sqlite3.connect(okf.okf_queue_db_path(state_dir)) as conn:
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET claimed_at = ?, claim_token = ?, okf_path = ?
+            WHERE tool_name = ?
+            """,
+            ("2026-07-10T12:00:00Z", "stale-claim", "/tmp/stale-invalid.md", tool_name),
+        )
+    before_retry = okf.error_candidates(state_dir, limit=1)[0]
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "status",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--json",
+        ]
+    )
+    status_payload = load_stdout_json(capsys)
+    assert status == 0
+    assert status_payload["counts"] == {"error": 1}
+    errors = status_payload["errors"]
+    assert isinstance(errors, list)
+    assert [row["tool"] for row in errors] == [tool_name]
+    assert_no_private_schema_values(status_payload)
+
+    retry_status = lci_cli.main(
+        [
+            "okf",
+            "retry",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--tool",
+            tool_name,
+            "--json",
+        ]
+    )
+    retry_payload = load_stdout_json(capsys)
+
+    assert retry_status == 0
+    assert retry_payload == {"success": True, "tool": tool_name}
+    assert okf.queue_counts(state_dir) == {"pending": 1}
+    pending = okf.pending_candidates(state_dir, limit=1)
+    assert pending[0]["attempt_count"] == 0
+    assert pending[0]["claimed_at"] is None
+    assert pending[0]["claim_token"] is None
+    assert pending[0]["okf_path"] is None
+    assert pending[0]["last_attempt_error"] is None
+    for preserved_field in (
+        "tool_name",
+        "toolset",
+        "schema_hash",
+        "schema_json",
+        "use_count",
+        "success_count",
+        "error_count",
+        "last_error_type",
+        "last_error_message",
+        "arg_shape_json",
+    ):
+        assert pending[0][preserved_field] == before_retry[preserved_field]
+    reclaimed = okf.claim_candidates(state_dir, limit=1, claim_token="retry-claim")
+    assert [row["tool_name"] for row in reclaimed] == [tool_name]
+
+
+def test_okf_cli_retry_rejects_non_error_candidate(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    seed_candidate(state_dir, tool_name="knowledge_search")
+    queue_db = okf.okf_queue_db_path(state_dir)
+    before_bytes = queue_db.read_bytes()
+    before_mtime_ns = queue_db.stat().st_mtime_ns
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "retry",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--tool",
+            "knowledge_search",
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 1
+    assert payload["success"] is False
+    assert payload["errors"] == ["candidate is missing or not in terminal error state"]
+    assert queue_db.read_bytes() == before_bytes
+    assert queue_db.stat().st_mtime_ns == before_mtime_ns
+    assert okf.queue_counts(state_dir) == {"pending": 1}
+
+
+def test_okf_cli_retry_missing_candidate_does_not_create_state(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    state_dir = tmp_path / "absent-state"
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "retry",
+            "--state-dir",
+            str(state_dir),
+            "--tool",
+            "missing_tool",
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 1
+    assert payload["success"] is False
+    assert not state_dir.exists()

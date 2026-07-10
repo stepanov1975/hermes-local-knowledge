@@ -470,6 +470,37 @@ def pending_candidates(state_dir: Path, *, limit: int = 10, min_use_count: int =
     return [_row_dict(row) for row in rows]
 
 
+def error_candidates(state_dir: Path, *, limit: int = 10) -> list[dict[str, Any]]:
+    with _connect(state_dir) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM okf_candidates
+            WHERE status = 'error'
+            ORDER BY use_count DESC, last_seen ASC, tool_name ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_row_dict(row) for row in rows]
+
+
+def retry_error_candidate(state_dir: Path, *, tool_name: str) -> bool:
+    db_path = okf_queue_db_path(state_dir)
+    if not db_path.is_file():
+        return False
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE okf_candidates
+            SET status = 'pending', attempt_count = 0, claimed_at = NULL,
+                claim_token = NULL, okf_path = NULL, last_attempt_error = NULL
+            WHERE tool_name = ? AND status = 'error'
+            """,
+            (tool_name,),
+        )
+        return cursor.rowcount == 1
+
+
 def claim_candidates(
     state_dir: Path,
     *,
