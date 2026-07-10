@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from hermes_local_knowledge import cli as lci_cli
 from hermes_local_knowledge import okf
 
@@ -336,3 +338,280 @@ def test_okf_cli_claim_stops_reclaiming_stale_rows_at_attempt_cap(tmp_path: Path
     assert status == 0
     assert payload["count"] == 0
     assert okf.queue_counts(state_dir) == {"error": 1}
+
+
+def test_okf_cli_status_and_retry_exhausted_candidate(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    tool_name = "mcp__siyuan__get_block_kramdown"
+    seed_candidate(state_dir, tool_name=tool_name)
+
+    for attempt in range(okf.DEFAULT_MAX_ATTEMPTS):
+        claim_token = f"failed-claim-{attempt}"
+        claimed = okf.claim_candidates(state_dir, limit=1, claim_token=claim_token)
+        assert [row["tool_name"] for row in claimed] == [tool_name]
+        assert okf.mark_candidate_error(
+            state_dir,
+            tool_name=tool_name,
+            claim_token=claim_token,
+            error="malformed generated OKF",
+        )
+
+    with sqlite3.connect(okf.okf_queue_db_path(state_dir)) as conn:
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET claimed_at = ?, claim_token = ?, okf_path = ?
+            WHERE tool_name = ?
+            """,
+            ("2026-07-10T12:00:00Z", "stale-claim", "/tmp/stale-invalid.md", tool_name),
+        )
+    before_retry = okf.error_candidates(state_dir, limit=1)[0]
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "status",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--json",
+        ]
+    )
+    status_payload = load_stdout_json(capsys)
+    assert status == 0
+    assert status_payload["counts"] == {"error": 1}
+    errors = status_payload["errors"]
+    assert isinstance(errors, list)
+    assert [row["tool"] for row in errors] == [tool_name]
+    assert_no_private_schema_values(status_payload)
+
+    retry_status = lci_cli.main(
+        [
+            "okf",
+            "retry",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--tool",
+            tool_name,
+            "--json",
+        ]
+    )
+    retry_payload = load_stdout_json(capsys)
+
+    assert retry_status == 0
+    assert retry_payload == {"success": True, "tool": tool_name}
+    assert okf.queue_counts(state_dir) == {"pending": 1}
+    pending = okf.pending_candidates(state_dir, limit=1)
+    assert pending[0]["attempt_count"] == 0
+    assert pending[0]["claimed_at"] is None
+    assert pending[0]["claim_token"] is None
+    assert pending[0]["okf_path"] is None
+    assert pending[0]["last_attempt_error"] is None
+    for preserved_field in (
+        "tool_name",
+        "toolset",
+        "schema_hash",
+        "schema_json",
+        "use_count",
+        "success_count",
+        "error_count",
+        "last_error_type",
+        "last_error_message",
+        "arg_shape_json",
+    ):
+        assert pending[0][preserved_field] == before_retry[preserved_field]
+    reclaimed = okf.claim_candidates(state_dir, limit=1, claim_token="retry-claim")
+    assert [row["tool_name"] for row in reclaimed] == [tool_name]
+
+
+def test_okf_cli_retry_migrates_legacy_queue_schema(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    state_dir = tmp_path / "legacy-state"
+    state_dir.mkdir()
+    queue_db = okf.okf_queue_db_path(state_dir)
+    tool_name = "legacy_tool"
+    with sqlite3.connect(queue_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE okf_candidates (
+              tool_name TEXT PRIMARY KEY, toolset TEXT, schema_hash TEXT,
+              schema_json TEXT, first_seen TEXT, last_seen TEXT,
+              use_count INTEGER, success_count INTEGER, error_count INTEGER,
+              last_error_type TEXT, last_error_message TEXT,
+              arg_shape_json TEXT, status TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO okf_candidates VALUES (
+              ?, 'legacy', 'sha256:legacy', '{}',
+              '2026-07-01T00:00:00Z', '2026-07-02T00:00:00Z',
+              7, 5, 2, 'tool_error', '<redacted>', '{"query":"str"}', 'error'
+            )
+            """,
+            (tool_name,),
+        )
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "retry",
+            "--state-dir",
+            str(state_dir),
+            "--tool",
+            tool_name,
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 0
+    assert payload == {"success": True, "tool": tool_name}
+    with sqlite3.connect(queue_db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(okf_candidates)")}
+        row = conn.execute(
+            """
+            SELECT status, attempt_count, last_attempt_error, toolset,
+                   schema_hash, use_count, success_count, error_count
+            FROM okf_candidates WHERE tool_name = ?
+            """,
+            (tool_name,),
+        ).fetchone()
+    assert {"attempt_count", "last_attempt_error", "claim_token"} <= columns
+    assert row == ("pending", 0, None, "legacy", "sha256:legacy", 7, 5, 2)
+    claimed = okf.claim_candidates(state_dir, limit=1, claim_token="legacy-retry")
+    assert [candidate["tool_name"] for candidate in claimed] == [tool_name]
+
+
+def test_retry_error_candidate_does_not_recreate_removed_queue(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    state_dir = tmp_path / "state"
+    seed_candidate(state_dir, tool_name="race_tool")
+    queue_db = okf.okf_queue_db_path(state_dir)
+    with sqlite3.connect(queue_db) as conn:
+        conn.execute("UPDATE okf_candidates SET status = 'error'")
+    original_connect = okf.sqlite3.connect
+
+    def remove_before_open(database, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("uri"):
+            queue_db.unlink()
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(okf.sqlite3, "connect", remove_before_open)
+
+    assert not okf.retry_error_candidate(state_dir, tool_name="race_tool")
+    assert not queue_db.exists()
+
+
+def test_retry_error_candidate_rolls_back_migration_if_row_disappears(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    queue_db = okf.okf_queue_db_path(state_dir)
+    with sqlite3.connect(queue_db) as conn:
+        conn.execute(
+            "CREATE TABLE okf_candidates (tool_name TEXT PRIMARY KEY, status TEXT)"
+        )
+        conn.execute("INSERT INTO okf_candidates VALUES ('race_tool', 'error')")
+    before_bytes = queue_db.read_bytes()
+    original_ensure_schema = okf._ensure_schema
+
+    def delete_before_migration(conn, *, commit=True):  # type: ignore[no-untyped-def]
+        conn.execute("DELETE FROM okf_candidates WHERE tool_name = 'race_tool'")
+        original_ensure_schema(conn, commit=commit)
+
+    monkeypatch.setattr(okf, "_ensure_schema", delete_before_migration)
+
+    assert not okf.retry_error_candidate(state_dir, tool_name="race_tool")
+    assert queue_db.read_bytes() == before_bytes
+    with sqlite3.connect(queue_db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(okf_candidates)")}
+        rows = conn.execute("SELECT tool_name, status FROM okf_candidates").fetchall()
+    assert columns == {"tool_name", "status"}
+    assert rows == [("race_tool", "error")]
+
+
+def test_retry_error_candidate_rejects_duplicate_malformed_schema_without_mutation(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    queue_db = okf.okf_queue_db_path(state_dir)
+    with sqlite3.connect(queue_db) as conn:
+        conn.execute("CREATE TABLE okf_candidates (tool_name TEXT, status TEXT)")
+        conn.executemany(
+            "INSERT INTO okf_candidates VALUES (?, 'error')",
+            [("duplicate",), ("duplicate",)],
+        )
+    before_bytes = queue_db.read_bytes()
+
+    with pytest.raises(RuntimeError, match="required tool_name primary key"):
+        okf.retry_error_candidate(state_dir, tool_name="duplicate")
+
+    assert queue_db.read_bytes() == before_bytes
+    with sqlite3.connect(queue_db) as conn:
+        rows = conn.execute("SELECT tool_name, status FROM okf_candidates").fetchall()
+    assert rows == [("duplicate", "error"), ("duplicate", "error")]
+
+
+def test_retry_missing_existing_candidate_does_not_mutate_queue(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    seed_candidate(state_dir, tool_name="other_tool")
+    queue_db = okf.okf_queue_db_path(state_dir)
+    before_bytes = queue_db.read_bytes()
+    before_mtime_ns = queue_db.stat().st_mtime_ns
+
+    assert not okf.retry_error_candidate(state_dir, tool_name="missing_tool")
+    assert queue_db.read_bytes() == before_bytes
+    assert queue_db.stat().st_mtime_ns == before_mtime_ns
+
+
+def test_okf_cli_retry_rejects_non_error_candidate(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    seed_candidate(state_dir, tool_name="knowledge_search")
+    queue_db = okf.okf_queue_db_path(state_dir)
+    before_bytes = queue_db.read_bytes()
+    before_mtime_ns = queue_db.stat().st_mtime_ns
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "retry",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--tool",
+            "knowledge_search",
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 1
+    assert payload["success"] is False
+    assert payload["errors"] == ["candidate is missing or not in terminal error state"]
+    assert queue_db.read_bytes() == before_bytes
+    assert queue_db.stat().st_mtime_ns == before_mtime_ns
+    assert okf.queue_counts(state_dir) == {"pending": 1}
+
+
+def test_okf_cli_retry_missing_candidate_does_not_create_state(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    state_dir = tmp_path / "absent-state"
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "retry",
+            "--state-dir",
+            str(state_dir),
+            "--tool",
+            "missing_tool",
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 1
+    assert payload["success"] is False
+    assert not state_dir.exists()

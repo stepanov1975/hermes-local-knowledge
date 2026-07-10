@@ -9,9 +9,10 @@ from typing import Any, Callable
 
 from . import __version__
 from .models import IndexSettings
+from .okf import index_dirty_tokens
 from .scanners import load_yaml_if_available
 from .schemas import CONFIG_SECTION, ROOT_ENV, STATE_ENV
-from .storage import artifact_type_counts, build_index, index_metadata
+from .storage import artifact_type_counts, build_index, index_build_lock, index_metadata
 
 BuildIndexFn = Callable[[Path, Path, Path, IndexSettings], tuple[list[Any], list[Any]]]
 
@@ -294,6 +295,7 @@ def _ensure_index(
 ) -> tuple[Path, dict[str, Any]]:
     cfg = _runtime_config()
     db_path = cfg.state_dir / "index.sqlite"
+    dirty_tokens = index_dirty_tokens(cfg.state_dir)
     metadata: dict[str, Any] = {
         "plugin_version": __version__,
         "root": str(cfg.source_root),
@@ -305,24 +307,29 @@ def _ensure_index(
         "warnings": list(cfg.warnings),
         "rebuilt": False,
     }
-    if rebuild or not db_path.exists():
-        build = build_index_fn or build_index
-        build_started = time.perf_counter()
-        artifacts, edges = build(
-            cfg.source_root,
-            cfg.state_dir,
-            cfg.hermes_home,
-            cfg.index_settings,
-        )
-        metadata.update(
-            {
-                "rebuilt": True,
-                "build_duration_ms": int((time.perf_counter() - build_started) * 1000),
-                "artifact_count": len(artifacts),
-                "artifact_counts_by_type": artifact_type_counts(artifacts),
-                "edge_count": len(edges),
-            }
-        )
+    if rebuild or not db_path.exists() or dirty_tokens:
+        with index_build_lock(cfg.state_dir):
+            dirty_tokens = index_dirty_tokens(cfg.state_dir)
+            if rebuild or not db_path.exists() or dirty_tokens:
+                build_started = time.perf_counter()
+                build: Any = build_index_fn or build_index
+                artifacts, edges = build(
+                    cfg.source_root,
+                    cfg.state_dir,
+                    cfg.hermes_home,
+                    cfg.index_settings,
+                )
+                metadata.update(
+                    {
+                        "rebuilt": True,
+                        "build_duration_ms": int((time.perf_counter() - build_started) * 1000),
+                        "artifact_count": len(artifacts),
+                        "artifact_counts_by_type": artifact_type_counts(artifacts),
+                        "edge_count": len(edges),
+                    }
+                )
+                for token in dirty_tokens:
+                    token.unlink(missing_ok=True)
     metadata.update(index_metadata(db_path))
     return db_path, metadata
 

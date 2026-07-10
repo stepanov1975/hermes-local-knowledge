@@ -19,7 +19,14 @@ from . import okf
 from .paths import default_output_dir, hermes_home_from_env
 from .runtime import RuntimeConfig, _runtime_config
 from .search import search_index
-from .storage import artifact_type_counts, build_index, get_artifact, get_neighbors, index_metadata
+from .storage import (
+    artifact_type_counts,
+    build_index,
+    get_artifact,
+    get_neighbors,
+    index_build_lock,
+    index_metadata,
+)
 from .telemetry import _record_usage
 
 
@@ -240,7 +247,7 @@ def _add_okf_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     okf_subparsers = okf_parser.add_subparsers(dest="okf_command", required=True)
 
     status_parser = okf_subparsers.add_parser("status", help="show OKF queue status")
-    status_parser.add_argument("--limit", type=int, default=10, help="pending candidate preview limit")
+    status_parser.add_argument("--limit", type=int, default=10, help="candidate preview limit per state")
     add_okf_common_args(status_parser)
 
     claim_parser = okf_subparsers.add_parser("claim", help="claim pending OKF candidates")
@@ -265,6 +272,10 @@ def _add_okf_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     fail_parser.add_argument("--tool", required=True)
     fail_parser.add_argument("--error", required=True)
     add_okf_common_args(fail_parser)
+
+    retry_parser = okf_subparsers.add_parser("retry", help="reset an exhausted OKF candidate for retry")
+    retry_parser.add_argument("--tool", required=True)
+    add_okf_common_args(retry_parser)
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -369,6 +380,33 @@ def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], Runt
         state_dir_source="cli" if args.db is not None else "default",
     )
     return db_path, (), cfg
+
+
+def _build_index_locked(build_index_fn, cfg: RuntimeConfig):  # type: ignore[no-untyped-def]
+    with index_build_lock(cfg.state_dir):
+        return build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
+
+
+def _refresh_default_index_if_dirty(
+    db_path: Path,
+    cfg: RuntimeConfig,
+    *,
+    build_index_fn,
+    explicit_db: bool,
+    configuration_backed: bool,
+) -> bool:  # type: ignore[no-untyped-def]
+    if explicit_db or not configuration_backed:
+        return False
+    default_db_path = (cfg.state_dir / "index.sqlite").resolve()
+    if db_path.resolve() != default_db_path:
+        return False
+    dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
+    if db_path.exists() and not dirty_tokens:
+        return False
+    _build_index_locked(build_index_fn, cfg)
+    for token in dirty_tokens:
+        token.unlink(missing_ok=True)
+    return True
 
 
 def _okf_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
@@ -484,6 +522,7 @@ def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[di
 
 def _okf_status_payload(cfg: RuntimeConfig, *, limit: int) -> dict[str, Any]:
     pending = okf.pending_candidates(cfg.state_dir, limit=max(1, limit), min_use_count=cfg.okf.min_use_count)
+    errors = okf.error_candidates(cfg.state_dir, limit=max(1, limit))
     return {
         "success": True,
         "state_dir": str(cfg.state_dir),
@@ -491,6 +530,7 @@ def _okf_status_payload(cfg: RuntimeConfig, *, limit: int) -> dict[str, Any]:
         "queue_db": str(okf.okf_queue_db_path(cfg.state_dir)),
         "counts": okf.queue_counts(cfg.state_dir),
         "pending": [okf.candidate_packet(row, cfg.state_dir) for row in pending],
+        "errors": [okf.candidate_packet(row, cfg.state_dir) for row in errors],
     }
 
 
@@ -545,6 +585,13 @@ def _handle_okf_command(args: argparse.Namespace) -> int:
             payload["errors"] = ["no claimed candidate was marked failed"]
         _emit_payload(payload, json_output=args.json)
         return 0 if marked else 1
+    if args.okf_command == "retry":
+        retried = okf.retry_error_candidate(cfg.state_dir, tool_name=args.tool)
+        payload = {"success": retried, "tool": args.tool}
+        if not retried:
+            payload["errors"] = ["candidate is missing or not in terminal error state"]
+        _emit_payload(payload, json_output=args.json)
+        return 0 if retried else 1
     return 1
 
 
@@ -625,9 +672,10 @@ def _doctor_payload(
     )
 
     if args.rebuild and not errors:
+        dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
         try:
             build_started = time.perf_counter()
-            artifacts, edges = build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
+            artifacts, edges = _build_index_locked(build_index_fn, cfg)
         except Exception as exc:
             payload["rebuilt"] = False
             check("rebuild_failed", False, f"{type(exc).__name__}: {exc}", fatal=True)
@@ -637,6 +685,8 @@ def _doctor_payload(
             payload["artifact_count"] = len(artifacts)
             payload["artifact_counts_by_type"] = artifact_type_counts(artifacts)
             payload["edge_count"] = len(edges)
+            for token in dirty_tokens:
+                token.unlink(missing_ok=True)
             check("index_exists_after_rebuild", db_path.exists(), str(db_path), fatal=True)
     else:
         payload["rebuilt"] = False
@@ -709,8 +759,9 @@ def main(
         db_path = cfg.state_dir / "index.sqlite"
         started = time.perf_counter()
         _print_warnings(cfg.warnings)
+        dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
         try:
-            artifacts, edges = build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
+            artifacts, edges = _build_index_locked(build_index_fn, cfg)
         except Exception as exc:
             message = f"cli_build failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
@@ -726,6 +777,8 @@ def main(
             )
             raise
         build_duration_ms = int((time.perf_counter() - started) * 1000)
+        for token in dirty_tokens:
+            token.unlink(missing_ok=True)
         counts = artifact_type_counts(artifacts)
         meta = {
             **index_metadata(db_path),
@@ -757,6 +810,13 @@ def main(
         started = time.perf_counter()
         _print_warnings(warnings)
         try:
+            _refresh_default_index_if_dirty(
+                db_path,
+                cfg,
+                build_index_fn=build_index_fn,
+                explicit_db=args.db is not None,
+                configuration_backed=args.from_hermes_config,
+            )
             rows = search_index_fn(db_path, args.query, limit=args.limit)
         except Exception as exc:
             message = f"cli_search failed: {type(exc).__name__}: {exc}"
@@ -796,6 +856,13 @@ def main(
         started = time.perf_counter()
         _print_warnings(warnings)
         try:
+            _refresh_default_index_if_dirty(
+                db_path,
+                cfg,
+                build_index_fn=build_index_fn,
+                explicit_db=args.db is not None,
+                configuration_backed=args.from_hermes_config,
+            )
             row = get_artifact_fn(db_path, args.artifact_id)
         except Exception as exc:
             message = f"cli_get failed: {type(exc).__name__}: {exc}"
@@ -844,6 +911,13 @@ def main(
         started = time.perf_counter()
         _print_warnings(warnings)
         try:
+            _refresh_default_index_if_dirty(
+                db_path,
+                cfg,
+                build_index_fn=build_index_fn,
+                explicit_db=args.db is not None,
+                configuration_backed=args.from_hermes_config,
+            )
             rows = get_neighbors_fn(db_path, args.artifact_id)
         except Exception as exc:
             message = f"cli_neighbors failed: {type(exc).__name__}: {exc}"

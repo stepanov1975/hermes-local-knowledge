@@ -72,7 +72,7 @@ def _classify_result(result: Any) -> tuple[bool, str | None, str | None]:
         return True, None, None
     if not isinstance(parsed, dict):
         return True, None, None
-    if parsed.get("success") is False or "error" in parsed:
+    if parsed.get("success") is False or bool(parsed.get("error")):
         error = parsed.get("error") or parsed.get("message") or "tool_error"
         return False, "tool_error", str(error)
     return True, None, None

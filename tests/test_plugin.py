@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+import threading
+import time
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import hermes_local_knowledge
+import pytest
+from hermes_local_knowledge import cli as lci_cli
 from hermes_local_knowledge import handlers as lci_handlers
+from hermes_local_knowledge import okf
 from hermes_local_knowledge import plugin
+from hermes_local_knowledge import runtime as lci_runtime
+from hermes_local_knowledge import storage as lci_storage
 from hermes_local_knowledge import telemetry as lci_telemetry
 
 
@@ -183,6 +193,535 @@ def test_plugin_rebuild_uses_compatibility_index_module(tmp_path, monkeypatch) -
         f"build:{repo.resolve()}:{state_dir.resolve()}:{hermes_home.resolve()}:True",
         f"search:{state_dir.resolve() / 'index.sqlite'}:demo:8:None",
     ]
+
+
+def test_ensure_index_rebuilds_and_clears_okf_dirty_marker(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "index.sqlite").touch()
+    okf.mark_index_dirty(state_dir)
+    calls: list[str] = []
+
+    def fake_build(root: Path, output_dir: Path, home: Path, settings):  # type: ignore[no-untyped-def]
+        calls.append(f"build:{root}:{output_dir}:{home}:{settings is not None}")
+        return [], []
+
+    db_path, metadata = lci_runtime._ensure_index(repo, build_index_fn=fake_build)
+
+    assert db_path == state_dir.resolve() / "index.sqlite"
+    assert metadata["rebuilt"] is True
+    assert calls == [f"build:{repo.resolve()}:{state_dir.resolve()}:{hermes_home.resolve()}:True"]
+    assert not okf.index_dirty_tokens(state_dir)
+
+
+def test_ensure_index_preserves_new_dirty_token_created_during_build(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "index.sqlite").touch()
+    okf.mark_index_dirty(state_dir)
+
+    def fake_build(root: Path, output_dir: Path, home: Path, settings):  # type: ignore[no-untyped-def]
+        okf.mark_index_dirty(state_dir)
+        return [], []
+
+    lci_runtime._ensure_index(repo, build_index_fn=fake_build)
+
+    assert len(okf.index_dirty_tokens(state_dir)) == 1
+
+
+def test_ensure_index_preserves_dirty_tokens_when_build_fails(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "index.sqlite").touch()
+    okf.mark_index_dirty(state_dir)
+
+    def failing_build(root: Path, output_dir: Path, home: Path, settings):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated build failure")
+
+    try:
+        lci_runtime._ensure_index(repo, build_index_fn=failing_build)
+    except RuntimeError as exc:
+        assert str(exc) == "simulated build failure"
+    else:
+        raise AssertionError("expected build failure")
+
+    assert len(okf.index_dirty_tokens(state_dir)) == 1
+    assert lci_storage.index_build_lock_path(state_dir).exists()
+    with lci_storage.index_build_lock(state_dir):
+        pass
+
+
+def test_ensure_index_serializes_concurrent_dirty_rebuilds(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "index.sqlite"
+    db_path.write_text("initial", encoding="utf-8")
+    okf.mark_index_dirty(state_dir)
+    a_started = threading.Event()
+    b_started = threading.Event()
+    errors: list[BaseException] = []
+
+    def coordinated_build(root: Path, output_dir: Path, home: Path, settings):  # type: ignore[no-untyped-def]
+        if threading.current_thread().name == "index-build-a":
+            a_started.set()
+            b_started.wait(timeout=0.2)
+            db_path.write_text("stale-without-new-okf", encoding="utf-8")
+        else:
+            b_started.set()
+            db_path.write_text("fresh-with-new-okf", encoding="utf-8")
+        return [], []
+
+    def ensure_index() -> None:
+        try:
+            lci_runtime._ensure_index(repo, build_index_fn=coordinated_build)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=ensure_index, name="index-build-a")
+    thread_a.start()
+    assert a_started.wait(timeout=2)
+    okf.mark_index_dirty(state_dir)
+    thread_b = threading.Thread(target=ensure_index, name="index-build-b")
+    thread_b.start()
+    thread_a.join(timeout=5)
+    thread_b.join(timeout=5)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert errors == []
+    assert db_path.read_text(encoding="utf-8") == "fresh-with-new-okf"
+    assert not okf.index_dirty_tokens(state_dir)
+    assert lci_storage.index_build_lock_path(state_dir).exists()
+
+
+def test_cli_build_cannot_overwrite_newer_native_rebuild(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    db_path = state_dir / "index.sqlite"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_text("initial", encoding="utf-8")
+    cli_started = threading.Event()
+    native_started = threading.Event()
+    statuses: list[int] = []
+    errors: list[BaseException] = []
+
+    def cli_build(*_args):  # type: ignore[no-untyped-def]
+        cli_started.set()
+        native_started.wait(timeout=0.2)
+        db_path.write_text("stale-cli", encoding="utf-8")
+        return [], []
+
+    def native_build(*_args):  # type: ignore[no-untyped-def]
+        native_started.set()
+        db_path.write_text("fresh-native", encoding="utf-8")
+        return [], []
+
+    def run_cli() -> None:
+        try:
+            statuses.append(
+                lci_cli.main(
+                    [
+                        "build",
+                        "--root",
+                        str(repo),
+                        "--output-dir",
+                        str(state_dir),
+                        "--hermes-home",
+                        str(hermes_home),
+                    ],
+                    build_index_fn=cli_build,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def run_native() -> None:
+        try:
+            lci_runtime._ensure_index(repo, build_index_fn=native_build)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    cli_thread = threading.Thread(target=run_cli)
+    cli_thread.start()
+    assert cli_started.wait(timeout=2)
+    okf.mark_index_dirty(state_dir)
+    native_thread = threading.Thread(target=run_native)
+    native_thread.start()
+    cli_thread.join(timeout=3)
+    native_thread.join(timeout=3)
+
+    assert not cli_thread.is_alive()
+    assert not native_thread.is_alive()
+    assert errors == []
+    assert statuses == [0]
+    assert db_path.read_text(encoding="utf-8") == "fresh-native"
+    assert not okf.index_dirty_tokens(state_dir)
+
+
+def test_generic_build_wrapper_does_not_deadlock_cli_or_runtime(tmp_path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    monkeypatch.setattr(lci_storage, "INDEX_BUILD_LOCK_WAIT_SECONDS", 0.1)
+    wrapper_calls: list[Path] = []
+
+    def generic_wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        wrapper_calls.append(Path(args[1]))
+        return lci_storage.build_index(*args, **kwargs)
+
+    status = lci_cli.main(
+        [
+            "build",
+            "--root",
+            str(repo),
+            "--output-dir",
+            str(state_dir),
+            "--hermes-home",
+            str(hermes_home),
+        ],
+        build_index_fn=generic_wrapper,
+    )
+    capsys.readouterr()
+    okf.mark_index_dirty(state_dir)
+    _db_path, metadata = lci_runtime._ensure_index(repo, build_index_fn=generic_wrapper)
+
+    assert status == 0
+    assert metadata["rebuilt"] is True
+    assert wrapper_calls == [state_dir, state_dir]
+    assert not okf.index_dirty_tokens(state_dir)
+
+
+def test_cli_search_refreshes_dirty_default_index(tmp_path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    lci_storage.build_index(repo, state_dir, hermes_home)
+    write(
+        repo / "custom_skills" / "note-taking" / "late-okf-router" / "SKILL.md",
+        """---
+name: late-okf-router
+description: Route newly completed late OKF lookups.
+tags:
+  - completion
+---
+# Late OKF router
+""",
+    )
+    okf.mark_index_dirty(state_dir)
+
+    status = lci_cli.main(
+        [
+            "search",
+            "newly completed late OKF",
+            "--json",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+        ]
+    )
+    rows = json.loads(capsys.readouterr().out)
+
+    assert status == 0
+    assert any(row["id"] == "skill:late-okf-router" for row in rows)
+    assert not okf.index_dirty_tokens(state_dir)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["search", "Paperless review automation", "--json"],
+        ["get", "skill:paperless-review-automation", "--json"],
+        ["neighbors", "skill:paperless-review-automation", "--json"],
+    ],
+)
+def test_cli_unconfigured_default_lookup_never_rebuilds_shared_state(
+    tmp_path: Path, monkeypatch, capsys, command: list[str]
+) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, _state_dir = make_temp_repo(tmp_path)
+    default_state = hermes_home / "local_knowledge"
+    lci_storage.build_index(repo, default_state, hermes_home)
+    okf.mark_index_dirty(default_state)
+    unrelated = tmp_path / "unrelated-cwd"
+    write(
+        unrelated / "custom_skills" / "wrong-source" / "SKILL.md",
+        """---
+name: wrong-source
+description: Artifact from an unrelated current directory.
+---
+# Wrong source
+""",
+    )
+    monkeypatch.chdir(unrelated)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    build_calls: list[str] = []
+
+    def unexpected_build(*_args):  # type: ignore[no-untyped-def]
+        build_calls.append("called")
+        raise AssertionError("unconfigured lookup must not rebuild shared default state")
+
+    status = lci_cli.main(
+        [*command, "--hermes-home", str(hermes_home)],
+        build_index_fn=unexpected_build,
+    )
+    capsys.readouterr()
+
+    assert status == 0
+    assert build_calls == []
+    assert len(okf.index_dirty_tokens(default_state)) == 1
+
+
+def test_cli_explicit_index_sqlite_is_never_auto_rebuilt(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, _state_dir = make_temp_repo(tmp_path)
+    custom_state = tmp_path / "custom-db"
+    db_path = custom_state / "index.sqlite"
+    lci_storage.build_index(repo, custom_state, hermes_home)
+    okf.mark_index_dirty(custom_state)
+    build_calls: list[str] = []
+
+    def unexpected_build(*_args):  # type: ignore[no-untyped-def]
+        build_calls.append("called")
+        raise AssertionError("explicit database must not be rebuilt")
+
+    status = lci_cli.main(
+        [
+            "search",
+            "Paperless review automation",
+            "--json",
+            "--db",
+            str(db_path),
+            "--hermes-home",
+            str(hermes_home),
+        ],
+        build_index_fn=unexpected_build,
+    )
+    rows = json.loads(capsys.readouterr().out)
+
+    assert status == 0
+    assert rows
+    assert build_calls == []
+    assert len(okf.index_dirty_tokens(custom_state)) == 1
+
+
+def test_index_build_lock_serializes_across_processes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    lock_path = lci_storage.index_build_lock_path(state_dir)
+    probe = """
+import fcntl
+import os
+import sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print('blocked')
+else:
+    print('acquired')
+finally:
+    os.close(fd)
+"""
+    with lci_storage.index_build_lock(state_dir):
+        blocked = subprocess.run(
+            [sys.executable, "-c", probe, str(lock_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    acquired = subprocess.run(
+        [sys.executable, "-c", probe, str(lock_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert blocked.stdout.strip() == "blocked"
+    assert acquired.stdout.strip() == "acquired"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_index_build_lock_resets_same_thread_state_after_fork(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(lci_storage, "INDEX_BUILD_LOCK_WAIT_SECONDS", 1.0)
+    read_fd, write_fd = os.pipe()
+    fork = getattr(os, "fork")
+
+    with lci_storage.index_build_lock(state_dir):
+        pid = fork()
+        if pid == 0:  # pragma: no cover - assertions run in the parent
+            os.close(read_fd)
+            started = time.monotonic()
+            try:
+                with lci_storage.index_build_lock(state_dir):
+                    elapsed = time.monotonic() - started
+                child_payload = f"{elapsed:.6f}".encode()
+            except BaseException as exc:
+                child_payload = f"ERROR:{type(exc).__name__}:{exc}".encode()
+            os.write(write_fd, child_payload)
+            os.close(write_fd)
+            os._exit(0)
+        os.close(write_fd)
+        time.sleep(0.2)
+
+    parent_payload = os.read(read_fd, 4096).decode()
+    os.close(read_fd)
+    _waited_pid, status = os.waitpid(pid, 0)
+
+    assert os.WIFEXITED(status)
+    assert not parent_payload.startswith("ERROR:"), parent_payload
+    assert float(parent_payload) >= 0.15
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_index_build_lock_closes_other_thread_descriptor_after_fork(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(lci_storage, "INDEX_BUILD_LOCK_WAIT_SECONDS", 1.0)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def owner() -> None:
+        with lci_storage.index_build_lock(state_dir):
+            entered.set()
+            release.wait(timeout=5)
+
+    owner_thread = threading.Thread(target=owner)
+    owner_thread.start()
+    assert entered.wait(timeout=2)
+    read_fd, write_fd = os.pipe()
+    fork = getattr(os, "fork")
+    pid = fork()
+    if pid == 0:  # pragma: no cover - assertions run in the parent
+        os.close(read_fd)
+        started = time.monotonic()
+        try:
+            with lci_storage.index_build_lock(state_dir):
+                elapsed = time.monotonic() - started
+            payload = f"{elapsed:.6f}".encode()
+        except BaseException as exc:
+            payload = f"ERROR:{type(exc).__name__}:{exc}".encode()
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    time.sleep(0.2)
+    release.set()
+    owner_thread.join(timeout=2)
+    parent_payload = os.read(read_fd, 4096).decode()
+    os.close(read_fd)
+    _waited_pid, status = os.waitpid(pid, 0)
+
+    assert not owner_thread.is_alive()
+    assert os.WIFEXITED(status)
+    assert not parent_payload.startswith("ERROR:"), parent_payload
+    assert float(parent_payload) >= 0.15
+
+
+def test_storage_import_does_not_require_platform_lock_modules() -> None:
+    script = """
+import builtins
+original_import = builtins.__import__
+def blocked_import(name, *args, **kwargs):
+    if name in {'fcntl', 'msvcrt'}:
+        raise ImportError(name)
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = blocked_import
+import hermes_local_knowledge.storage as storage
+assert storage._fcntl is None
+assert storage._msvcrt is None
+print('imported')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "imported"
+
+
+def test_index_build_lock_uses_windows_fallback(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[int] = []
+
+    class FakeMsvcrt:
+        LK_NBLCK = 1
+        LK_UNLCK = 2
+
+        @staticmethod
+        def locking(_fd: int, mode: int, _length: int) -> None:
+            calls.append(mode)
+
+    monkeypatch.setattr(lci_storage, "_fcntl", None)
+    monkeypatch.setattr(lci_storage, "_msvcrt", FakeMsvcrt)
+
+    with lci_storage.index_build_lock(tmp_path / "state"):
+        with lci_storage.index_build_lock(tmp_path / "state"):
+            pass
+
+    assert calls == [FakeMsvcrt.LK_NBLCK, FakeMsvcrt.LK_UNLCK]
+
+
+def test_completed_okf_is_discoverable_on_next_normal_search(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    initial = json.loads(plugin._handle_search({"query": "paperless", "rebuild": True}))
+    assert initial["success"] is True
+
+    tool_name = "mcp__paperless__paperless_find_latest_document"
+    schema = {"type": "object"}
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=tool_name,
+        toolset="paperless",
+        schema=schema,
+        args={},
+    )
+    claimed = okf.claim_candidates(state_dir, limit=1, claim_token="claim-1")
+    assert [row["tool_name"] for row in claimed] == [tool_name]
+    output = okf.okf_file_path(state_dir, tool_name)
+    write(
+        output,
+        f"""---
+artifact_type: tool_okf
+tool: {tool_name}
+toolset: paperless
+schema_hash: {okf.schema_hash(schema)}
+generated_at: '2026-07-10T12:00:00Z'
+aliases:
+  - find newest paperless document
+triggers:
+  - User asks for the latest matching Paperless document metadata.
+---
+
+# Tool OKF: paperless_find_latest_document
+
+Route to this tool for metadata about the newest matching Paperless document.
+""",
+    )
+    assert okf.mark_candidate_done(
+        state_dir,
+        tool_name=tool_name,
+        claim_token="claim-1",
+        okf_path=output,
+    )
+
+    result = json.loads(
+        plugin._handle_search(
+            {
+                "query": "find newest paperless document",
+                "artifact_type": "tool_okf",
+            }
+        )
+    )
+
+    assert result["success"] is True
+    assert result["rebuilt"] is True
+    assert [row["id"] for row in result["results"]] == [
+        "tool_okf:mcp-paperless-paperless-find-latest-document"
+    ]
+    assert not okf.index_dirty_tokens(state_dir)
 
 
 def test_handlers_return_json_errors_for_malformed_args() -> None:

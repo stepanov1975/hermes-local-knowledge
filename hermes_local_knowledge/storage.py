@@ -5,13 +5,159 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 from .models import Artifact, Edge, IndexSettings
+
+try:  # POSIX
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised by the import compatibility test
+    _fcntl = None  # type: ignore[assignment]
+
+try:  # Windows
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - unavailable on POSIX
+    _msvcrt = None  # type: ignore[assignment]
+
+INDEX_BUILD_LOCK_NAME = "index_build.lock"
+INDEX_BUILD_LOCK_WAIT_SECONDS = 120.0
+_INDEX_BUILD_LOCK_STATE = threading.local()
+_INDEX_BUILD_LOCK_FDS: set[int] = set()
+_INDEX_BUILD_LOCK_FDS_MUTEX = threading.Lock()
+
+
+def _before_fork() -> None:
+    _INDEX_BUILD_LOCK_FDS_MUTEX.acquire()
+
+
+def _after_fork_in_parent() -> None:
+    _INDEX_BUILD_LOCK_FDS_MUTEX.release()
+
+
+def _after_fork_in_child() -> None:
+    global _INDEX_BUILD_LOCK_STATE
+    for fd in tuple(_INDEX_BUILD_LOCK_FDS):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _INDEX_BUILD_LOCK_FDS.clear()
+    _INDEX_BUILD_LOCK_STATE = threading.local()
+    _INDEX_BUILD_LOCK_FDS_MUTEX.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_in_parent,
+        after_in_child=_after_fork_in_child,
+    )
+
+
+def index_build_lock_path(output_dir: Path) -> Path:
+    return output_dir.expanduser().resolve() / INDEX_BUILD_LOCK_NAME
+
+
+def _held_index_build_locks() -> dict[str, int]:
+    held = getattr(_INDEX_BUILD_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        setattr(_INDEX_BUILD_LOCK_STATE, "held", held)
+    return held
+
+
+def _open_index_build_lock(path: Path) -> int:
+    with _INDEX_BUILD_LOCK_FDS_MUTEX:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        _INDEX_BUILD_LOCK_FDS.add(fd)
+    if _fcntl is None and os.fstat(fd).st_size < 1:
+        os.write(fd, b"\0")
+        os.fsync(fd)
+    return fd
+
+
+def _close_index_build_lock(fd: int) -> None:
+    with _INDEX_BUILD_LOCK_FDS_MUTEX:
+        if fd not in _INDEX_BUILD_LOCK_FDS:
+            return
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        _INDEX_BUILD_LOCK_FDS.discard(fd)
+
+
+def _try_acquire_index_build_lock(fd: int) -> bool:
+    if _fcntl is not None:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    if _msvcrt is not None:  # pragma: no cover - Windows-only behavior
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        except OSError:
+            return False
+        return True
+    raise RuntimeError("index build locking is unsupported on this platform")
+
+
+def _release_index_build_lock(fd: int) -> None:
+    if fd not in _INDEX_BUILD_LOCK_FDS:
+        return
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        elif _msvcrt is not None:  # pragma: no cover - Windows-only behavior
+            os.lseek(fd, 0, os.SEEK_SET)
+            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+    except OSError:
+        # A fork-child reset may already have closed this inherited descriptor.
+        pass
+
+
+@contextmanager
+def index_build_lock(output_dir: Path) -> Iterator[Path]:
+    lock_path = index_build_lock_path(output_dir)
+    lock_key = str(lock_path)
+    held = _held_index_build_locks()
+    if held.get(lock_key, 0):
+        held[lock_key] += 1
+        try:
+            yield lock_path
+        finally:
+            held[lock_key] -= 1
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = _open_index_build_lock(lock_path)
+    deadline = time.monotonic() + INDEX_BUILD_LOCK_WAIT_SECONDS
+    try:
+        while not _try_acquire_index_build_lock(fd):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for index build lock: {lock_path}")
+            time.sleep(0.05)
+        payload = json.dumps({"pid": os.getpid(), "acquired_at": time.time()}).encode("utf-8")
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload)
+        os.ftruncate(fd, max(1, len(payload)))
+        os.fsync(fd)
+        held[lock_key] = 1
+        try:
+            yield lock_path
+        finally:
+            held.pop(lock_key, None)
+            _release_index_build_lock(fd)
+    finally:
+        _close_index_build_lock(fd)
 
 
 def write_jsonl(path: Path, artifacts: Sequence[Artifact]) -> None:
@@ -142,7 +288,13 @@ def build_index(
     output_dir: Path,
     hermes_home: Path,
     settings: IndexSettings | None = None,
+    *,
+    acquire_lock: bool = True,
 ) -> tuple[list[Artifact], list[Edge]]:
+    if acquire_lock:
+        with index_build_lock(output_dir):
+            return build_index(root, output_dir, hermes_home, settings, acquire_lock=False)
+
     from .scanners import build_edges, collect_artifacts
 
     artifacts = collect_artifacts(root, hermes_home, settings, okf_root=output_dir / "okfs")

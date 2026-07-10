@@ -81,6 +81,7 @@ from .storage import (
     decode_artifact_row,
     get_artifact,
     get_neighbors,
+    index_build_lock,
     write_jsonl,
 )
 from .text_utils import (
@@ -137,6 +138,8 @@ def build_index(
     output_dir: Path,
     hermes_home: Path,
     settings: IndexSettings | None = None,
+    *,
+    acquire_lock: bool = True,
 ) -> tuple[list[Artifact], list[Edge]]:
     """Build an index through the compatibility-module function seams.
 
@@ -145,6 +148,10 @@ def build_index(
     tests/tools that monkeypatch ``indexer.collect_artifacts`` or
     ``indexer.build_edges`` keep working after the module split.
     """
+    if acquire_lock:
+        with index_build_lock(output_dir):
+            return build_index(root, output_dir, hermes_home, settings, acquire_lock=False)
+
     artifacts = _collect_artifacts_compat(root, hermes_home, settings, output_dir / "okfs")
     edges = build_edges(artifacts)
     output_dir.mkdir(parents=True, exist_ok=True)

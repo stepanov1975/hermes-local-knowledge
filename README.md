@@ -20,7 +20,7 @@ Native Hermes tools under the `local_knowledge` toolset:
 | `knowledge_feedback` | Record lookup quality feedback locally. |
 | `knowledge_usage_report` | Summarize usage, zero-result queries, errors, and feedback. |
 
-The plugin also has lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The post-tool hook queues safe structural candidates, and the session-finalize hook can generate a bounded batch through Hermes' host-owned `ctx.llm` interface. Automatic OKF generation is a vital part of the plugin's intended functionality: without it, search still works, but the plugin cannot automatically create the tool-routing knowledge that lets coverage improve from real usage. Completed OKFs are indexed as whole `tool_okf` artifacts on the next normal index rebuild, scheduled rebuild cron, or lookup with `rebuild=true`.
+The plugin also has lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The post-tool hook queues safe structural candidates, and the session-finalize hook can generate a bounded batch through Hermes' host-owned `ctx.llm` interface. Automatic OKF generation is a vital part of the plugin's intended functionality: without it, search still works, but the plugin cannot automatically create the tool-routing knowledge that lets coverage improve from real usage. Completing an OKF marks the index stale so the next normal lookup rebuilds it and makes the new `tool_okf` searchable.
 
 ## Install
 
@@ -234,6 +234,8 @@ The plugin writes:
 <state_dir>/okf_queue.sqlite
 <state_dir>/okfs/tools/*.md
 <state_dir>/okf_generation.lock
+<state_dir>/index_build.lock
+<state_dir>/okf_index_dirty/ (possibly empty)
 ```
 
 These are generated or local-only state. Do not commit them.
@@ -258,9 +260,16 @@ python -m hermes_local_knowledge.cli okf complete --from-hermes-config \
   --json
 ```
 
-Use `python -m hermes_local_knowledge.cli okf fail --from-hermes-config --claim-token <token> --tool <tool> --error <short-redacted-error>` to release a failed manual claim.
+Use `python -m hermes_local_knowledge.cli okf fail --from-hermes-config --claim-token <token> --tool <tool> --error <short-redacted-error>` to release a failed manual claim. Candidates move to terminal `error` state after the retry cap. `okf status` lists those candidates under `errors`; reset one for another bounded generation attempt with:
 
-The validator requires generated OKFs to live under `<state_dir>/okfs/tools`, use `.md`, declare `artifact_type: tool_okf`, match the claimed tool/schema hash/target path, contain useful routing aliases or triggers, and avoid obvious secret assignments. After an OKF is complete, rebuild the index or run a search with `rebuild=true` so the new `tool_okf` artifact is searchable.
+```bash
+python -m hermes_local_knowledge.cli okf retry --from-hermes-config \
+  --tool <tool> --json
+```
+
+`retry` only accepts terminal-error candidates. It clears generation-attempt state but preserves tool usage counters and schema metadata.
+
+The validator requires generated OKFs to live under `<state_dir>/okfs/tools`, use `.md`, declare `artifact_type: tool_okf`, match the claimed tool/schema hash/target path, contain useful routing aliases or triggers, and avoid obvious secret assignments. Completing an OKF adds a token under `okf_index_dirty/`; the next normal native or configuration-backed CLI (`--from-hermes-config`) `search`, `get`, or `neighbors` lookup rebuilds the configured default index and removes only the tokens covered by that successful build. Standalone CLI lookups without `--from-hermes-config` reuse the existing index but never rebuild shared default state or consume its dirty tokens, because their current-directory source has no verified relationship to that index. An explicit CLI `--db` is always treated as caller-owned and is never rebuilt automatically, even when its filename is `index.sqlite`. Tokens added concurrently remain for the following lookup. Every native, CLI, doctor, and compatibility-wrapper index publisher participates in the same reentrant OS advisory lock on `index_build.lock` (`flock` on POSIX and a byte-range lock on Windows), so an older scan cannot overwrite a newer index and consume its dirty tokens. Nested same-thread compatibility wrappers reuse the held lock; other threads and processes wait. POSIX fork children close inherited lock descriptors and clear inherited ownership before continuing. The lock file may remain while idle; the OS releases ownership automatically if a builder exits.
 
 ## Usage-history-informed behavior
 

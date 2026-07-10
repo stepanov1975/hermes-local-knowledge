@@ -113,6 +113,49 @@ def test_post_tool_call_records_candidate_without_result_or_arg_values(tmp_path:
     assert "abc123" not in persisted
 
 
+def test_post_tool_call_treats_null_error_as_success(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _repo, _hermes_home, state_dir = configure(tmp_path, monkeypatch, enabled=True)
+    monkeypatch.setattr(
+        hooks,
+        "_tool_metadata",
+        lambda tool_name: ("terminal", {"type": "object"}),
+    )
+
+    hooks._on_post_tool_call(
+        tool_name="terminal",
+        args={"command": "true"},
+        result=json.dumps({"output": "", "exit_code": 0, "error": None}),
+    )
+
+    rows = okf.pending_candidates(state_dir, limit=1)
+    assert len(rows) == 1
+    assert rows[0]["success_count"] == 1
+    assert rows[0]["error_count"] == 0
+    assert rows[0]["last_error_type"] is None
+
+
+def test_result_classification_preserves_independent_failure_signals() -> None:
+    assert hooks._classify_result(json.dumps({"success": False, "error": None})) == (
+        False,
+        "tool_error",
+        "tool_error",
+    )
+    assert hooks._classify_result(json.dumps({"error": "command failed"})) == (
+        False,
+        "tool_error",
+        "command failed",
+    )
+
+
+def test_success_status_overrides_failing_fallback_payload() -> None:
+    assert hooks._classify_hook_outcome(
+        {
+            "status": "success",
+            "result": json.dumps({"success": False, "error": "stale fallback"}),
+        }
+    ) == (True, None, None)
+
+
 def test_post_tool_call_prefers_hermes_status_fields(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     _repo, _hermes_home, state_dir = configure(tmp_path, monkeypatch, enabled=True)
     monkeypatch.setattr(
