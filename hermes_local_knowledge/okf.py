@@ -333,16 +333,28 @@ def _connect(state_dir: Path) -> sqlite3.Connection:
     state_dir.expanduser().resolve().mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(okf_queue_db_path(state_dir))
     conn.row_factory = sqlite3.Row
-    _ensure_schema(conn)
+    try:
+        _ensure_schema(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
-def _ensure_schema(conn: sqlite3.Connection) -> None:
+def _candidate_table_columns(conn: sqlite3.Connection) -> set[str]:
+    table_info = conn.execute("PRAGMA table_info(okf_candidates)").fetchall()
+    if not table_info:
+        return set()
+    primary_key = [row[1] for row in sorted(table_info, key=lambda row: row[5]) if row[5]]
+    if primary_key != ["tool_name"]:
+        raise RuntimeError("okf_candidates exists without required tool_name primary key")
+    return {row[1] for row in table_info}
+
+
+def _ensure_schema(conn: sqlite3.Connection, *, commit: bool = True) -> None:
     columns_sql = ",\n      ".join(f"{name} {definition}" for name, definition in _COLUMN_DEFINITIONS.items())
     conn.execute(f"CREATE TABLE IF NOT EXISTS okf_candidates (\n      {columns_sql}\n    )")
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(okf_candidates)")}
-    if "tool_name" not in existing:
-        raise RuntimeError("okf_candidates exists without required tool_name primary key")
+    existing = _candidate_table_columns(conn)
     for name in _COLUMN_DEFINITIONS:
         if name not in existing:
             conn.execute(f"ALTER TABLE okf_candidates ADD COLUMN {name} {_MIGRATION_COLUMN_DEFINITIONS[name]}")
@@ -367,7 +379,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 (safe_arg_shape_json, row["tool_name"]),
             )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_okf_candidates_status_seen ON okf_candidates(status, use_count, last_seen)")
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -488,7 +501,27 @@ def retry_error_candidate(state_dir: Path, *, tool_name: str) -> bool:
     db_path = okf_queue_db_path(state_dir)
     if not db_path.is_file():
         return False
-    with sqlite3.connect(db_path) as conn:
+    try:
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=rw", uri=True)
+    except sqlite3.OperationalError:
+        if not db_path.is_file():
+            return False
+        raise
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = _candidate_table_columns(conn)
+        if not {"tool_name", "status"} <= existing:
+            conn.rollback()
+            return False
+        row = conn.execute(
+            "SELECT status FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone()
+        if row is None or row["status"] != "error":
+            conn.rollback()
+            return False
+        _ensure_schema(conn, commit=False)
         cursor = conn.execute(
             """
             UPDATE okf_candidates
@@ -498,7 +531,16 @@ def retry_error_candidate(state_dir: Path, *, tool_name: str) -> bool:
             """,
             (tool_name,),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def claim_candidates(
