@@ -20,7 +20,7 @@ Native Hermes tools under the `local_knowledge` toolset:
 | `knowledge_feedback` | Record lookup quality feedback locally. |
 | `knowledge_usage_report` | Summarize usage, zero-result queries, errors, and feedback. |
 
-The plugin also has optional lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The post-tool hook queues safe structural candidates, and the session-finalize hook can optionally generate a bounded batch through Hermes' host-owned `ctx.llm` interface. Completed OKFs are indexed as whole `tool_okf` artifacts on the next normal index rebuild, scheduled rebuild cron, or lookup with `rebuild=true`.
+The plugin also has lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The post-tool hook queues safe structural candidates, and the session-finalize hook can generate a bounded batch through Hermes' host-owned `ctx.llm` interface. Automatic OKF generation is a vital part of the plugin's intended functionality: without it, search still works, but the plugin cannot automatically create the tool-routing knowledge that lets coverage improve from real usage. Completed OKFs are indexed as whole `tool_okf` artifacts on the next normal index rebuild, scheduled rebuild cron, or lookup with `rebuild=true`.
 
 ## Install
 
@@ -35,6 +35,22 @@ SSH also works when your host has GitHub SSH keys configured:
 ```bash
 hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --enable
 ```
+
+### Required installer conversation: automatic OKF generation
+
+Automatic OKF generation is a vital part of this plugin, but it is an explicit opt-in because it invokes the active model and consumes additional tokens. An AI agent performing an installation **must not declare the installation complete** until it has done all of the following:
+
+1. Explain that functionality is degraded while `local_knowledge.okf.auto_generate` is disabled: lookup of existing artifacts still works, but the plugin will not automatically turn real tool usage into new tool-routing OKFs.
+2. Explain that enabling it makes one bounded model call at session finalization, processes at most the configured candidate limit, and may extend finalization by up to `max_generation_seconds`.
+3. Ask the user explicitly: **"Enable automatic OKF generation now? (Recommended; uses additional model tokens.)"**
+4. Only after the user agrees, run:
+
+   ```bash
+   hermes config set local_knowledge.okf.enabled true
+   hermes config set local_knowledge.okf.auto_generate true
+   ```
+
+If it is already enabled, report that fact instead of asking again. If the user declines, leave it disabled and clearly report that the installation is operating in degraded/manual-OKF mode.
 
 ### Install the routing skill
 
@@ -144,7 +160,7 @@ local_knowledge:
 
 `source_root` is the high-signal directory being indexed. `state_dir` is generated local state and should not be committed. `exclude_dir_names` adds extra directory names to the built-in skip list (`.archive`, `worktrees`, `.worktrees`, `.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.mypy_cache`, `.pytest_cache`, `htmlcov`, `logs`). Use YAML lists in `config.yaml`; when using `hermes config set` from the shell, comma-separated strings or bracket-list strings are accepted and normalized by the plugin.
 
-`local_knowledge.okf.enabled` controls whether the plugin records safe, structural tool-use candidates. Full functionality, including automatic tool-OKF generation, requires `local_knowledge.okf.auto_generate: true` in Hermes config. The runtime default remains intentionally `false` so installation does not silently consume model tokens. Before enabling automatic generation, an installer—especially an AI agent performing the installation—must warn the user that it invokes the active model at session finalization, consumes additional tokens, and can delay finalization by up to `max_generation_seconds`. If the user does not want that additional usage, leave `auto_generate` disabled; the core knowledge tools and manual OKF workflow remain available, but automatic generation will not run.
+`local_knowledge.okf.enabled` controls whether the plugin records safe, structural tool-use candidates. Full functionality requires `local_knowledge.okf.auto_generate: true` in Hermes config. With it disabled, lookup of existing artifacts still works, but the plugin is degraded because it cannot automatically create new tool-routing OKFs from real usage. The runtime default remains intentionally `false` so installation does not silently consume model tokens. The installer must follow the explicit disclosure-and-consent conversation in the Install section before changing it. If the user declines, leave `auto_generate` disabled and report that the installation is operating in degraded/manual-OKF mode.
 
 When enabled, `on_session_finalize` claims at most `max_candidates_per_session` candidates and makes one bounded `ctx.llm.complete_structured` call with `max_generation_seconds` as its timeout. The plugin renders and validates the files itself; the model never receives terminal or file tools. The post-tool hook uses Hermes' canonical outcome fields and does not persist raw session transcripts, raw tool outputs, argument values, emails, OCR text, or private documents.
 
@@ -256,7 +272,7 @@ This standalone shape keeps the lessons from the initial deployment:
 - feedback and zero-result telemetry stays local and is summarized by `knowledge_usage_report` before changing ranking or source coverage;
 - `knowledge_usage_report` separates live-root, pytest/probe, and other telemetry, suppresses resolved zero-result/negative-feedback candidates, and buckets legacy feedback ratings;
 - both native tools and standalone CLI lookups write local usage events with plugin version, config source, index age/mtime, artifact counts by type, and build duration when a build occurs.
-- optional OKF hooks record safe structural tool-use candidates and can generate a bounded batch through `ctx.llm` at session finalization when `local_knowledge.okf.auto_generate` is enabled.
+- OKF hooks record safe structural tool-use candidates and generate a bounded batch through `ctx.llm` at session finalization when the explicitly consented `local_knowledge.okf.auto_generate` setting is enabled.
 
 ## CLI use
 
@@ -315,7 +331,7 @@ hermes local-knowledge doctor --json
 hermes local-knowledge doctor --rebuild --query 'backup runbook'
 ```
 
-`doctor` reports nonfatal warnings when the proactive router skill is missing or differs from the bundled version, and when automatic OKF generation is disabled. This lets an installer agent distinguish a valid minimal installation from the full-function configuration without silently changing user settings.
+`doctor` reports nonfatal warnings when the proactive router skill is missing or differs from the bundled version, and when automatic OKF generation is disabled. An installer agent must treat the latter as degraded/manual-OKF mode, explain the impact and bounded model cost, and ask for consent as specified in the Install section before declaring setup complete.
 
 When running directly from an uninstalled source checkout, replace `hermes local-knowledge` with `python -m hermes_local_knowledge.cli`.
 

@@ -6,6 +6,25 @@ Enable the plugin if you did not pass `--enable`:
 hermes plugins enable local_knowledge
 ```
 
+## Required installer conversation: automatic OKF generation
+
+Automatic OKF generation is a **vital part of the plugin's intended functionality**. The plugin can still search existing artifacts when it is disabled, but functionality is degraded: real tool usage is queued without being automatically converted into new tool-routing OKFs, so coverage does not improve automatically.
+
+It remains an explicit opt-in because generation invokes the active model at session finalization, consumes additional tokens, and may extend finalization by up to the configured `max_generation_seconds` timeout. An AI agent performing the installation **must not declare the installation complete** until it has:
+
+1. explained the degraded behavior when automatic generation is off;
+2. disclosed the bounded model-token and finalization-time cost; and
+3. asked the user explicitly: **"Enable automatic OKF generation now? (Recommended; uses additional model tokens.)"**
+
+Only after the user agrees, enable it:
+
+```bash
+hermes config set local_knowledge.okf.enabled true
+hermes config set local_knowledge.okf.auto_generate true
+```
+
+If it is already enabled, report that fact instead of asking again. If the user declines, leave it disabled and clearly report that the installation is operating in degraded/manual-OKF mode.
+
 Install the routing skill too. The plugin registers the `knowledge_*` tools, but a normal installed skill tells Hermes when to use them proactively for local runbooks, scripts, cron jobs, MCP wrappers, and custom skills:
 
 ```bash
@@ -35,7 +54,7 @@ local_knowledge:
     auto_generate: true                                      # full automatic OKF functionality; uses model tokens
 ```
 
-Full functionality includes automatic tool-OKF generation and therefore requires `local_knowledge.okf.auto_generate: true`. The runtime default is intentionally `false` so installation does not silently consume model tokens. Before enabling it, an installer—especially an AI agent performing the installation—must warn the user that automatic generation invokes the active model at session finalization, consumes additional tokens, and can delay finalization by up to the configured generation timeout. If the user does not want that additional usage, leave `auto_generate` disabled; the core knowledge tools and manual OKF workflow remain available, but automatic generation will not run.
+Full functionality requires `local_knowledge.okf.auto_generate: true`. The runtime default is intentionally `false` so installation does not silently consume model tokens. The installer must follow the required disclosure-and-consent conversation above before changing it. If the user declines, existing-artifact lookup and the manual OKF workflow remain available, but the installation must be reported as degraded/manual-OKF mode because it will not automatically create new tool-routing knowledge from real usage.
 
 CLI-safe equivalent. `hermes config set` stores scalar strings; the plugin accepts comma-separated values for list-like settings:
 
