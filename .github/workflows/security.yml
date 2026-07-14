@@ -84,16 +84,23 @@ jobs:
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import glob
+          import os
           import tomllib
           from pathlib import Path
 
-          present = bool(glob.glob("requirements*.txt"))
+          requirements_present = bool(glob.glob("requirements*.txt"))
+          dependencies = []
           pyproject = Path("pyproject.toml")
           if pyproject.exists():
               data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
               project = data.get("project", {})
-              present = present or bool(project.get("dependencies"))
-              present = present or bool(project.get("optional-dependencies"))
+              dependencies.extend(project.get("dependencies", []))
+              for group in project.get("optional-dependencies", {}).values():
+                  dependencies.extend(group)
+
+          dependency_file = Path(os.environ["RUNNER_TEMP"]) / "project-dependencies.txt"
+          dependency_file.write_text("\n".join(dependencies), encoding="utf-8")
+          present = requirements_present or bool(dependencies)
           print(f"present={str(present).lower()}")
           PY
 
@@ -101,13 +108,15 @@ jobs:
         if: steps.python-deps.outputs.present == 'true'
         run: |
           set -euo pipefail
+          # Audit project manifests explicitly. The ambient environment also
+          # contains the security scanners and is not the project's dependency set.
           if compgen -G 'requirements*.txt' > /dev/null; then
             for requirements_file in requirements*.txt; do
               pip-audit --progress-spinner off -r "${requirements_file}"
             done
-          else
-            python -m pip install -e '.[test]'
-            pip-audit --progress-spinner off
+          fi
+          if [[ -s "${RUNNER_TEMP}/project-dependencies.txt" ]]; then
+            pip-audit --progress-spinner off -r "${RUNNER_TEMP}/project-dependencies.txt"
           fi
 
   shellcheck:
