@@ -8,7 +8,6 @@ This repository uses lightweight GitHub hygiene suitable for a public reusable H
 | --- | --- |
 | `.github/workflows/ci.yml` | Runs tests and Ruff on Python 3.11 and 3.12. |
 | `.github/workflows/security.yml` | Runs Gitleaks, actionlint, Semgrep, zizmor, ShellCheck, and gated pip-audit. |
-| `.github/workflows/codeql.yml` | Runs GitHub CodeQL for Python after the repository is public. The job is skipped while the repository is private. |
 | `.github/dependabot.yml` | Weekly dependency/update checks for GitHub Actions and Python packaging metadata, with a 7-day cooldown. |
 | `.gitleaks.toml` | Secret scanner config with narrow placeholder allowlist. |
 | `.semgrepignore` | Excludes caches/build output from Semgrep scans. |
@@ -52,12 +51,13 @@ Recommended settings:
    - Enable Secret scanning.
    - Enable Push protection.
    - Enable Private vulnerability reporting if available.
+   - Enable GitHub CodeQL default setup for both Python and GitHub Actions.
 2. **Settings → Actions → General**
    - Allow GitHub Actions to run.
-   - Keep workflow permissions read-only unless a workflow explicitly needs writes. CodeQL needs `security-events: write` in its own workflow.
+   - Keep workflow permissions read-only unless a workflow explicitly needs writes.
 3. **Settings → Branches / Rulesets**
    - Protect `main` or add a ruleset requiring pull requests and passing CI before merge.
-   - Recommended required checks after the first public run: `Python 3.11`, `Python 3.12`, `Gitleaks`, `actionlint`, `Python static/security checks`, `ShellCheck`, and `CodeQL Python` if CodeQL is active.
+   - Recommended required checks after the first public run: `Python 3.11`, `Python 3.12`, `Gitleaks`, `actionlint`, `Python static/security checks`, `ShellCheck`, `Analyze (python)`, and `Analyze (actions)`.
 4. **Settings → General**
    - Delete head branches after merge.
    - Keep wiki and projects disabled unless project documentation actually moves there.
@@ -66,4 +66,5 @@ Recommended settings:
 
 - The security workflow intentionally uses pinned action SHAs and pinned Docker image digests. When Dependabot opens an update PR for actions or scanner config, review both the human-readable version and the pinned SHA/digest before merging.
 - GitHub-native Secret scanning and Push protection are separate from CI-based Gitleaks/Semgrep scanning. Confirm both after the visibility change.
+- CodeQL uses GitHub's default setup rather than a checked-in advanced workflow, avoiding duplicate configurations while keeping Python and GitHub Actions analysis active.
 - Public repositories receive GitHub code security features that may not be available while the repository is private on a free plan.
