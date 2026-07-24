@@ -1,0 +1,144 @@
+name: Automated release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out verified commit
+        # actions/checkout v7.0.0
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        # actions/setup-python v6.3.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.11"
+
+      - name: Determine whether a release is needed
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          version=$(python - <<'PY'
+          import pathlib
+          import re
+          import tomllib
+
+          root = pathlib.Path(".")
+          project_version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+          plugin_match = re.search(
+              r"(?m)^version:\s*['\"]?([^\s'\"]+)",
+              (root / "plugin.yaml").read_text(),
+          )
+          package_match = re.search(
+              r"(?m)^__version__\s*=\s*['\"]([^'\"]+)",
+              (root / "hermes_local_knowledge/__init__.py").read_text(),
+          )
+          if plugin_match is None or package_match is None:
+              raise SystemExit("Could not read all version metadata")
+          versions = {project_version, plugin_match.group(1), package_match.group(1)}
+          if len(versions) != 1:
+              raise SystemExit(f"Version metadata is not synchronized: {sorted(versions)}")
+          print(project_version)
+          PY
+          )
+          tag="v${version}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists; nothing to publish."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            git fetch --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
+            tag_sha=$(git rev-list -n 1 "$tag")
+            if [[ "$tag_sha" != "$HEAD_SHA" ]]; then
+              echo "Tag ${tag} points to ${tag_sha}, not verified commit ${HEAD_SHA}." >&2
+              exit 1
+            fi
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and verify release artifacts
+        if: steps.release.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip build twine
+          python -m build --outdir dist
+          python -m twine check dist/*
+          python -m venv /tmp/release-smoke
+          /tmp/release-smoke/bin/python -m pip install dist/*.whl
+          /tmp/release-smoke/bin/python - <<'PY'
+          import importlib.metadata as metadata
+
+          entries = [
+              entry
+              for entry in metadata.entry_points().select(group="hermes_agent.plugins")
+              if entry.name == "local_knowledge"
+          ]
+          if len(entries) != 1:
+              raise SystemExit(f"Expected one local_knowledge entry point, found {entries!r}")
+          module = entries[0].load()
+          if not callable(getattr(module, "register", None)):
+              raise SystemExit("Plugin register entry point is not callable")
+          PY
+
+      - name: Create GitHub release from existing tag
+        if: >-
+          steps.release.outputs.needed == 'true' &&
+          steps.release.outputs.tag_exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release create "${{ steps.release.outputs.tag }}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "${{ steps.release.outputs.tag }}" \
+            --generate-notes; then
+            gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null
+            echo "Another run created the release first."
+          fi
+
+      - name: Create tag and GitHub release
+        if: >-
+          steps.release.outputs.needed == 'true' &&
+          steps.release.outputs.tag_exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if ! gh release create "${{ steps.release.outputs.tag }}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$HEAD_SHA" \
+            --title "${{ steps.release.outputs.tag }}" \
+            --generate-notes; then
+            gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null
+            echo "Another run created the release first."
+          fi

@@ -23,6 +23,12 @@ git diff --check
 
 The package has no runtime dependencies beyond the Python standard library. Test dependencies are intentionally small.
 
+## Release process
+
+Release-relevant changes must bump the synchronized version metadata described below. After a push to `main` passes the `CI` workflow, `.github/workflows/release.yml` compares that version with existing GitHub releases. For a new version it builds and checks a fresh wheel and source distribution, verifies the installed Hermes plugin entry point, and creates the matching `v<version>` tag and GitHub release with both artifacts.
+
+Re-running CI for an already released version is safe: the release workflow detects the existing release and exits without changing it. If a matching tag exists without a release, the workflow only uses it when it points to the exact commit that passed CI.
+
 ## Pull request expectations
 
 A good pull request includes:
