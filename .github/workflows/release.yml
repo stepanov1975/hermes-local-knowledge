@@ -1,20 +1,13 @@
 name: Automated release
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
+  workflow_call:
 
 permissions:
   contents: write
 
 jobs:
   release:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
 
     steps:
@@ -22,7 +15,7 @@ jobs:
         # actions/checkout v7.0.0
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -36,7 +29,7 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           version=$(python - <<'PY'
@@ -114,14 +107,15 @@ jobs:
           steps.release.outputs.tag_exists == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          if ! gh release create "${{ steps.release.outputs.tag }}" dist/* \
+          if ! gh release create "$RELEASE_TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "${{ steps.release.outputs.tag }}" \
+            --title "$RELEASE_TAG" \
             --generate-notes; then
-            gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
             echo "Another run created the release first."
           fi
 
@@ -131,14 +125,15 @@ jobs:
           steps.release.outputs.tag_exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          if ! gh release create "${{ steps.release.outputs.tag }}" dist/* \
+          if ! gh release create "$RELEASE_TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$HEAD_SHA" \
-            --title "${{ steps.release.outputs.tag }}" \
+            --title "$RELEASE_TAG" \
             --generate-notes; then
-            gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
             echo "Another run created the release first."
           fi

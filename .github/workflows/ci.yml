@@ -53,3 +53,11 @@ jobs:
 
       - name: Run mypy
         run: python -m mypy
+
+  release:
+    name: Publish new version
+    needs: tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
