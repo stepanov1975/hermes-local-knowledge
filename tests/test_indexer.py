@@ -1572,6 +1572,48 @@ Find the newest matching Paperless document metadata without downloading the fil
     assert results[0]["id"] == "tool_okf:mcp-paperless-paperless-find-latest-document"
 
 
+def test_tool_okf_negative_metadata_is_not_positive_search_text(tmp_path: Path) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    write(
+        output_dir / "okfs" / "tools" / "cronjob.md",
+        """---
+artifact_type: tool_okf
+tool: cronjob
+toolset: cron
+schema_hash: sha256:abc123
+generator_version: '2'
+title: Manage scheduled jobs
+aliases:
+  - recurring task scheduler
+triggers:
+  - create or update a scheduled job
+when_not_to_use:
+  - retrieve a Paperless document
+related_tools:
+  - mcp__paperless__paperless_get_document
+---
+
+# Manage scheduled jobs
+
+Create, update, pause, resume, or remove recurring scheduled jobs.
+""",
+    )
+
+    artifacts, _edges = lci.build_index(root, output_dir, hermes_home)
+    cron = next(artifact for artifact in artifacts if artifact.id == "tool_okf:cronjob")
+    assert "paperless" not in cron.triggers
+    assert "Paperless" not in cron.entities
+    assert cron.related == ["tool_okf:mcp-paperless-paperless-get-document"]
+
+    db_path = output_dir / "index.sqlite"
+    negative_results = lci.search_index(db_path, "retrieve Paperless document", limit=10, artifact_type="tool_okf")
+    positive_results = lci.search_index(db_path, "create scheduled job", limit=10, artifact_type="tool_okf")
+
+    assert "tool_okf:cronjob" not in [row["id"] for row in negative_results]
+    assert positive_results[0]["id"] == "tool_okf:cronjob"
+
+
 def test_missing_okf_dir_is_noop(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"
@@ -2246,6 +2288,124 @@ def test_cli_search_from_hermes_config_uses_configured_state_dir(tmp_path: Path,
     rows = json.loads(capsys.readouterr().out)
 
     assert any(row["id"] == "skill:paperless-review-automation" for row in rows)
+
+
+@pytest.mark.parametrize("index_state", ["missing", "v0", "corrupt"])
+@pytest.mark.parametrize("lookup", ["search", "get", "neighbors"])
+def test_cli_lookups_from_hermes_config_rebuild_noncurrent_default_index_in_isolation(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    index_state: str,
+    lookup: str,
+) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+""",
+    )
+    write(
+        state_dir / "okfs" / "tools" / "cronjob.md",
+        """---
+artifact_type: tool_okf
+tool: cronjob
+toolset: cron
+schema_hash: sha256:abc123
+aliases:
+  - recurring task scheduler
+triggers:
+  - create or update a scheduled job
+when_not_to_use:
+  - retrieve a Paperless document
+related_tools:
+  - mcp__paperless__paperless_get_document
+---
+
+# Manage scheduled jobs
+
+Create, update, pause, resume, or remove recurring scheduled jobs.
+""",
+    )
+    db_path = state_dir / "index.sqlite"
+    if index_state == "v0":
+        stale = lci.Artifact(
+            id="tool_okf:stale-only",
+            type="tool_okf",
+            title="Stale only",
+            path="okfs/tools/stale-only.md",
+            summary="Stale only",
+            triggers=["stale only"],
+            search_text="stale only",
+        )
+        lci_storage.build_sqlite(db_path, [stale], [])
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("PRAGMA user_version = 0")
+    elif index_state == "corrupt":
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+    command = {
+        "search": ["search", "paperless review"],
+        "get": ["get", "skill:paperless-review-automation"],
+        "neighbors": ["neighbors", "cron:paperless-reviewer"],
+    }[lookup]
+    command.extend(
+        [
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--json",
+        ]
+    )
+
+    assert lci_cli.main(command) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert lci_storage.index_format_version(db_path) == lci_storage.INDEX_FORMAT_VERSION
+    if lookup == "search":
+        assert any(row["id"] == "skill:paperless-review-automation" for row in payload)
+        assert all(row["id"] != "tool_okf:cronjob" for row in payload)
+    elif lookup == "get":
+        assert payload["id"] == "skill:paperless-review-automation"
+    else:
+        assert any(row["id"] == "skill:paperless-review-automation" for row in payload)
+
+
+def test_cli_search_explicit_db_remains_caller_owned(tmp_path: Path, monkeypatch) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    configured_state = tmp_path / "configured_state"
+    caller_db = tmp_path / "caller" / "index.sqlite"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {configured_state}
+""",
+    )
+    write(caller_db, "not a sqlite database")
+
+    with pytest.raises(sqlite3.DatabaseError):
+        lci_cli.main(
+            [
+                "search",
+                "paperless",
+                "--from-hermes-config",
+                "--hermes-home",
+                str(hermes_home),
+                "--db",
+                str(caller_db),
+            ]
+        )
+
+    assert caller_db.read_text(encoding="utf-8") == "not a sqlite database"
+    assert not (configured_state / "index.sqlite").exists()
 
 
 def test_cli_commands_record_usage_telemetry_from_config(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]

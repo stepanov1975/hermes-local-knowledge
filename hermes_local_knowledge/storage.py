@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - unavailable on POSIX
 
 INDEX_BUILD_LOCK_NAME = "index_build.lock"
 INDEX_BUILD_LOCK_WAIT_SECONDS = 120.0
+INDEX_FORMAT_VERSION = 1
 _INDEX_BUILD_LOCK_STATE = threading.local()
 _INDEX_BUILD_LOCK_FDS: set[int] = set()
 _INDEX_BUILD_LOCK_FDS_MUTEX = threading.Lock()
@@ -273,6 +274,7 @@ def build_sqlite(path: Path, artifacts: Sequence[Artifact], edges: Sequence[Edge
             "INSERT INTO edges (source, target, kind, evidence) VALUES (?, ?, ?, ?)",
             [(edge.source, edge.target, edge.kind, edge.evidence) for edge in edges],
         )
+        conn.execute(f"PRAGMA user_version = {INDEX_FORMAT_VERSION}")
         conn.commit()
         conn.close()
         os.replace(temp_path, path)
@@ -348,6 +350,8 @@ def index_metadata(db_path: Path) -> dict[str, Any]:
             }
             artifact_count = sum(counts.values())
             edge_count = int(conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0])
+            format_row = conn.execute("PRAGMA user_version").fetchone()
+            format_version = int(format_row[0]) if format_row is not None else None
         finally:
             conn.close()
     except Exception as exc:
@@ -358,6 +362,7 @@ def index_metadata(db_path: Path) -> dict[str, Any]:
                 "artifact_count": artifact_count,
                 "artifact_counts_by_type": dict(sorted(counts.items())),
                 "edge_count": edge_count,
+                "index_format_version": format_version,
             }
         )
     return metadata
@@ -367,6 +372,25 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def index_format_version(db_path: Path) -> int | None:
+    if not db_path.is_file():
+        return None
+    try:
+        conn = connect_readonly(db_path)
+        try:
+            row = conn.execute("PRAGMA user_version").fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return None
+    return int(row[0]) if row is not None else None
+
+
+def index_needs_rebuild(db_path: Path) -> bool:
+    return not db_path.is_file() or index_format_version(db_path) != INDEX_FORMAT_VERSION
+
 
 def decode_artifact_row(row: sqlite3.Row) -> dict[str, Any]:
     output = dict(row)

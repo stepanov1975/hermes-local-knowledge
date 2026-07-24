@@ -221,7 +221,7 @@ def test_session_finalize_generates_bounded_okf_with_host_llm(tmp_path: Path, mo
                             "aliases": ["search local operational knowledge"],
                             "triggers": ["find the right local artifact"],
                             "when_not_to_use": ["when the user already supplied the exact artifact"],
-                            "related_tools": ["knowledge_get"],
+                            "related_tools": [],
                             "body": "Use this tool to route a local question to the most relevant whole artifact.",
                         }
                     ]
@@ -233,12 +233,62 @@ def test_session_finalize_generates_bounded_okf_with_host_llm(tmp_path: Path, mo
     call = calls[0]
     assert call["timeout"] == 120
     assert call["purpose"] == "local_knowledge.okf_generation"
+    assert "Treat each candidate independently" in call["instructions"]
+    assert "merely because it appears in the same batch" in call["instructions"]
+    assert "Leave when_not_to_use empty" in call["instructions"]
+    assert "allowed_related_tools" in call["instructions"]
     assert "private customer text" not in json.dumps(call)
+    packet = json.loads(call["input"][0]["text"])["candidates"][0]
+    assert set(packet) == {"tool", "toolset", "schema_hash", "schema", "allowed_related_tools", "arg_shape"}
+    assert packet["allowed_related_tools"] == []
     assert okf.queue_counts(state_dir) == {"done": 1}
     output = okf.okf_file_path(state_dir, "knowledge_search")
     assert output.exists()
-    assert "artifact_type: tool_okf" in output.read_text(encoding="utf-8")
+    rendered = output.read_text(encoding="utf-8")
+    assert "artifact_type: tool_okf" in rendered
+    assert 'toolset: "local_knowledge"' in rendered
+    assert f'generator_version: "{okf.OKF_GENERATOR_VERSION}"' in rendered
     assert not okf.generation_lock_path(state_dir).exists()
+
+
+def test_session_finalize_rejects_cross_batch_related_tools(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _repo, _hermes_home, state_dir = configure(tmp_path, monkeypatch, enabled=True, auto_generate=True)
+    schema = {"type": "object"}
+    for tool_name, toolset in (("cronjob", "cron"), ("paperless_get_document", "paperless")):
+        okf.upsert_tool_candidate(
+            state_dir,
+            tool_name=tool_name,
+            toolset=toolset,
+            schema=schema,
+            args={},
+        )
+
+    class CrossLinkLlm:
+        def complete_structured(self, **kwargs):  # type: ignore[no-untyped-def]
+            packets = json.loads(kwargs["input"][0]["text"])["candidates"]
+            other = {packets[0]["tool"]: packets[1]["tool"], packets[1]["tool"]: packets[0]["tool"]}
+            return SimpleNamespace(
+                parsed={
+                    "okfs": [
+                        {
+                            "tool": packet["tool"],
+                            "schema_hash": packet["schema_hash"],
+                            "title": f"Tool OKF: {packet['tool']}",
+                            "aliases": [f"route requests through {packet['tool']}"],
+                            "triggers": [f"use {packet['tool']} for this operation"],
+                            "when_not_to_use": [],
+                            "related_tools": [other[packet["tool"]]],
+                            "body": f"Use {packet['tool']} for its matching operation.",
+                        }
+                        for packet in packets
+                    ]
+                }
+            )
+
+    assert hooks._on_session_finalize(llm=CrossLinkLlm(), session_id="s", platform="cli") is False
+    assert okf.queue_counts(state_dir) == {"pending": 2}
+    assert not okf.okf_file_path(state_dir, "cronjob").exists()
+    assert not okf.okf_file_path(state_dir, "paperless_get_document").exists()
 
 
 def test_session_finalize_releases_claims_when_host_llm_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

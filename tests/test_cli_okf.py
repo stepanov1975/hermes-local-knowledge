@@ -69,10 +69,13 @@ artifact_type: tool_okf
 tool: {tool_name}
 toolset: paperless
 schema_hash: {schema_hash}
+generator_version: {okf.OKF_GENERATOR_VERSION}
 aliases:
   - latest paperless document metadata
 triggers:
   - User asks for newest matching Paperless document metadata.
+when_not_to_use:
+related_tools:
 ---
 
 # Tool OKF: {tool_name}
@@ -240,6 +243,41 @@ aliases:
     error_list = payload["errors"]
     assert isinstance(error_list, list)
     assert any("specific multi-word routing phrase" in str(error) for error in error_list)
+
+
+def test_okf_cli_validate_rejects_transient_and_generic_negative_guidance(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    hermes_home, state_dir = configure_hermes_home(tmp_path)
+    seed_candidate(state_dir)
+    claimed = okf.claim_candidates(state_dir, limit=1, claim_token="claim-noise")
+    tool_name = str(claimed[0]["tool_name"])
+    target_path = okf.okf_file_path(state_dir, tool_name)
+    content = okf_markdown(tool_name, str(claimed[0]["schema_hash"]))
+    content = content.replace("when_not_to_use:\n", "when_not_to_use:\n  - do not send credentials\n")
+    content += "\nObserved counters: use_count 4, error_count 1.\n"
+    write(target_path, content)
+
+    status = lci_cli.main(
+        [
+            "okf",
+            "validate",
+            "--from-hermes-config",
+            "--hermes-home",
+            str(hermes_home),
+            "--claim-token",
+            "claim-noise",
+            "--path",
+            str(target_path),
+            "--json",
+        ]
+    )
+    payload = load_stdout_json(capsys)
+
+    assert status == 1
+    error_list = payload["errors"]
+    assert isinstance(error_list, list)
+    errors = "\n".join(str(error) for error in error_list)
+    assert "generic privacy or credential guidance" in errors
+    assert "runtime counters" in errors
 
 
 def test_okf_cli_fail_requeues_until_max_attempts(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]

@@ -20,6 +20,7 @@ from hermes_local_knowledge import plugin
 from hermes_local_knowledge import runtime as lci_runtime
 from hermes_local_knowledge import storage as lci_storage
 from hermes_local_knowledge import telemetry as lci_telemetry
+from hermes_local_knowledge.models import Artifact
 
 
 def write(path: Path, content: str) -> None:
@@ -213,6 +214,59 @@ def test_ensure_index_rebuilds_and_clears_okf_dirty_marker(tmp_path, monkeypatch
     assert metadata["rebuilt"] is True
     assert calls == [f"build:{repo.resolve()}:{state_dir.resolve()}:{hermes_home.resolve()}:True"]
     assert not okf.index_dirty_tokens(state_dir)
+
+
+def test_ensure_index_rebuilds_outdated_format_before_ordinary_lookup(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    write(
+        state_dir / "okfs" / "tools" / "cronjob.md",
+        """---
+artifact_type: tool_okf
+tool: cronjob
+toolset: cron
+schema_hash: sha256:abc123
+title: Manage scheduled jobs
+aliases:
+  - recurring task scheduler
+triggers:
+  - create or update a scheduled job
+when_not_to_use:
+  - retrieve a Paperless document
+related_tools:
+  - mcp__paperless__paperless_get_document
+---
+
+# Manage scheduled jobs
+
+Create, update, pause, resume, or remove recurring scheduled jobs.
+""",
+    )
+    stale = Artifact(
+        id="tool_okf:cronjob",
+        type="tool_okf",
+        title="Manage scheduled jobs",
+        path="state/okfs/tools/cronjob.md",
+        summary="Manage scheduled jobs",
+        triggers=["retrieve a Paperless document"],
+        entities=["Paperless"],
+        search_text="retrieve a Paperless document",
+    )
+    db_path = state_dir / "index.sqlite"
+    lci_storage.build_sqlite(db_path, [stale], [])
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 0")
+
+    rebuilt_path, metadata = lci_runtime._ensure_index(repo)
+
+    assert rebuilt_path == db_path
+    assert metadata["rebuilt"] is True
+    assert lci_storage.index_format_version(db_path) == lci_storage.INDEX_FORMAT_VERSION
+    with sqlite3.connect(db_path) as conn:
+        matches = conn.execute(
+            "SELECT id FROM artifact_fts WHERE artifact_fts MATCH 'paperless'"
+        ).fetchall()
+    assert ("tool_okf:cronjob",) not in matches
 
 
 def test_ensure_index_preserves_new_dirty_token_created_during_build(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1057,22 +1111,55 @@ def test_feedback_rejects_invalid_rating_and_event_id():
     assert invalid_event_id["error"] == "event_id must be an integer when provided"
 
 
-def test_lookup_handlers_return_json_errors_for_corrupt_existing_index(tmp_path, monkeypatch):
+@pytest.mark.parametrize("index_state", ["missing", "v0", "corrupt"])
+@pytest.mark.parametrize("lookup", ["search", "get", "neighbors"])
+def test_lookup_handlers_rebuild_noncurrent_index_in_isolation(
+    tmp_path,
+    monkeypatch,
+    index_state: str,
+    lookup: str,
+):
     repo, hermes_home, state_dir = make_temp_repo(tmp_path)
     configure_env(monkeypatch, repo, hermes_home, state_dir)
-    state_dir.mkdir(parents=True)
-    (state_dir / "index.sqlite").write_text("not a sqlite db", encoding="utf-8")
+    db_path = state_dir / "index.sqlite"
+    if index_state == "v0":
+        stale = Artifact(
+            id="tool_okf:stale-only",
+            type="tool_okf",
+            title="Stale only",
+            path="okfs/tools/stale-only.md",
+            summary="Stale only",
+            triggers=["stale only"],
+            search_text="stale only",
+        )
+        lci_storage.build_sqlite(db_path, [stale], [])
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("PRAGMA user_version = 0")
+    elif index_state == "corrupt":
+        state_dir.mkdir(parents=True)
+        db_path.write_text("not a sqlite db", encoding="utf-8")
 
-    search = json.loads(plugin._handle_search({"query": "paperless"}))
-    fetched = json.loads(plugin._handle_get({"artifact_id": "skill:paperless-review-automation"}))
-    neighbors = json.loads(plugin._handle_neighbors({"artifact_id": "skill:paperless-review-automation"}))
+    handler, args = {
+        "search": (plugin._handle_search, {"query": "paperless"}),
+        "get": (
+            plugin._handle_get,
+            {"artifact_id": "skill:paperless-review-automation"},
+        ),
+        "neighbors": (
+            plugin._handle_neighbors,
+            {"artifact_id": "skill:paperless-review-automation"},
+        ),
+    }[lookup]
+    payload = json.loads(handler(args))
 
-    assert search["success"] is False
-    assert "knowledge_search failed" in search["error"]
-    assert fetched["success"] is False
-    assert "knowledge_get failed" in fetched["error"]
-    assert neighbors["success"] is False
-    assert "knowledge_neighbors failed" in neighbors["error"]
+    assert payload["success"] is True
+    assert lci_storage.index_format_version(db_path) == lci_storage.INDEX_FORMAT_VERSION
+    if lookup == "search":
+        assert any(row["id"] == "skill:paperless-review-automation" for row in payload["results"])
+    elif lookup == "get":
+        assert payload["artifact"]["id"] == "skill:paperless-review-automation"
+    else:
+        assert any(row["id"] == "skill:paperless-helper" for row in payload["neighbors"])
 
 
 def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):

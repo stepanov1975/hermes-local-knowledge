@@ -482,6 +482,16 @@ def _frontmatter_list(fm: dict[str, Any], key: str) -> list[str]:
     return []
 
 
+def _markdown_body(text: str) -> str:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return text
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return "\n".join(lines[index + 1 :])
+    return ""
+
+
 def scan_tool_okfs(
     okf_root: Path | None,
     root: Path,
@@ -501,6 +511,7 @@ def scan_tool_okfs(
         excluded_dir_names=settings.exclude_dir_names,
     ) or []:
         text = safe_read_text(path)
+        body = _markdown_body(text)
         fm = parse_frontmatter(text)
         artifact_type = str(fm.get("artifact_type") or "tool_okf").strip()
         if artifact_type != "tool_okf":
@@ -512,10 +523,9 @@ def scan_tool_okfs(
         toolset = str(fm.get("toolset") or "").strip()
         aliases = _frontmatter_list(fm, "aliases")
         frontmatter_triggers = _frontmatter_list(fm, "triggers")
-        when_not_to_use = _frontmatter_list(fm, "when_not_to_use")
         related_tools = _frontmatter_list(fm, "related_tools")
         title = str(fm.get("title") or f"Tool OKF: {tool}").strip()
-        summary = first_heading_or_paragraph(text) or f"Generated OKF for Hermes tool {tool}"
+        summary = first_heading_or_paragraph(body) or f"Generated OKF for Hermes tool {tool}"
         metadata_terms = identifier_terms(
             tool,
             toolset,
@@ -531,8 +541,8 @@ def scan_tool_okfs(
             summary,
             " ".join(aliases),
             " ".join(frontmatter_triggers),
-            " ".join(when_not_to_use),
             " ".join(metadata_terms),
+            body,
         )
         entities = extract_entities(
             tool,
@@ -541,7 +551,7 @@ def scan_tool_okfs(
             summary,
             " ".join(aliases),
             " ".join(frontmatter_triggers),
-            text[:20_000],
+            body[:20_000],
             known_entities=settings.known_entities,
         )
         related = [f"tool_okf:{slugify(item)}" for item in related_tools]
@@ -565,10 +575,8 @@ def scan_tool_okfs(
                         summary,
                         " ".join(aliases),
                         " ".join(frontmatter_triggers),
-                        " ".join(when_not_to_use),
-                        " ".join(related_tools),
                         " ".join(metadata_terms),
-                        text[:20_000],
+                        body[:20_000],
                     ]
                 ),
             )

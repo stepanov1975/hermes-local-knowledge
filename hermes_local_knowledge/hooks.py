@@ -164,11 +164,8 @@ def _generation_packet(row: Mapping[str, Any], state_dir: Path) -> dict[str, Any
             "toolset",
             "schema_hash",
             "schema",
+            "allowed_related_tools",
             "arg_shape",
-            "use_count",
-            "success_count",
-            "error_count",
-            "last_error_type",
         )
     }
 
@@ -184,7 +181,7 @@ def _quoted(value: Any, *, max_chars: int = 500) -> str:
     return json.dumps(clean, ensure_ascii=False)
 
 
-def _render_okf(item: Mapping[str, Any]) -> str:
+def _render_okf(item: Mapping[str, Any], *, toolset: str | None) -> str:
     tool_name = str(item.get("tool") or "").strip()
     schema_digest = str(item.get("schema_hash") or "").strip()
     title = str(item.get("title") or f"Tool OKF: {tool_name}").strip()[:500]
@@ -193,10 +190,17 @@ def _render_okf(item: Mapping[str, Any]) -> str:
         "---",
         "artifact_type: tool_okf",
         f"tool: {_quoted(tool_name)}",
-        f"schema_hash: {_quoted(schema_digest)}",
-        f"title: {_quoted(title)}",
-        f"generated_at: {_quoted(okf.utc_now())}",
     ]
+    if toolset:
+        lines.append(f"toolset: {_quoted(toolset)}")
+    lines.extend(
+        [
+            f"schema_hash: {_quoted(schema_digest)}",
+            f"generator_version: {_quoted(okf.OKF_GENERATOR_VERSION)}",
+            f"title: {_quoted(title)}",
+            f"generated_at: {_quoted(okf.utc_now())}",
+        ]
+    )
     for key in ("aliases", "triggers", "when_not_to_use", "related_tools"):
         lines.append(f"{key}:")
         values = _bounded_list(item.get(key))
@@ -235,7 +239,10 @@ def _write_and_complete_item(
     path.parent.mkdir(parents=True, exist_ok=True)
     previous = path.read_bytes() if path.exists() else None
     temp_path = path.with_suffix(".md.tmp")
-    temp_path.write_text(_render_okf(item), encoding="utf-8")
+    temp_path.write_text(
+        _render_okf(item, toolset=str(row.get("toolset") or "").strip() or None),
+        encoding="utf-8",
+    )
     os.replace(temp_path, path)
     validation = okf.validate_okf_file(cfg.state_dir, claim_token=claim_token, path=path)
     if not validation["valid"]:
@@ -273,10 +280,21 @@ def _generate_claimed_okfs(cfg: RuntimeConfig, *, llm: Any, rows: list[dict[str,
     result = llm.complete_structured(
         instructions=(
             "Create one compact routing note for every supplied Hermes tool candidate. "
-            "Use only the supplied structural packet. Never infer or request raw transcripts, "
-            "tool outputs, document contents, emails, credentials, or secret values. Return every "
-            "tool and schema_hash exactly as supplied. Aliases and triggers must be specific multi-word "
-            "phrases that help route user intent."
+            "Treat each candidate independently. Do not mention, contrast, or relate another candidate "
+            "merely because it appears in the same batch. Use only the supplied privacy-safe structural "
+            "packet. Never infer or request raw transcripts, tool outputs, document contents, emails, "
+            "credentials, secret values, unsupported methods, permissions, side effects, enum choices, "
+            "or capabilities. Return every tool and schema_hash exactly as supplied. Aliases and triggers "
+            "must be concrete multi-word user intents that positively select this tool and include the "
+            "relevant action and domain or object; avoid generic phrases. For when_not_to_use, include only "
+            "a meaningful boundary from a genuine near-neighbor supported by this candidate's packet. Leave "
+            "when_not_to_use empty when no such distinction is available; never use unrelated domains, "
+            "missing-argument checks, credentials, secrets, privacy policy, or generic non-use cases. "
+            "Every related_tools value must be an exact identifier from this candidate's "
+            "allowed_related_tools and a genuine alternative or complementary step; leave it empty rather "
+            "than guessing. Write an evergreen one-to-three-sentence body explaining purpose, selection "
+            "boundary, and important required inputs without counters, errors, timestamps, redaction notes, "
+            "or unsupported behavior."
         ),
         input=[{"type": "text", "text": json.dumps({"candidates": packets}, ensure_ascii=False, sort_keys=True)}],
         json_schema=OKF_GENERATION_SCHEMA,

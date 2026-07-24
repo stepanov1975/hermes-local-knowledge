@@ -16,14 +16,17 @@ from .text_utils import parse_frontmatter, safe_read_text, slugify
 
 QUEUE_DB_NAME = "okf_queue.sqlite"
 INDEX_DIRTY_MARKER_NAME = "okf_index_dirty"
+OKF_GENERATOR_VERSION = "2"
 DEFAULT_MAX_ARG_ITEMS = 8
 DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_RELATED_TOOLS = 32
 
 _COLUMN_DEFINITIONS = {
     "tool_name": "TEXT PRIMARY KEY",
     "toolset": "TEXT",
     "schema_hash": "TEXT",
     "schema_json": "TEXT",
+    "generator_version": "TEXT",
     "first_seen": "TEXT NOT NULL",
     "last_seen": "TEXT NOT NULL",
     "use_count": "INTEGER NOT NULL DEFAULT 0",
@@ -36,6 +39,8 @@ _COLUMN_DEFINITIONS = {
     "attempt_count": "INTEGER NOT NULL DEFAULT 0",
     "claimed_at": "TEXT",
     "claim_token": "TEXT",
+    "claim_generator_version": "TEXT",
+    "related_tools_json": "TEXT NOT NULL DEFAULT '[]'",
     "okf_path": "TEXT",
     "last_attempt_error": "TEXT",
 }
@@ -44,6 +49,7 @@ _MIGRATION_COLUMN_DEFINITIONS = {
     "toolset": "TEXT",
     "schema_hash": "TEXT",
     "schema_json": "TEXT",
+    "generator_version": "TEXT",
     "first_seen": "TEXT",
     "last_seen": "TEXT",
     "use_count": "INTEGER DEFAULT 0",
@@ -56,6 +62,8 @@ _MIGRATION_COLUMN_DEFINITIONS = {
     "attempt_count": "INTEGER DEFAULT 0",
     "claimed_at": "TEXT",
     "claim_token": "TEXT",
+    "claim_generator_version": "TEXT",
+    "related_tools_json": "TEXT DEFAULT '[]'",
     "okf_path": "TEXT",
     "last_attempt_error": "TEXT",
 }
@@ -78,6 +86,12 @@ _SCHEMA_VALUE_KEYS = {
     "title",
 }
 _GENERIC_ROUTING_PHRASES = {"okf", "placeholder", "tbd", "todo", "tool", "x"}
+_EPHEMERAL_OKF_TEXT = re.compile(
+    r"(?i)\b(?:use_count|success_count|error_count|last_error_type|observed counters?)\b"
+)
+_GENERIC_NEGATIVE_GUIDANCE = re.compile(
+    r"(?i)\b(?:credentials?|secret values?|raw transcripts?|raw tool outputs?)\b"
+)
 
 
 def utc_now() -> str:
@@ -363,7 +377,33 @@ def _ensure_schema(conn: sqlite3.Connection, *, commit: bool = True) -> None:
     conn.execute("UPDATE okf_candidates SET error_count = 0 WHERE error_count IS NULL")
     conn.execute("UPDATE okf_candidates SET attempt_count = 0 WHERE attempt_count IS NULL")
     conn.execute("UPDATE okf_candidates SET arg_shape_json = '{}' WHERE arg_shape_json IS NULL")
+    conn.execute("UPDATE okf_candidates SET related_tools_json = '[]' WHERE related_tools_json IS NULL")
     conn.execute("UPDATE okf_candidates SET status = 'pending' WHERE status IS NULL")
+    conn.execute(
+        """
+        UPDATE okf_candidates
+        SET generator_version = CASE
+                WHEN status = 'claimed' THEN generator_version
+                ELSE ?
+            END,
+            status = CASE WHEN status = 'done' THEN 'pending' ELSE status END,
+            attempt_count = CASE WHEN status = 'done' THEN 0 ELSE attempt_count END,
+            claimed_at = CASE WHEN status = 'done' THEN NULL ELSE claimed_at END,
+            claim_token = CASE WHEN status = 'done' THEN NULL ELSE claim_token END,
+            claim_generator_version = CASE
+                WHEN status = 'claimed' THEN claim_generator_version
+                ELSE NULL
+            END,
+            related_tools_json = CASE
+                WHEN status = 'claimed' THEN related_tools_json
+                ELSE '[]'
+            END,
+            okf_path = CASE WHEN status = 'done' THEN NULL ELSE okf_path END,
+            last_attempt_error = CASE WHEN status = 'done' THEN NULL ELSE last_attempt_error END
+        WHERE COALESCE(generator_version, '') != ?
+        """,
+        (OKF_GENERATOR_VERSION, OKF_GENERATOR_VERSION),
+    )
     for row in conn.execute("SELECT tool_name, schema_json FROM okf_candidates WHERE schema_json IS NOT NULL").fetchall():
         safe_schema_json = _safe_schema_json_text(row["schema_json"])
         if safe_schema_json != row["schema_json"]:
@@ -413,14 +453,22 @@ def upsert_tool_candidate(
         conn.execute(
             """
             INSERT INTO okf_candidates (
-              tool_name, toolset, schema_hash, schema_json, first_seen, last_seen,
+              tool_name, toolset, schema_hash, schema_json, generator_version, first_seen, last_seen,
               use_count, success_count, error_count, last_error_type,
               last_error_message, arg_shape_json, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'pending')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'pending')
             ON CONFLICT(tool_name) DO UPDATE SET
               toolset=excluded.toolset,
               schema_hash=excluded.schema_hash,
               schema_json=excluded.schema_json,
+              generator_version=CASE
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN excluded.generator_version
+                WHEN okf_candidates.status = 'claimed'
+                THEN okf_candidates.generator_version
+                ELSE excluded.generator_version
+              END,
               last_seen=excluded.last_seen,
               use_count=okf_candidates.use_count + 1,
               success_count=okf_candidates.success_count + excluded.success_count,
@@ -429,27 +477,51 @@ def upsert_tool_candidate(
               last_error_message=COALESCE(excluded.last_error_message, okf_candidates.last_error_message),
               arg_shape_json=excluded.arg_shape_json,
               status=CASE
-                WHEN okf_candidates.schema_hash != excluded.schema_hash THEN 'pending'
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN 'pending'
                 ELSE okf_candidates.status
               END,
               claimed_at=CASE
-                WHEN okf_candidates.schema_hash != excluded.schema_hash THEN NULL
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN NULL
                 ELSE okf_candidates.claimed_at
               END,
               claim_token=CASE
-                WHEN okf_candidates.schema_hash != excluded.schema_hash THEN NULL
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN NULL
                 ELSE okf_candidates.claim_token
               END,
+              claim_generator_version=CASE
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN NULL
+                ELSE okf_candidates.claim_generator_version
+              END,
+              related_tools_json=CASE
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN '[]'
+                ELSE okf_candidates.related_tools_json
+              END,
               okf_path=CASE
-                WHEN okf_candidates.schema_hash != excluded.schema_hash THEN NULL
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN NULL
                 ELSE okf_candidates.okf_path
               END,
               attempt_count=CASE
-                WHEN okf_candidates.schema_hash != excluded.schema_hash THEN 0
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN 0
                 ELSE okf_candidates.attempt_count
               END,
               last_attempt_error=CASE
-                WHEN okf_candidates.schema_hash != excluded.schema_hash THEN NULL
+                WHEN okf_candidates.schema_hash != excluded.schema_hash
+                  OR NOT (okf_candidates.toolset IS excluded.toolset)
+                THEN NULL
                 ELSE okf_candidates.last_attempt_error
               END
             """,
@@ -458,6 +530,7 @@ def upsert_tool_candidate(
                 toolset,
                 digest,
                 schema_json,
+                OKF_GENERATOR_VERSION,
                 timestamp,
                 timestamp,
                 success_increment,
@@ -526,7 +599,8 @@ def retry_error_candidate(state_dir: Path, *, tool_name: str) -> bool:
             """
             UPDATE okf_candidates
             SET status = 'pending', attempt_count = 0, claimed_at = NULL,
-                claim_token = NULL, okf_path = NULL, last_attempt_error = NULL
+                claim_token = NULL, claim_generator_version = NULL, related_tools_json = '[]',
+                okf_path = NULL, last_attempt_error = NULL
             WHERE tool_name = ? AND status = 'error'
             """,
             (tool_name,),
@@ -562,16 +636,17 @@ def claim_candidates(
         conn.execute(
             """
             UPDATE okf_candidates
-            SET status = 'error', claim_token = NULL, claimed_at = NULL,
+            SET status = 'error', generator_version = ?, claim_token = NULL, claimed_at = NULL,
+                claim_generator_version = NULL, related_tools_json = '[]',
                 last_attempt_error = '<redacted>'
             WHERE attempt_count >= ?
               AND (status = 'pending' OR (status = 'claimed' AND claimed_at < ?))
             """,
-            (max_attempts, cutoff),
+            (OKF_GENERATOR_VERSION, max_attempts, cutoff),
         )
         rows = conn.execute(
             """
-            SELECT tool_name FROM okf_candidates
+            SELECT * FROM okf_candidates
             WHERE use_count >= ?
               AND attempt_count < ?
               AND (status = 'pending' OR (status = 'claimed' AND claimed_at < ?))
@@ -582,14 +657,29 @@ def claim_candidates(
         ).fetchall()
         names = [str(row["tool_name"]) for row in rows]
         if names:
+            updates = [
+                (
+                    timestamp,
+                    token,
+                    OKF_GENERATOR_VERSION,
+                    OKF_GENERATOR_VERSION,
+                    json.dumps(
+                        _allowed_related_tools_from_conn(conn, dict(row), limit=DEFAULT_MAX_RELATED_TOOLS),
+                        separators=(",", ":"),
+                    ),
+                    str(row["tool_name"]),
+                )
+                for row in rows
+            ]
             conn.executemany(
                 """
                 UPDATE okf_candidates
                 SET status = 'claimed', claimed_at = ?, claim_token = ?, attempt_count = attempt_count + 1,
+                    generator_version = ?, claim_generator_version = ?, related_tools_json = ?,
                     last_attempt_error = NULL
                 WHERE tool_name = ?
                 """,
-                [(timestamp, token, name) for name in names],
+                updates,
             )
         claimed = conn.execute(
             f"SELECT * FROM okf_candidates WHERE claim_token = ? AND tool_name IN ({','.join('?' for _ in names)})"
@@ -618,12 +708,15 @@ def recover_stale_claims(
             """
             UPDATE okf_candidates
             SET status = CASE WHEN attempt_count >= ? THEN 'error' ELSE 'pending' END,
+                generator_version = ?,
                 claim_token = NULL,
                 claimed_at = NULL,
+                claim_generator_version = NULL,
+                related_tools_json = '[]',
                 last_attempt_error = '<redacted>'
             WHERE status = 'claimed' AND claimed_at < ?
             """,
-            (max_attempts, cutoff),
+            (max_attempts, OKF_GENERATOR_VERSION, cutoff),
         )
         return cursor.rowcount
 
@@ -633,11 +726,17 @@ def mark_candidate_done(state_dir: Path, *, tool_name: str, claim_token: str, ok
         cursor = conn.execute(
             """
             UPDATE okf_candidates
-            SET status = 'done', okf_path = ?, claim_token = NULL, claimed_at = NULL,
-                last_attempt_error = NULL
-            WHERE tool_name = ? AND claim_token = ?
+            SET status = 'done', okf_path = ?, generator_version = ?, claim_token = NULL, claimed_at = NULL,
+                claim_generator_version = NULL, related_tools_json = '[]', last_attempt_error = NULL
+            WHERE tool_name = ? AND claim_token = ? AND claim_generator_version = ?
             """,
-            (str(okf_path), tool_name, claim_token),
+            (
+                str(okf_path),
+                OKF_GENERATOR_VERSION,
+                tool_name,
+                claim_token,
+                OKF_GENERATOR_VERSION,
+            ),
         )
         updated = cursor.rowcount == 1
         if updated:
@@ -661,6 +760,8 @@ def mark_candidate_error(
             SET status = CASE WHEN attempt_count >= ? THEN 'error' ELSE 'pending' END,
                 claim_token = NULL,
                 claimed_at = NULL,
+                claim_generator_version = NULL,
+                related_tools_json = '[]',
                 last_attempt_error = ?
             WHERE tool_name = ? AND claim_token = ?
             """,
@@ -682,6 +783,51 @@ def _json_field(row: Mapping[str, Any], field: str) -> Any:
         return {}
 
 
+def _allowed_related_tools_from_conn(
+    conn: sqlite3.Connection,
+    row: Mapping[str, Any],
+    *,
+    limit: int,
+) -> list[str]:
+    tool_name = str(row.get("tool_name") or row.get("tool") or "").strip()
+    toolset = str(row.get("toolset") or "").strip()
+    if not tool_name or not toolset or limit <= 0:
+        return []
+    rows = conn.execute(
+        """
+        SELECT tool_name FROM okf_candidates
+        WHERE toolset = ? AND tool_name != ?
+        ORDER BY use_count DESC, tool_name ASC
+        LIMIT ?
+        """,
+        (toolset, tool_name, limit),
+    ).fetchall()
+    return [str(candidate["tool_name"]) for candidate in rows]
+
+
+def allowed_related_tools(
+    state_dir: Path,
+    row: Mapping[str, Any],
+    *,
+    limit: int = DEFAULT_MAX_RELATED_TOOLS,
+) -> list[str]:
+    """Return a bounded relation allowlist from the candidate's own toolset."""
+
+    with _connect(state_dir) as conn:
+        return _allowed_related_tools_from_conn(conn, row, limit=limit)
+
+
+def _claim_related_tools(row: Mapping[str, Any]) -> list[str]:
+    try:
+        values = json.loads(str(row.get("related_tools_json") or "[]"))
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(values, list):
+        return []
+    normalized = [str(value).strip() for value in values if isinstance(value, str) and value.strip()]
+    return list(dict.fromkeys(normalized))[:DEFAULT_MAX_RELATED_TOOLS]
+
+
 def candidate_packet(row: Mapping[str, Any], state_dir: Path) -> dict[str, Any]:
     """Return the privacy-safe packet a worker may use to author an OKF."""
 
@@ -692,6 +838,10 @@ def candidate_packet(row: Mapping[str, Any], state_dir: Path) -> dict[str, Any]:
         "toolset": row.get("toolset"),
         "schema_hash": row.get("schema_hash"),
         "schema": _safe_schema_from_json_text(row.get("schema_json")),
+        "generator_version": row.get("generator_version") or OKF_GENERATOR_VERSION,
+        "allowed_related_tools": (
+            _claim_related_tools(row) if row.get("status") == "claimed" else allowed_related_tools(state_dir, row)
+        ),
         "arg_shape": _safe_arg_shape_from_json_text(row.get("arg_shape_json")),
         "use_count": int(row.get("use_count") or 0),
         "success_count": int(row.get("success_count") or 0),
@@ -758,10 +908,19 @@ def validate_okf_file(state_dir: Path, *, claim_token: str, path: Path) -> dict[
     schema_digest = str(frontmatter.get("schema_hash") or "").strip()
     if not schema_digest:
         errors.append("frontmatter schema_hash is required")
+    generator_version = str(frontmatter.get("generator_version") or "").strip()
+    if generator_version != OKF_GENERATOR_VERSION:
+        errors.append(f"frontmatter generator_version must be {OKF_GENERATOR_VERSION}")
     aliases = _frontmatter_list(frontmatter, "aliases")
     triggers = _frontmatter_list(frontmatter, "triggers")
+    when_not_to_use = _frontmatter_list(frontmatter, "when_not_to_use")
+    related_tools = _frontmatter_list(frontmatter, "related_tools")
     if not any(_useful_routing_phrase(phrase, tool_name=tool_name) for phrase in [*aliases, *triggers]):
         errors.append("frontmatter aliases or triggers must include at least one specific multi-word routing phrase")
+    if any(_GENERIC_NEGATIVE_GUIDANCE.search(phrase) for phrase in when_not_to_use):
+        errors.append("frontmatter when_not_to_use must not contain generic privacy or credential guidance")
+    if _EPHEMERAL_OKF_TEXT.search(text):
+        errors.append("OKF content must not persist runtime counters or transient error fields")
 
     row = claimed_candidate(resolved_state_dir, tool_name=tool_name, claim_token=claim_token) if tool_name else None
     if row is None:
@@ -772,6 +931,15 @@ def validate_okf_file(state_dir: Path, *, claim_token: str, path: Path) -> dict[
             errors.append(f"path must match claimed target path {expected_path}")
         if schema_digest != str(row.get("schema_hash") or ""):
             errors.append("frontmatter schema_hash does not match claimed candidate")
+        expected_toolset = str(row.get("toolset") or "").strip()
+        actual_toolset = str(frontmatter.get("toolset") or "").strip()
+        if actual_toolset != expected_toolset:
+            errors.append("frontmatter toolset does not match claimed candidate")
+        if str(row.get("claim_generator_version") or "") != OKF_GENERATOR_VERSION:
+            errors.append("claimed candidate generator version does not match current generator")
+        allowed_related = set(_claim_related_tools(row))
+        if set(related_tools) - allowed_related:
+            errors.append("frontmatter related_tools contains identifiers outside allowed_related_tools")
 
     return {
         "valid": not errors,

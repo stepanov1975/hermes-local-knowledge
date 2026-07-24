@@ -12,7 +12,14 @@ from .models import IndexSettings
 from .okf import index_dirty_tokens
 from .scanners import load_yaml_if_available
 from .schemas import CONFIG_SECTION, ROOT_ENV, STATE_ENV
-from .storage import artifact_type_counts, build_index, index_build_lock, index_metadata
+from .storage import (
+    INDEX_FORMAT_VERSION,
+    artifact_type_counts,
+    build_index,
+    index_build_lock,
+    index_metadata,
+    index_needs_rebuild,
+)
 
 BuildIndexFn = Callable[[Path, Path, Path, IndexSettings], tuple[list[Any], list[Any]]]
 
@@ -296,6 +303,7 @@ def _ensure_index(
     cfg = _runtime_config()
     db_path = cfg.state_dir / "index.sqlite"
     dirty_tokens = index_dirty_tokens(cfg.state_dir)
+    needs_rebuild = index_needs_rebuild(db_path)
     metadata: dict[str, Any] = {
         "plugin_version": __version__,
         "root": str(cfg.source_root),
@@ -306,11 +314,13 @@ def _ensure_index(
         "db_path": str(db_path),
         "warnings": list(cfg.warnings),
         "rebuilt": False,
+        "expected_index_format_version": INDEX_FORMAT_VERSION,
     }
-    if rebuild or not db_path.exists() or dirty_tokens:
+    if rebuild or needs_rebuild or dirty_tokens:
         with index_build_lock(cfg.state_dir):
             dirty_tokens = index_dirty_tokens(cfg.state_dir)
-            if rebuild or not db_path.exists() or dirty_tokens:
+            needs_rebuild = index_needs_rebuild(db_path)
+            if rebuild or needs_rebuild or dirty_tokens:
                 build_started = time.perf_counter()
                 build: Any = build_index_fn or build_index
                 artifacts, edges = build(

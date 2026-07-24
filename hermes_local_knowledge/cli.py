@@ -26,6 +26,7 @@ from .storage import (
     get_neighbors,
     index_build_lock,
     index_metadata,
+    index_needs_rebuild,
 )
 from .telemetry import _record_usage
 
@@ -401,7 +402,7 @@ def _refresh_default_index_if_dirty(
     if db_path.resolve() != default_db_path:
         return False
     dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
-    if db_path.exists() and not dirty_tokens:
+    if not index_needs_rebuild(db_path) and not dirty_tokens:
         return False
     _build_index_locked(build_index_fn, cfg)
     for token in dirty_tokens:

@@ -220,6 +220,14 @@ These came out of review but were not all implemented during the July 2026 pass:
 - Run mutation testing periodically and triage high-signal survivors in search/evaluation/scanners; do not chase every survivor blindly.
 - Consider sklearn/TF-IDF tooling only if the data grows; it was absent and not required for the successful deterministic implementation.
 
+## Tool OKF generation hardening
+
+- Candidate batches are an execution optimization, not semantic evidence. The prompt must isolate candidates, and generated `related_tools` must be checked against the exact bounded same-toolset allowlist snapshot persisted with that claim. Recomputing a top-N set during validation creates a concurrency-dependent contract.
+- `when_not_to_use` and `related_tools` are negative/graph metadata. Do not add them to positive FTS text, trigger extraction, or entity extraction; doing so made unrelated batch partners searchable for each other. Persist an index-format version and make ordinary lookups rebuild older or corrupt indexes when scanner semantics change.
+- Usage/error counters help prioritize the queue but are not durable tool semantics. Keep them out of the structured generation packet and reject generated prose that persists transient counters.
+- Keep arbitrary schema descriptions, examples, defaults, enum values, and similar scalar metadata redacted. Dynamic tool schemas are not guaranteed to be public or static.
+- Version generated artifacts independently of the package. A generator-version bump requeues completed artifacts once without resetting pending/error lifecycle state; active claims retain their old generator identity and only current-version claims may complete. Treat null-safe toolset changes like schema changes and requeue the stale artifact.
+
 ## Verification checklist used successfully
 
 For code changes, run the full local gates unless the change is truly docs-only:
