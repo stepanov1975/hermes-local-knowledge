@@ -25,9 +25,9 @@ The package has no runtime dependencies beyond the Python standard library. Test
 
 ## Release process
 
-Release-relevant changes must bump the synchronized version metadata described below. After a push to `main` passes the `CI` workflow, `.github/workflows/release.yml` compares that version with existing GitHub releases. For a new version it builds and checks a fresh wheel and source distribution, verifies the installed Hermes plugin entry point, and creates the matching `v<version>` tag and GitHub release with both artifacts.
+Release-relevant changes must bump the synchronized version metadata described below. After a push to `main` passes the `CI` workflow, `.github/workflows/release.yml` compares that version with existing GitHub releases. For a new version it builds and checks a fresh wheel and source distribution, installation-smokes both artifacts, verifies the Hermes plugin entry point, and creates the matching `v<version>` tag and GitHub release.
 
-Re-running CI for an already released version is safe: the release workflow detects the existing release and exits without changing it. If a matching tag exists without a release, the workflow only uses it when it points to the exact commit that passed CI.
+Re-running CI for an already released version is safe: the release workflow verifies that the release is published and contains both expected artifacts before skipping it. A draft or incomplete release is rebuilt from its existing tag and repaired. If a matching tag exists without a release, the workflow only uses it when it points to the exact commit that passed CI.
 
 ## Pull request expectations
 
