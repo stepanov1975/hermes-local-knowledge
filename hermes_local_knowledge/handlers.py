@@ -9,7 +9,7 @@ from typing import Any, Callable
 from .runtime import _coerce_bool, _coerce_int, _ensure_index, _repo_root, _usage_db_path
 from .schemas import FEEDBACK_RATINGS
 from .search import search_index
-from .storage import get_artifact, get_neighbors
+from .storage import NewerIndexFormatError, get_artifact, get_neighbors
 from .telemetry import _record_feedback, _record_usage, _usage_context, _usage_report
 from .tooling import tool_error, tool_result
 
@@ -48,6 +48,16 @@ def _validate_args(args: Any, deps: HandlerDeps) -> str | None:
     if isinstance(args, dict):
         return None
     return deps.tool_error("args must be an object", success=False)
+
+
+def _exception_fields(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, NewerIndexFormatError):
+        return {
+            "error_code": "newer_index_format",
+            "expected_index_format_version": exc.expected_version,
+            "actual_index_format_version": exc.actual_version,
+        }
+    return {}
 
 
 def _handle_search(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
@@ -121,7 +131,7 @@ def _handle_search(args: dict[str, Any], *, deps: HandlerDeps | None = None, **k
             context=context,
             index_metadata=meta,
         )
-        return deps.tool_error(message, success=False, usage_event_id=event_id)
+        return deps.tool_error(message, success=False, usage_event_id=event_id, **_exception_fields(exc))
 
 def _handle_get(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
     deps = _handler_deps(deps)
@@ -202,7 +212,7 @@ def _handle_get(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwar
             context=context,
             index_metadata=meta,
         )
-        return deps.tool_error(message, success=False, usage_event_id=event_id)
+        return deps.tool_error(message, success=False, usage_event_id=event_id, **_exception_fields(exc))
 
 def _handle_neighbors(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
     deps = _handler_deps(deps)
@@ -289,7 +299,7 @@ def _handle_neighbors(args: dict[str, Any], *, deps: HandlerDeps | None = None, 
             context=context,
             index_metadata=meta,
         )
-        return deps.tool_error(message, success=False, usage_event_id=event_id)
+        return deps.tool_error(message, success=False, usage_event_id=event_id, **_exception_fields(exc))
 
 def _handle_feedback(args: dict[str, Any], *, deps: HandlerDeps | None = None, **kwargs) -> str:
     deps = _handler_deps(deps)

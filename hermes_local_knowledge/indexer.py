@@ -76,6 +76,7 @@ from .scanners import (
 )
 from .search import search_index
 from .storage import (
+    _refuse_newer_index,
     build_sqlite,
     connect_readonly,
     decode_artifact_row,
@@ -152,6 +153,7 @@ def build_index(
         with index_build_lock(output_dir):
             return build_index(root, output_dir, hermes_home, settings, acquire_lock=False)
 
+    _refuse_newer_index(output_dir / "index.sqlite")
     artifacts = _collect_artifacts_compat(root, hermes_home, settings, output_dir / "okfs")
     edges = build_edges(artifacts)
     output_dir.mkdir(parents=True, exist_ok=True)

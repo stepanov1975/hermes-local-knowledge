@@ -27,10 +27,24 @@ except ImportError:  # pragma: no cover - unavailable on POSIX
 
 INDEX_BUILD_LOCK_NAME = "index_build.lock"
 INDEX_BUILD_LOCK_WAIT_SECONDS = 120.0
-INDEX_FORMAT_VERSION = 1
+INDEX_FORMAT_VERSION = 2
+SQLITE_REPLACE_ATTEMPTS = 20
+SQLITE_REPLACE_RETRY_SECONDS = 0.05
 _INDEX_BUILD_LOCK_STATE = threading.local()
 _INDEX_BUILD_LOCK_FDS: set[int] = set()
 _INDEX_BUILD_LOCK_FDS_MUTEX = threading.Lock()
+
+
+class NewerIndexFormatError(RuntimeError):
+    """Raised when an older runtime encounters a newer persisted index."""
+
+    def __init__(self, *, expected_version: int, actual_version: int) -> None:
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__(
+            f"index format {actual_version} is newer than supported format {expected_version}; "
+            "restart or update this older local_knowledge runtime"
+        )
 
 
 def _before_fork() -> None:
@@ -177,8 +191,33 @@ def write_jsonl(path: Path, artifacts: Sequence[Artifact]) -> None:
         temp_path.unlink(missing_ok=True)
         raise
 
+
+def _refuse_newer_index(path: Path) -> None:
+    version = index_format_version(path)
+    if version is not None and version > INDEX_FORMAT_VERSION:
+        raise NewerIndexFormatError(
+            expected_version=INDEX_FORMAT_VERSION,
+            actual_version=version,
+        )
+
+
+def _replace_sqlite_with_retry(source: Path, destination: Path) -> None:
+    for attempt in range(SQLITE_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            if attempt + 1 >= SQLITE_REPLACE_ATTEMPTS:
+                raise PermissionError(
+                    f"failed to publish SQLite index after {SQLITE_REPLACE_ATTEMPTS} attempts; "
+                    "the destination index was not replaced and may still be held by an active reader"
+                ) from exc
+            time.sleep(SQLITE_REPLACE_RETRY_SECONDS)
+
+
 def build_sqlite(path: Path, artifacts: Sequence[Artifact], edges: Sequence[Edge]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    _refuse_newer_index(path)
     temp_file = tempfile.NamedTemporaryFile(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False)
     temp_path = Path(temp_file.name)
     temp_file.close()
@@ -277,7 +316,7 @@ def build_sqlite(path: Path, artifacts: Sequence[Artifact], edges: Sequence[Edge
         conn.execute(f"PRAGMA user_version = {INDEX_FORMAT_VERSION}")
         conn.commit()
         conn.close()
-        os.replace(temp_path, path)
+        _replace_sqlite_with_retry(temp_path, path)
     finally:
         try:
             if conn is not None:
@@ -297,6 +336,7 @@ def build_index(
         with index_build_lock(output_dir):
             return build_index(root, output_dir, hermes_home, settings, acquire_lock=False)
 
+    _refuse_newer_index(output_dir / "index.sqlite")
     from .scanners import build_edges, collect_artifacts
 
     artifacts = collect_artifacts(root, hermes_home, settings, okf_root=output_dir / "okfs")
@@ -388,8 +428,28 @@ def index_format_version(db_path: Path) -> int | None:
     return int(row[0]) if row is not None else None
 
 
+def index_format_state(db_path: Path) -> tuple[str, int | None]:
+    if not db_path.is_file():
+        return "missing", None
+    version = index_format_version(db_path)
+    if version is None:
+        return "corrupt", None
+    if version < INDEX_FORMAT_VERSION:
+        return "older", version
+    if version > INDEX_FORMAT_VERSION:
+        return "newer", version
+    return "current", version
+
+
 def index_needs_rebuild(db_path: Path) -> bool:
-    return not db_path.is_file() or index_format_version(db_path) != INDEX_FORMAT_VERSION
+    state, version = index_format_state(db_path)
+    if state == "newer":
+        assert version is not None
+        raise NewerIndexFormatError(
+            expected_version=INDEX_FORMAT_VERSION,
+            actual_version=version,
+        )
+    return state in {"missing", "corrupt", "older"}
 
 
 def decode_artifact_row(row: sqlite3.Row) -> dict[str, Any]:

@@ -237,6 +237,8 @@ def test_session_finalize_generates_bounded_okf_with_host_llm(tmp_path: Path, mo
     assert "merely because it appears in the same batch" in call["instructions"]
     assert "Leave when_not_to_use empty" in call["instructions"]
     assert "allowed_related_tools" in call["instructions"]
+    assert "body explaining only positive purpose" in call["instructions"]
+    assert "body explaining purpose, selection boundary" not in call["instructions"]
     assert "private customer text" not in json.dumps(call)
     packet = json.loads(call["input"][0]["text"])["candidates"][0]
     assert set(packet) == {"tool", "toolset", "schema_hash", "schema", "allowed_related_tools", "arg_shape"}

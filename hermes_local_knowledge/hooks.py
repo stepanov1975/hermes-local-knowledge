@@ -292,9 +292,10 @@ def _generate_claimed_okfs(cfg: RuntimeConfig, *, llm: Any, rows: list[dict[str,
             "missing-argument checks, credentials, secrets, privacy policy, or generic non-use cases. "
             "Every related_tools value must be an exact identifier from this candidate's "
             "allowed_related_tools and a genuine alternative or complementary step; leave it empty rather "
-            "than guessing. Write an evergreen one-to-three-sentence body explaining purpose, selection "
-            "boundary, and important required inputs without counters, errors, timestamps, redaction notes, "
-            "or unsupported behavior."
+            "than guessing. Write an evergreen one-to-three-sentence body explaining only positive purpose "
+            "and important required inputs. Keep selection boundaries, comparisons, and all negative/non-use "
+            "guidance exclusively in when_not_to_use. Do not include counters, errors, timestamps, redaction "
+            "notes, or unsupported behavior."
         ),
         input=[{"type": "text", "text": json.dumps({"candidates": packets}, ensure_ascii=False, sort_keys=True)}],
         json_schema=OKF_GENERATION_SCHEMA,

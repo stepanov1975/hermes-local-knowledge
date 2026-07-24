@@ -1596,13 +1596,15 @@ related_tools:
 
 # Manage scheduled jobs
 
-Create, update, pause, resume, or remove recurring scheduled jobs.
+Create scheduled jobs. Do not use this tool to retrieve a Paperless document.
 """,
     )
 
     artifacts, _edges = lci.build_index(root, output_dir, hermes_home)
     cron = next(artifact for artifact in artifacts if artifact.id == "tool_okf:cronjob")
     assert "paperless" not in cron.triggers
+    assert "retrieve" not in cron.triggers
+    assert "document" not in cron.triggers
     assert "Paperless" not in cron.entities
     assert cron.related == ["tool_okf:mcp-paperless-paperless-get-document"]
 
@@ -1915,7 +1917,7 @@ def test_build_sqlite_preserves_existing_db_when_rebuild_fails(tmp_path: Path, m
     db_path = output_dir / "index.sqlite"
     before = db_path.read_bytes()
 
-    def fail_connect(_path: str) -> sqlite3.Connection:
+    def fail_connect(_path: str, *args, **kwargs) -> sqlite3.Connection:  # type: ignore[no-untyped-def]
         raise RuntimeError("simulated sqlite failure")
 
     monkeypatch.setattr(lci_storage.sqlite3, "connect", fail_connect)
@@ -1924,6 +1926,147 @@ def test_build_sqlite_preserves_existing_db_when_rebuild_fails(tmp_path: Path, m
         lci.build_sqlite(db_path, [], [])
 
     assert db_path.read_bytes() == before
+
+
+def test_build_sqlite_retries_transient_replace_failure_with_active_reader(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    db_path = tmp_path / "state" / "index.sqlite"
+    old = lci.Artifact(
+        id="skill:old",
+        type="skill",
+        title="Old",
+        path="custom_skills/old/SKILL.md",
+        summary="Old index",
+        search_text="old index",
+    )
+    new = lci.Artifact(
+        id="skill:new",
+        type="skill",
+        title="New",
+        path="custom_skills/new/SKILL.md",
+        summary="New index",
+        search_text="new index",
+    )
+    lci_storage.build_sqlite(db_path, [old], [])
+    reader = lci_storage.connect_readonly(db_path)
+    real_replace = lci_storage.os.replace
+    replace_calls = 0
+
+    def simulate_windows_replace(source: Path, destination: Path) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 1:
+            assert reader.execute("SELECT id FROM artifacts").fetchone()[0] == "skill:old"
+            reader.close()
+            raise PermissionError("simulated active Windows SQLite reader")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(lci_storage, "SQLITE_REPLACE_ATTEMPTS", 3)
+    monkeypatch.setattr(lci_storage, "SQLITE_REPLACE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(lci_storage.os, "replace", simulate_windows_replace)
+    try:
+        lci_storage.build_sqlite(db_path, [new], [])
+    finally:
+        try:
+            reader.close()
+        except sqlite3.Error:
+            pass
+
+    assert replace_calls == 2
+    assert lci_storage.get_artifact(db_path, "skill:old") is None
+    assert lci_storage.get_artifact(db_path, "skill:new") is not None
+
+
+def test_build_sqlite_exhausted_replace_retries_preserve_existing_db(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    db_path = tmp_path / "state" / "index.sqlite"
+    old = lci.Artifact(
+        id="skill:old",
+        type="skill",
+        title="Old",
+        path="custom_skills/old/SKILL.md",
+        summary="Old index",
+        search_text="old index",
+    )
+    new = lci.Artifact(
+        id="skill:new",
+        type="skill",
+        title="New",
+        path="custom_skills/new/SKILL.md",
+        summary="New index",
+        search_text="new index",
+    )
+    lci_storage.build_sqlite(db_path, [old], [])
+    reader = lci_storage.connect_readonly(db_path)
+
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise PermissionError("[WinError 32] file is in use")
+
+    monkeypatch.setattr(lci_storage, "SQLITE_REPLACE_ATTEMPTS", 2)
+    monkeypatch.setattr(lci_storage, "SQLITE_REPLACE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(lci_storage.os, "replace", fail_replace)
+    try:
+        with pytest.raises(PermissionError, match="failed to publish SQLite index after 2 attempts") as exc_info:
+            lci_storage.build_sqlite(db_path, [new], [])
+        assert "destination index was not replaced" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, PermissionError)
+        assert "WinError 32" in str(exc_info.value.__cause__)
+        assert reader.execute("SELECT id FROM artifacts").fetchone()[0] == "skill:old"
+    finally:
+        reader.close()
+
+    assert lci_storage.get_artifact(db_path, "skill:old") is not None
+    assert lci_storage.get_artifact(db_path, "skill:new") is None
+    assert list(db_path.parent.glob(".index.sqlite.*.tmp")) == []
+
+
+def test_build_sqlite_refuses_to_overwrite_newer_index_format(tmp_path: Path) -> None:
+    db_path = tmp_path / "state" / "index.sqlite"
+    current = lci.Artifact(
+        id="skill:current",
+        type="skill",
+        title="Current",
+        path="custom_skills/current/SKILL.md",
+        summary="Current index",
+        search_text="current index",
+    )
+    lci_storage.build_sqlite(db_path, [current], [])
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION + 1}")
+        conn.commit()
+    finally:
+        conn.close()
+    before = db_path.read_bytes()
+
+    with pytest.raises(lci_storage.NewerIndexFormatError) as exc_info:
+        lci_storage.build_sqlite(db_path, [], [])
+
+    assert exc_info.value.expected_version == lci_storage.INDEX_FORMAT_VERSION
+    assert exc_info.value.actual_version == lci_storage.INDEX_FORMAT_VERSION + 1
+    assert db_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("builder", [lci.build_index, lci_storage.build_index])
+def test_build_index_refuses_newer_format_before_publishing_jsonl(tmp_path: Path, builder) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    builder(root, output_dir, hermes_home)
+    db_path = output_dir / "index.sqlite"
+    jsonl_path = output_dir / "index.jsonl"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION + 1}")
+        conn.commit()
+    finally:
+        conn.close()
+    db_before = db_path.read_bytes()
+    jsonl_before = jsonl_path.read_bytes()
+    write(root / "custom_skills" / "new" / "SKILL.md", "# New\n")
+
+    with pytest.raises(lci_storage.NewerIndexFormatError):
+        builder(root, output_dir, hermes_home)
+
+    assert db_path.read_bytes() == db_before
+    assert jsonl_path.read_bytes() == jsonl_before
 
 
 def test_build_sqlite_creates_nested_parent_directories(tmp_path: Path) -> None:
@@ -2290,7 +2433,7 @@ def test_cli_search_from_hermes_config_uses_configured_state_dir(tmp_path: Path,
     assert any(row["id"] == "skill:paperless-review-automation" for row in rows)
 
 
-@pytest.mark.parametrize("index_state", ["missing", "v0", "corrupt"])
+@pytest.mark.parametrize("index_state", ["missing", "older", "corrupt"])
 @pytest.mark.parametrize("lookup", ["search", "get", "neighbors"])
 def test_cli_lookups_from_hermes_config_rebuild_noncurrent_default_index_in_isolation(
     tmp_path: Path,
@@ -2333,7 +2476,7 @@ Create, update, pause, resume, or remove recurring scheduled jobs.
 """,
     )
     db_path = state_dir / "index.sqlite"
-    if index_state == "v0":
+    if index_state == "older":
         stale = lci.Artifact(
             id="tool_okf:stale-only",
             type="tool_okf",
@@ -2344,8 +2487,12 @@ Create, update, pause, resume, or remove recurring scheduled jobs.
             search_text="stale only",
         )
         lci_storage.build_sqlite(db_path, [stale], [])
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("PRAGMA user_version = 0")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION - 1}")
+            conn.commit()
+        finally:
+            conn.close()
     elif index_state == "corrupt":
         db_path.write_text("not a sqlite database", encoding="utf-8")
 
@@ -2374,6 +2521,65 @@ Create, update, pause, resume, or remove recurring scheduled jobs.
         assert payload["id"] == "skill:paperless-review-automation"
     else:
         assert any(row["id"] == "skill:paperless-review-automation" for row in payload)
+
+
+@pytest.mark.parametrize("lookup", ["search", "get", "neighbors"])
+def test_cli_lookups_reject_newer_default_index_without_rebuild(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    lookup: str,
+) -> None:  # type: ignore[no-untyped-def]
+    root, hermes_home = build_fixture(tmp_path)
+    state_dir = tmp_path / "configured_state"
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+    write(
+        hermes_home / "config.yaml",
+        f"""local_knowledge:
+  source_root: {root}
+  state_dir: {state_dir}
+""",
+    )
+    db_path = state_dir / "index.sqlite"
+    current = lci.Artifact(
+        id="skill:current",
+        type="skill",
+        title="Current",
+        path="custom_skills/current/SKILL.md",
+        summary="Current index",
+        search_text="current index",
+    )
+    lci_storage.build_sqlite(db_path, [current], [])
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION + 1}")
+        conn.commit()
+    finally:
+        conn.close()
+    before = db_path.read_bytes()
+    build_calls: list[str] = []
+
+    def unexpected_build(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        build_calls.append("build")
+        raise AssertionError("newer indexes must not be rebuilt")
+
+    command = {
+        "search": ["search", "current"],
+        "get": ["get", "skill:current"],
+        "neighbors": ["neighbors", "skill:current"],
+    }[lookup]
+    command.extend(["--from-hermes-config", "--hermes-home", str(hermes_home), "--json"])
+
+    assert lci_cli.main(command, build_index_fn=unexpected_build) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["success"] is False
+    assert payload["error_code"] == "newer_index_format"
+    assert payload["expected_index_format_version"] == lci_storage.INDEX_FORMAT_VERSION
+    assert payload["actual_index_format_version"] == lci_storage.INDEX_FORMAT_VERSION + 1
+    assert build_calls == []
+    assert db_path.read_bytes() == before
 
 
 def test_cli_search_explicit_db_remains_caller_owned(tmp_path: Path, monkeypatch) -> None:

@@ -16,7 +16,7 @@ from .text_utils import parse_frontmatter, safe_read_text, slugify
 
 QUEUE_DB_NAME = "okf_queue.sqlite"
 INDEX_DIRTY_MARKER_NAME = "okf_index_dirty"
-OKF_GENERATOR_VERSION = "2"
+OKF_GENERATOR_VERSION = "3"
 DEFAULT_MAX_ARG_ITEMS = 8
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_RELATED_TOOLS = 32

@@ -20,6 +20,7 @@ from .paths import default_output_dir, hermes_home_from_env
 from .runtime import RuntimeConfig, _runtime_config
 from .search import search_index
 from .storage import (
+    NewerIndexFormatError,
     artifact_type_counts,
     build_index,
     get_artifact,
@@ -435,6 +436,20 @@ def _emit_payload(payload: dict[str, Any], *, json_output: bool) -> None:
                 print(f"{key}: {value}")
 
 
+def _emit_newer_index_error(exc: NewerIndexFormatError, *, json_output: bool) -> None:
+    payload = {
+        "success": False,
+        "error_code": "newer_index_format",
+        "error": str(exc),
+        "expected_index_format_version": exc.expected_version,
+        "actual_index_format_version": exc.actual_version,
+    }
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(f"ERROR: {exc}", file=sys.stderr)
+
+
 def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[dict[str, Any], int]:
     source = _bundled_router_skill_path()
     target = _installed_router_skill_path(hermes_home)
@@ -776,6 +791,9 @@ def main(
                 db_path=db_path,
                 index_meta=index_metadata(db_path),
             )
+            if isinstance(exc, NewerIndexFormatError):
+                _emit_newer_index_error(exc, json_output=False)
+                return 1
             raise
         build_duration_ms = int((time.perf_counter() - started) * 1000)
         for token in dirty_tokens:
@@ -832,6 +850,9 @@ def main(
                 db_path=db_path,
                 index_meta=index_metadata(db_path),
             )
+            if isinstance(exc, NewerIndexFormatError):
+                _emit_newer_index_error(exc, json_output=args.json)
+                return 1
             raise
         _record_cli_usage(
             cfg,
@@ -877,6 +898,9 @@ def main(
                 db_path=db_path,
                 index_meta=index_metadata(db_path),
             )
+            if isinstance(exc, NewerIndexFormatError):
+                _emit_newer_index_error(exc, json_output=args.json)
+                return 1
             raise
         if row is None:
             _record_cli_usage(
@@ -932,6 +956,9 @@ def main(
                 db_path=db_path,
                 index_meta=index_metadata(db_path),
             )
+            if isinstance(exc, NewerIndexFormatError):
+                _emit_newer_index_error(exc, json_output=args.json)
+                return 1
             raise
         _record_cli_usage(
             cfg,

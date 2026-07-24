@@ -254,8 +254,12 @@ Create, update, pause, resume, or remove recurring scheduled jobs.
     )
     db_path = state_dir / "index.sqlite"
     lci_storage.build_sqlite(db_path, [stale], [])
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("PRAGMA user_version = 0")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION - 1}")
+        conn.commit()
+    finally:
+        conn.close()
 
     rebuilt_path, metadata = lci_runtime._ensure_index(repo)
 
@@ -1111,7 +1115,7 @@ def test_feedback_rejects_invalid_rating_and_event_id():
     assert invalid_event_id["error"] == "event_id must be an integer when provided"
 
 
-@pytest.mark.parametrize("index_state", ["missing", "v0", "corrupt"])
+@pytest.mark.parametrize("index_state", ["missing", "older", "corrupt"])
 @pytest.mark.parametrize("lookup", ["search", "get", "neighbors"])
 def test_lookup_handlers_rebuild_noncurrent_index_in_isolation(
     tmp_path,
@@ -1122,7 +1126,7 @@ def test_lookup_handlers_rebuild_noncurrent_index_in_isolation(
     repo, hermes_home, state_dir = make_temp_repo(tmp_path)
     configure_env(monkeypatch, repo, hermes_home, state_dir)
     db_path = state_dir / "index.sqlite"
-    if index_state == "v0":
+    if index_state == "older":
         stale = Artifact(
             id="tool_okf:stale-only",
             type="tool_okf",
@@ -1133,8 +1137,12 @@ def test_lookup_handlers_rebuild_noncurrent_index_in_isolation(
             search_text="stale only",
         )
         lci_storage.build_sqlite(db_path, [stale], [])
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("PRAGMA user_version = 0")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION - 1}")
+            conn.commit()
+        finally:
+            conn.close()
     elif index_state == "corrupt":
         state_dir.mkdir(parents=True)
         db_path.write_text("not a sqlite db", encoding="utf-8")
@@ -1160,6 +1168,59 @@ def test_lookup_handlers_rebuild_noncurrent_index_in_isolation(
         assert payload["artifact"]["id"] == "skill:paperless-review-automation"
     else:
         assert any(row["id"] == "skill:paperless-helper" for row in payload["neighbors"])
+
+
+@pytest.mark.parametrize("rebuild", [False, True])
+@pytest.mark.parametrize(
+    ("handler", "args"),
+    [
+        (plugin._handle_search, {"query": "current"}),
+        (plugin._handle_get, {"artifact_id": "skill:current"}),
+        (plugin._handle_neighbors, {"artifact_id": "skill:current"}),
+    ],
+)
+def test_lookup_handlers_reject_newer_index_without_rebuild(
+    tmp_path,
+    monkeypatch,
+    handler,
+    args,
+    rebuild,
+):  # type: ignore[no-untyped-def]
+    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
+    configure_env(monkeypatch, repo, hermes_home, state_dir)
+    db_path = state_dir / "index.sqlite"
+    current = Artifact(
+        id="skill:current",
+        type="skill",
+        title="Current",
+        path="custom_skills/current/SKILL.md",
+        summary="Current index",
+        search_text="current index",
+    )
+    lci_storage.build_sqlite(db_path, [current], [])
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION + 1}")
+        conn.commit()
+    finally:
+        conn.close()
+    before = db_path.read_bytes()
+    build_calls: list[str] = []
+
+    def unexpected_build(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        build_calls.append("build")
+        raise AssertionError("newer indexes must not be rebuilt")
+
+    monkeypatch.setattr(plugin.indexer, "build_index", unexpected_build)
+
+    payload = json.loads(handler({**args, "rebuild": rebuild}))
+
+    assert payload["success"] is False
+    assert payload["error_code"] == "newer_index_format"
+    assert payload["expected_index_format_version"] == lci_storage.INDEX_FORMAT_VERSION
+    assert payload["actual_index_format_version"] == lci_storage.INDEX_FORMAT_VERSION + 1
+    assert build_calls == []
+    assert db_path.read_bytes() == before
 
 
 def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):
