@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1947,30 +1948,59 @@ def test_build_sqlite_retries_transient_replace_failure_with_active_reader(tmp_p
         search_text="new index",
     )
     lci_storage.build_sqlite(db_path, [old], [])
-    reader = lci_storage.connect_readonly(db_path)
+    reader_ready = threading.Event()
+    publication_started = threading.Event()
+    allow_reader_release = threading.Event()
+    reader_released = threading.Event()
+    reader_errors: list[Exception] = []
+
+    def hold_reader_until_retry() -> None:
+        reader: sqlite3.Connection | None = None
+        try:
+            reader = lci_storage.connect_readonly(db_path)
+            assert reader.execute("SELECT id FROM artifacts").fetchone()[0] == "skill:old"
+            reader_ready.set()
+            if not allow_reader_release.wait(timeout=2):
+                raise TimeoutError("reader was not released during the publication retry")
+        except Exception as exc:
+            reader_errors.append(exc)
+        finally:
+            if reader is not None:
+                reader.close()
+            reader_released.set()
+
+    reader_thread = threading.Thread(target=hold_reader_until_retry, name="sqlite-reader")
+    reader_thread.start()
     real_replace = lci_storage.os.replace
     replace_calls = 0
 
     def simulate_windows_replace(source: Path, destination: Path) -> None:
         nonlocal replace_calls
         replace_calls += 1
-        if replace_calls == 1:
-            assert reader.execute("SELECT id FROM artifacts").fetchone()[0] == "skill:old"
-            reader.close()
+        if not reader_released.is_set():
+            publication_started.set()
             raise PermissionError("simulated active Windows SQLite reader")
         real_replace(source, destination)
 
+    def release_reader_during_retry(delay_seconds: float) -> None:
+        assert delay_seconds > 0
+        assert publication_started.is_set()
+        allow_reader_release.set()
+        assert reader_released.wait(timeout=2)
+
     monkeypatch.setattr(lci_storage, "SQLITE_REPLACE_ATTEMPTS", 3)
-    monkeypatch.setattr(lci_storage, "SQLITE_REPLACE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(lci_storage, "SQLITE_REPLACE_RETRY_SECONDS", 0.01)
     monkeypatch.setattr(lci_storage.os, "replace", simulate_windows_replace)
+    monkeypatch.setattr(lci_storage.time, "sleep", release_reader_during_retry)
     try:
+        assert reader_ready.wait(timeout=2)
         lci_storage.build_sqlite(db_path, [new], [])
     finally:
-        try:
-            reader.close()
-        except sqlite3.Error:
-            pass
+        allow_reader_release.set()
+        reader_thread.join(timeout=2)
 
+    assert not reader_thread.is_alive()
+    assert reader_errors == []
     assert replace_calls == 2
     assert lci_storage.get_artifact(db_path, "skill:old") is None
     assert lci_storage.get_artifact(db_path, "skill:new") is not None
