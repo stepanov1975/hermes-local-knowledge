@@ -526,8 +526,12 @@ def test_retry_error_candidate_does_not_recreate_removed_queue(tmp_path: Path, m
     state_dir = tmp_path / "state"
     seed_candidate(state_dir, tool_name="race_tool")
     queue_db = okf.okf_queue_db_path(state_dir)
-    with sqlite3.connect(queue_db) as conn:
+    conn = sqlite3.connect(queue_db)
+    try:
         conn.execute("UPDATE okf_candidates SET status = 'error'")
+        conn.commit()
+    finally:
+        conn.close()
     original_connect = okf.sqlite3.connect
 
     def remove_before_open(database, *args, **kwargs):  # type: ignore[no-untyped-def]

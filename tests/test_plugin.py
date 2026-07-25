@@ -567,18 +567,19 @@ def test_index_build_lock_serializes_across_processes(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     lock_path = lci_storage.index_build_lock_path(state_dir)
     probe = """
-import fcntl
-import os
 import sys
-fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+from pathlib import Path
+from hermes_local_knowledge import storage
+
+fd = storage._open_index_build_lock(Path(sys.argv[1]))
+acquired = False
 try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    print('blocked')
-else:
-    print('acquired')
+    acquired = storage._try_acquire_index_build_lock(fd)
+    print('acquired' if acquired else 'blocked')
 finally:
-    os.close(fd)
+    if acquired:
+        storage._release_index_build_lock(fd)
+    storage._close_index_build_lock(fd)
 """
     with lci_storage.index_build_lock(state_dir):
         blocked = subprocess.run(
