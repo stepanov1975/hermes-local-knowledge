@@ -1735,6 +1735,39 @@ Route to this Paperless tool when the user needs metadata for the newest matchin
     assert "tool_okf:mcp-paperless-paperless-find-latest-document" in {row["id"] for row in rows}
 
 
+def test_scan_tool_okfs_ignores_hidden_staging_markdown(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    okf_root = tmp_path / "state" / "okfs" / "tools"
+    write(
+        okf_root / "final-demo.md",
+        """---
+artifact_type: tool_okf
+tool: final_demo
+schema_hash: sha256:final
+---
+
+# Final demo
+""",
+    )
+    write(
+        okf_root / ".final-demo.md.random.md",
+        """---
+artifact_type: tool_okf
+tool: staged_demo
+schema_hash: sha256:staged
+---
+
+# Staged demo
+""",
+    )
+
+    artifacts = lci.scan_tool_okfs(okf_root, root)
+
+    assert [(artifact.id, Path(artifact.path).name) for artifact in artifacts] == [
+        ("tool_okf:final-demo", "final-demo.md")
+    ]
+
+
 def test_tool_okf_under_source_root_is_not_indexed_as_doc(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
     output_dir = root / "local_knowledge"

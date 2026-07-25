@@ -582,6 +582,8 @@ def scan_tool_okfs(
         followlinks=False,
         excluded_dir_names=settings.exclude_dir_names,
     ) or []:
+        if path.name.startswith("."):
+            continue
         text = safe_read_text(path)
         fm = parse_frontmatter(text)
         artifact_type = str(fm.get("artifact_type") or "tool_okf").strip()
