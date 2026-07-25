@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .search import search_index
-from .storage import connect_readonly, decode_artifact_row
+from .storage import connect_readonly, decode_artifact_row, readonly_sqlite_uri
 
 POSITIVE_FEEDBACK_RATINGS = frozenset({"useful", "great"})
 IGNORED_LABEL_VALUES = frozenset({"", "none", "null", "xxxx", "sentinel unlikely", "demo"})
@@ -137,7 +137,7 @@ def load_positive_feedback_labels(
     caller can pass ``valid_artifact_ids`` to discard stale artifact labels.
     """
 
-    conn = sqlite3.connect(f"file:{usage_db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(readonly_sqlite_uri(usage_db_path), uri=True)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(

@@ -574,6 +574,74 @@ def test_compare_helper_parent_equivalence_counts_sibling_support_docs() -> None
     ) is True
 
 
+@pytest.mark.parametrize(
+    ("builder", "module"),
+    [(lci.build_index, lci), (lci_storage.build_index, lci_storage)],
+)
+def test_sqlite_publication_failure_preserves_previous_jsonl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builder: Any,
+    module: Any,
+) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    builder(root, output_dir, hermes_home)
+    before = (output_dir / "index.jsonl").read_bytes()
+    write(root / "docs" / "new.md", "# New generation\n")
+    monkeypatch.setattr(
+        module,
+        "build_sqlite",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("blocked")),
+    )
+
+    with pytest.raises(PermissionError, match="blocked"):
+        builder(root, output_dir, hermes_home)
+
+    assert (output_dir / "index.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize("marker", ["state#one", "state%one"])
+def test_readonly_sqlite_uris_escape_special_state_paths(tmp_path: Path, marker: str) -> None:
+    db_path = tmp_path / marker / "index.sqlite"
+    artifact = lci.Artifact(
+        id="skill:alpha",
+        type="skill",
+        title="Alpha",
+        path="custom_skills/alpha/SKILL.md",
+        summary="Alpha",
+        search_text="alpha",
+    )
+    lci.build_sqlite(db_path, [artifact], [])
+
+    assert lci.get_artifact(db_path, "skill:alpha") is not None
+
+    usage_db = tmp_path / marker / "usage.sqlite"
+    create_usage_db(usage_db)
+    assert lci.load_positive_feedback_labels(usage_db) == {
+        "paperless review": {"skill:paperless-review-automation"},
+        "siyuan mcp": {"mcp:siyuan"},
+        "paperless reviewer script": {"script:scripts-paperless-review-run-reviewer-py"},
+        "stale artifact": {"script:missing"},
+    }
+
+
+def test_historical_helper_escapes_sqlite_uri_paths(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    db_path = tmp_path / "state#one" / "index.sqlite"
+    artifact = lci.Artifact(
+        id="skill:alpha",
+        type="skill",
+        title="Alpha",
+        path="custom_skills/alpha/SKILL.md",
+        summary="Alpha",
+        search_text="alpha",
+    )
+    lci.build_sqlite(db_path, [artifact], [])
+
+    assert helper.artifact_ids(db_path) == {"skill:alpha"}
+
+
 def test_compare_helper_build_uses_explicit_state_guards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     helper = load_compare_helper()
     calls: list[tuple[list[str], dict[str, str] | None]] = []

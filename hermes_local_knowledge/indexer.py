@@ -157,8 +157,8 @@ def build_index(
     artifacts = _collect_artifacts_compat(root, hermes_home, settings, output_dir / "okfs")
     edges = build_edges(artifacts)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_jsonl(output_dir / "index.jsonl", artifacts)
     build_sqlite(output_dir / "index.sqlite", artifacts, edges)
+    write_jsonl(output_dir / "index.jsonl", artifacts)
     return artifacts, edges
 
 def main(argv=None) -> int:

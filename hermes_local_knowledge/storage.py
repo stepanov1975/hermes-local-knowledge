@@ -342,8 +342,8 @@ def build_index(
     artifacts = collect_artifacts(root, hermes_home, settings, okf_root=output_dir / "okfs")
     edges = build_edges(artifacts)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_jsonl(output_dir / "index.jsonl", artifacts)
     build_sqlite(output_dir / "index.sqlite", artifacts, edges)
+    write_jsonl(output_dir / "index.jsonl", artifacts)
     return artifacts, edges
 
 
@@ -408,8 +408,12 @@ def index_metadata(db_path: Path) -> dict[str, Any]:
     return metadata
 
 
+def readonly_sqlite_uri(path: Path) -> str:
+    return f"{path.expanduser().resolve().as_uri()}?mode=ro"
+
+
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(readonly_sqlite_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
