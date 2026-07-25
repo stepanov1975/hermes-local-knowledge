@@ -6,7 +6,8 @@ import json
 import re
 import sqlite3
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -343,16 +344,17 @@ def _redacted_error_marker(value: Any) -> str | None:
     return "<redacted>"
 
 
-def _connect(state_dir: Path) -> sqlite3.Connection:
+@contextmanager
+def _connect(state_dir: Path) -> Iterator[sqlite3.Connection]:
     state_dir.expanduser().resolve().mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(okf_queue_db_path(state_dir))
     conn.row_factory = sqlite3.Row
     try:
         _ensure_schema(conn)
-    except Exception:
+        with conn:
+            yield conn
+    finally:
         conn.close()
-        raise
-    return conn
 
 
 def _candidate_table_columns(conn: sqlite3.Connection) -> set[str]:
