@@ -239,6 +239,31 @@ def test_mcp_fallback_parses_block_args_and_env_names_without_values(tmp_path: P
     assert "private-value" not in artifact.search_text
 
 
+def test_mcp_fallback_redacts_inline_args_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    root.mkdir()
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  demo:
+    command: npx
+    args: [demo-package, --profile, local, --api-key, INLINE_TEST_SECRET, --token=INLINE_ASSIGNMENT_SECRET]
+""",
+    )
+    monkeypatch.setattr(lci_scanners, "load_yaml_if_available", lambda _path: None)
+
+    artifact = lci.scan_mcp_servers(root, hermes_home)[0]
+    persisted = "\n".join([artifact.summary, artifact.search_text, " ".join(artifact.triggers)])
+
+    assert "demo-package" in persisted
+    assert "--profile local" in persisted
+    assert "--api-key <redacted>" in persisted
+    assert "--token=<redacted>" in persisted
+    assert "INLINE_TEST_SECRET" not in persisted
+    assert "INLINE_ASSIGNMENT_SECRET" not in persisted
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

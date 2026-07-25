@@ -18,6 +18,7 @@ from .text_utils import (
     first_heading_or_paragraph,
     first_sentence,
     identifier_terms,
+    parse_bracket_list,
     parse_frontmatter,
     regex_list_after_key,
     relpath_matches_config_dir,
@@ -468,6 +469,9 @@ def parse_mcp_servers_fallback(text: str) -> dict[str, tuple[dict[str, Any], str
             if key == "args" and not value:
                 servers[current][0][key] = []
                 current_container = "args"
+            elif key == "args" and value.startswith("[") and value.endswith("]"):
+                servers[current][0][key] = parse_bracket_list(value)
+                current_container = None
             elif key == "env" and not value:
                 servers[current][0][key] = {}
                 current_container = "env"
