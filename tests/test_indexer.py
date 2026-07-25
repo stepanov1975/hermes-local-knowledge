@@ -2591,6 +2591,35 @@ def test_cli_get_missing_artifact_exits_nonzero(tmp_path: Path, capsys) -> None:
     assert "Artifact not found: skill:nope" in captured.err
 
 
+def test_cli_get_missing_artifact_emits_json_error(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    db_path = tmp_path / "index.sqlite"
+    lci.build_sqlite(db_path, [], [])
+    assert lci.main(["get", "skill:missing", "--db", str(db_path), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "command": "get",
+        "error": "Artifact not found: skill:missing",
+        "success": False,
+    }
+
+
+@pytest.mark.parametrize("command", ["search", "get", "neighbors", "evaluate"])
+def test_cli_json_mode_serializes_operational_errors(command: str, tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+    missing = tmp_path / "missing.sqlite"
+    argv = {
+        "search": ["search", "alpha", "--db", str(missing), "--json"],
+        "get": ["get", "skill:alpha", "--db", str(missing), "--json"],
+        "neighbors": ["neighbors", "skill:alpha", "--db", str(missing), "--json"],
+        "evaluate": ["evaluate", "--db", str(missing), "--json"],
+    }[command]
+    assert lci.main(argv) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["success"] is False
+    assert payload["command"] == command
+    assert payload["error"]
+
+
 def test_cli_build_from_hermes_config_uses_configured_layout(tmp_path: Path, capsys, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     root, hermes_home = build_fixture(tmp_path)
     state_dir = tmp_path / "configured_state"

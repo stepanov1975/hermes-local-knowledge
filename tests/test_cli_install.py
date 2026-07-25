@@ -216,6 +216,28 @@ def test_doctor_warns_for_missing_router_skill_and_disabled_auto_generation(
     assert "additional model tokens" in str(checks["okf_auto_generate"]["detail"])
 
 
+@pytest.mark.parametrize("auto_generate", [False, True])
+def test_doctor_rejects_disabled_okf_queue_even_when_generation_is_enabled(
+    tmp_path: Path,
+    capsys,
+    auto_generate: bool,
+) -> None:  # type: ignore[no-untyped-def]
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "local_knowledge:\n  okf:\n    enabled: false\n"
+        f"    auto_generate: {str(auto_generate).lower()}\n",
+        encoding="utf-8",
+    )
+
+    assert lci_cli.main(["doctor", "--hermes-home", str(hermes_home), "--json"]) == 0
+    check = doctor_checks(stdout_json(capsys))["okf_auto_generate"]
+    assert check["ok"] is False
+    assert "local_knowledge.okf.enabled true" in str(check["detail"])
+    if not auto_generate:
+        assert "local_knowledge.okf.auto_generate true" in str(check["detail"])
+
+
 def test_doctor_accepts_current_router_skill_and_enabled_auto_generation(
     tmp_path: Path,
     capsys,

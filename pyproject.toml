@@ -22,6 +22,7 @@ classifiers = [
 
 [project.optional-dependencies]
 test = [
+    "build>=1,<2",
     "mypy>=1.18,<3",
     "pytest>=8,<10",
     "PyYAML>=6,<7",

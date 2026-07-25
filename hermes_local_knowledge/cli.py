@@ -447,6 +447,10 @@ def _emit_payload(payload: dict[str, Any], *, json_output: bool) -> None:
                 print(f"{key}: {value}")
 
 
+def _emit_cli_json_error(command: str, message: str) -> None:
+    _emit_payload({"success": False, "command": command, "error": message}, json_output=True)
+
+
 def _emit_newer_index_error(exc: NewerIndexFormatError, *, json_output: bool) -> None:
     payload = {
         "success": False,
@@ -686,14 +690,20 @@ def _doctor_payload(
         ),
         fatal=False,
     )
+    okf_ready = cfg.okf.enabled and cfg.okf.auto_generate
+    recommendations = []
+    if not cfg.okf.enabled:
+        recommendations.append("hermes config set local_knowledge.okf.enabled true")
+    if not cfg.okf.auto_generate:
+        recommendations.append("hermes config set local_knowledge.okf.auto_generate true")
     check(
         "okf_auto_generate",
-        cfg.okf.auto_generate,
+        okf_ready,
         "enabled; automatic OKF generation uses additional model tokens"
-        if cfg.okf.auto_generate
+        if okf_ready
         else (
             "disabled; full automatic OKF generation is unavailable. After the user accepts "
-            "additional model tokens, run `hermes config set local_knowledge.okf.auto_generate true`"
+            f"additional model tokens, run {'; '.join(recommendations)}"
         ),
         fatal=False,
     )
@@ -864,6 +874,9 @@ def main(
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
                 return 1
+            if args.json:
+                _emit_cli_json_error("search", f"{type(exc).__name__}: {exc}")
+                return 1
             raise
         _record_cli_usage(
             cfg,
@@ -912,6 +925,9 @@ def main(
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
                 return 1
+            if args.json:
+                _emit_cli_json_error("get", f"{type(exc).__name__}: {exc}")
+                return 1
             raise
         if row is None:
             _record_cli_usage(
@@ -924,7 +940,11 @@ def main(
                 db_path=db_path,
                 index_meta=index_metadata(db_path),
             )
-            print(f"Artifact not found: {args.artifact_id}", file=sys.stderr)
+            not_found_message = f"Artifact not found: {args.artifact_id}"
+            if args.json:
+                _emit_cli_json_error("get", not_found_message)
+            else:
+                print(not_found_message, file=sys.stderr)
             return 1
         _record_cli_usage(
             cfg,
@@ -970,6 +990,9 @@ def main(
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
                 return 1
+            if args.json:
+                _emit_cli_json_error("neighbors", f"{type(exc).__name__}: {exc}")
+                return 1
             raise
         _record_cli_usage(
             cfg,
@@ -993,8 +1016,17 @@ def main(
         db_path, warnings, _cfg = _db_from_args(args)
         _print_warnings(warnings)
         usage_db_path = _resolved(args.usage_db) if args.usage_db is not None else db_path.parent / "usage.sqlite"
-        report = evaluate_index_against_feedback_report(db_path, usage_db_path)
-        metrics = report.as_dict() if args.details else report.metrics.as_dict()
+        try:
+            report = evaluate_index_against_feedback_report(db_path, usage_db_path)
+            metrics = report.as_dict() if args.details else report.metrics.as_dict()
+        except Exception as exc:
+            if isinstance(exc, NewerIndexFormatError):
+                _emit_newer_index_error(exc, json_output=args.json)
+                return 1
+            if args.json:
+                _emit_cli_json_error("evaluate", f"{type(exc).__name__}: {exc}")
+                return 1
+            raise
         if args.json:
             print(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True))
         else:
