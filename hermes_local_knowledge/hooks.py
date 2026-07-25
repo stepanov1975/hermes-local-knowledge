@@ -269,6 +269,17 @@ def _write_and_complete_item(
         return False
     path = okf.okf_file_path(cfg.state_dir, tool_name)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        existing = okf.parse_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+        existing_tool = str(existing.get("tool") or "").strip()
+        if existing_tool and existing_tool != tool_name:
+            okf.mark_candidate_error(
+                cfg.state_dir,
+                tool_name=tool_name,
+                claim_token=claim_token,
+                error="generated target collision",
+            )
+            return False
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",

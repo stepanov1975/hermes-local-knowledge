@@ -317,6 +317,39 @@ def test_generation_publishes_under_owned_lease_and_cleans_unique_temp(tmp_path:
     assert okf.queue_counts(state_dir) == {"done": 1}
 
 
+def test_generation_rejects_colliding_tool_slug_without_overwrite(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _repo, hermes_home, state_dir = configure(tmp_path, monkeypatch)
+    rows = []
+    for tool_name in ("foo-bar", "foo_bar"):
+        okf.upsert_tool_candidate(
+            state_dir,
+            tool_name=tool_name,
+            toolset="demo",
+            schema={"type": "object"},
+            args={},
+        )
+        rows.append(okf.claim_candidates(state_dir, limit=1, claim_token=f"claim-{tool_name}")[0])
+    assert okf.acquire_generation_lease(state_dir, owner="publishing-worker", lease_seconds=60)
+
+    cfg = okf_worker._runtime_config(hermes_home)
+    assert hooks._write_and_complete_item(
+        cfg,
+        row=rows[0],
+        item=generated_item(okf.candidate_packet(rows[0], state_dir)),
+        lease_owner="publishing-worker",
+    ) is True
+    assert hooks._write_and_complete_item(
+        cfg,
+        row=rows[1],
+        item=generated_item(okf.candidate_packet(rows[1], state_dir)),
+        lease_owner="publishing-worker",
+    ) is False
+
+    rendered = okf.okf_file_path(state_dir, "foo-bar").read_text(encoding="utf-8")
+    assert 'tool: "foo-bar"' in rendered
+    assert okf.queue_counts(state_dir) == {"done": 1, "pending": 1}
+
+
 def test_stale_publication_cannot_mutate_new_owner_artifact(tmp_path: Path) -> None:
     state_dir = tmp_path / "knowledge"
     okf.upsert_tool_candidate(
