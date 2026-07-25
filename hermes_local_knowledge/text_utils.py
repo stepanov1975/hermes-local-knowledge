@@ -254,9 +254,22 @@ def fts_query(query: str, *, operator: str = "AND") -> str:
     # FTS5 treats punctuation as syntax in bare MATCH terms (for example,
     # `manifest-backed*` can be parsed as `manifest` NOT column `backed`).
     # Split punctuation-heavy human queries into plain prefix terms instead.
-    terms = query_terms(query)
+    components: list[str] = []
+    cursor = 0
+    quoted = re.compile(r'(?<!\w)(["\'])([^"\'\n]+)\1(?!\w)')
+    for match in quoted.finditer(query):
+        components.extend(f"{term}*" for term in query_terms(query[cursor : match.start()]))
+        phrase_terms = query_terms(match.group(2))
+        if phrase_terms:
+            raw_terms = re.findall(r"[A-Za-z0-9]{2,}", match.group(2).lower())
+            raw_terms = unique_preserve_order(
+                term for term in raw_terms if normalize_query_term(term) not in QUERY_STOPWORDS
+            )
+            components.append(f'"{" ".join(raw_terms or phrase_terms)}"')
+        cursor = match.end()
+    components.extend(f"{term}*" for term in query_terms(query[cursor:]))
     separator = " OR " if operator.upper() == "OR" else " "
-    return separator.join(f"{term}*" for term in terms)
+    return separator.join(components)
 
 def token_hits(tokens: set[str], terms: Sequence[str]) -> int:
     hits = 0

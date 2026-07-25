@@ -19,9 +19,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _equivalence_family(artifact_id: str, equivalents: Mapping[str, set[str]]) -> set[str]:
+    return {artifact_id, *equivalents.get(artifact_id, set())}
+
+
+def matches_parent(result_id: str, expected: set[str], equivalents: Mapping[str, set[str]]) -> bool:
+    result_family = _equivalence_family(result_id, equivalents)
+    return any(result_family & _equivalence_family(expected_id, equivalents) for expected_id in expected)
 
 EVALUATOR_CODE = r'''
 from __future__ import annotations
@@ -30,7 +39,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 try:
     from hermes_local_knowledge.indexer import search_index
@@ -120,8 +129,13 @@ def parent_equivalents(db_path: Path) -> dict[str, set[str]]:
     return out
 
 
-def matches_parent(result_id: str, expected: set[str], equivalents: dict[str, set[str]]) -> bool:
-    return result_id in expected or bool(equivalents.get(result_id, set()) & expected)
+def _equivalence_family(artifact_id: str, equivalents: Mapping[str, set[str]]) -> set[str]:
+    return {artifact_id, *equivalents.get(artifact_id, set())}
+
+
+def matches_parent(result_id: str, expected: set[str], equivalents: Mapping[str, set[str]]) -> bool:
+    result_family = _equivalence_family(result_id, equivalents)
+    return any(result_family & _equivalence_family(expected_id, equivalents) for expected_id in expected)
 
 
 def metrics_for(db_path: Path, usage_db: Path) -> dict[str, Any]:

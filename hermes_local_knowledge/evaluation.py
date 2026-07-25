@@ -167,14 +167,20 @@ def load_positive_feedback_labels(
     return labels
 
 
+def _equivalence_family(artifact_id: str, equivalents: Mapping[str, set[str]]) -> set[str]:
+    return {artifact_id, *equivalents.get(artifact_id, set())}
+
+
 def _matches_with_parent_equivalence(
     result_id: str,
     expected_ids: set[str],
     parent_equivalents: Mapping[str, set[str]],
 ) -> bool:
-    if result_id in expected_ids:
-        return True
-    return bool(parent_equivalents.get(result_id, set()) & expected_ids)
+    result_family = _equivalence_family(result_id, parent_equivalents)
+    return any(
+        result_family & _equivalence_family(expected_id, parent_equivalents)
+        for expected_id in expected_ids
+    )
 
 
 def evaluate_search_labels(

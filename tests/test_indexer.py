@@ -453,6 +453,17 @@ def test_parent_equivalent_metrics_only_count_support_doc_parent_pairs() -> None
     assert peer_skill.hit_at_1 == 0.0
     assert peer_skill.parent_equiv_hit_at_1 == 0.0
 
+    siblings = lci.evaluate_search_labels(
+        {"query": {"skill_support_doc:child-a"}},
+        lambda _query, _limit: ["skill_support_doc:child-b"],
+        parent_equivalents={
+            "skill:parent": {"skill_support_doc:child-a", "skill_support_doc:child-b"},
+            "skill_support_doc:child-a": {"skill:parent"},
+            "skill_support_doc:child-b": {"skill:parent"},
+        },
+    )
+    assert siblings.parent_equiv_hit_at_1 == 1.0
+
 
 def test_evaluation_metrics_are_capped_to_top_ten() -> None:
     rank_eleven = lci.evaluate_search_labels(
@@ -546,6 +557,21 @@ def test_compare_helper_ref_names_are_collision_resistant() -> None:
     helper = load_compare_helper()
 
     assert helper.safe_ref_name("feature/a") != helper.safe_ref_name("feature-a")
+
+
+def test_compare_helper_parent_equivalence_counts_sibling_support_docs() -> None:
+    helper = load_compare_helper()
+    equivalents = {
+        "skill:parent": {"skill_support_doc:child-a", "skill_support_doc:child-b"},
+        "skill_support_doc:child-a": {"skill:parent"},
+        "skill_support_doc:child-b": {"skill:parent"},
+    }
+
+    assert helper.matches_parent(
+        "skill_support_doc:child-b",
+        {"skill_support_doc:child-a"},
+        equivalents,
+    ) is True
 
 
 def test_compare_helper_build_uses_explicit_state_guards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1485,6 +1511,31 @@ def test_quoted_query_does_not_backfill_relaxed_fallback_results(tmp_path: Path)
     results = lci.search_index(db_path, '"unique exact phrase"', limit=5)
 
     assert [row["id"] for row in results] == [exact.id]
+
+
+def test_quoted_phrase_requires_adjacent_terms(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    adjacent = lci.Artifact(
+        id="runbook:adjacent",
+        type="runbook",
+        title="Adjacent",
+        path="docs/adjacent.md",
+        summary="alpha beta",
+        search_text="alpha beta",
+    )
+    separated = lci.Artifact(
+        id="runbook:separated",
+        type="runbook",
+        title="Separated",
+        path="docs/separated.md",
+        summary="alpha intervening words beta",
+        search_text="alpha intervening words beta",
+    )
+    lci.build_sqlite(db_path, [adjacent, separated], [])
+
+    assert [row["id"] for row in lci.search_index(db_path, '"alpha beta"', limit=5)] == [
+        "runbook:adjacent"
+    ]
 
 
 def test_identifier_metadata_expands_text_poor_home_assistant_artifacts(tmp_path: Path) -> None:
