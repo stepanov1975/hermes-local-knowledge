@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.12] - 2026-07-26
+
+### Fixed
+
+- Kept obvious MCP credential arguments out of routing metadata while preserving useful local identifiers and paths.
+- Rejected artifact and tool-OKF slug collisions instead of silently overwriting whole artifacts.
+- Validated generated OKFs before atomic publication and kept failed index generations consistent.
+- Corrected quoted search, parent-equivalent evaluation, cross-platform MCP wrapper paths, JSON diagnostics, SQLite special-character paths, and source-distribution contents.
+
 ## [0.3.11] - 2026-07-26
 
 ### Fixed
@@ -43,6 +52,7 @@ All notable changes to this project are documented in this file.
 - Added bounded retries for SQLite index publication when short-lived Windows readers temporarily prevent `os.replace`, while preserving the previous usable index if retries are exhausted ([#19]).
 - Prevented older plugin runtimes from downgrading indexes created by newer index formats across native tools and config-backed CLI lookups ([#20]).
 
+[0.3.12]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.8...v0.3.9
