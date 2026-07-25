@@ -225,9 +225,13 @@ def first_sentence(text: str) -> str:
         return match.group(1)[:500]
     return clean[:500]
 
+_LOCAL_PATH = re.compile(
+    r'(?:(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s\'"`]+|\\\\[^\s\'"`]+|~[\\/][^\s\'"`]+|(?<![A-Za-z0-9:/])/(?!/)[^\s\'"`]+)'
+)
+
+
 def extract_paths(text: str) -> list[str]:
-    paths = re.findall(r"(?:/home/[A-Za-z0-9_./-]+|~/[A-Za-z0-9_./-]+)", text)
-    return unique_preserve_order(path.rstrip("`.,);]") for path in paths)
+    return unique_preserve_order(match.rstrip("`.,);]") for match in _LOCAL_PATH.findall(text))
 
 def normalize_query_term(term: str) -> str:
     term = term.lower().strip()

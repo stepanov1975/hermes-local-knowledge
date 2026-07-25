@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from .constants import SCRIPT_SUFFIXES, STOPWORDS
 from .models import Artifact, Edge, IndexSettings
@@ -374,11 +375,62 @@ def load_yaml_if_available(path: Path) -> Any:
     except (OSError, yaml.YAMLError):  # type: ignore[name-defined]
         return None
 
+
+_MCP_SECRET_WORDS = {"token", "secret", "password", "authorization", "credential"}
+_MCP_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b([A-Za-z0-9_-]*(?:token|secret|password|authorization|credential|api[_-]?key)[A-Za-z0-9_-]*)=([^\s]+)"
+)
+
+
+def _mcp_secret_option(value: str) -> bool:
+    name = value.split("=", 1)[0].lstrip("-").lower()
+    parts = set(re.findall(r"[a-z0-9]+", name))
+    return bool(parts & _MCP_SECRET_WORDS) or "apikey" in name.replace("-", "").replace("_", "") or {
+        "api",
+        "key",
+    } <= parts
+
+
+def _sanitize_mcp_args(args: Any) -> str:
+    values = [str(item) for item in args] if isinstance(args, list) else [str(args)] if args else []
+    output: list[str] = []
+    redact_next = False
+    for value in values:
+        if redact_next:
+            output.append("<redacted>")
+            redact_next = False
+        elif value.startswith("-") and "=" in value and _mcp_secret_option(value):
+            output.append(f"{value.split('=', 1)[0]}=<redacted>")
+        else:
+            output.append(value)
+            redact_next = value.startswith("-") and _mcp_secret_option(value)
+    return " ".join(output)
+
+
+def _sanitize_mcp_url(value: str) -> str:
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        if not hostname:
+            return ""
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+    except ValueError:
+        return ""
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 def parse_mcp_servers_fallback(text: str) -> dict[str, tuple[dict[str, Any], str]]:
     servers: dict[str, tuple[dict[str, Any], str]] = {}
     section: str | None = None
     in_servers = False
     current: str | None = None
+    current_container: str | None = None
     current_path = "mcp.servers"
     for raw_line in text.splitlines():
         top_level = re.match(r"^([A-Za-z0-9_-]+):\s*$", raw_line)
@@ -387,6 +439,7 @@ def parse_mcp_servers_fallback(text: str) -> dict[str, tuple[dict[str, Any], str
             in_servers = section == "mcp_servers"
             current_path = "mcp_servers" if in_servers else "mcp.servers"
             current = None
+            current_container = None
             continue
         if section not in {"mcp", "mcp_servers"}:
             continue
@@ -394,6 +447,7 @@ def parse_mcp_servers_fallback(text: str) -> dict[str, tuple[dict[str, Any], str
             in_servers = True
             current_path = "mcp.servers"
             current = None
+            current_container = None
             continue
         if not in_servers:
             continue
@@ -404,10 +458,34 @@ def parse_mcp_servers_fallback(text: str) -> dict[str, tuple[dict[str, Any], str
             server_name = server_match.group(1)
             current = server_name
             servers[server_name] = ({}, current_path)
+            current_container = None
             continue
-        value_match = re.match(rf"^\s{{{value_indent}}}([A-Za-z0-9_-]+):\s*(.+)$", raw_line)
+        nested_indent = value_indent + 2
+        value_match = re.match(rf"^\s{{{value_indent}}}([A-Za-z0-9_-]+):\s*(.*)$", raw_line)
         if current and value_match:
-            servers[current][0][value_match.group(1)] = value_match.group(2).strip().strip("'\"")
+            key, raw_value = value_match.groups()
+            value = raw_value.strip().strip("'\"")
+            if key == "args" and not value:
+                servers[current][0][key] = []
+                current_container = "args"
+            elif key == "env" and not value:
+                servers[current][0][key] = {}
+                current_container = "env"
+            else:
+                servers[current][0][key] = value
+                current_container = None
+            continue
+        if current and current_container == "args":
+            item = re.match(rf"^\s{{{nested_indent}}}-\s*(.+)$", raw_line)
+            if item:
+                servers[current][0]["args"].append(item.group(1).strip().strip("'\""))
+                continue
+        if current and current_container == "env":
+            env_key = re.match(rf"^\s{{{nested_indent}}}([A-Za-z0-9_-]+):", raw_line)
+            if env_key:
+                servers[current][0]["env"][env_key.group(1)] = ""
+                continue
+        current_container = None
     return servers
 
 def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | None = None) -> list[Artifact]:
@@ -434,11 +512,11 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
     for name, (data, config_path_key) in sorted(servers.items()):
         if not isinstance(data, dict):
             data = {}
-        command = str(data.get("command") or "")
-        url = str(data.get("url") or data.get("base_url") or "")
+        command = _MCP_SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=<redacted>", str(data.get("command") or ""))
+        url = _sanitize_mcp_url(str(data.get("url") or data.get("base_url") or ""))
         args = data.get("args") or []
         env = data.get("env") or {}
-        args_text = " ".join(str(item) for item in args) if isinstance(args, list) else str(args)
+        args_text = _sanitize_mcp_args(args)
         env_text = " ".join(str(key) for key in env.keys()) if isinstance(env, dict) else ""
         summary_bits = [bit for bit in [f"command {command}" if command else "", f"url {url}" if url else "", args_text] if bit]
         summary = f"Hermes MCP server {name}: " + ("; ".join(summary_bits) if summary_bits else "configured in Hermes config")
@@ -591,6 +669,9 @@ def collect_artifacts(
     ]
     deduped: dict[str, Artifact] = {}
     for artifact in artifacts:
+        previous = deduped.get(artifact.id)
+        if previous is not None and previous.path != artifact.path:
+            raise ValueError(f"duplicate artifact id {artifact.id}: {previous.path} and {artifact.path}")
         deduped[artifact.id] = artifact
     return sorted(deduped.values(), key=lambda item: item.id)
 
@@ -639,7 +720,7 @@ def resolve_related(
     normalized = clean.replace(str(Path.home()), "~")
     if normalized in by_display_path:
         return by_display_path[normalized]
-    basename = Path(clean).name
+    basename = PureWindowsPath(clean).name if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", clean) else Path(clean).name
     basename = basename.rstrip("`.,);]")
     candidates = by_basename.get(basename, [])
     if len(candidates) == 1:

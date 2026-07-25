@@ -190,6 +190,80 @@ Author did not reply after 24h; use this GitHub review reminder cron workflow wh
     return root, hermes_home
 
 
+def test_scan_mcp_servers_redacts_only_obvious_credentials(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    root.mkdir()
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  demo:
+    command: npx
+    args: [demo-package, --profile, local, --api-key, TEST_ONLY_SECRET, --token=SECOND_SECRET]
+    url: https://user:URL_SECRET@example.invalid/api/v1?token=QUERY_SECRET#fragment
+""",
+    )
+
+    artifact = lci.scan_mcp_servers(root, hermes_home)[0]
+    persisted = "\n".join([artifact.summary, artifact.search_text, " ".join(artifact.triggers)])
+
+    assert "demo-package" in persisted
+    assert "--profile local" in persisted
+    assert "example.invalid/api/v1" in persisted
+    for secret in ("TEST_ONLY_SECRET", "SECOND_SECRET", "URL_SECRET", "QUERY_SECRET"):
+        assert secret not in persisted
+
+
+def test_mcp_fallback_parses_block_args_and_env_names_without_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    root.mkdir()
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  home:
+    command: npx
+    args:
+      - @acme/home-assistant-mcp
+      - --stdio
+    env:
+      HOMEASSISTANT_URL: private-value
+""",
+    )
+    monkeypatch.setattr(lci_scanners, "load_yaml_if_available", lambda _path: None)
+
+    artifact = lci.scan_mcp_servers(root, hermes_home)[0]
+
+    assert "@acme/home-assistant-mcp" in artifact.search_text
+    assert "HOMEASSISTANT_URL" in artifact.search_text
+    assert "private-value" not in artifact.search_text
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (r"C:\\Users\\alex\\tools\\run.py", r"C:\\Users\\alex\\tools\\run.py"),
+        (r"\\\\server\\share\\run.py", r"\\\\server\\share\\run.py"),
+        ("/Users/alex/tools/run.py", "/Users/alex/tools/run.py"),
+        ("/opt/tools/run.sh", "/opt/tools/run.sh"),
+    ],
+)
+def test_extract_paths_supports_cross_platform_absolute_paths(raw: str, expected: str) -> None:
+    assert expected in lci.extract_paths(f"wrapper {raw}")
+    assert lci.extract_paths(f"https://example.invalid/api/{Path(expected).name}") == []
+
+
+def test_collect_artifacts_rejects_duplicate_ids_instead_of_dropping_one(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    write(root / "scripts" / "foo-bar.py", "# first\n")
+    write(root / "scripts" / "foo_bar.py", "# second\n")
+    hermes_home.mkdir()
+
+    with pytest.raises(ValueError, match=r"duplicate artifact id script:scripts-foo-bar-py"):
+        lci.collect_artifacts(root, hermes_home)
+
+
 def test_build_index_writes_searchable_artifacts_and_edges(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"
