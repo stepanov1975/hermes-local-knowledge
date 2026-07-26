@@ -374,6 +374,85 @@ def load_yaml_if_available(path: Path) -> Any:
     except (OSError, yaml.YAMLError):  # type: ignore[name-defined]
         return None
 
+
+def _mcp_secret_name(value: str) -> bool:
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value.lstrip("-"))
+    parts = re.findall(r"[a-z0-9]+", separated.lower())
+    if parts and parts[-1] in {"url", "uri", "endpoint", "file", "path"}:
+        return False
+    part_set = set(parts)
+    compact = "".join(parts)
+    secret_parts = ("token", "secret", "password", "passwd", "authorization", "credential", "credentials")
+    return (
+        bool(set(secret_parts) & part_set)
+        or {"api", "key"} <= part_set
+        or compact.endswith((*secret_parts, "apikey"))
+    )
+
+
+def _sanitize_mcp_header(value: str) -> str:
+    match = re.match(r"^(?P<name>[^:=\r\n]+):(.*)$", value, re.DOTALL)
+    if not match or not _mcp_secret_name(match.group("name")):
+        return value
+    return f"{match.group('name')}: <redacted>"
+
+
+def _sanitize_mcp_arg_value(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        # MCP process args are scalar. Fail closed for invalid nested containers
+        # rather than serializing arbitrary values into routing metadata.
+        return "<redacted>"
+    if isinstance(value, dict):
+        # PyYAML parses unquoted ``Authorization: ...`` list items as mappings.
+        output: list[str] = []
+        for raw_name, raw_value in value.items():
+            name = str(raw_name)
+            if isinstance(raw_value, (dict, list, tuple, set)):
+                rendered_value = "<redacted>"
+            elif _mcp_secret_name(name):
+                rendered_value = "<redacted>"
+            elif name in {"--header", "-H"}:
+                rendered_value = _sanitize_mcp_header(str(raw_value))
+            else:
+                rendered_value = _sanitize_mcp_arg_value(raw_value)
+            output.append(f"{name}: {rendered_value}")
+        return " ".join(output)
+
+    text = str(value)
+    if "=" not in text:
+        return _sanitize_mcp_header(text)
+
+    segments = text.split("=")
+    prefix: list[str] = []
+    for index, segment in enumerate(segments[:-1]):
+        if ":" in segment:
+            header = "=".join(segments[index:])
+            sanitized_header = _sanitize_mcp_header(header)
+            if sanitized_header != header:
+                return "=".join([*prefix, sanitized_header])
+        prefix.append(segment)
+        if _mcp_secret_name(segment):
+            return f"{'='.join(prefix)}=<redacted>"
+    return "=".join([*prefix, _sanitize_mcp_header(segments[-1])])
+
+
+def _sanitize_mcp_args(args: Any) -> str:
+    values = args if isinstance(args, list) else [args] if args else []
+    output: list[str] = []
+    redact_next = False
+    for value in values:
+        if redact_next:
+            output.append("<redacted>")
+            redact_next = False
+            continue
+
+        rendered = _sanitize_mcp_arg_value(value)
+        output.append(rendered)
+        if isinstance(value, str):
+            redact_next = value.startswith("-") and "=" not in value and _mcp_secret_name(value)
+    return " ".join(output)
+
+
 def parse_mcp_servers_fallback(text: str) -> dict[str, tuple[dict[str, Any], str]]:
     servers: dict[str, tuple[dict[str, Any], str]] = {}
     section: str | None = None
@@ -438,7 +517,7 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
         url = str(data.get("url") or data.get("base_url") or "")
         args = data.get("args") or []
         env = data.get("env") or {}
-        args_text = " ".join(str(item) for item in args) if isinstance(args, list) else str(args)
+        args_text = _sanitize_mcp_args(args)
         env_text = " ".join(str(key) for key in env.keys()) if isinstance(env, dict) else ""
         summary_bits = [bit for bit in [f"command {command}" if command else "", f"url {url}" if url else "", args_text] if bit]
         summary = f"Hermes MCP server {name}: " + ("; ".join(summary_bits) if summary_bits else "configured in Hermes config")

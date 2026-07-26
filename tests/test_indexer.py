@@ -2194,6 +2194,171 @@ def test_scan_mcp_servers_preserves_legacy_yaml_path_and_base_url(tmp_path: Path
     assert lci.search_index(tmp_path / "index.sqlite", "sentinelcredential", limit=5) == []
 
 
+def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  example:
+    command: uvx
+    args:
+      - example-mcp-server
+      - --config
+      - /home/example/server.json
+      - https://example.invalid/api
+      - MODE=stdio
+      - API_KEY=assignmentcanary
+      - SERVICE_CREDENTIAL=credentialcanary
+      - --token
+      - flagcanary
+      - --password
+      - passwordcanary
+      - --header
+      - Authorization: Bearer authorizationcanary
+      - -H
+      - X-Api-Key: headercanary
+      - "--header=Proxy-Authorization: Basic proxycanary"
+      - -H
+      - X-Service-Secret: secretcanary
+      - --header
+      - Accept: application/json
+      - {"--header": "Authorization: Bearer mappingauthorizationcanary"}
+      - {"-H": "X-Api-Key: mappingapikeycanary"}
+      - {"--token": "mappingtokencanary"}
+      - {"--env": "API_KEY=mappingassignmentcanary"}
+      - {"--metadata": "Authorization: Bearer mappin...nary"}
+      - "--metadata=Authorization: Basic basicp...ry=="
+      - "--env=API_KEY=compoundassignmentcanary=Authorization: Basic compoundheadercanary=="
+      - --env=API_KEY=wrappedassignmentcanary
+      - TOKEN_URL=https://example.invalid/oauth/token
+      - --token-endpoint
+      - https://example.invalid/oauth/token
+      - --token-file
+      - /home/example/token.json
+      - {"--header": {"Accept": "application/json", "Authorization": "Bearer nestedheadercanary"}}
+      - {"outer": ["--token", "nestedlistcanary"]}
+      - --token
+      - -dashsecretcanary
+      - --config
+      - /home/example/missing-token-config.json
+    env:
+      EXAMPLE_TOKEN: envcanary
+""",
+    )
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:example"]
+    artifact = artifacts[0]
+    serialized = json.dumps(artifact.__dict__, default=str).lower()
+    for canary in (
+        "assignmentcanary",
+        "credentialcanary",
+        "flagcanary",
+        "passwordcanary",
+        "authorizationcanary",
+        "headercanary",
+        "proxycanary",
+        "secretcanary",
+        "mappingauthorizationcanary",
+        "mappingapikeycanary",
+        "mappingtokencanary",
+        "mappingassignmentcanary",
+        "mappingheadercanary",
+        "basicpaddingcanary",
+        "compoundassignmentcanary",
+        "compoundheadercanary",
+        "wrappedassignmentcanary",
+        "nestedheadercanary",
+        "nestedlistcanary",
+        "dashsecretcanary",
+        "envcanary",
+    ):
+        assert canary not in serialized
+    assert "example-mcp-server" in artifact.summary
+    assert "--config" in artifact.summary
+    assert "/home/example/server.json" in artifact.summary
+    assert "https://example.invalid/api" in artifact.summary
+    assert "mode=stdio" in artifact.summary.lower()
+    assert "--header: authorization: <redacted>" in artifact.summary.lower()
+    assert "-h: x-api-key: <redacted>" in artifact.summary.lower()
+    assert "--token: <redacted>" in artifact.summary.lower()
+    assert "--env: api_key=<redacted>" in artifact.summary.lower()
+    assert "--metadata: authorization: <redacted>" in artifact.summary.lower()
+    assert "--metadata=authorization: <redacted>" in artifact.summary.lower()
+    assert "--env=api_key=<redacted>" in artifact.summary.lower()
+    assert "token_url=https://example.invalid/oauth/token" in artifact.search_text.lower()
+    assert "--token-endpoint https://example.invalid/oauth/token" in artifact.search_text.lower()
+    assert "--token-file /home/example/token.json" in artifact.search_text.lower()
+    assert "--header: <redacted>" in artifact.search_text.lower()
+    assert "outer: <redacted>" in artifact.search_text.lower()
+    assert "--token <redacted> --config /home/example/missing-token-config.json" in artifact.search_text.lower()
+    for locator in (
+        "token_url=https://example.invalid/oauth/token",
+        "--token-endpoint https://example.invalid/oauth/token",
+        "--token-file /home/example/token.json",
+    ):
+        assert locator in serialized
+    assert "api_key=<redacted>" in artifact.summary.lower()
+    assert "service_credential=<redacted>" in artifact.summary.lower()
+    assert "--token <redacted>" in artifact.summary.lower()
+    assert "--password <redacted>" in artifact.summary.lower()
+    assert "authorization: <redacted>" in artifact.summary.lower()
+    assert "x-api-key: <redacted>" in artifact.summary.lower()
+    assert "--header=proxy-authorization: <redacted>" in artifact.summary.lower()
+    assert "x-service-secret: <redacted>" in artifact.summary.lower()
+    assert "accept: application/json" in artifact.summary.lower()
+    assert artifact.related == [
+        "/home/example/server.json",
+        "/home/example/token.json",
+        "/home/example/missing-token-config.json",
+    ]
+
+    db_path = tmp_path / "index.sqlite"
+    lci.build_sqlite(db_path, artifacts, [])
+    for canary in (
+        "assignmentcanary",
+        "credentialcanary",
+        "flagcanary",
+        "passwordcanary",
+        "authorizationcanary",
+        "headercanary",
+        "proxycanary",
+        "secretcanary",
+        "mappingauthorizationcanary",
+        "mappingapikeycanary",
+        "mappingtokencanary",
+        "mappingassignmentcanary",
+        "mappingheadercanary",
+        "basicpaddingcanary",
+        "compoundassignmentcanary",
+        "compoundheadercanary",
+        "wrappedassignmentcanary",
+        "nestedheadercanary",
+        "nestedlistcanary",
+        "dashsecretcanary",
+    ):
+        assert lci.search_index(db_path, canary, limit=5) == []
+    assert [row["id"] for row in lci.search_index(db_path, "example mcp server", limit=5)] == ["mcp:example"]
+    assert [row["id"] for row in lci.search_index(db_path, "token endpoint", limit=5)] == ["mcp:example"]
+    assert [row["id"] for row in lci.search_index(db_path, "token json", limit=5)] == ["mcp:example"]
+
+
+def test_mcp_arg_sanitizer_handles_many_assignment_separators_without_recursion() -> None:
+    ordinary = "MODE=" + ("=" * 1_500) + "stdio"
+    wrapped_secret = "--env=" + ("=" * 1_500) + "API_KEY=deepcanary"
+
+    assert lci_scanners._sanitize_mcp_arg_value(ordinary) == ordinary
+    sanitized = lci_scanners._sanitize_mcp_arg_value(wrapped_secret)
+    assert "deepcanary" not in sanitized
+    assert sanitized.endswith("API_KEY=<redacted>")
+    compound = lci_scanners._sanitize_mcp_arg_value(
+        "--env=API_KEY=outercanary=Authorization: Basic innercanary=="
+    )
+    assert compound == "--env=API_KEY=<redacted>"
+
+
 def test_scan_mcp_servers_fallback_supports_native_top_level_config(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
