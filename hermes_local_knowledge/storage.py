@@ -408,8 +408,14 @@ def index_metadata(db_path: Path) -> dict[str, Any]:
     return metadata
 
 
+def sqlite_readonly_uri(db_path: Path) -> str:
+    """Return an encoded absolute SQLite file URI in read-only mode."""
+
+    return f"{db_path.expanduser().resolve().as_uri()}?mode=ro"
+
+
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 

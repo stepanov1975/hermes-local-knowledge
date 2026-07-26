@@ -1,13 +1,12 @@
 """Search helpers for the SQLite-backed local knowledge index."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
 from .constants import ROUTING_HINT_TERMS
 from .storage import connect_readonly, decode_artifact_row
-from .text_utils import fts_query, high_signal_terms, query_terms, search_sort_key, token_hits
+from .text_utils import _QUOTED_QUERY_SPAN_RE, fts_query, high_signal_terms, query_terms, search_sort_key, token_hits
 
 
 FTS_BM25_WEIGHTS = "0.0, 0.2, 6.0, 1.0, 3.0, 2.0, 5.0, 0.4"
@@ -381,21 +380,22 @@ def _finalize_results(
 
 
 def _has_quoted_phrase(query: str) -> bool:
-    """Return true only for balanced quoted phrases, not apostrophes."""
+    """Return true for balanced quote spans, not unmatched apostrophes."""
 
-    return bool(re.search(r'(?<!\w)"[^"\n]+"(?!\w)|(?<!\w)\'[^\'\n]+\'(?!\w)', query))
+    return bool(_QUOTED_QUERY_SPAN_RE.search(query))
 
 
 def _is_quoted_only_query(query: str) -> bool:
     """Return true when the query contains quoted phrase(s) and no extra terms."""
 
-    without_quoted = re.sub(r'(?<!\w)"[^"\n]+"(?!\w)|(?<!\w)\'[^\'\n]+\'(?!\w)', " ", query)
+    without_quoted = _QUOTED_QUERY_SPAN_RE.sub(" ", query)
     return _has_quoted_phrase(query) and not query_terms(without_quoted)
 
 
 def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: str | None = None) -> list[dict[str, Any]]:
     terms = query_terms(query)
     match = fts_query(query)
+    fallback_match = fts_query(query, operator="OR")
     if not match:
         return []
     type_filter = str(artifact_type or "").strip()
@@ -441,8 +441,9 @@ def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: s
                 strict_ids=strict_ids,
             )
         if len(strict) >= output_limit and not requested_operational_types and metadata_identity:
+            prioritized = [*strict, *metadata_identity] if exact_query else [*metadata_identity, *strict]
             return _finalize_results(
-                [*metadata_identity, *strict],
+                prioritized,
                 output_limit,
                 terms,
                 requested_operational_types=requested_operational_types,
@@ -451,7 +452,7 @@ def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: s
 
         metadata_identity_ids = {str(row["id"]) for row in metadata_identity}
         fallback_rows = _merge_candidate_rows(
-            _query_rows(conn, fts_query(query, operator="OR"), candidate_limit, type_filter) if len(terms) > 1 else [],
+            _query_rows(conn, fallback_match, candidate_limit, type_filter) if fallback_match != match else [],
             [] if metadata_identity else _metadata_rows(conn, terms, candidate_limit, type_filter),
         )
         fallback = _rank_rows(
@@ -467,8 +468,9 @@ def search_index(db_path: Path, query: str, *, limit: int = 10, artifact_type: s
         fallback = [
             row for row in fallback if str(row["id"]) not in strict_ids and str(row["id"]) not in metadata_identity_ids
         ]
+        prioritized = [*strict, *metadata_identity] if exact_query else [*metadata_identity, *strict]
         return _finalize_results(
-            [*metadata_identity, *strict, *fallback] if metadata_identity else [*strict, *fallback],
+            [*prioritized, *fallback],
             output_limit,
             terms,
             requested_operational_types=requested_operational_types,

@@ -8,6 +8,19 @@ from typing import Any, Iterable, Sequence
 from .constants import DEFAULT_KNOWN_ENTITIES, QUERY_STOPWORDS, ROUTING_HINT_TERMS, STOPWORDS
 
 
+_QUOTED_QUERY_SPAN_RE = re.compile(r'"(?P<double>[^"\n]+)"|(?<!\w)\'(?P<single>[^\'\n]+)\'(?!\w)')
+_HTTP_URL_SPAN_RE = re.compile(r'https?://[^\s`"<>]+', re.IGNORECASE)
+_LOCAL_PATH_RE = re.compile(
+    r"""
+    (?P<home>(?<![\w~])~/[^\s`"'<>|?*]+)
+    |(?P<drive>(?<!\w)[A-Za-z]:[\\/][^\s`"'<>|?*]+)
+    |(?P<unc>(?<!\\)\\\\[^\\/\s`"'<>|?*]+\\[^\\/\s`"'<>|?*]+(?:\\[^\\/\s`"'<>|?*]+)*)
+    |(?P<posix>(?<![\w:/~.-])/(?!/)[^\s`"'<>|?*]+)
+    """,
+    re.VERBOSE,
+)
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "artifact"
@@ -226,7 +239,8 @@ def first_sentence(text: str) -> str:
     return clean[:500]
 
 def extract_paths(text: str) -> list[str]:
-    paths = re.findall(r"(?:/home/[A-Za-z0-9_./-]+|~/[A-Za-z0-9_./-]+)", text)
+    text_without_urls = _HTTP_URL_SPAN_RE.sub(" ", text)
+    paths = (match.group(0) for match in _LOCAL_PATH_RE.finditer(text_without_urls))
     return unique_preserve_order(path.rstrip("`.,);]") for path in paths)
 
 def normalize_query_term(term: str) -> str:
@@ -249,10 +263,30 @@ def query_terms(query: str, *, drop_stopwords: bool = True) -> list[str]:
 def fts_query(query: str, *, operator: str = "AND") -> str:
     # FTS5 treats punctuation as syntax in bare MATCH terms (for example,
     # `manifest-backed*` can be parsed as `manifest` NOT column `backed`).
-    # Split punctuation-heavy human queries into plain prefix terms instead.
-    terms = query_terms(query)
+    # Split punctuation-heavy unquoted text into plain prefix terms. Balanced
+    # quoted spans remain FTS5 phrases, including duplicates and stopwords.
+    expressions: list[str] = []
+    unquoted_terms: set[str] = set()
+
+    def append_unquoted(value: str) -> None:
+        for term in query_terms(value):
+            if term in unquoted_terms:
+                continue
+            unquoted_terms.add(term)
+            expressions.append(f"{term}*")
+
+    cursor = 0
+    for match in _QUOTED_QUERY_SPAN_RE.finditer(query):
+        append_unquoted(query[cursor : match.start()])
+        phrase = match.group("double") if match.group("double") is not None else match.group("single")
+        phrase_terms = re.findall(r"[A-Za-z0-9]+", phrase.lower())
+        if phrase_terms:
+            expressions.append(f'"{" ".join(phrase_terms)}"')
+        cursor = match.end()
+    append_unquoted(query[cursor:])
+
     separator = " OR " if operator.upper() == "OR" else " "
-    return separator.join(f"{term}*" for term in terms)
+    return separator.join(expressions)
 
 def token_hits(tokens: set[str], terms: Sequence[str]) -> int:
     hits = 0

@@ -6,7 +6,7 @@ import os
 import sqlite3
 import sys
 import threading
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any
 
@@ -38,6 +38,43 @@ Route local questions to whole artifacts.
 """
 
     assert lci.first_heading_or_paragraph(text) == "Tool OKF: knowledge_search"
+
+
+def test_extract_paths_supports_portable_local_path_forms_without_urls() -> None:
+    windows_backslash = r"C:\Users\Alex\Hermes\run.ps1"
+    windows_forward = "D:/Hermes/scripts/rebuild.cmd"
+    unc = r"\\fileserver\Hermes\scripts\sync.ps1"
+    text = (
+        f"Run /opt/hermes/bin/worker.sh or ~/.hermes/scripts/rebuild.py. "
+        f"Windows: {windows_backslash}, {windows_forward}, or {unc}. "
+        "Ignore https://example.com/api/run and //example.com/download/file.zip."
+    )
+
+    paths = lci.extract_paths(text)
+
+    assert paths == [
+        "/opt/hermes/bin/worker.sh",
+        "~/.hermes/scripts/rebuild.py",
+        windows_backslash,
+        windows_forward,
+        unc,
+    ]
+    assert PureWindowsPath(windows_backslash).name == "run.ps1"
+    assert PureWindowsPath(unc).name == "sync.ps1"
+
+
+def test_extract_paths_excludes_complete_http_urls_and_preserves_other_local_paths() -> None:
+    text = (
+        "Keep /opt/hermes/local.sh before the URLs. "
+        "Ignore https://example.com/#/opt/hermes/run.sh, "
+        "https://example.com/?next=~/scripts/run.sh, "
+        "https://example.com/C:/Windows/System32/cmd.exe, "
+        "https://example.test/?next='~/scripts/quoted.sh', and "
+        "https://example.test/'/opt/hermes/quoted.sh. "
+        "Keep ~/scripts/local.sh after them."
+    )
+
+    assert lci.extract_paths(text) == ["/opt/hermes/local.sh", "~/scripts/local.sh"]
 
 
 def create_usage_db(path: Path) -> None:
@@ -1388,6 +1425,114 @@ def test_quoted_query_does_not_backfill_relaxed_fallback_results(tmp_path: Path)
     assert [row["id"] for row in results] == [exact.id]
 
 
+@pytest.mark.parametrize("query", ['foo"bar baz"', '"bar baz"foo'])
+def test_adjacent_quoted_spans_keep_exact_search_semantics(tmp_path: Path, query: str) -> None:
+    db_path = tmp_path / "index.sqlite"
+    parent = lci.Artifact(
+        id="skill:parent",
+        type="skill",
+        title="parent",
+        path="skills/parent",
+        summary="Owning skill.",
+        search_text="owning skill",
+    )
+    exact = lci.Artifact(
+        id="skill_support_doc:exact",
+        type="skill_support_doc",
+        title="exact reference",
+        path="skills/parent/references/exact.md",
+        summary="Foo bar baz appears together.",
+        related=[parent.id],
+        search_text="foo bar baz",
+    )
+    separated = lci.Artifact(
+        id="runbook:separated",
+        type="runbook",
+        title="separated",
+        path="docs/separated.md",
+        summary="Foo and bar are separated from baz.",
+        triggers=["bar", "foo", "baz"],
+        search_text="foo bar middle baz",
+    )
+    loose_identity = lci.Artifact(
+        id="runbook:loose-identity",
+        type="runbook",
+        title="foo baz bar",
+        path="docs/foo-baz-bar.md",
+        summary="All terms appear, but the phrase order is wrong.",
+        search_text="foo baz bar",
+    )
+    lci.build_sqlite(db_path, [parent, exact, separated, loose_identity], [])
+
+    results = lci.search_index(db_path, query, limit=5)
+
+    assert results[0]["id"] == exact.id
+    assert parent.id not in {row["id"] for row in results}
+
+
+def test_mixed_quoted_query_uses_parsed_fts_expressions_for_relaxed_fallback(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    update_only = lci.Artifact(
+        id="runbook:update-only",
+        type="runbook",
+        title="Update status",
+        path="docs/update.md",
+        summary="Release update status.",
+        search_text="release update status",
+    )
+    phrase_only = lci.Artifact(
+        id="runbook:phrase-only",
+        type="runbook",
+        title="Next steps",
+        path="docs/next.md",
+        summary="What next guidance.",
+        search_text="what next guidance",
+    )
+    lci.build_sqlite(db_path, [update_only, phrase_only], [])
+
+    results = lci.search_index(db_path, 'updates "what next"', limit=5)
+
+    assert {row["id"] for row in results} == {update_only.id, phrase_only.id}
+
+
+def test_quoted_queries_require_adjacent_ordered_literal_tokens(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    artifacts = [
+        lci.Artifact(
+            id="runbook:ordered",
+            type="runbook",
+            title="ordered",
+            path="docs/ordered.md",
+            summary="Alpha beta and echo echo. Find target in the owner's guide, then say target now. What next?",
+            search_text="alpha beta echo echo find target owner's guide say target now what next",
+        ),
+        lci.Artifact(
+            id="runbook:separated",
+            type="runbook",
+            title="separated",
+            path="docs/separated.md",
+            summary="Alpha middle beta; echo once; find another target.",
+            search_text="alpha middle beta echo once find another target",
+        ),
+        lci.Artifact(
+            id="runbook:reversed",
+            type="runbook",
+            title="reversed",
+            path="docs/reversed.md",
+            summary="Beta alpha.",
+            search_text="beta alpha",
+        ),
+    ]
+    lci.build_sqlite(db_path, artifacts, [])
+
+    assert [row["id"] for row in lci.search_index(db_path, '"alpha beta"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, '"echo echo"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, '"find target"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, '"what next"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, '"owner\'s guide"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, "'say target now'", limit=5)] == ["runbook:ordered"]
+
+
 def test_identifier_metadata_expands_text_poor_home_assistant_artifacts(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
@@ -2121,6 +2266,33 @@ def test_build_sqlite_creates_nested_parent_directories(tmp_path: Path) -> None:
     assert fetched is not None
     assert fetched["title"] == "Alpha"
     assert fetched["triggers"] == ["alpha"]
+
+
+@pytest.mark.parametrize(
+    "basename",
+    [
+        "index with spaces.sqlite",
+        "index#fragment.sqlite",
+        pytest.param("index?query.sqlite", marks=pytest.mark.skipif(os.name == "nt", reason="? is not a valid Windows filename")),
+    ],
+)
+def test_connect_readonly_opens_encoded_sqlite_paths(tmp_path: Path, basename: str) -> None:
+    db_path = tmp_path / basename
+    artifact = lci.Artifact(
+        id="skill:portable-path",
+        type="skill",
+        title="Portable Path",
+        path="custom_skills/portable-path",
+        summary="Portable path test.",
+        search_text="portable path test",
+    )
+    lci.build_sqlite(db_path, [artifact], [])
+
+    conn = lci_storage.connect_readonly(db_path)
+    try:
+        assert conn.execute("SELECT title FROM artifacts WHERE id = ?", (artifact.id,)).fetchone()[0] == artifact.title
+    finally:
+        conn.close()
 
 
 def test_scan_mcp_servers_supports_native_top_level_config(tmp_path: Path) -> None:
@@ -3004,6 +3176,19 @@ def test_fts_query_splits_hyphenated_human_terms() -> None:
     assert lci.fts_query("self hosted application updates backup flow update markdown") == (
         "self* hosted* application* update* backup*"
     )
+
+
+def test_fts_query_preserves_balanced_quoted_phrases() -> None:
+    assert lci.fts_query('"echo echo"') == '"echo echo"'
+    assert lci.fts_query('"find target"') == '"find target"'
+    assert lci.fts_query('"owner\'s guide"') == '"owner s guide"'
+    assert lci.fts_query("'say \"target\" now'") == '"say target now"'
+    assert lci.fts_query('updates "what next"') == 'update* "what next"'
+    assert lci.fts_query('foo"bar baz"') == 'foo* "bar baz"'
+    assert lci.fts_query('"bar baz"foo') == '"bar baz" foo*'
+    assert lci.fts_query("foo 'bar baz'") == 'foo* "bar baz"'
+    assert lci.fts_query("owner's guide 'manual page'") == 'owner* guide* "manual page"'
+    assert lci.fts_query("owner's guide") == "owner* guide*"
 
 
 def test_search_sort_key_scores_each_ranking_tier() -> None:

@@ -83,6 +83,7 @@ from .storage import (
     get_artifact,
     get_neighbors,
     index_build_lock,
+    sqlite_readonly_uri,
     write_jsonl,
 )
 from .text_utils import (
@@ -252,6 +253,7 @@ __all__ = [
     "significant_words",
     "skill_support_file_names",
     "slugify",
+    "sqlite_readonly_uri",
     "stat_key",
     "token_hits",
     "type_priority",
