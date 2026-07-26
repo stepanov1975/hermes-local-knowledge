@@ -27,6 +27,10 @@ from .text_utils import (
     unique_preserve_order,
 )
 
+_MCP_URI_AUTHORITY_RE = re.compile(
+    r"(?i)(?P<prefix>[a-z][a-z0-9+.-]*://)(?P<authority>[^/?#\s]*)"
+)
+
 
 def skill_support_file_names(skill_dir: Path, excluded_dir_names: Sequence[str] | None = None) -> list[str]:
     names: list[str] = []
@@ -398,6 +402,16 @@ def _sanitize_mcp_header(value: str) -> str:
     return f"{match.group('name')}: <redacted>"
 
 
+def _sanitize_mcp_url_userinfo(value: str) -> str:
+    def sanitize_authority(match: re.Match[str]) -> str:
+        authority = match.group("authority")
+        if "@" not in authority:
+            return match.group(0)
+        return f"{match.group('prefix')}{authority.rsplit('@', 1)[1]}"
+
+    return _MCP_URI_AUTHORITY_RE.sub(sanitize_authority, value)
+
+
 def _sanitize_mcp_arg_value(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         # MCP process args are scalar. Fail closed for invalid nested containers
@@ -413,13 +427,13 @@ def _sanitize_mcp_arg_value(value: Any) -> str:
             elif _mcp_secret_name(name):
                 rendered_value = "<redacted>"
             elif name in {"--header", "-H"}:
-                rendered_value = _sanitize_mcp_header(str(raw_value))
+                rendered_value = _sanitize_mcp_header(_sanitize_mcp_url_userinfo(str(raw_value)))
             else:
                 rendered_value = _sanitize_mcp_arg_value(raw_value)
             output.append(f"{name}: {rendered_value}")
         return " ".join(output)
 
-    text = str(value)
+    text = _sanitize_mcp_url_userinfo(str(value))
     if "=" not in text:
         return _sanitize_mcp_header(text)
 
@@ -561,7 +575,7 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
         if not isinstance(data, dict):
             data = {}
         command = str(data.get("command") or "")
-        url = str(data.get("url") or data.get("base_url") or "")
+        url = _sanitize_mcp_url_userinfo(str(data.get("url") or data.get("base_url") or ""))
         args = data.get("args") or []
         env = data.get("env") or {}
         args_text = _sanitize_mcp_args(args)

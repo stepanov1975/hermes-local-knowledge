@@ -97,6 +97,29 @@ def test_extracted_windows_paths_resolve_related_edges_on_posix() -> None:
     }
 
 
+def test_extract_paths_strips_prose_colon_before_related_edge_resolution() -> None:
+    source = lci.Artifact(
+        id="runbook:colon-path",
+        type="runbook",
+        title="Colon path",
+        path="docs/colon-path.md",
+        summary="Run the referenced script.",
+        related=lci.extract_paths("Run /opt/scripts/run.sh: then continue."),
+    )
+    target = lci.Artifact(
+        id="script:run-sh",
+        type="script",
+        title="run.sh",
+        path="scripts/run.sh",
+        summary="Run script.",
+    )
+
+    assert source.related == ["/opt/scripts/run.sh"]
+    assert {(edge.source, edge.target, edge.kind) for edge in lci.build_edges([source, target])} == {
+        (source.id, target.id, "related_to")
+    }
+
+
 def test_extract_paths_excludes_complete_http_urls_and_preserves_other_local_paths() -> None:
     text = (
         "Keep /opt/hermes/local.sh before the URLs. "
@@ -2227,6 +2250,11 @@ def test_build_sqlite_exhausted_replace_retries_preserve_existing_db(tmp_path: P
     assert list(db_path.parent.glob(".index.sqlite.*.tmp")) == []
 
 
+def test_index_format_invalidates_pre_mcp_redaction_indexes() -> None:
+    # Format 2 artifacts may contain unsanitized MCP argument metadata.
+    assert lci_storage.INDEX_FORMAT_VERSION == 3
+
+
 def test_build_sqlite_refuses_to_overwrite_newer_index_format(tmp_path: Path) -> None:
     db_path = tmp_path / "state" / "index.sqlite"
     current = lci.Artifact(
@@ -2400,6 +2428,61 @@ def test_scan_mcp_servers_preserves_legacy_yaml_path_and_base_url(tmp_path: Path
     assert lci.search_index(tmp_path / "index.sqlite", "sentinelcredential", limit=5) == []
 
 
+def test_scan_mcp_servers_sanitizes_top_level_url_userinfo(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp:
+  servers:
+    legacy:
+      command: uvx
+      base_url: http://legacyusercanary:legacypasscanary@legacyfragmentcanary@legacy.invalid:9000/path
+mcp_servers:
+  native:
+    command: uvx
+    url: https://nativeusercanary:nativepasscanary@example.invalid/api?mode=stdio
+  safe-query:
+    command: uvx
+    url: https://route.invalid?contact=owner@example.com&mode=stdio
+""",
+    )
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:legacy", "mcp:native", "mcp:safe-query"]
+    serialized = json.dumps([artifact.__dict__ for artifact in artifacts], default=str).lower()
+    for canary in (
+        "legacyusercanary",
+        "legacypasscanary",
+        "legacyfragmentcanary",
+        "nativeusercanary",
+        "nativepasscanary",
+    ):
+        assert canary not in serialized
+    assert "url http://legacy.invalid:9000/path" in artifacts[0].summary
+    assert "url https://example.invalid/api?mode=stdio" in artifacts[1].summary
+    assert "url https://route.invalid?contact=owner@example.com&mode=stdio" in artifacts[2].summary
+
+    jsonl_path = tmp_path / "index.jsonl"
+    db_path = tmp_path / "index.sqlite"
+    lci_storage.write_jsonl(jsonl_path, artifacts)
+    lci.build_sqlite(db_path, artifacts, [])
+    persisted = jsonl_path.read_text(encoding="utf-8").lower()
+    for canary in (
+        "legacyusercanary",
+        "legacypasscanary",
+        "legacyfragmentcanary",
+        "nativeusercanary",
+        "nativepasscanary",
+    ):
+        assert canary not in persisted
+        assert lci.search_index(db_path, canary, limit=5) == []
+    assert lci.search_index(db_path, "legacy invalid 9000", limit=5)[0]["id"] == "mcp:legacy"
+    assert lci.search_index(db_path, "example invalid mode stdio", limit=5)[0]["id"] == "mcp:native"
+    assert lci.search_index(db_path, "route invalid contact owner", limit=5)[0]["id"] == "mcp:safe-query"
+
+
 def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
@@ -2413,6 +2496,8 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
       - --config
       - /home/example/server.json
       - https://example.invalid/api
+      - https://arg-route.invalid?contact=owner@example.net&mode=stdio
+      - https://urlusercanary:urlpasscanary@example.invalid/private-api
       - MODE=stdio
       - API_KEY=assignmentcanary
       - SERVICE_CREDENTIAL=credentialcanary
@@ -2430,6 +2515,7 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
       - --header
       - Accept: application/json
       - {"--header": "Authorization: Bearer mappingauthorizationcanary"}
+      - {"--header": "Link: https://mappingurlusercanary:mappingurlpasscanary@header.invalid/api"}
       - {"-H": "X-Api-Key: mappingapikeycanary"}
       - {"--token": "mappingtokencanary"}
       - {"--env": "API_KEY=mappingassignmentcanary"}
@@ -2468,6 +2554,8 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
         "proxycanary",
         "secretcanary",
         "mappingauthorizationcanary",
+        "mappingurlusercanary",
+        "mappingurlpasscanary",
         "mappingapikeycanary",
         "mappingtokencanary",
         "mappingassignmentcanary",
@@ -2479,6 +2567,8 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
         "nestedheadercanary",
         "nestedlistcanary",
         "dashsecretcanary",
+        "urlusercanary",
+        "urlpasscanary",
         "envcanary",
     ):
         assert canary not in serialized
@@ -2486,19 +2576,22 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
     assert "--config" in artifact.summary
     assert "/home/example/server.json" in artifact.summary
     assert "https://example.invalid/api" in artifact.summary
+    assert "https://arg-route.invalid?contact=owner@example.net&mode=stdio" in artifact.search_text
+    assert "https://example.invalid/private-api" in artifact.summary
     assert "mode=stdio" in artifact.summary.lower()
     assert "--header: authorization: <redacted>" in artifact.summary.lower()
     assert "-h: x-api-key: <redacted>" in artifact.summary.lower()
     assert "--token: <redacted>" in artifact.summary.lower()
     assert "--env: api_key=<redacted>" in artifact.summary.lower()
     assert "--metadata: authorization: <redacted>" in artifact.summary.lower()
-    assert "--metadata=authorization: <redacted>" in artifact.summary.lower()
-    assert "--env=api_key=<redacted>" in artifact.summary.lower()
+    assert "--metadata=authorization: <redacted>" in artifact.search_text.lower()
+    assert "--env=api_key=<redacted>" in artifact.search_text.lower()
     assert "token_url=https://example.invalid/oauth/token" in artifact.search_text.lower()
     assert "--token-endpoint https://example.invalid/oauth/token" in artifact.search_text.lower()
     assert "--token-file /home/example/token.json" in artifact.search_text.lower()
     assert "--header: <redacted>" in artifact.search_text.lower()
     assert "outer: <redacted>" in artifact.search_text.lower()
+    assert "--header: link: https://header.invalid/api" in artifact.search_text.lower()
     assert "--token <redacted> --config /home/example/missing-token-config.json" in artifact.search_text.lower()
     for locator in (
         "token_url=https://example.invalid/oauth/token",
@@ -2506,15 +2599,15 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
         "--token-file /home/example/token.json",
     ):
         assert locator in serialized
-    assert "api_key=<redacted>" in artifact.summary.lower()
-    assert "service_credential=<redacted>" in artifact.summary.lower()
-    assert "--token <redacted>" in artifact.summary.lower()
-    assert "--password <redacted>" in artifact.summary.lower()
-    assert "authorization: <redacted>" in artifact.summary.lower()
-    assert "x-api-key: <redacted>" in artifact.summary.lower()
-    assert "--header=proxy-authorization: <redacted>" in artifact.summary.lower()
-    assert "x-service-secret: <redacted>" in artifact.summary.lower()
-    assert "accept: application/json" in artifact.summary.lower()
+    assert "api_key=<redacted>" in artifact.search_text.lower()
+    assert "service_credential=<redacted>" in artifact.search_text.lower()
+    assert "--token <redacted>" in artifact.search_text.lower()
+    assert "--password <redacted>" in artifact.search_text.lower()
+    assert "authorization: <redacted>" in artifact.search_text.lower()
+    assert "x-api-key: <redacted>" in artifact.search_text.lower()
+    assert "--header=proxy-authorization: <redacted>" in artifact.search_text.lower()
+    assert "x-service-secret: <redacted>" in artifact.search_text.lower()
+    assert "accept: application/json" in artifact.search_text.lower()
     assert artifact.related == [
         "/home/example/server.json",
         "/home/example/token.json",
@@ -2522,7 +2615,10 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
     ]
 
     db_path = tmp_path / "index.sqlite"
+    jsonl_path = tmp_path / "index.jsonl"
+    lci_storage.write_jsonl(jsonl_path, artifacts)
     lci.build_sqlite(db_path, artifacts, [])
+    persisted = jsonl_path.read_text(encoding="utf-8").lower()
     for canary in (
         "assignmentcanary",
         "credentialcanary",
@@ -2533,6 +2629,8 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
         "proxycanary",
         "secretcanary",
         "mappingauthorizationcanary",
+        "mappingurlusercanary",
+        "mappingurlpasscanary",
         "mappingapikeycanary",
         "mappingtokencanary",
         "mappingassignmentcanary",
@@ -2544,11 +2642,16 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
         "nestedheadercanary",
         "nestedlistcanary",
         "dashsecretcanary",
+        "urlusercanary",
+        "urlpasscanary",
     ):
+        assert canary not in persisted
         assert lci.search_index(db_path, canary, limit=5) == []
     assert [row["id"] for row in lci.search_index(db_path, "example mcp server", limit=5)] == ["mcp:example"]
     assert [row["id"] for row in lci.search_index(db_path, "token endpoint", limit=5)] == ["mcp:example"]
     assert [row["id"] for row in lci.search_index(db_path, "token json", limit=5)] == ["mcp:example"]
+    assert lci.search_index(db_path, "arg route contact owner", limit=5)[0]["id"] == "mcp:example"
+    assert lci.search_index(db_path, "header invalid link", limit=5)[0]["id"] == "mcp:example"
 
 
 def test_mcp_arg_sanitizer_handles_many_assignment_separators_without_recursion(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -2563,6 +2666,22 @@ def test_mcp_arg_sanitizer_handles_many_assignment_separators_without_recursion(
         "--env=API_KEY=outercanary=Authorization: Basic innercanary=="
     )
     assert compound == "--env=API_KEY=<redacted>"
+    assert lci_scanners._sanitize_mcp_arg_value(
+        "--endpoint=https://urlusercanary:urlpasscanary@example.invalid/api?mode=stdio"
+    ) == "--endpoint=https://example.invalid/api?mode=stdio"
+    assert lci_scanners._sanitize_mcp_arg_value(
+        "--endpoint=https://urlusercanary:partone@parttwo@example.invalid/api"
+    ) == "--endpoint=https://example.invalid/api"
+    assert lci_scanners._sanitize_mcp_arg_value(
+        "--endpoint=https://route.invalid?contact=owner@example.net&mode=stdio"
+    ) == "--endpoint=https://route.invalid?contact=owner@example.net&mode=stdio"
+    assert lci_scanners._sanitize_mcp_arg_value(
+        "--endpoint=https://route.invalid/path#contact=owner@example.net"
+    ) == "--endpoint=https://route.invalid/path#contact=owner@example.net"
+    assert (
+        lci_scanners._sanitize_mcp_arg_value("--endpoint=https://example.invalid/api?mode=stdio")
+        == "--endpoint=https://example.invalid/api?mode=stdio"
+    )
 
     header_calls = 0
     original_sanitize_header = lci_scanners._sanitize_mcp_header

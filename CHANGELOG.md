@@ -4,11 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [0.3.12] - 2026-07-26
 
+### Changed
+
+- Advanced the persisted index format to version 3 so indexes created before MCP argument redaction rebuild automatically instead of retaining old summaries and FTS rows.
+
 ### Fixed
 
-- Redacted obvious credential values from structured MCP process arguments before they enter summaries, routing fields, related paths, or the search index, while preserving useful commands, paths, URLs, and locator metadata.
+- Redacted obvious credential values, including URL userinfo, from structured MCP process arguments before they enter summaries, routing fields, related paths, or the search index, while preserving useful commands, routing-safe URLs, paths, and locator metadata.
 - Preserved literal phrase order, duplicates, and stopwords in quoted searches; kept strict phrase matches ahead of phrase-blind identity and relaxed fallback results.
-- Recognized portable POSIX, home, Windows drive, and UNC paths without extracting local-looking paths embedded in HTTP URLs, and encoded read-only SQLite URIs for paths containing spaces, `#`, or `?`.
+- Recognized portable POSIX, home, Windows drive, and UNC paths without extracting local-looking paths embedded in HTTP URLs, trimmed trailing prose punctuation before relationship resolution, and encoded read-only SQLite URIs for paths containing spaces, `#`, or `?`.
 - Prevented normalized OKF output-name collisions from replacing a routing note owned by a different tool while retaining same-tool regeneration.
 
 ## [0.3.11] - 2026-07-26

@@ -249,7 +249,7 @@ def first_sentence(text: str) -> str:
 def extract_paths(text: str) -> list[str]:
     text_without_urls = _HTTP_URL_SPAN_RE.sub(" ", text)
     paths = (match.group(0) for match in _LOCAL_PATH_RE.finditer(text_without_urls))
-    return unique_preserve_order(path.rstrip("`.,);]") for path in paths)
+    return unique_preserve_order(path.rstrip("`.,);]:") for path in paths)
 
 def normalize_query_term(term: str) -> str:
     term = term.lower().strip()
