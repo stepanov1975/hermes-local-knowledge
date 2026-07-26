@@ -1,7 +1,6 @@
 """Offline evaluation helpers for local knowledge search quality."""
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,8 +136,7 @@ def load_positive_feedback_labels(
     caller can pass ``valid_artifact_ids`` to discard stale artifact labels.
     """
 
-    conn = sqlite3.connect(f"file:{usage_db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = connect_readonly(usage_db_path)
     try:
         rows = conn.execute(
             """

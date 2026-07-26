@@ -18,12 +18,17 @@ from .text_utils import (
     first_sentence,
     identifier_terms,
     parse_frontmatter,
+    portable_basename,
     regex_list_after_key,
     relpath_matches_config_dir,
     safe_read_text,
     significant_words,
     slugify,
     unique_preserve_order,
+)
+
+_MCP_URI_AUTHORITY_RE = re.compile(
+    r"(?i)(?P<prefix>[a-z][a-z0-9+.-]*://)(?P<authority>[^/?#\s]*)"
 )
 
 
@@ -374,6 +379,141 @@ def load_yaml_if_available(path: Path) -> Any:
     except (OSError, yaml.YAMLError):  # type: ignore[name-defined]
         return None
 
+
+def _mcp_secret_name(value: str) -> bool:
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value.lstrip("-"))
+    parts = re.findall(r"[a-z0-9]+", separated.lower())
+    if parts and parts[-1] in {"url", "uri", "endpoint", "file", "path"}:
+        return False
+    part_set = set(parts)
+    compact = "".join(parts)
+    secret_parts = ("token", "secret", "password", "passwd", "authorization", "credential", "credentials")
+    return (
+        bool(set(secret_parts) & part_set)
+        or {"api", "key"} <= part_set
+        or compact.endswith((*secret_parts, "apikey"))
+    )
+
+
+def _sanitize_mcp_header(value: str) -> str:
+    match = re.match(r"^(?P<name>[^:=\r\n]+):(.*)$", value, re.DOTALL)
+    if not match or not _mcp_secret_name(match.group("name")):
+        return value
+    return f"{match.group('name')}: <redacted>"
+
+
+def _sanitize_mcp_url_userinfo(value: str) -> str:
+    def sanitize_authority(match: re.Match[str]) -> str:
+        authority = match.group("authority")
+        if "@" not in authority:
+            return match.group(0)
+        return f"{match.group('prefix')}{authority.rsplit('@', 1)[1]}"
+
+    return _MCP_URI_AUTHORITY_RE.sub(sanitize_authority, value)
+
+
+def _sanitize_mcp_arg_value(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        # MCP process args are scalar. Fail closed for invalid nested containers
+        # rather than serializing arbitrary values into routing metadata.
+        return "<redacted>"
+    if isinstance(value, dict):
+        # PyYAML parses unquoted ``Authorization: ...`` list items as mappings.
+        output: list[str] = []
+        for raw_name, raw_value in value.items():
+            name = str(raw_name)
+            if isinstance(raw_value, (dict, list, tuple, set)):
+                rendered_value = "<redacted>"
+            elif _mcp_secret_name(name):
+                rendered_value = "<redacted>"
+            elif name in {"--header", "-H"}:
+                rendered_value = _sanitize_mcp_header(_sanitize_mcp_url_userinfo(str(raw_value)))
+            else:
+                rendered_value = _sanitize_mcp_arg_value(raw_value)
+            output.append(f"{name}: {rendered_value}")
+        return " ".join(output)
+
+    text = _sanitize_mcp_url_userinfo(str(value))
+    if "=" not in text:
+        return _sanitize_mcp_header(text)
+
+    segments = text.split("=")
+    prefix: list[str] = []
+    for segment in segments[:-1]:
+        header_name, separator, _ = segment.partition(":")
+        if separator and _mcp_secret_name(header_name):
+            return "=".join([*prefix, f"{header_name}: <redacted>"])
+        prefix.append(segment)
+        if _mcp_secret_name(segment):
+            return f"{'='.join(prefix)}=<redacted>"
+    return "=".join([*prefix, _sanitize_mcp_header(segments[-1])])
+
+
+def _parse_inline_mcp_args(value: str) -> list[str] | None:
+    """Parse one fallback ``args: [...]`` scalar without expanding YAML scope."""
+
+    text = value.strip()
+    if not text.startswith("["):
+        return None
+
+    output: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 1
+    closed = False
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                if quote == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                    current.append("'")
+                    index += 2
+                    continue
+                quote = None
+            elif char == "\\" and quote == '"' and index + 1 < len(text):
+                current.append(text[index + 1])
+                index += 2
+                continue
+            else:
+                current.append(char)
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == ",":
+            output.append("".join(current).strip())
+            current = []
+        elif char == "]":
+            output.append("".join(current).strip())
+            index += 1
+            closed = True
+            break
+        else:
+            current.append(char)
+        index += 1
+
+    trailing = text[index:].strip()
+    if quote or not closed or (trailing and not trailing.startswith("#")):
+        return ["<redacted>"]
+    return [item for item in output if item]
+
+
+def _sanitize_mcp_args(args: Any) -> str:
+    inline_values = _parse_inline_mcp_args(args) if isinstance(args, str) else None
+    values = inline_values if inline_values is not None else args if isinstance(args, list) else [args] if args else []
+    output: list[str] = []
+    redact_next = False
+    for value in values:
+        if redact_next:
+            output.append("<redacted>")
+            redact_next = False
+            continue
+
+        rendered = _sanitize_mcp_arg_value(value)
+        output.append(rendered)
+        if isinstance(value, str):
+            redact_next = value.startswith("-") and "=" not in value and _mcp_secret_name(value)
+    return " ".join(output)
+
+
 def parse_mcp_servers_fallback(text: str) -> dict[str, tuple[dict[str, Any], str]]:
     servers: dict[str, tuple[dict[str, Any], str]] = {}
     section: str | None = None
@@ -435,10 +575,10 @@ def scan_mcp_servers(root: Path, hermes_home: Path, settings: IndexSettings | No
         if not isinstance(data, dict):
             data = {}
         command = str(data.get("command") or "")
-        url = str(data.get("url") or data.get("base_url") or "")
+        url = _sanitize_mcp_url_userinfo(str(data.get("url") or data.get("base_url") or ""))
         args = data.get("args") or []
         env = data.get("env") or {}
-        args_text = " ".join(str(item) for item in args) if isinstance(args, list) else str(args)
+        args_text = _sanitize_mcp_args(args)
         env_text = " ".join(str(key) for key in env.keys()) if isinstance(env, dict) else ""
         summary_bits = [bit for bit in [f"command {command}" if command else "", f"url {url}" if url else "", args_text] if bit]
         summary = f"Hermes MCP server {name}: " + ("; ".join(summary_bits) if summary_bits else "configured in Hermes config")
@@ -601,7 +741,7 @@ def build_edges(artifacts: Sequence[Artifact]) -> list[Edge]:
     for artifact in artifacts:
         path = artifact.path.split("#", 1)[0]
         by_display_path[path] = artifact.id
-        by_basename.setdefault(Path(path).name, []).append(artifact.id)
+        by_basename.setdefault(portable_basename(path), []).append(artifact.id)
 
     edges: list[Edge] = []
     for artifact in artifacts:
@@ -639,8 +779,7 @@ def resolve_related(
     normalized = clean.replace(str(Path.home()), "~")
     if normalized in by_display_path:
         return by_display_path[normalized]
-    basename = Path(clean).name
-    basename = basename.rstrip("`.,);]")
+    basename = portable_basename(clean)
     candidates = by_basename.get(basename, [])
     if len(candidates) == 1:
         return candidates[0]

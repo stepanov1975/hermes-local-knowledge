@@ -14,9 +14,15 @@ from typing import Any
 
 from . import okf
 from .runtime import RuntimeConfig, _runtime_config
+from .text_utils import parse_frontmatter
 
 logger = logging.getLogger(__name__)
 OKF_WORKER_ENV = "HERMES_LOCAL_KNOWLEDGE_OKF_WORKER"
+
+
+class _OkfPathCollisionError(RuntimeError):
+    pass
+
 
 OKF_GENERATION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -285,6 +291,11 @@ def _write_and_complete_item(
     def publish() -> None:
         nonlocal previous, published
         previous = path.read_bytes() if path.exists() else None
+        if previous is not None:
+            existing_frontmatter = parse_frontmatter(previous.decode("utf-8", errors="replace"))
+            existing_tool = str(existing_frontmatter.get("tool") or "").strip()
+            if existing_tool and existing_tool != tool_name:
+                raise _OkfPathCollisionError("OKF target path belongs to a different tool")
         os.replace(temp_path, path)
         published = True
 
@@ -307,15 +318,24 @@ def _write_and_complete_item(
                 error="generated validation failed",
             )
             return False
-        outcome = okf.publish_claimed_okf(
-            cfg.state_dir,
-            lease_owner=lease_owner,
-            tool_name=tool_name,
-            claim_token=claim_token,
-            okf_path=path,
-            publish=publish,
-            rollback=rollback,
-        )
+        try:
+            outcome = okf.publish_claimed_okf(
+                cfg.state_dir,
+                lease_owner=lease_owner,
+                tool_name=tool_name,
+                claim_token=claim_token,
+                okf_path=path,
+                publish=publish,
+                rollback=rollback,
+            )
+        except _OkfPathCollisionError:
+            okf.mark_candidate_error(
+                cfg.state_dir,
+                tool_name=tool_name,
+                claim_token=claim_token,
+                error="OKF target path belongs to a different tool",
+            )
+            return False
         if outcome == "invalid":
             okf.mark_candidate_error(
                 cfg.state_dir,

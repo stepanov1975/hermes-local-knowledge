@@ -46,8 +46,15 @@ def clean(value: Any) -> str:
     return "" if text.lower() in IGNORED else text
 
 
+def connect_readonly(db_path: Path) -> sqlite3.Connection:
+    uri = f"{db_path.expanduser().resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def artifact_ids(db_path: Path) -> set[str]:
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_readonly(db_path)
     try:
         return {str(row[0]) for row in conn.execute("SELECT id FROM artifacts").fetchall()}
     finally:
@@ -55,7 +62,7 @@ def artifact_ids(db_path: Path) -> set[str]:
 
 
 def table_count(db_path: Path, table: str) -> int:
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_readonly(db_path)
     try:
         exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -69,8 +76,7 @@ def table_count(db_path: Path, table: str) -> int:
 
 
 def labels_from_usage(usage_db: Path, valid: set[str]) -> dict[str, set[str]]:
-    conn = sqlite3.connect(f"file:{usage_db}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = connect_readonly(usage_db)
     try:
         rows = conn.execute(
             """
@@ -97,8 +103,7 @@ def labels_from_usage(usage_db: Path, valid: set[str]) -> dict[str, set[str]]:
 
 
 def parent_equivalents(db_path: Path) -> dict[str, set[str]]:
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = connect_readonly(db_path)
     try:
         rows = conn.execute("SELECT id, type, related_json FROM artifacts").fetchall()
     finally:

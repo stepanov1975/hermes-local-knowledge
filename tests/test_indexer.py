@@ -6,7 +6,7 @@ import os
 import sqlite3
 import sys
 import threading
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any
 
@@ -38,6 +38,100 @@ Route local questions to whole artifacts.
 """
 
     assert lci.first_heading_or_paragraph(text) == "Tool OKF: knowledge_search"
+
+
+def test_extract_paths_supports_portable_local_path_forms_without_urls() -> None:
+    windows_backslash = r"C:\Users\Alex\Hermes\run.ps1"
+    windows_forward = "D:/Hermes/scripts/rebuild.cmd"
+    unc = r"\\fileserver\Hermes\scripts\sync.ps1"
+    text = (
+        f"Run /opt/hermes/bin/worker.sh or ~/.hermes/scripts/rebuild.py. "
+        f"Windows: {windows_backslash}, {windows_forward}, or {unc}. "
+        "Ignore https://example.com/api/run and //example.com/download/file.zip."
+    )
+
+    paths = lci.extract_paths(text)
+
+    assert paths == [
+        "/opt/hermes/bin/worker.sh",
+        "~/.hermes/scripts/rebuild.py",
+        windows_backslash,
+        windows_forward,
+        unc,
+    ]
+    assert PureWindowsPath(windows_backslash).name == "run.ps1"
+    assert PureWindowsPath(unc).name == "sync.ps1"
+
+
+def test_extracted_windows_paths_resolve_related_edges_on_posix() -> None:
+    windows_backslash = r"C:\Users\Alex\Hermes\run.ps1"
+    unc = r"\\fileserver\Hermes\scripts\sync.ps1"
+    source = lci.Artifact(
+        id="runbook:windows-commands",
+        type="runbook",
+        title="Windows commands",
+        path="docs/windows-commands.md",
+        summary="Run the referenced scripts.",
+        related=lci.extract_paths(f"Run {windows_backslash} and {unc}."),
+    )
+    run_script = lci.Artifact(
+        id="script:run-ps1",
+        type="script",
+        title="run.ps1",
+        path="scripts/run.ps1",
+        summary="Run script.",
+    )
+    sync_script = lci.Artifact(
+        id="script:sync-ps1",
+        type="script",
+        title="sync.ps1",
+        path="scripts/sync.ps1",
+        summary="Sync script.",
+    )
+
+    edges = lci.build_edges([source, run_script, sync_script])
+
+    assert {(edge.source, edge.target, edge.kind) for edge in edges} == {
+        (source.id, run_script.id, "related_to"),
+        (source.id, sync_script.id, "related_to"),
+    }
+
+
+def test_extract_paths_strips_prose_colon_before_related_edge_resolution() -> None:
+    source = lci.Artifact(
+        id="runbook:colon-path",
+        type="runbook",
+        title="Colon path",
+        path="docs/colon-path.md",
+        summary="Run the referenced script.",
+        related=lci.extract_paths("Run /opt/scripts/run.sh: then continue."),
+    )
+    target = lci.Artifact(
+        id="script:run-sh",
+        type="script",
+        title="run.sh",
+        path="scripts/run.sh",
+        summary="Run script.",
+    )
+
+    assert source.related == ["/opt/scripts/run.sh"]
+    assert {(edge.source, edge.target, edge.kind) for edge in lci.build_edges([source, target])} == {
+        (source.id, target.id, "related_to")
+    }
+
+
+def test_extract_paths_excludes_complete_http_urls_and_preserves_other_local_paths() -> None:
+    text = (
+        "Keep /opt/hermes/local.sh before the URLs. "
+        "Ignore https://example.com/#/opt/hermes/run.sh, "
+        "https://example.com/?next=~/scripts/run.sh, "
+        "https://example.com/C:/Windows/System32/cmd.exe, "
+        "https://example.test/?next='~/scripts/quoted.sh', and "
+        "https://example.test/'/opt/hermes/quoted.sh. "
+        "Keep ~/scripts/local.sh after them."
+    )
+
+    assert lci.extract_paths(text) == ["/opt/hermes/local.sh", "~/scripts/local.sh"]
 
 
 def create_usage_db(path: Path) -> None:
@@ -1388,6 +1482,114 @@ def test_quoted_query_does_not_backfill_relaxed_fallback_results(tmp_path: Path)
     assert [row["id"] for row in results] == [exact.id]
 
 
+@pytest.mark.parametrize("query", ['foo"bar baz"', '"bar baz"foo'])
+def test_adjacent_quoted_spans_keep_exact_search_semantics(tmp_path: Path, query: str) -> None:
+    db_path = tmp_path / "index.sqlite"
+    parent = lci.Artifact(
+        id="skill:parent",
+        type="skill",
+        title="parent",
+        path="skills/parent",
+        summary="Owning skill.",
+        search_text="owning skill",
+    )
+    exact = lci.Artifact(
+        id="skill_support_doc:exact",
+        type="skill_support_doc",
+        title="exact reference",
+        path="skills/parent/references/exact.md",
+        summary="Foo bar baz appears together.",
+        related=[parent.id],
+        search_text="foo bar baz",
+    )
+    separated = lci.Artifact(
+        id="runbook:separated",
+        type="runbook",
+        title="separated",
+        path="docs/separated.md",
+        summary="Foo and bar are separated from baz.",
+        triggers=["bar", "foo", "baz"],
+        search_text="foo bar middle baz",
+    )
+    loose_identity = lci.Artifact(
+        id="runbook:loose-identity",
+        type="runbook",
+        title="foo baz bar",
+        path="docs/foo-baz-bar.md",
+        summary="All terms appear, but the phrase order is wrong.",
+        search_text="foo baz bar",
+    )
+    lci.build_sqlite(db_path, [parent, exact, separated, loose_identity], [])
+
+    results = lci.search_index(db_path, query, limit=5)
+
+    assert results[0]["id"] == exact.id
+    assert parent.id not in {row["id"] for row in results}
+
+
+def test_mixed_quoted_query_uses_parsed_fts_expressions_for_relaxed_fallback(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    update_only = lci.Artifact(
+        id="runbook:update-only",
+        type="runbook",
+        title="Update status",
+        path="docs/update.md",
+        summary="Release update status.",
+        search_text="release update status",
+    )
+    phrase_only = lci.Artifact(
+        id="runbook:phrase-only",
+        type="runbook",
+        title="Next steps",
+        path="docs/next.md",
+        summary="What next guidance.",
+        search_text="what next guidance",
+    )
+    lci.build_sqlite(db_path, [update_only, phrase_only], [])
+
+    results = lci.search_index(db_path, 'updates "what next"', limit=5)
+
+    assert {row["id"] for row in results} == {update_only.id, phrase_only.id}
+
+
+def test_quoted_queries_require_adjacent_ordered_literal_tokens(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite"
+    artifacts = [
+        lci.Artifact(
+            id="runbook:ordered",
+            type="runbook",
+            title="ordered",
+            path="docs/ordered.md",
+            summary="Alpha beta and echo echo. Find target in the owner's guide, then say target now. What next?",
+            search_text="alpha beta echo echo find target owner's guide say target now what next",
+        ),
+        lci.Artifact(
+            id="runbook:separated",
+            type="runbook",
+            title="separated",
+            path="docs/separated.md",
+            summary="Alpha middle beta; echo once; find another target.",
+            search_text="alpha middle beta echo once find another target",
+        ),
+        lci.Artifact(
+            id="runbook:reversed",
+            type="runbook",
+            title="reversed",
+            path="docs/reversed.md",
+            summary="Beta alpha.",
+            search_text="beta alpha",
+        ),
+    ]
+    lci.build_sqlite(db_path, artifacts, [])
+
+    assert [row["id"] for row in lci.search_index(db_path, '"alpha beta"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, '"echo echo"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, '"find target"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, '"what next"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, '"owner\'s guide"', limit=5)] == ["runbook:ordered"]
+    assert [row["id"] for row in lci.search_index(db_path, "'say target now'", limit=5)] == ["runbook:ordered"]
+
+
 def test_identifier_metadata_expands_text_poor_home_assistant_artifacts(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
@@ -2048,6 +2250,11 @@ def test_build_sqlite_exhausted_replace_retries_preserve_existing_db(tmp_path: P
     assert list(db_path.parent.glob(".index.sqlite.*.tmp")) == []
 
 
+def test_index_format_invalidates_pre_mcp_redaction_indexes() -> None:
+    # Format 2 artifacts may contain unsanitized MCP argument metadata.
+    assert lci_storage.INDEX_FORMAT_VERSION == 3
+
+
 def test_build_sqlite_refuses_to_overwrite_newer_index_format(tmp_path: Path) -> None:
     db_path = tmp_path / "state" / "index.sqlite"
     current = lci.Artifact(
@@ -2123,6 +2330,33 @@ def test_build_sqlite_creates_nested_parent_directories(tmp_path: Path) -> None:
     assert fetched["triggers"] == ["alpha"]
 
 
+@pytest.mark.parametrize(
+    "basename",
+    [
+        "index with spaces.sqlite",
+        "index#fragment.sqlite",
+        pytest.param("index?query.sqlite", marks=pytest.mark.skipif(os.name == "nt", reason="? is not a valid Windows filename")),
+    ],
+)
+def test_connect_readonly_opens_encoded_sqlite_paths(tmp_path: Path, basename: str) -> None:
+    db_path = tmp_path / basename
+    artifact = lci.Artifact(
+        id="skill:portable-path",
+        type="skill",
+        title="Portable Path",
+        path="custom_skills/portable-path",
+        summary="Portable path test.",
+        search_text="portable path test",
+    )
+    lci.build_sqlite(db_path, [artifact], [])
+
+    conn = lci_storage.connect_readonly(db_path)
+    try:
+        assert conn.execute("SELECT title FROM artifacts WHERE id = ?", (artifact.id,)).fetchone()[0] == artifact.title
+    finally:
+        conn.close()
+
+
 def test_scan_mcp_servers_supports_native_top_level_config(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     hermes_home = tmp_path / "hermes_home"
@@ -2192,6 +2426,303 @@ def test_scan_mcp_servers_preserves_legacy_yaml_path_and_base_url(tmp_path: Path
     assert "sentinelcredential" not in serialized
     lci.build_sqlite(tmp_path / "index.sqlite", artifacts, [])
     assert lci.search_index(tmp_path / "index.sqlite", "sentinelcredential", limit=5) == []
+
+
+def test_scan_mcp_servers_sanitizes_top_level_url_userinfo(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp:
+  servers:
+    legacy:
+      command: uvx
+      base_url: http://legacyusercanary:legacypasscanary@legacyfragmentcanary@legacy.invalid:9000/path
+mcp_servers:
+  native:
+    command: uvx
+    url: https://nativeusercanary:nativepasscanary@example.invalid/api?mode=stdio
+  safe-query:
+    command: uvx
+    url: https://route.invalid?contact=owner@example.com&mode=stdio
+""",
+    )
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:legacy", "mcp:native", "mcp:safe-query"]
+    serialized = json.dumps([artifact.__dict__ for artifact in artifacts], default=str).lower()
+    for canary in (
+        "legacyusercanary",
+        "legacypasscanary",
+        "legacyfragmentcanary",
+        "nativeusercanary",
+        "nativepasscanary",
+    ):
+        assert canary not in serialized
+    assert "url http://legacy.invalid:9000/path" in artifacts[0].summary
+    assert "url https://example.invalid/api?mode=stdio" in artifacts[1].summary
+    assert "url https://route.invalid?contact=owner@example.com&mode=stdio" in artifacts[2].summary
+
+    jsonl_path = tmp_path / "index.jsonl"
+    db_path = tmp_path / "index.sqlite"
+    lci_storage.write_jsonl(jsonl_path, artifacts)
+    lci.build_sqlite(db_path, artifacts, [])
+    persisted = jsonl_path.read_text(encoding="utf-8").lower()
+    for canary in (
+        "legacyusercanary",
+        "legacypasscanary",
+        "legacyfragmentcanary",
+        "nativeusercanary",
+        "nativepasscanary",
+    ):
+        assert canary not in persisted
+        assert lci.search_index(db_path, canary, limit=5) == []
+    assert lci.search_index(db_path, "legacy invalid 9000", limit=5)[0]["id"] == "mcp:legacy"
+    assert lci.search_index(db_path, "example invalid mode stdio", limit=5)[0]["id"] == "mcp:native"
+    assert lci.search_index(db_path, "route invalid contact owner", limit=5)[0]["id"] == "mcp:safe-query"
+
+
+def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  example:
+    command: uvx
+    args:
+      - example-mcp-server
+      - --config
+      - /home/example/server.json
+      - https://example.invalid/api
+      - https://arg-route.invalid?contact=owner@example.net&mode=stdio
+      - https://urlusercanary:urlpasscanary@example.invalid/private-api
+      - MODE=stdio
+      - API_KEY=assignmentcanary
+      - SERVICE_CREDENTIAL=credentialcanary
+      - --token
+      - flagcanary
+      - --password
+      - passwordcanary
+      - --header
+      - Authorization: Bearer authorizationcanary
+      - -H
+      - X-Api-Key: headercanary
+      - "--header=Proxy-Authorization: Basic proxycanary"
+      - -H
+      - X-Service-Secret: secretcanary
+      - --header
+      - Accept: application/json
+      - {"--header": "Authorization: Bearer mappingauthorizationcanary"}
+      - {"--header": "Link: https://mappingurlusercanary:mappingurlpasscanary@header.invalid/api"}
+      - {"-H": "X-Api-Key: mappingapikeycanary"}
+      - {"--token": "mappingtokencanary"}
+      - {"--env": "API_KEY=mappingassignmentcanary"}
+      - {"--metadata": "Authorization: Bearer mappin...nary"}
+      - "--metadata=Authorization: Basic basicp...ry=="
+      - "--env=API_KEY=compoundassignmentcanary=Authorization: Basic compoundheadercanary=="
+      - --env=API_KEY=wrappedassignmentcanary
+      - TOKEN_URL=https://example.invalid/oauth/token
+      - --token-endpoint
+      - https://example.invalid/oauth/token
+      - --token-file
+      - /home/example/token.json
+      - {"--header": {"Accept": "application/json", "Authorization": "Bearer nestedheadercanary"}}
+      - {"outer": ["--token", "nestedlistcanary"]}
+      - --token
+      - -dashsecretcanary
+      - --config
+      - /home/example/missing-token-config.json
+    env:
+      EXAMPLE_TOKEN: envcanary
+""",
+    )
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:example"]
+    artifact = artifacts[0]
+    serialized = json.dumps(artifact.__dict__, default=str).lower()
+    for canary in (
+        "assignmentcanary",
+        "credentialcanary",
+        "flagcanary",
+        "passwordcanary",
+        "authorizationcanary",
+        "headercanary",
+        "proxycanary",
+        "secretcanary",
+        "mappingauthorizationcanary",
+        "mappingurlusercanary",
+        "mappingurlpasscanary",
+        "mappingapikeycanary",
+        "mappingtokencanary",
+        "mappingassignmentcanary",
+        "mappingheadercanary",
+        "basicpaddingcanary",
+        "compoundassignmentcanary",
+        "compoundheadercanary",
+        "wrappedassignmentcanary",
+        "nestedheadercanary",
+        "nestedlistcanary",
+        "dashsecretcanary",
+        "urlusercanary",
+        "urlpasscanary",
+        "envcanary",
+    ):
+        assert canary not in serialized
+    assert "example-mcp-server" in artifact.summary
+    assert "--config" in artifact.summary
+    assert "/home/example/server.json" in artifact.summary
+    assert "https://example.invalid/api" in artifact.summary
+    assert "https://arg-route.invalid?contact=owner@example.net&mode=stdio" in artifact.search_text
+    assert "https://example.invalid/private-api" in artifact.summary
+    assert "mode=stdio" in artifact.summary.lower()
+    assert "--header: authorization: <redacted>" in artifact.summary.lower()
+    assert "-h: x-api-key: <redacted>" in artifact.summary.lower()
+    assert "--token: <redacted>" in artifact.summary.lower()
+    assert "--env: api_key=<redacted>" in artifact.summary.lower()
+    assert "--metadata: authorization: <redacted>" in artifact.summary.lower()
+    assert "--metadata=authorization: <redacted>" in artifact.search_text.lower()
+    assert "--env=api_key=<redacted>" in artifact.search_text.lower()
+    assert "token_url=https://example.invalid/oauth/token" in artifact.search_text.lower()
+    assert "--token-endpoint https://example.invalid/oauth/token" in artifact.search_text.lower()
+    assert "--token-file /home/example/token.json" in artifact.search_text.lower()
+    assert "--header: <redacted>" in artifact.search_text.lower()
+    assert "outer: <redacted>" in artifact.search_text.lower()
+    assert "--header: link: https://header.invalid/api" in artifact.search_text.lower()
+    assert "--token <redacted> --config /home/example/missing-token-config.json" in artifact.search_text.lower()
+    for locator in (
+        "token_url=https://example.invalid/oauth/token",
+        "--token-endpoint https://example.invalid/oauth/token",
+        "--token-file /home/example/token.json",
+    ):
+        assert locator in serialized
+    assert "api_key=<redacted>" in artifact.search_text.lower()
+    assert "service_credential=<redacted>" in artifact.search_text.lower()
+    assert "--token <redacted>" in artifact.search_text.lower()
+    assert "--password <redacted>" in artifact.search_text.lower()
+    assert "authorization: <redacted>" in artifact.search_text.lower()
+    assert "x-api-key: <redacted>" in artifact.search_text.lower()
+    assert "--header=proxy-authorization: <redacted>" in artifact.search_text.lower()
+    assert "x-service-secret: <redacted>" in artifact.search_text.lower()
+    assert "accept: application/json" in artifact.search_text.lower()
+    assert artifact.related == [
+        "/home/example/server.json",
+        "/home/example/token.json",
+        "/home/example/missing-token-config.json",
+    ]
+
+    db_path = tmp_path / "index.sqlite"
+    jsonl_path = tmp_path / "index.jsonl"
+    lci_storage.write_jsonl(jsonl_path, artifacts)
+    lci.build_sqlite(db_path, artifacts, [])
+    persisted = jsonl_path.read_text(encoding="utf-8").lower()
+    for canary in (
+        "assignmentcanary",
+        "credentialcanary",
+        "flagcanary",
+        "passwordcanary",
+        "authorizationcanary",
+        "headercanary",
+        "proxycanary",
+        "secretcanary",
+        "mappingauthorizationcanary",
+        "mappingurlusercanary",
+        "mappingurlpasscanary",
+        "mappingapikeycanary",
+        "mappingtokencanary",
+        "mappingassignmentcanary",
+        "mappingheadercanary",
+        "basicpaddingcanary",
+        "compoundassignmentcanary",
+        "compoundheadercanary",
+        "wrappedassignmentcanary",
+        "nestedheadercanary",
+        "nestedlistcanary",
+        "dashsecretcanary",
+        "urlusercanary",
+        "urlpasscanary",
+    ):
+        assert canary not in persisted
+        assert lci.search_index(db_path, canary, limit=5) == []
+    assert [row["id"] for row in lci.search_index(db_path, "example mcp server", limit=5)] == ["mcp:example"]
+    assert [row["id"] for row in lci.search_index(db_path, "token endpoint", limit=5)] == ["mcp:example"]
+    assert [row["id"] for row in lci.search_index(db_path, "token json", limit=5)] == ["mcp:example"]
+    assert lci.search_index(db_path, "arg route contact owner", limit=5)[0]["id"] == "mcp:example"
+    assert lci.search_index(db_path, "header invalid link", limit=5)[0]["id"] == "mcp:example"
+
+
+def test_mcp_arg_sanitizer_handles_many_assignment_separators_without_recursion(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    ordinary = "MODE=" + ("=" * 1_500) + "stdio"
+    wrapped_secret = "--env=" + ("=" * 1_500) + "API_KEY=deepcanary"
+
+    assert lci_scanners._sanitize_mcp_arg_value(ordinary) == ordinary
+    sanitized = lci_scanners._sanitize_mcp_arg_value(wrapped_secret)
+    assert "deepcanary" not in sanitized
+    assert sanitized.endswith("API_KEY=<redacted>")
+    compound = lci_scanners._sanitize_mcp_arg_value(
+        "--env=API_KEY=outercanary=Authorization: Basic innercanary=="
+    )
+    assert compound == "--env=API_KEY=<redacted>"
+    assert lci_scanners._sanitize_mcp_arg_value(
+        "--endpoint=https://urlusercanary:urlpasscanary@example.invalid/api?mode=stdio"
+    ) == "--endpoint=https://example.invalid/api?mode=stdio"
+    assert lci_scanners._sanitize_mcp_arg_value(
+        "--endpoint=https://urlusercanary:partone@parttwo@example.invalid/api"
+    ) == "--endpoint=https://example.invalid/api"
+    assert lci_scanners._sanitize_mcp_arg_value(
+        "--endpoint=https://route.invalid?contact=owner@example.net&mode=stdio"
+    ) == "--endpoint=https://route.invalid?contact=owner@example.net&mode=stdio"
+    assert lci_scanners._sanitize_mcp_arg_value(
+        "--endpoint=https://route.invalid/path#contact=owner@example.net"
+    ) == "--endpoint=https://route.invalid/path#contact=owner@example.net"
+    assert (
+        lci_scanners._sanitize_mcp_arg_value("--endpoint=https://example.invalid/api?mode=stdio")
+        == "--endpoint=https://example.invalid/api?mode=stdio"
+    )
+
+    header_calls = 0
+    original_sanitize_header = lci_scanners._sanitize_mcp_header
+
+    def counting_sanitize_header(value: str) -> str:
+        nonlocal header_calls
+        header_calls += 1
+        return original_sanitize_header(value)
+
+    monkeypatch.setattr(lci_scanners, "_sanitize_mcp_header", counting_sanitize_header)
+    colon_heavy = "safe:=" * 30_000
+    assert lci_scanners._sanitize_mcp_arg_value(colon_heavy) == colon_heavy
+    assert header_calls == 1
+
+
+def test_scan_mcp_servers_fallback_sanitizes_inline_args(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  demo:
+    command: uvx
+    args: [demo-server, --token, fallbackargcanary] # routing comment is ignored
+""",
+    )
+    monkeypatch.setattr(lci_scanners, "load_yaml_if_available", lambda _path: None)
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:demo"]
+    artifact = artifacts[0]
+    serialized = json.dumps(artifact.__dict__, default=str).lower()
+    assert "fallbackargcanary" not in serialized
+    assert "demo-server" in artifact.summary
+    assert "--token <redacted>" in artifact.summary
+
+    db_path = tmp_path / "index.sqlite"
+    lci.build_sqlite(db_path, artifacts, [])
+    assert lci.search_index(db_path, "fallbackargcanary", limit=5) == []
+    assert [row["id"] for row in lci.search_index(db_path, "demo server", limit=5)] == ["mcp:demo"]
 
 
 def test_scan_mcp_servers_fallback_supports_native_top_level_config(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -2839,6 +3370,19 @@ def test_fts_query_splits_hyphenated_human_terms() -> None:
     assert lci.fts_query("self hosted application updates backup flow update markdown") == (
         "self* hosted* application* update* backup*"
     )
+
+
+def test_fts_query_preserves_balanced_quoted_phrases() -> None:
+    assert lci.fts_query('"echo echo"') == '"echo echo"'
+    assert lci.fts_query('"find target"') == '"find target"'
+    assert lci.fts_query('"owner\'s guide"') == '"owner s guide"'
+    assert lci.fts_query("'say \"target\" now'") == '"say target now"'
+    assert lci.fts_query('updates "what next"') == 'update* "what next"'
+    assert lci.fts_query('foo"bar baz"') == 'foo* "bar baz"'
+    assert lci.fts_query('"bar baz"foo') == '"bar baz" foo*'
+    assert lci.fts_query("foo 'bar baz'") == 'foo* "bar baz"'
+    assert lci.fts_query("owner's guide 'manual page'") == 'owner* guide* "manual page"'
+    assert lci.fts_query("owner's guide") == "owner* guide*"
 
 
 def test_search_sort_key_scores_each_ranking_tier() -> None:
