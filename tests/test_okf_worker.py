@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from hermes_local_knowledge import hooks, okf, okf_worker
 
 
@@ -314,6 +316,88 @@ def test_generation_publishes_under_owned_lease_and_cleans_unique_temp(tmp_path:
     target = okf.okf_file_path(state_dir, "knowledge_search")
     assert target.exists()
     assert not list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert okf.queue_counts(state_dir) == {"done": 1}
+
+
+@pytest.mark.parametrize(
+    ("first_tool", "second_tool"),
+    [("mcp.tool", "mcp-tool"), ("Tool Name", "tool_name")],
+)
+def test_worker_rejects_okf_filename_collision_without_replacing_existing_tool(
+    tmp_path: Path,
+    monkeypatch,
+    first_tool: str,
+    second_tool: str,
+) -> None:  # type: ignore[no-untyped-def]
+    _repo, hermes_home, state_dir = configure(tmp_path, monkeypatch)
+    schema = {"type": "object"}
+
+    class FakeLlm:
+        def complete_structured(self, **kwargs):  # type: ignore[no-untyped-def]
+            packet = json.loads(kwargs["input"][0]["text"])["candidates"][0]
+            return SimpleNamespace(parsed={"okfs": [generated_item(packet)]})
+
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=first_tool,
+        toolset="demo",
+        schema=schema,
+        args={},
+    )
+    assert okf_worker.run_worker(llm=FakeLlm(), hermes_home=hermes_home) == 0
+    target = okf.okf_file_path(state_dir, first_tool)
+    assert target == okf.okf_file_path(state_dir, second_tool)
+    first_artifact = target.read_bytes()
+
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=second_tool,
+        toolset="demo",
+        schema=schema,
+        args={},
+    )
+    assert okf_worker.run_worker(llm=FakeLlm(), hermes_home=hermes_home) == 1
+
+    assert target.read_bytes() == first_artifact
+    assert okf.queue_counts(state_dir) == {"done": 1, "pending": 1}
+    pending = okf.pending_candidates(state_dir, limit=2)
+    assert [row["tool_name"] for row in pending] == [second_tool]
+    assert pending[0]["attempt_count"] == 1
+    assert pending[0]["last_attempt_error"] == "<redacted>"
+
+
+def test_worker_still_regenerates_existing_okf_for_same_tool(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _repo, hermes_home, state_dir = configure(tmp_path, monkeypatch)
+    tool_name = "mcp.tool"
+
+    class FakeLlm:
+        def complete_structured(self, **kwargs):  # type: ignore[no-untyped-def]
+            packet = json.loads(kwargs["input"][0]["text"])["candidates"][0]
+            return SimpleNamespace(parsed={"okfs": [generated_item(packet)]})
+
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=tool_name,
+        toolset="demo",
+        schema={"type": "object"},
+        args={},
+    )
+    assert okf_worker.run_worker(llm=FakeLlm(), hermes_home=hermes_home) == 0
+    target = okf.okf_file_path(state_dir, tool_name)
+    first_artifact = target.read_bytes()
+
+    changed_schema = {"type": "object", "properties": {"query": {"type": "string"}}}
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=tool_name,
+        toolset="demo",
+        schema=changed_schema,
+        args={},
+    )
+    assert okf_worker.run_worker(llm=FakeLlm(), hermes_home=hermes_home) == 0
+
+    assert target.read_bytes() != first_artifact
+    assert f'tool: "{tool_name}"' in target.read_text(encoding="utf-8")
     assert okf.queue_counts(state_dir) == {"done": 1}
 
 
