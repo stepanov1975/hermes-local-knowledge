@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -11,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from .models import Artifact, Edge, IndexSettings
 
@@ -324,6 +325,40 @@ def build_sqlite(path: Path, artifacts: Sequence[Artifact], edges: Sequence[Edge
         finally:
             temp_path.unlink(missing_ok=True)
 
+
+def _publish_index_generation(
+    sqlite_path: Path,
+    jsonl_path: Path,
+    artifacts: Sequence[Artifact],
+    edges: Sequence[Edge],
+    *,
+    build_sqlite_fn: Callable[[Path, Sequence[Artifact], Sequence[Edge]], None],
+    write_jsonl_fn: Callable[[Path, Sequence[Artifact]], None],
+) -> None:
+    backup_path: Path | None = None
+    if sqlite_path.exists():
+        backup_file = tempfile.NamedTemporaryFile(
+            prefix=f".{sqlite_path.name}.", suffix=".bak", dir=sqlite_path.parent, delete=False
+        )
+        backup_path = Path(backup_file.name)
+        backup_file.close()
+        shutil.copyfile(sqlite_path, backup_path)
+    try:
+        build_sqlite_fn(sqlite_path, artifacts, edges)
+        try:
+            write_jsonl_fn(jsonl_path, artifacts)
+        except Exception:
+            if backup_path is None:
+                sqlite_path.unlink(missing_ok=True)
+            else:
+                _replace_sqlite_with_retry(backup_path, sqlite_path)
+                backup_path = None
+            raise
+    finally:
+        if backup_path is not None:
+            backup_path.unlink(missing_ok=True)
+
+
 def build_index(
     root: Path,
     output_dir: Path,
@@ -342,8 +377,14 @@ def build_index(
     artifacts = collect_artifacts(root, hermes_home, settings, okf_root=output_dir / "okfs")
     edges = build_edges(artifacts)
     output_dir.mkdir(parents=True, exist_ok=True)
-    build_sqlite(output_dir / "index.sqlite", artifacts, edges)
-    write_jsonl(output_dir / "index.jsonl", artifacts)
+    _publish_index_generation(
+        output_dir / "index.sqlite",
+        output_dir / "index.jsonl",
+        artifacts,
+        edges,
+        build_sqlite_fn=build_sqlite,
+        write_jsonl_fn=write_jsonl,
+    )
     return artifacts, edges
 
 

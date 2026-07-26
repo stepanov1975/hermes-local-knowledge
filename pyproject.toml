@@ -27,6 +27,8 @@ test = [
     "pytest>=8,<10",
     "PyYAML>=6,<7",
     "ruff>=0.15,<0.16",
+    "setuptools>=69",
+    "wheel",
 ]
 mutation = [
     "mutmut>=3,<4",

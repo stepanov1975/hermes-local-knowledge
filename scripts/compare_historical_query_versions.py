@@ -37,13 +37,8 @@ def artifact_ids(db_path: Path) -> set[str]:
         conn.close()
 
 
-def _equivalence_family(artifact_id: str, equivalents: Mapping[str, set[str]]) -> set[str]:
-    return {artifact_id, *equivalents.get(artifact_id, set())}
-
-
 def matches_parent(result_id: str, expected: set[str], equivalents: Mapping[str, set[str]]) -> bool:
-    result_family = _equivalence_family(result_id, equivalents)
-    return any(result_family & _equivalence_family(expected_id, equivalents) for expected_id in expected)
+    return result_id in expected or bool(equivalents.get(result_id, set()) & expected)
 
 EVALUATOR_CODE = r'''
 from __future__ import annotations
@@ -146,13 +141,8 @@ def parent_equivalents(db_path: Path) -> dict[str, set[str]]:
     return out
 
 
-def _equivalence_family(artifact_id: str, equivalents: Mapping[str, set[str]]) -> set[str]:
-    return {artifact_id, *equivalents.get(artifact_id, set())}
-
-
 def matches_parent(result_id: str, expected: set[str], equivalents: Mapping[str, set[str]]) -> bool:
-    result_family = _equivalence_family(result_id, equivalents)
-    return any(result_family & _equivalence_family(expected_id, equivalents) for expected_id in expected)
+    return result_id in expected or bool(equivalents.get(result_id, set()) & expected)
 
 
 def metrics_for(db_path: Path, usage_db: Path) -> dict[str, Any]:

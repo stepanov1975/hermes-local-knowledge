@@ -6,7 +6,7 @@ import os
 import sqlite3
 import sys
 import threading
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any
 
@@ -199,7 +199,7 @@ def test_scan_mcp_servers_redacts_only_obvious_credentials(tmp_path: Path) -> No
         """mcp_servers:
   demo:
     command: npx
-    args: [demo-package, --profile, local, --api-key, TEST_ONLY_SECRET, --token=SECOND_SECRET]
+    args: [demo-package, --profile, local, --api-key, TEST_ONLY_SECRET, --token=SECOND_SECRET, API_KEY=ARG_SECRET, --header, Authorization=HEADER_SECRET]
     url: https://user:URL_SECRET@example.invalid/api/v1?token=QUERY_SECRET#fragment
 """,
     )
@@ -209,8 +209,10 @@ def test_scan_mcp_servers_redacts_only_obvious_credentials(tmp_path: Path) -> No
 
     assert "demo-package" in persisted
     assert "--profile local" in persisted
+    assert "API_KEY=<redacted>" in persisted
+    assert "Authorization=<redacted>" in persisted
     assert "example.invalid/api/v1" in persisted
-    for secret in ("TEST_ONLY_SECRET", "SECOND_SECRET", "URL_SECRET", "QUERY_SECRET"):
+    for secret in ("TEST_ONLY_SECRET", "SECOND_SECRET", "ARG_SECRET", "HEADER_SECRET", "URL_SECRET", "QUERY_SECRET"):
         assert secret not in persisted
 
 
@@ -275,7 +277,8 @@ def test_mcp_fallback_redacts_inline_args_credentials(tmp_path: Path, monkeypatc
 )
 def test_extract_paths_supports_cross_platform_absolute_paths(raw: str, expected: str) -> None:
     assert expected in lci.extract_paths(f"wrapper {raw}")
-    assert lci.extract_paths(f"https://example.invalid/api/{Path(expected).name}") == []
+    name = PureWindowsPath(expected).name if "\\" in expected else Path(expected).name
+    assert lci.extract_paths(f"https://example.invalid/api/{name}") == []
 
 
 def test_collect_artifacts_rejects_duplicate_ids_instead_of_dropping_one(tmp_path: Path) -> None:
@@ -462,7 +465,7 @@ def test_parent_equivalent_metrics_only_count_support_doc_parent_pairs() -> None
             "skill_support_doc:child-b": {"skill:parent"},
         },
     )
-    assert siblings.parent_equiv_hit_at_1 == 1.0
+    assert siblings.parent_equiv_hit_at_1 == 0.0
 
 
 def test_evaluation_metrics_are_capped_to_top_ten() -> None:
@@ -559,7 +562,7 @@ def test_compare_helper_ref_names_are_collision_resistant() -> None:
     assert helper.safe_ref_name("feature/a") != helper.safe_ref_name("feature-a")
 
 
-def test_compare_helper_parent_equivalence_counts_sibling_support_docs() -> None:
+def test_compare_helper_parent_equivalence_does_not_count_sibling_support_docs() -> None:
     helper = load_compare_helper()
     equivalents = {
         "skill:parent": {"skill_support_doc:child-a", "skill_support_doc:child-b"},
@@ -571,7 +574,7 @@ def test_compare_helper_parent_equivalence_counts_sibling_support_docs() -> None
         "skill_support_doc:child-b",
         {"skill_support_doc:child-a"},
         equivalents,
-    ) is True
+    ) is False
 
 
 @pytest.mark.parametrize(
@@ -599,6 +602,61 @@ def test_sqlite_publication_failure_preserves_previous_jsonl(
         builder(root, output_dir, hermes_home)
 
     assert (output_dir / "index.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("builder", "module"),
+    [(lci.build_index, lci), (lci_storage.build_index, lci_storage)],
+)
+def test_jsonl_publication_failure_restores_previous_sqlite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builder: Any,
+    module: Any,
+) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    builder(root, output_dir, hermes_home)
+    before_jsonl = (output_dir / "index.jsonl").read_bytes()
+    write(root / "docs" / "new.md", "# New generation\n")
+    monkeypatch.setattr(
+        module,
+        "write_jsonl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("blocked")),
+    )
+
+    with pytest.raises(RuntimeError, match="blocked"):
+        builder(root, output_dir, hermes_home)
+
+    db_path = output_dir / "index.sqlite"
+    assert lci.get_artifact(db_path, "skill:paperless-review-automation") is not None
+    assert lci.get_artifact(db_path, "runbook:docs-new") is None
+    assert (output_dir / "index.jsonl").read_bytes() == before_jsonl
+
+
+@pytest.mark.parametrize(
+    ("builder", "module"),
+    [(lci.build_index, lci), (lci_storage.build_index, lci_storage)],
+)
+def test_jsonl_publication_failure_removes_first_sqlite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builder: Any,
+    module: Any,
+) -> None:
+    root, hermes_home = build_fixture(tmp_path)
+    output_dir = tmp_path / "state"
+    monkeypatch.setattr(
+        module,
+        "write_jsonl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("blocked")),
+    )
+
+    with pytest.raises(RuntimeError, match="blocked"):
+        builder(root, output_dir, hermes_home)
+
+    assert not (output_dir / "index.sqlite").exists()
+    assert not (output_dir / "index.jsonl").exists()
 
 
 @pytest.mark.parametrize("marker", ["state#one", "state%one"])

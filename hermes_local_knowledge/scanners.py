@@ -403,7 +403,7 @@ def _sanitize_mcp_args(args: Any) -> str:
         elif value.startswith("-") and "=" in value and _mcp_secret_option(value):
             output.append(f"{value.split('=', 1)[0]}=<redacted>")
         else:
-            output.append(value)
+            output.append(_MCP_SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=<redacted>", value))
             redact_next = value.startswith("-") and _mcp_secret_option(value)
     return " ".join(output)
 

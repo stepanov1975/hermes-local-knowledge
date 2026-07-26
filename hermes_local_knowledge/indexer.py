@@ -76,6 +76,7 @@ from .scanners import (
 )
 from .search import search_index
 from .storage import (
+    _publish_index_generation,
     _refuse_newer_index,
     build_sqlite,
     connect_readonly,
@@ -157,8 +158,14 @@ def build_index(
     artifacts = _collect_artifacts_compat(root, hermes_home, settings, output_dir / "okfs")
     edges = build_edges(artifacts)
     output_dir.mkdir(parents=True, exist_ok=True)
-    build_sqlite(output_dir / "index.sqlite", artifacts, edges)
-    write_jsonl(output_dir / "index.jsonl", artifacts)
+    _publish_index_generation(
+        output_dir / "index.sqlite",
+        output_dir / "index.jsonl",
+        artifacts,
+        edges,
+        build_sqlite_fn=build_sqlite,
+        write_jsonl_fn=write_jsonl,
+    )
     return artifacts, edges
 
 def main(argv=None) -> int:
