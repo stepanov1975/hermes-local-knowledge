@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
 from .constants import DEFAULT_KNOWN_ENTITIES, QUERY_STOPWORDS, ROUTING_HINT_TERMS, STOPWORDS
@@ -35,6 +35,14 @@ def unique_preserve_order(values: Iterable[str]) -> list[str]:
         seen.add(clean)
         output.append(clean)
     return output
+
+
+def portable_basename(value: str) -> str:
+    """Return a basename for POSIX or Windows display paths on any host OS."""
+
+    clean = str(value).rstrip("`.,);]")
+    path_type = PureWindowsPath if "\\" in clean else PurePosixPath
+    return path_type(clean).name
 
 def relative_config_parts(value: str) -> tuple[str, ...]:
     """Return normalized relative path parts from a scanner config entry."""
@@ -317,8 +325,8 @@ def identity_match_tier(row: dict[str, Any], terms: Sequence[str]) -> int:
     artifact_id = str(row.get("id") or "")
     title = str(row.get("title") or "")
     path = str(row.get("path") or "")
-    path_name = Path(path).name
-    path_stem = Path(path).stem
+    path_name = portable_basename(path)
+    path_stem = Path(path_name).stem
     query_compact = "".join(terms)
 
     if len(terms) >= 2 and query_compact:

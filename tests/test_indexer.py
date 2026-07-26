@@ -63,6 +63,40 @@ def test_extract_paths_supports_portable_local_path_forms_without_urls() -> None
     assert PureWindowsPath(unc).name == "sync.ps1"
 
 
+def test_extracted_windows_paths_resolve_related_edges_on_posix() -> None:
+    windows_backslash = r"C:\Users\Alex\Hermes\run.ps1"
+    unc = r"\\fileserver\Hermes\scripts\sync.ps1"
+    source = lci.Artifact(
+        id="runbook:windows-commands",
+        type="runbook",
+        title="Windows commands",
+        path="docs/windows-commands.md",
+        summary="Run the referenced scripts.",
+        related=lci.extract_paths(f"Run {windows_backslash} and {unc}."),
+    )
+    run_script = lci.Artifact(
+        id="script:run-ps1",
+        type="script",
+        title="run.ps1",
+        path="scripts/run.ps1",
+        summary="Run script.",
+    )
+    sync_script = lci.Artifact(
+        id="script:sync-ps1",
+        type="script",
+        title="sync.ps1",
+        path="scripts/sync.ps1",
+        summary="Sync script.",
+    )
+
+    edges = lci.build_edges([source, run_script, sync_script])
+
+    assert {(edge.source, edge.target, edge.kind) for edge in edges} == {
+        (source.id, run_script.id, "related_to"),
+        (source.id, sync_script.id, "related_to"),
+    }
+
+
 def test_extract_paths_excludes_complete_http_urls_and_preserves_other_local_paths() -> None:
     text = (
         "Keep /opt/hermes/local.sh before the URLs. "
@@ -2517,7 +2551,7 @@ def test_scan_mcp_servers_sanitizes_credentials_from_structured_args(tmp_path: P
     assert [row["id"] for row in lci.search_index(db_path, "token json", limit=5)] == ["mcp:example"]
 
 
-def test_mcp_arg_sanitizer_handles_many_assignment_separators_without_recursion() -> None:
+def test_mcp_arg_sanitizer_handles_many_assignment_separators_without_recursion(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     ordinary = "MODE=" + ("=" * 1_500) + "stdio"
     wrapped_secret = "--env=" + ("=" * 1_500) + "API_KEY=deepcanary"
 
@@ -2529,6 +2563,47 @@ def test_mcp_arg_sanitizer_handles_many_assignment_separators_without_recursion(
         "--env=API_KEY=outercanary=Authorization: Basic innercanary=="
     )
     assert compound == "--env=API_KEY=<redacted>"
+
+    header_calls = 0
+    original_sanitize_header = lci_scanners._sanitize_mcp_header
+
+    def counting_sanitize_header(value: str) -> str:
+        nonlocal header_calls
+        header_calls += 1
+        return original_sanitize_header(value)
+
+    monkeypatch.setattr(lci_scanners, "_sanitize_mcp_header", counting_sanitize_header)
+    colon_heavy = "safe:=" * 30_000
+    assert lci_scanners._sanitize_mcp_arg_value(colon_heavy) == colon_heavy
+    assert header_calls == 1
+
+
+def test_scan_mcp_servers_fallback_sanitizes_inline_args(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes_home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp_servers:
+  demo:
+    command: uvx
+    args: [demo-server, --token, fallbackargcanary] # routing comment is ignored
+""",
+    )
+    monkeypatch.setattr(lci_scanners, "load_yaml_if_available", lambda _path: None)
+
+    artifacts = lci.scan_mcp_servers(root, hermes_home)
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:demo"]
+    artifact = artifacts[0]
+    serialized = json.dumps(artifact.__dict__, default=str).lower()
+    assert "fallbackargcanary" not in serialized
+    assert "demo-server" in artifact.summary
+    assert "--token <redacted>" in artifact.summary
+
+    db_path = tmp_path / "index.sqlite"
+    lci.build_sqlite(db_path, artifacts, [])
+    assert lci.search_index(db_path, "fallbackargcanary", limit=5) == []
+    assert [row["id"] for row in lci.search_index(db_path, "demo server", limit=5)] == ["mcp:demo"]
 
 
 def test_scan_mcp_servers_fallback_supports_native_top_level_config(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

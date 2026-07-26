@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.12] - 2026-07-26
+
+### Fixed
+
+- Redacted obvious credential values from structured MCP process arguments before they enter summaries, routing fields, related paths, or the search index, while preserving useful commands, paths, URLs, and locator metadata.
+- Preserved literal phrase order, duplicates, and stopwords in quoted searches; kept strict phrase matches ahead of phrase-blind identity and relaxed fallback results.
+- Recognized portable POSIX, home, Windows drive, and UNC paths without extracting local-looking paths embedded in HTTP URLs, and encoded read-only SQLite URIs for paths containing spaces, `#`, or `?`.
+- Prevented normalized OKF output-name collisions from replacing a routing note owned by a different tool while retaining same-tool regeneration.
+
 ## [0.3.11] - 2026-07-26
 
 ### Fixed
@@ -43,6 +52,7 @@ All notable changes to this project are documented in this file.
 - Added bounded retries for SQLite index publication when short-lived Windows readers temporarily prevent `os.replace`, while preserving the previous usable index if retries are exhausted ([#19]).
 - Prevented older plugin runtimes from downgrading indexes created by newer index formats across native tools and config-backed CLI lookups ([#20]).
 
+[0.3.12]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.8...v0.3.9

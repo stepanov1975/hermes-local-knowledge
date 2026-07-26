@@ -18,6 +18,7 @@ from .text_utils import (
     first_sentence,
     identifier_terms,
     parse_frontmatter,
+    portable_basename,
     regex_list_after_key,
     relpath_matches_config_dir,
     safe_read_text,
@@ -424,20 +425,66 @@ def _sanitize_mcp_arg_value(value: Any) -> str:
 
     segments = text.split("=")
     prefix: list[str] = []
-    for index, segment in enumerate(segments[:-1]):
-        if ":" in segment:
-            header = "=".join(segments[index:])
-            sanitized_header = _sanitize_mcp_header(header)
-            if sanitized_header != header:
-                return "=".join([*prefix, sanitized_header])
+    for segment in segments[:-1]:
+        header_name, separator, _ = segment.partition(":")
+        if separator and _mcp_secret_name(header_name):
+            return "=".join([*prefix, f"{header_name}: <redacted>"])
         prefix.append(segment)
         if _mcp_secret_name(segment):
             return f"{'='.join(prefix)}=<redacted>"
     return "=".join([*prefix, _sanitize_mcp_header(segments[-1])])
 
 
+def _parse_inline_mcp_args(value: str) -> list[str] | None:
+    """Parse one fallback ``args: [...]`` scalar without expanding YAML scope."""
+
+    text = value.strip()
+    if not text.startswith("["):
+        return None
+
+    output: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 1
+    closed = False
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                if quote == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                    current.append("'")
+                    index += 2
+                    continue
+                quote = None
+            elif char == "\\" and quote == '"' and index + 1 < len(text):
+                current.append(text[index + 1])
+                index += 2
+                continue
+            else:
+                current.append(char)
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == ",":
+            output.append("".join(current).strip())
+            current = []
+        elif char == "]":
+            output.append("".join(current).strip())
+            index += 1
+            closed = True
+            break
+        else:
+            current.append(char)
+        index += 1
+
+    trailing = text[index:].strip()
+    if quote or not closed or (trailing and not trailing.startswith("#")):
+        return ["<redacted>"]
+    return [item for item in output if item]
+
+
 def _sanitize_mcp_args(args: Any) -> str:
-    values = args if isinstance(args, list) else [args] if args else []
+    inline_values = _parse_inline_mcp_args(args) if isinstance(args, str) else None
+    values = inline_values if inline_values is not None else args if isinstance(args, list) else [args] if args else []
     output: list[str] = []
     redact_next = False
     for value in values:
@@ -680,7 +727,7 @@ def build_edges(artifacts: Sequence[Artifact]) -> list[Edge]:
     for artifact in artifacts:
         path = artifact.path.split("#", 1)[0]
         by_display_path[path] = artifact.id
-        by_basename.setdefault(Path(path).name, []).append(artifact.id)
+        by_basename.setdefault(portable_basename(path), []).append(artifact.id)
 
     edges: list[Edge] = []
     for artifact in artifacts:
@@ -718,8 +765,7 @@ def resolve_related(
     normalized = clean.replace(str(Path.home()), "~")
     if normalized in by_display_path:
         return by_display_path[normalized]
-    basename = Path(clean).name
-    basename = basename.rstrip("`.,);]")
+    basename = portable_basename(clean)
     candidates = by_basename.get(basename, [])
     if len(candidates) == 1:
         return candidates[0]
