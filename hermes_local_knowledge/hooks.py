@@ -4,8 +4,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
-from collections.abc import Mapping
+import subprocess
+import sys
+import tempfile
+import threading
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,7 @@ from . import okf
 from .runtime import RuntimeConfig, _runtime_config
 
 logger = logging.getLogger(__name__)
+OKF_WORKER_ENV = "HERMES_LOCAL_KNOWLEDGE_OKF_WORKER"
 
 OKF_GENERATION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -63,6 +67,14 @@ def _tool_metadata(tool_name: str) -> tuple[str | None, dict[str, Any] | None]:
         return None, None
 
 
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _inside_okf_worker() -> bool:
+    return _truthy_env(OKF_WORKER_ENV)
+
+
 def _classify_result(result: Any) -> tuple[bool, str | None, str | None]:
     if not isinstance(result, str):
         return True, None, None
@@ -91,6 +103,8 @@ def _classify_hook_outcome(kwargs: Mapping[str, Any]) -> tuple[bool, str | None,
 
 
 def _on_post_tool_call(**kwargs: Any) -> None:
+    if _inside_okf_worker():
+        return
     try:
         cfg = _runtime_config()
         if not cfg.okf.enabled:
@@ -117,42 +131,59 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         logger.exception("Failed to record local-knowledge OKF tool candidate")
 
 
-def _lock_payload() -> str:
-    payload = {"pid": os.getpid(), "created_at": time.time()}
-    return json.dumps(payload, sort_keys=True)
+def _worker_command(cfg: RuntimeConfig) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "hermes_cli.main",
+        "local-knowledge",
+        "okf-worker",
+        "--hermes-home",
+        str(cfg.hermes_home),
+    ]
 
 
-def _lock_is_stale(lock_path: Path, *, stale_after_seconds: int) -> bool:
+def _detached_process_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        creationflags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        creationflags |= int(getattr(subprocess, "DETACHED_PROCESS", 0))
+        return {"creationflags": creationflags}
+    return {"start_new_session": True}
+
+
+def _start_worker_reaper(process: subprocess.Popen[Any]) -> None:
+    """Reap the detached child without making session finalization wait."""
+
+    thread = threading.Thread(
+        target=process.wait,
+        name=f"local-knowledge-okf-worker-{process.pid}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _spawn_worker(cfg: RuntimeConfig) -> bool:
+    log_path = cfg.state_dir / "okf_worker.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env[OKF_WORKER_ENV] = "1"
+    env["HERMES_HOME"] = str(cfg.hermes_home)
+    log_handle = log_path.open("a", encoding="utf-8")
     try:
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-        created_at = float(payload.get("created_at", 0))
-    except Exception:
+        process = subprocess.Popen(
+            _worker_command(cfg),
+            cwd=str(cfg.hermes_home),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            **_detached_process_kwargs(),
+        )
+        _start_worker_reaper(process)
         return True
-    return time.time() - created_at > stale_after_seconds
-
-
-def _acquire_generation_lock(lock_path: Path, *, stale_after_seconds: int) -> bool:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        if not _lock_is_stale(lock_path, stale_after_seconds=stale_after_seconds):
-            return False
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
-        return _acquire_generation_lock(lock_path, stale_after_seconds=stale_after_seconds)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(_lock_payload())
-    return True
-
-
-def _release_generation_lock(lock_path: Path) -> None:
-    try:
-        lock_path.unlink()
-    except FileNotFoundError:
-        pass
+    finally:
+        log_handle.close()
 
 
 def _generation_packet(row: Mapping[str, Any], state_dir: Path) -> dict[str, Any]:
@@ -224,6 +255,7 @@ def _write_and_complete_item(
     *,
     row: Mapping[str, Any],
     item: Mapping[str, Any],
+    lease_owner: str,
 ) -> bool:
     tool_name = str(row.get("tool_name") or "")
     claim_token = str(row.get("claim_token") or "")
@@ -237,32 +269,68 @@ def _write_and_complete_item(
         return False
     path = okf.okf_file_path(cfg.state_dir, tool_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    previous = path.read_bytes() if path.exists() else None
-    temp_path = path.with_suffix(".md.tmp")
-    temp_path.write_text(
-        _render_okf(item, toolset=str(row.get("toolset") or "").strip() or None),
+    with tempfile.NamedTemporaryFile(
+        mode="w",
         encoding="utf-8",
-    )
-    os.replace(temp_path, path)
-    validation = okf.validate_okf_file(cfg.state_dir, claim_token=claim_token, path=path)
-    if not validation["valid"]:
-        _restore_file(path, previous)
-        okf.mark_candidate_error(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        handle.write(_render_okf(item, toolset=str(row.get("toolset") or "").strip() or None))
+        temp_path = Path(handle.name)
+    previous: bytes | None = None
+    published = False
+
+    def publish() -> None:
+        nonlocal previous, published
+        previous = path.read_bytes() if path.exists() else None
+        os.replace(temp_path, path)
+        published = True
+
+    def rollback() -> None:
+        if published:
+            _restore_file(path, previous)
+
+    try:
+        prevalidation = okf.validate_okf_file(
             cfg.state_dir,
+            claim_token=claim_token,
+            path=path,
+            _content_path=temp_path,
+        )
+        if not prevalidation["valid"]:
+            okf.mark_candidate_error(
+                cfg.state_dir,
+                tool_name=tool_name,
+                claim_token=claim_token,
+                error="generated validation failed",
+            )
+            return False
+        outcome = okf.publish_claimed_okf(
+            cfg.state_dir,
+            lease_owner=lease_owner,
             tool_name=tool_name,
             claim_token=claim_token,
-            error="generated validation failed",
+            okf_path=path,
+            publish=publish,
+            rollback=rollback,
         )
-        return False
-    if okf.mark_candidate_done(
-        cfg.state_dir,
-        tool_name=tool_name,
-        claim_token=claim_token,
-        okf_path=path,
-    ):
-        return True
-    _restore_file(path, previous)
-    return False
+        if outcome == "invalid":
+            okf.mark_candidate_error(
+                cfg.state_dir,
+                tool_name=tool_name,
+                claim_token=claim_token,
+                error="generated validation failed",
+            )
+        elif outcome == "stale":
+            logger.error("Discarding generated local-knowledge OKF for %s after ownership loss", tool_name)
+        return outcome == "done"
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _fail_claimed_rows(cfg: RuntimeConfig, rows: list[dict[str, Any]], *, error: str) -> None:
@@ -275,7 +343,14 @@ def _fail_claimed_rows(cfg: RuntimeConfig, rows: list[dict[str, Any]], *, error:
         )
 
 
-def _generate_claimed_okfs(cfg: RuntimeConfig, *, llm: Any, rows: list[dict[str, Any]]) -> bool:
+def _generate_claimed_okfs(
+    cfg: RuntimeConfig,
+    *,
+    llm: Any,
+    rows: list[dict[str, Any]],
+    lease_owner: str,
+    can_publish: Callable[[], bool] | None = None,
+) -> bool:
     packets = [_generation_packet(row, cfg.state_dir) for row in rows]
     result = llm.complete_structured(
         instructions=(
@@ -305,6 +380,9 @@ def _generate_claimed_okfs(cfg: RuntimeConfig, *, llm: Any, rows: list[dict[str,
         timeout=cfg.okf.max_generation_seconds,
         purpose="local_knowledge.okf_generation",
     )
+    if can_publish is not None and not can_publish():
+        logger.error("Discarding generated local-knowledge OKFs after generation lease loss")
+        return False
     parsed = getattr(result, "parsed", None)
     items = parsed.get("okfs") if isinstance(parsed, Mapping) else None
     if not isinstance(items, list):
@@ -327,45 +405,28 @@ def _generate_claimed_okfs(cfg: RuntimeConfig, *, llm: Any, rows: list[dict[str,
                 error="structured response omitted candidate",
             )
             continue
-        completed += int(_write_and_complete_item(cfg, row=row, item=item))
+        completed += int(_write_and_complete_item(cfg, row=row, item=item, lease_owner=lease_owner))
     return completed > 0
 
 
-def _on_session_finalize(*, llm: Any = None, **kwargs: Any) -> bool:
+def _on_session_finalize(**kwargs: Any) -> bool:
+    if _inside_okf_worker():
+        return False
     try:
         cfg = _runtime_config()
-        if not cfg.okf.enabled or not cfg.okf.auto_generate or llm is None:
+        if not cfg.okf.enabled or not cfg.okf.auto_generate:
             return False
         stale_after = max(cfg.okf.max_generation_seconds * 2, 60)
-        okf.recover_stale_claims(
+        if not okf.has_generation_work(
             cfg.state_dir,
+            min_use_count=cfg.okf.min_use_count,
             stale_after_seconds=stale_after,
-            max_attempts=okf.DEFAULT_MAX_ATTEMPTS,
-        )
-        if not okf.pending_candidates(cfg.state_dir, limit=1, min_use_count=cfg.okf.min_use_count):
+            timeout_seconds=0.05,
+        ):
             return False
-        lock_path = okf.generation_lock_path(cfg.state_dir)
-        if not _acquire_generation_lock(lock_path, stale_after_seconds=stale_after):
-            return False
-        try:
-            claimed = okf.claim_candidates(
-                cfg.state_dir,
-                limit=cfg.okf.max_candidates_per_session,
-                min_use_count=cfg.okf.min_use_count,
-                stale_after_seconds=stale_after,
-            )
-            if not claimed:
-                return False
-            try:
-                return _generate_claimed_okfs(cfg, llm=llm, rows=claimed)
-            except Exception:
-                _fail_claimed_rows(cfg, claimed, error="host LLM generation failed")
-                logger.exception("Failed to generate local-knowledge OKFs through ctx.llm")
-                return False
-        finally:
-            _release_generation_lock(lock_path)
+        return _spawn_worker(cfg)
     except Exception:
-        logger.exception("Failed during local-knowledge OKF session-finalize hook")
+        logger.exception("Failed to launch local-knowledge OKF worker during session finalization")
         return False
 
 

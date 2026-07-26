@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.11] - 2026-07-26
+
+### Fixed
+
+- Moved automatic tool OKF model generation out of the synchronous `on_session_finalize` callback. Session finalization now performs only a queue check and detached worker launch, so `/new`, `/reset`, session expiry, and CLI exit no longer wait for the model call.
+- Kept generation on Hermes' host-owned `ctx.llm` path by running the bounded deterministic generator through a fresh `hermes local-knowledge okf-worker` plugin CLI process rather than a general agent with terminal or file tools.
+- Added a durable SQLite generation lease that is renewed while the host LLM call runs. Each publication prevalidates a worker-unique temporary file and uses a short SQLite write transaction that revalidates the lease and claim before replacing, validating again, and completing the canonical artifact. Automatic and manual claim paths use the same transaction-fenced stale reconciliation, which completes valid canonical output left by hard process death before applying the retry cap. The synchronous launcher uses a read-only, timeout-bounded queue check, and a worker recursion guard prevents recursive launches.
+
 ## [0.3.10] - 2026-07-25
 
 ### Added
@@ -35,6 +43,7 @@ All notable changes to this project are documented in this file.
 - Added bounded retries for SQLite index publication when short-lived Windows readers temporarily prevent `os.replace`, while preserving the previous usable index if retries are exhausted ([#19]).
 - Prevented older plugin runtimes from downgrading indexes created by newer index formats across native tools and config-backed CLI lookups ([#20]).
 
+[0.3.11]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.8...v0.3.9
 [#18]: https://github.com/stepanov1975/hermes-local-knowledge/issues/18

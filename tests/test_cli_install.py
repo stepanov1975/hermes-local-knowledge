@@ -297,6 +297,46 @@ def test_hermes_cli_adapter_runs_doctor(tmp_path: Path, capsys) -> None:  # type
     assert "checks" in payload
 
 
+def test_hermes_cli_adapter_runs_okf_worker_with_child_host_llm(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    parser = argparse.ArgumentParser()
+    host_llm = object()
+    calls = []
+
+    lci_cli.setup_hermes_cli(parser)
+    args = parser.parse_args(["okf-worker", "--hermes-home", str(hermes_home)])
+
+    def fake_worker(*, llm, hermes_home):  # type: ignore[no-untyped-def]
+        calls.append((llm, hermes_home))
+        return 0
+
+    monkeypatch.setattr(lci_cli, "run_okf_worker", fake_worker)
+
+    assert lci_cli.handle_hermes_cli(args, llm=host_llm) == 0
+    assert calls == [(host_llm, hermes_home)]
+
+
+def test_hermes_cli_adapter_preserves_okf_worker_failure_exit_status(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    parser = argparse.ArgumentParser()
+    lci_cli.setup_hermes_cli(parser)
+    args = parser.parse_args(["okf-worker", "--hermes-home", str(hermes_home)])
+    monkeypatch.setattr(lci_cli, "run_okf_worker", lambda **_kwargs: 7)
+
+    with pytest.raises(SystemExit) as exc_info:
+        lci_cli.handle_hermes_cli(args, llm=object())
+
+    assert exc_info.value.code == 7
+
+
 def test_hermes_cli_adapter_preserves_failure_exit_status(
     tmp_path: Path,
     capsys,

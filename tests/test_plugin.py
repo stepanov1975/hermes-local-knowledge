@@ -105,8 +105,11 @@ def test_register_exposes_native_tools_and_bundled_skill():
     tool_calls = []
     skill_calls = []
     cli_calls = []
+    host_llm = object()
 
     class Ctx:
+        llm = host_llm
+
         def register_tool(self, **kwargs):
             tool_calls.append(kwargs)
 
@@ -135,6 +138,7 @@ def test_register_exposes_native_tools_and_bundled_skill():
     assert cli_calls[0]["name"] == "local-knowledge"
     assert callable(cli_calls[0]["setup_fn"])
     assert callable(cli_calls[0]["handler_fn"])
+    assert cli_calls[0]["handler_fn"].keywords["llm"] is host_llm
 
 
 def test_bundled_router_skill_matches_install_example() -> None:

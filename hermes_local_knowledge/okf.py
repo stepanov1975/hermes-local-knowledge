@@ -5,8 +5,9 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,6 +22,7 @@ OKF_GENERATOR_VERSION = "3"
 DEFAULT_MAX_ARG_ITEMS = 8
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_RELATED_TOOLS = 32
+GENERATION_LEASE_NAME = "okf_generation"
 
 _COLUMN_DEFINITIONS = {
     "tool_name": "TEXT PRIMARY KEY",
@@ -421,8 +423,79 @@ def _ensure_schema(conn: sqlite3.Connection, *, commit: bool = True) -> None:
                 (safe_arg_shape_json, row["tool_name"]),
             )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_okf_candidates_status_seen ON okf_candidates(status, use_count, last_seen)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS okf_worker_leases (
+          name TEXT PRIMARY KEY,
+          owner TEXT NOT NULL,
+          expires_at REAL NOT NULL
+        )
+        """
+    )
     if commit:
         conn.commit()
+
+
+def acquire_generation_lease(
+    state_dir: Path,
+    *,
+    owner: str,
+    lease_seconds: int,
+    now: float | None = None,
+) -> bool:
+    """Acquire or replace an expired singleton lease for OKF generation."""
+
+    if not owner:
+        raise ValueError("generation lease owner must not be empty")
+    current = time.time() if now is None else float(now)
+    expires_at = current + max(1, int(lease_seconds))
+    with _connect(state_dir) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO okf_worker_leases (name, owner, expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+              owner = excluded.owner,
+              expires_at = excluded.expires_at
+            WHERE okf_worker_leases.expires_at <= ?
+            """,
+            (GENERATION_LEASE_NAME, owner, expires_at, current),
+        )
+        return cursor.rowcount == 1
+
+
+def renew_generation_lease(
+    state_dir: Path,
+    *,
+    owner: str,
+    lease_seconds: int,
+    now: float | None = None,
+) -> bool:
+    """Extend the generation lease only while *owner* still owns it."""
+
+    current = time.time() if now is None else float(now)
+    expires_at = current + max(1, int(lease_seconds))
+    with _connect(state_dir) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE okf_worker_leases
+            SET expires_at = ?
+            WHERE name = ? AND owner = ?
+            """,
+            (expires_at, GENERATION_LEASE_NAME, owner),
+        )
+        return cursor.rowcount == 1
+
+
+def release_generation_lease(state_dir: Path, *, owner: str) -> bool:
+    """Release the generation lease only when *owner* still owns it."""
+
+    with _connect(state_dir) as conn:
+        cursor = conn.execute(
+            "DELETE FROM okf_worker_leases WHERE name = ? AND owner = ?",
+            (GENERATION_LEASE_NAME, owner),
+        )
+        return cursor.rowcount == 1
 
 
 def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -558,6 +631,46 @@ def pending_candidates(state_dir: Path, *, limit: int = 10, min_use_count: int =
     return [_row_dict(row) for row in rows]
 
 
+def has_generation_work(
+    state_dir: Path,
+    *,
+    min_use_count: int,
+    stale_after_seconds: int,
+    now: str | None = None,
+    timeout_seconds: float = 0.05,
+) -> bool:
+    """Return whether a worker can claim pending work or recover a stale claim."""
+
+    current = (
+        datetime.fromisoformat(now.replace("Z", "+00:00"))
+        if now is not None
+        else datetime.now(timezone.utc)
+    )
+    cutoff = (current - timedelta(seconds=stale_after_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    db_path = okf_queue_db_path(state_dir)
+    if not db_path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=timeout_seconds)
+    except sqlite3.OperationalError:
+        return False
+    try:
+        row = conn.execute(
+            """
+            SELECT 1 FROM okf_candidates
+            WHERE (status = 'pending' AND use_count >= ?)
+               OR (status = 'claimed' AND claimed_at < ?)
+            LIMIT 1
+            """,
+            (min_use_count, cutoff),
+        ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
 def error_candidates(state_dir: Path, *, limit: int = 10) -> list[dict[str, Any]]:
     with _connect(state_dir) as conn:
         rows = conn.execute(
@@ -619,6 +732,67 @@ def retry_error_candidate(state_dir: Path, *, tool_name: str) -> bool:
         conn.close()
 
 
+def _stale_claim_cutoff(*, stale_after_seconds: int, now: str | None = None) -> str:
+    current = (
+        datetime.fromisoformat(now.replace("Z", "+00:00"))
+        if now is not None
+        else datetime.now(timezone.utc)
+    )
+    return (current - timedelta(seconds=stale_after_seconds)).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _recover_stale_claims_on_connection(
+    conn: sqlite3.Connection,
+    state_dir: Path,
+    *,
+    cutoff: str,
+    max_attempts: int,
+) -> int:
+    stale_rows = conn.execute(
+        "SELECT * FROM okf_candidates WHERE status = 'claimed' AND claimed_at < ?",
+        (cutoff,),
+    ).fetchall()
+    completed = 0
+    for stale_row in stale_rows:
+        row = _row_dict(stale_row)
+        tool_name = str(row.get("tool_name") or "")
+        claim_token = str(row.get("claim_token") or "")
+        path = okf_file_path(state_dir, tool_name)
+        if path.is_file() and validate_okf_file(
+            state_dir,
+            claim_token=claim_token,
+            path=path,
+            _conn=conn,
+        )["valid"]:
+            completed += int(
+                _mark_candidate_done_on_connection(
+                    conn,
+                    tool_name=tool_name,
+                    claim_token=claim_token,
+                    okf_path=path,
+                )
+            )
+    if completed:
+        mark_index_dirty(state_dir)
+    cursor = conn.execute(
+        """
+        UPDATE okf_candidates
+        SET status = CASE WHEN attempt_count >= ? THEN 'error' ELSE 'pending' END,
+            generator_version = ?,
+            claim_token = NULL,
+            claimed_at = NULL,
+            claim_generator_version = NULL,
+            related_tools_json = '[]',
+            last_attempt_error = '<redacted>'
+        WHERE status = 'claimed' AND claimed_at < ?
+        """,
+        (max_attempts, OKF_GENERATOR_VERSION, cutoff),
+    )
+    return completed + cursor.rowcount
+
+
 def claim_candidates(
     state_dir: Path,
     *,
@@ -631,31 +805,35 @@ def claim_candidates(
 ) -> list[dict[str, Any]]:
     token = claim_token or uuid.uuid4().hex
     timestamp = now or utc_now()
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
-    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    cutoff = _stale_claim_cutoff(stale_after_seconds=stale_after_seconds, now=now)
     with _connect(state_dir) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _recover_stale_claims_on_connection(
+            conn,
+            state_dir,
+            cutoff=cutoff,
+            max_attempts=max_attempts,
+        )
         conn.execute(
             """
             UPDATE okf_candidates
             SET status = 'error', generator_version = ?, claim_token = NULL, claimed_at = NULL,
                 claim_generator_version = NULL, related_tools_json = '[]',
                 last_attempt_error = '<redacted>'
-            WHERE attempt_count >= ?
-              AND (status = 'pending' OR (status = 'claimed' AND claimed_at < ?))
+            WHERE attempt_count >= ? AND status = 'pending'
             """,
-            (OKF_GENERATOR_VERSION, max_attempts, cutoff),
+            (OKF_GENERATOR_VERSION, max_attempts),
         )
         rows = conn.execute(
             """
             SELECT * FROM okf_candidates
             WHERE use_count >= ?
               AND attempt_count < ?
-              AND (status = 'pending' OR (status = 'claimed' AND claimed_at < ?))
+              AND status = 'pending'
             ORDER BY use_count DESC, last_seen ASC, tool_name ASC
             LIMIT ?
             """,
-            (min_use_count, max_attempts, cutoff, limit),
+            (min_use_count, max_attempts, limit),
         ).fetchall()
         names = [str(row["tool_name"]) for row in rows]
         if names:
@@ -699,51 +877,123 @@ def recover_stale_claims(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     now: str | None = None,
 ) -> int:
-    current = (
-        datetime.fromisoformat(now.replace("Z", "+00:00"))
-        if now is not None
-        else datetime.now(timezone.utc)
-    )
-    cutoff = (current - timedelta(seconds=stale_after_seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    cutoff = _stale_claim_cutoff(stale_after_seconds=stale_after_seconds, now=now)
     with _connect(state_dir) as conn:
-        cursor = conn.execute(
-            """
-            UPDATE okf_candidates
-            SET status = CASE WHEN attempt_count >= ? THEN 'error' ELSE 'pending' END,
-                generator_version = ?,
-                claim_token = NULL,
-                claimed_at = NULL,
-                claim_generator_version = NULL,
-                related_tools_json = '[]',
-                last_attempt_error = '<redacted>'
-            WHERE status = 'claimed' AND claimed_at < ?
-            """,
-            (max_attempts, OKF_GENERATOR_VERSION, cutoff),
+        conn.execute("BEGIN IMMEDIATE")
+        return _recover_stale_claims_on_connection(
+            conn,
+            state_dir,
+            cutoff=cutoff,
+            max_attempts=max_attempts,
         )
-        return cursor.rowcount
+
+
+def _mark_candidate_done_on_connection(
+    conn: sqlite3.Connection,
+    *,
+    tool_name: str,
+    claim_token: str,
+    okf_path: Path,
+) -> bool:
+    cursor = conn.execute(
+        """
+        UPDATE okf_candidates
+        SET status = 'done', okf_path = ?, generator_version = ?, claim_token = NULL, claimed_at = NULL,
+            claim_generator_version = NULL, related_tools_json = '[]', last_attempt_error = NULL
+        WHERE tool_name = ? AND claim_token = ? AND claim_generator_version = ?
+        """,
+        (
+            str(okf_path),
+            OKF_GENERATOR_VERSION,
+            tool_name,
+            claim_token,
+            OKF_GENERATOR_VERSION,
+        ),
+    )
+    return cursor.rowcount == 1
 
 
 def mark_candidate_done(state_dir: Path, *, tool_name: str, claim_token: str, okf_path: Path) -> bool:
     with _connect(state_dir) as conn:
-        cursor = conn.execute(
-            """
-            UPDATE okf_candidates
-            SET status = 'done', okf_path = ?, generator_version = ?, claim_token = NULL, claimed_at = NULL,
-                claim_generator_version = NULL, related_tools_json = '[]', last_attempt_error = NULL
-            WHERE tool_name = ? AND claim_token = ? AND claim_generator_version = ?
-            """,
-            (
-                str(okf_path),
-                OKF_GENERATOR_VERSION,
-                tool_name,
-                claim_token,
-                OKF_GENERATOR_VERSION,
-            ),
+        updated = _mark_candidate_done_on_connection(
+            conn,
+            tool_name=tool_name,
+            claim_token=claim_token,
+            okf_path=okf_path,
         )
-        updated = cursor.rowcount == 1
         if updated:
             mark_index_dirty(state_dir)
     return updated
+
+
+def publish_claimed_okf(
+    state_dir: Path,
+    *,
+    lease_owner: str,
+    tool_name: str,
+    claim_token: str,
+    okf_path: Path,
+    publish: Callable[[], None],
+    rollback: Callable[[], None],
+) -> str:
+    """Fence canonical publication against lease takeover and stale-claim recovery."""
+
+    outcome = "stale"
+    with _connect(state_dir) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        lease = conn.execute(
+            """
+            SELECT 1 FROM okf_worker_leases
+            WHERE name = ? AND owner = ? AND expires_at > ?
+            """,
+            (GENERATION_LEASE_NAME, lease_owner, time.time()),
+        ).fetchone()
+        claim = conn.execute(
+            """
+            SELECT 1 FROM okf_candidates
+            WHERE tool_name = ? AND status = 'claimed' AND claim_token = ? AND claim_generator_version = ?
+            """,
+            (tool_name, claim_token, OKF_GENERATOR_VERSION),
+        ).fetchone()
+        if lease is None or claim is None:
+            conn.rollback()
+            return outcome
+
+        reverted = False
+
+        def revert() -> None:
+            nonlocal reverted
+            if reverted:
+                return
+            reverted = True
+            try:
+                rollback()
+            finally:
+                conn.rollback()
+
+        try:
+            publish()
+            validation = validate_okf_file(state_dir, claim_token=claim_token, path=okf_path, _conn=conn)
+            if not validation["valid"]:
+                revert()
+                return "invalid"
+            if not _mark_candidate_done_on_connection(
+                conn,
+                tool_name=tool_name,
+                claim_token=claim_token,
+                okf_path=okf_path,
+            ):
+                revert()
+                return outcome
+            # Publish the dirty marker before committing so process death cannot leave
+            # a durable done row whose new artifact is invisible to the next index pass.
+            mark_index_dirty(state_dir)
+            conn.commit()
+            outcome = "done"
+        except Exception:
+            revert()
+            raise
+    return outcome
 
 
 def mark_candidate_error(
@@ -855,13 +1105,22 @@ def candidate_packet(row: Mapping[str, Any], state_dir: Path) -> dict[str, Any]:
     }
 
 
+def _claimed_candidate_from_connection(
+    conn: sqlite3.Connection,
+    *,
+    tool_name: str,
+    claim_token: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM okf_candidates WHERE tool_name = ? AND claim_token = ? AND status = 'claimed'",
+        (tool_name, claim_token),
+    ).fetchone()
+    return _row_dict(row) if row else None
+
+
 def claimed_candidate(state_dir: Path, *, tool_name: str, claim_token: str) -> dict[str, Any] | None:
     with _connect(state_dir) as conn:
-        row = conn.execute(
-            "SELECT * FROM okf_candidates WHERE tool_name = ? AND claim_token = ? AND status = 'claimed'",
-            (tool_name, claim_token),
-        ).fetchone()
-    return _row_dict(row) if row else None
+        return _claimed_candidate_from_connection(conn, tool_name=tool_name, claim_token=claim_token)
 
 
 def _frontmatter_list(frontmatter: Mapping[str, Any], key: str) -> list[str]:
@@ -884,18 +1143,28 @@ def _useful_routing_phrase(phrase: str, *, tool_name: str) -> bool:
     return not tokens.issubset(tool_tokens)
 
 
-def validate_okf_file(state_dir: Path, *, claim_token: str, path: Path) -> dict[str, Any]:
+def validate_okf_file(
+    state_dir: Path,
+    *,
+    claim_token: str,
+    path: Path,
+    _conn: sqlite3.Connection | None = None,
+    _content_path: Path | None = None,
+) -> dict[str, Any]:
     """Validate a worker-authored OKF before marking a candidate done."""
 
     errors: list[str] = []
     resolved_state_dir = state_dir.expanduser().resolve()
     allowed_root = okf_dir(resolved_state_dir)
     resolved_path = path.expanduser().resolve()
+    resolved_content_path = (_content_path or path).expanduser().resolve()
     if not path_is_relative_to(resolved_path, allowed_root):
         errors.append(f"path must be under {allowed_root}")
+    if not path_is_relative_to(resolved_content_path, allowed_root):
+        errors.append(f"content path must be under {allowed_root}")
     if resolved_path.suffix != ".md":
         errors.append("OKF path must use .md suffix")
-    text = safe_read_text(resolved_path, max_chars=80_000)
+    text = safe_read_text(resolved_content_path, max_chars=80_000)
     if not text:
         errors.append("OKF file is missing or empty")
     if _SECRET_ASSIGNMENT.search(text):
@@ -924,7 +1193,13 @@ def validate_okf_file(state_dir: Path, *, claim_token: str, path: Path) -> dict[
     if _EPHEMERAL_OKF_TEXT.search(text):
         errors.append("OKF content must not persist runtime counters or transient error fields")
 
-    row = claimed_candidate(resolved_state_dir, tool_name=tool_name, claim_token=claim_token) if tool_name else None
+    row = None
+    if tool_name:
+        row = (
+            _claimed_candidate_from_connection(_conn, tool_name=tool_name, claim_token=claim_token)
+            if _conn is not None
+            else claimed_candidate(resolved_state_dir, tool_name=tool_name, claim_token=claim_token)
+        )
     if row is None:
         errors.append("no claimed candidate matches the provided claim token and tool")
     else:

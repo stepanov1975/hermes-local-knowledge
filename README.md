@@ -20,7 +20,7 @@ Native Hermes tools under the `local_knowledge` toolset:
 | `knowledge_feedback` | Record lookup quality feedback locally. |
 | `knowledge_usage_report` | Summarize usage, zero-result queries, errors, and feedback. |
 
-The plugin also has lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The post-tool hook queues safe structural candidates, and the session-finalize hook can generate a bounded batch through Hermes' host-owned `ctx.llm` interface. Automatic OKF generation is a vital part of the plugin's intended functionality: without it, search still works, but the plugin cannot automatically create the tool-routing knowledge that lets coverage improve from real usage. Completing an OKF marks the index stale so the next normal lookup rebuilds it and makes the new `tool_okf` searchable.
+The plugin also has lifecycle hooks for **tool OKFs**: compact, generated routing notes for Hermes tools that have actually been used locally. The post-tool hook queues safe structural candidates, and the session-finalize hook launches a bounded detached worker. That worker uses its own fresh Hermes plugin context and host-owned `ctx.llm` interface, so `/new`, `/reset`, session expiry, and CLI exit do not wait for model generation. Automatic OKF generation is a vital part of the plugin's intended functionality: without it, search still works, but the plugin cannot automatically create the tool-routing knowledge that lets coverage improve from real usage. Completing an OKF marks the index stale so the next normal lookup rebuilds it and makes the new `tool_okf` searchable.
 
 ## Install
 
@@ -41,7 +41,7 @@ hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --
 Automatic OKF generation is a vital part of this plugin, but it is an explicit opt-in because it invokes the active model and consumes additional tokens. An AI agent performing an installation **must not declare the installation complete** until it has done all of the following:
 
 1. Explain that functionality is degraded while `local_knowledge.okf.auto_generate` is disabled: lookup of existing artifacts still works, but the plugin will not automatically turn real tool usage into new tool-routing OKFs.
-2. Explain that enabling it makes one bounded model call at session finalization, processes at most the configured candidate limit, and may extend finalization by up to `max_generation_seconds`.
+2. Explain that enabling it launches a detached worker at session finalization. The worker processes at most the configured candidate limit and passes `max_generation_seconds` as each provider-request timeout; Hermes retry/fallback policy can extend the worker's total lifetime, but session closure does not wait for it.
 3. Ask the user explicitly: **"Enable automatic OKF generation now? (Recommended; uses additional model tokens.)"**
 4. Only after the user agrees, run:
 
@@ -162,7 +162,7 @@ local_knowledge:
 
 `local_knowledge.okf.enabled` controls whether the plugin records safe, structural tool-use candidates. Full functionality requires `local_knowledge.okf.auto_generate: true` in Hermes config. With it disabled, lookup of existing artifacts still works, but the plugin is degraded because it cannot automatically create new tool-routing OKFs from real usage. The runtime default remains intentionally `false` so installation does not silently consume model tokens. The installer must follow the explicit disclosure-and-consent conversation in the Install section before changing it. If the user declines, leave `auto_generate` disabled and report that the installation is operating in degraded/manual-OKF mode.
 
-When enabled, `on_session_finalize` claims at most `max_candidates_per_session` candidates and makes one bounded `ctx.llm.complete_structured` call with `max_generation_seconds` as its timeout. The plugin renders and validates the files itself; the model never receives terminal or file tools. The post-tool hook uses Hermes' canonical outcome fields and does not persist raw session transcripts, raw tool outputs, argument values, emails, OCR text, or private documents.
+When enabled, `on_session_finalize` performs only a read-only, tightly timeout-bounded queue check and detached-process launch. The child runs `hermes local-knowledge okf-worker` in a fresh plugin context, acquires the durable generation lease stored in `okf_queue.sqlite`, claims at most `max_candidates_per_session` candidates, and makes one `ctx.llm.complete_structured` call with `max_generation_seconds` passed as each provider-request timeout. Hermes may retry or fall back to another provider, so the worker renews its singleton lease while the host-owned call is running. The child renders and prevalidates each artifact in a worker-unique temporary file, then uses a short SQLite write transaction to revalidate its lease and claim while replacing, validating again, and completing the canonical artifact. If a hard process death leaves a prevalidated canonical file with a stale claim, recovery completes that valid file before applying the retry cap. The model never receives terminal or file tools. The post-tool hook uses Hermes' canonical outcome fields and does not persist raw session transcripts, raw tool outputs, argument values, emails, OCR text, or private documents.
 
 For compatibility with v0.3.0 configuration, `max_worker_seconds` is still accepted as a fallback when `max_generation_seconds` is not set.
 
@@ -233,7 +233,7 @@ The plugin writes:
 <state_dir>/usage.sqlite
 <state_dir>/okf_queue.sqlite
 <state_dir>/okfs/tools/*.md
-<state_dir>/okf_generation.lock
+<state_dir>/okf_worker.log
 <state_dir>/index_build.lock
 <state_dir>/okf_index_dirty/ (possibly empty)
 ```
@@ -283,7 +283,7 @@ This standalone shape keeps the lessons from the initial deployment:
 - feedback and zero-result telemetry stays local and is summarized by `knowledge_usage_report` before changing ranking or source coverage;
 - `knowledge_usage_report` separates live-root, pytest/probe, and other telemetry, suppresses resolved zero-result/negative-feedback candidates, and buckets legacy feedback ratings;
 - both native tools and standalone CLI lookups write local usage events with plugin version, config source, index age/mtime, artifact counts by type, and build duration when a build occurs.
-- OKF hooks record safe structural tool-use candidates and generate a bounded batch through `ctx.llm` at session finalization when the explicitly consented `local_knowledge.okf.auto_generate` setting is enabled.
+- OKF hooks record safe structural tool-use candidates and launch a bounded detached plugin-CLI worker at session finalization when the explicitly consented `local_knowledge.okf.auto_generate` setting is enabled; session closure does not wait for the worker's host-owned `ctx.llm` call.
 
 ## CLI use
 

@@ -127,6 +127,7 @@ jobs:
             "$smoke_dir/bin/python" -m pip install "$artifact"
             "$smoke_dir/bin/python" - <<'PY'
           import importlib.metadata as metadata
+          import hermes_local_knowledge.okf_worker as okf_worker
 
           entries = [
               entry
@@ -138,6 +139,8 @@ jobs:
           module = entries[0].load()
           if not callable(getattr(module, "register", None)):
               raise SystemExit("Plugin register entry point is not callable")
+          if not callable(getattr(okf_worker, "run_worker", None)):
+              raise SystemExit("Packaged OKF worker entry point is not callable")
           PY
             rm -rf "$smoke_dir"
           done

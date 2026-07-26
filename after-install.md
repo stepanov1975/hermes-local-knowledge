@@ -10,10 +10,10 @@ hermes plugins enable local_knowledge
 
 Automatic OKF generation is a **vital part of the plugin's intended functionality**. The plugin can still search existing artifacts when it is disabled, but functionality is degraded: real tool usage is queued without being automatically converted into new tool-routing OKFs, so coverage does not improve automatically.
 
-It remains an explicit opt-in because generation invokes the active model at session finalization, consumes additional tokens, and may extend finalization by up to the configured `max_generation_seconds` timeout. An AI agent performing the installation **must not declare the installation complete** until it has:
+It remains an explicit opt-in because a detached worker invokes the active model after session finalization and consumes additional tokens. The worker passes `max_generation_seconds` as each provider-request timeout; Hermes retry/fallback policy can extend total worker lifetime, but `/new`, `/reset`, session expiry, and CLI exit do not wait for it. An AI agent performing the installation **must not declare the installation complete** until it has:
 
 1. explained the degraded behavior when automatic generation is off;
-2. disclosed the bounded model-token and finalization-time cost; and
+2. disclosed the bounded background model-token cost; and
 3. asked the user explicitly: **"Enable automatic OKF generation now? (Recommended; uses additional model tokens.)"**
 
 Only after the user agrees, enable it:

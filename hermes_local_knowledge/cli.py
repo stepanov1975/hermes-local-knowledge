@@ -16,6 +16,7 @@ from .constants import DEFAULT_ROOT
 from .evaluation import evaluate_index_against_feedback_report
 from .models import IndexSettings
 from . import okf
+from .okf_worker import run_worker as run_okf_worker
 from .paths import default_output_dir, hermes_home_from_env
 from .runtime import RuntimeConfig, _runtime_config
 from .search import search_index
@@ -219,11 +220,21 @@ def setup_hermes_cli(parser: argparse.ArgumentParser) -> None:
         help="check plugin configuration and installation health",
     )
     _add_doctor_args(doctor_parser)
+    worker_parser = subparsers.add_parser(
+        "okf-worker",
+        help="run one bounded automatic OKF generation batch",
+    )
+    worker_parser.add_argument("--hermes-home", type=Path, default=None, help="Hermes home directory")
 
 
-def handle_hermes_cli(args: argparse.Namespace) -> int:
+def handle_hermes_cli(args: argparse.Namespace, *, llm: Any = None) -> int:
     """Dispatch the Hermes-native CLI adapter through the standalone CLI."""
     command = str(args.local_knowledge_command)
+    if command == "okf-worker":
+        status = run_okf_worker(llm=llm, hermes_home=args.hermes_home)
+        if status:
+            raise SystemExit(status)
+        return status
     argv = [command]
     if args.hermes_home is not None:
         argv.extend(["--hermes-home", str(args.hermes_home)])

@@ -195,7 +195,7 @@ def _register_cli(ctx) -> None:
         help="Install and diagnose the local knowledge plugin",
         description="Install the proactive router skill or check plugin health.",
         setup_fn=setup_hermes_cli,
-        handler_fn=handle_hermes_cli,
+        handler_fn=partial(handle_hermes_cli, llm=getattr(ctx, "llm", None)),
     )
 
 
@@ -221,5 +221,4 @@ def register(ctx) -> None:
     register_hook = getattr(ctx, "register_hook", None)
     if register_hook is not None:
         register_hook("post_tool_call", _on_post_tool_call)
-        llm = getattr(ctx, "llm", None)
-        register_hook("on_session_finalize", partial(_on_session_finalize, llm=llm))
+        register_hook("on_session_finalize", _on_session_finalize)
