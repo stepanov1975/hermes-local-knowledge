@@ -1,2 +1,3 @@
 include tests/search_regression_cases.json
 include scripts/compare_historical_query_versions.py
+include scripts/evaluate_ref.py
