@@ -12,7 +12,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Iterator, Sequence
+from collections.abc import Callable
+from typing import Any, Iterator, Literal, Sequence, overload
 
 from . import __version__
 from .artifacts import Artifact, Edge, build_edges, collect_artifacts
@@ -485,17 +486,20 @@ def _build_locked(
     output_dir: Path,
     hermes_home: Path,
     settings: IndexSettings,
+    *,
+    collect_artifacts_fn: Callable[..., list[Artifact]],
+    build_edges_fn: Callable[[Sequence[Artifact]], list[Edge]],
 ) -> tuple[list[Artifact], list[Edge]]:
     db_path = output_dir / "index.sqlite"
     _refuse_newer_index(db_path)
     covered_tokens = _dirty_tokens(output_dir)
     started = time.perf_counter()
     artifacts = sorted(
-        collect_artifacts(root, hermes_home, settings, okf_root=output_dir / "okfs"),
+        collect_artifacts_fn(root, hermes_home, settings, okf_root=output_dir / "okfs"),
         key=lambda artifact: artifact.id,
     )
     edges = sorted(
-        build_edges(artifacts),
+        build_edges_fn(artifacts),
         key=lambda edge: (edge.source, edge.target, edge.kind, edge.evidence),
     )
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -527,6 +531,76 @@ def _build_locked(
         jsonl_temp.unlink(missing_ok=True)
 
 
+def _build_index_with_dependencies(
+    root: Path,
+    output_dir: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None = None,
+    *,
+    force: bool = True,
+    acquire_lock: bool = True,
+    collect_artifacts_fn: Callable[..., list[Artifact]] | None = None,
+    build_edges_fn: Callable[[Sequence[Artifact]], list[Edge]] | None = None,
+) -> tuple[list[Artifact], list[Edge]] | None:
+    root = root.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    hermes_home = hermes_home.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_settings = settings or IndexSettings()
+    collector = collect_artifacts_fn or collect_artifacts
+    edge_builder = build_edges_fn or build_edges
+
+    def build_once() -> tuple[list[Artifact], list[Edge]] | None:
+        if not force and not index_needs_rebuild(output_dir / "index.sqlite") and not _dirty_tokens(output_dir):
+            return None
+        return _build_locked(
+            root,
+            output_dir,
+            hermes_home,
+            resolved_settings,
+            collect_artifacts_fn=collector,
+            build_edges_fn=edge_builder,
+        )
+
+    if not acquire_lock:
+        return build_once()
+    with index_build_lock(output_dir):
+        return build_once()
+
+
+@overload
+def build_index(
+    root: Path,
+    output_dir: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None = None,
+    *,
+    force: Literal[True] = True,
+) -> tuple[list[Artifact], list[Edge]]: ...
+
+
+@overload
+def build_index(
+    root: Path,
+    output_dir: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None = None,
+    *,
+    force: Literal[False],
+) -> tuple[list[Artifact], list[Edge]] | None: ...
+
+
+@overload
+def build_index(
+    root: Path,
+    output_dir: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None = None,
+    *,
+    force: bool,
+) -> tuple[list[Artifact], list[Edge]] | None: ...
+
+
 def build_index(
     root: Path,
     output_dir: Path,
@@ -537,15 +611,13 @@ def build_index(
 ) -> tuple[list[Artifact], list[Edge]] | None:
     """Collect, validate, and atomically publish a format-4 local index."""
 
-    root = root.expanduser().resolve()
-    output_dir = output_dir.expanduser().resolve()
-    hermes_home = hermes_home.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    resolved_settings = settings or IndexSettings()
-    with index_build_lock(output_dir):
-        if not force and not index_needs_rebuild(output_dir / "index.sqlite") and not _dirty_tokens(output_dir):
-            return None
-        return _build_locked(root, output_dir, hermes_home, resolved_settings)
+    return _build_index_with_dependencies(
+        root,
+        output_dir,
+        hermes_home,
+        settings,
+        force=force,
+    )
 
 
 def artifact_type_counts(artifacts: Sequence[Artifact]) -> dict[str, int]:
@@ -974,9 +1046,18 @@ def _support_parent(row: dict[str, Any]) -> str | None:
     return next((str(value) for value in row.get("related") or [] if str(value).startswith("skill:")), None)
 
 
-def _fetch_parent(connection: sqlite3.Connection, artifact_id: str) -> dict[str, Any] | None:
-    row = connection.execute("SELECT a.*, 0.0 AS rank FROM artifacts a WHERE id=?", (artifact_id,)).fetchone()
-    return decode_artifact_row(row) if row else None
+def _fetch_parents(
+    connection: sqlite3.Connection,
+    artifact_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    if not artifact_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in artifact_ids)
+    rows = connection.execute(
+        f"SELECT a.*, 0.0 AS rank FROM artifacts a WHERE a.id IN ({placeholders})",
+        list(artifact_ids),
+    ).fetchall()
+    return {str(row["id"]): decode_artifact_row(row) for row in rows}
 
 
 def _select_candidates(candidates: Sequence[_Candidate]) -> list[_Candidate]:
@@ -1014,13 +1095,21 @@ def _rank_group(
     if not lift_parents:
         return _select_candidates(ordered)
     existing = {str(candidate.row.get("id") or ""): candidate for candidate in ordered}
+    missing_parent_ids = list(
+        dict.fromkeys(
+            parent
+            for candidate in ordered
+            if (parent := _support_parent(candidate.row)) and parent not in existing
+        )
+    )
+    parents = _fetch_parents(connection, missing_parent_ids)
     expanded: list[_Candidate] = []
     for candidate in ordered:
         parent = _support_parent(candidate.row)
         if parent:
             parent_candidate = existing.get(parent)
             if parent_candidate is None:
-                parent_row = _fetch_parent(connection, parent)
+                parent_row = parents.get(parent)
                 if parent_row is not None:
                     parent_candidate = _Candidate(
                         parent_row,
@@ -1035,19 +1124,19 @@ def _rank_group(
 
 def _finalize_candidates(
     candidates: Sequence[_Candidate],
-    terms: Sequence[str],
     requested_types: set[str],
     specific_terms: Sequence[str],
     output_limit: int,
 ) -> list[dict[str, Any]]:
     selected = _select_candidates(candidates)
     if requested_types:
-        selected = [
-            candidate
-            for tier in range(5)
-            for candidate in selected
-            if _rank_key(candidate, terms, requested_types, specific_terms)[0] == tier
-        ]
+        selected.sort(
+            key=lambda candidate: _operational_tier(
+                candidate,
+                requested_types,
+                specific_terms,
+            )
+        )
     return [candidate.row for candidate in selected[:output_limit]]
 
 
@@ -1110,7 +1199,7 @@ def search_index(
         )
         strict_ids = {str(candidate.row.get("id") or "") for candidate in strict}
         if quoted_only:
-            return _finalize_candidates(strict, terms, requested, specific_terms, output_limit)
+            return _finalize_candidates(strict, requested, specific_terms, output_limit)
 
         identity: list[_Candidate] = []
         if not requested:
@@ -1134,11 +1223,19 @@ def search_index(
             )
         identity_ids = {str(candidate.row.get("id") or "") for candidate in identity}
         prioritized = [*strict, *identity] if exact_query else [*identity, *strict]
+        if len(strict) >= output_limit and not requested:
+            return _finalize_candidates(
+                prioritized,
+                requested,
+                specific_terms,
+                output_limit,
+            )
 
         fallback_rows: list[sqlite3.Row] = []
         if fallback_match != strict_match:
             fallback_rows.extend(_query_fts_rows(connection, fallback_match, candidate_limit, type_filter))
-        fallback_rows.extend(_query_metadata_rows(connection, terms, candidate_limit, type_filter))
+        if not identity:
+            fallback_rows.extend(_query_metadata_rows(connection, terms, candidate_limit, type_filter))
         fallback = _rank_group(
             connection,
             _decode_candidates(
@@ -1154,7 +1251,6 @@ def search_index(
         )
         return _finalize_candidates(
             [*prioritized, *fallback],
-            terms,
             requested,
             specific_terms,
             output_limit,

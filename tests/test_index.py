@@ -534,15 +534,43 @@ def test_candidate_union_uses_one_ranker_then_parent_lifting_and_diversity(
     support_only = index.search_index(db_path, "needle phrase", limit=5, artifact_type="skill_support_doc")
     assert support_only
     assert {row["type"] for row in support_only} == {"skill_support_doc"}
+    parent_batches: list[tuple[str, ...]] = []
+    fetch_parents = index._fetch_parents
+
+    def counted_fetch_parents(connection: Any, artifact_ids: list[str]) -> dict[str, dict[str, Any]]:
+        parent_batches.append(tuple(artifact_ids))
+        return fetch_parents(connection, artifact_ids)
+
+    monkeypatch.setattr(index, "_fetch_parents", counted_fetch_parents)
     lifted = index.search_index(db_path, "needle phrase", limit=5)
     assert lifted[0]["id"] == "skill:alpha"
     assert len([row for row in lifted if row["type"] == "skill_support_doc"]) == 1
+    assert [batch for batch in parent_batches if batch] == [
+        ("skill:alpha",),
+        ("skill:alpha",),
+    ]
     quoted = index.search_index(db_path, '"needle phrase"', limit=5)
     assert quoted
     assert quoted[0]["type"] == "skill_support_doc"
     assert all(row["id"] != "skill:alpha" for row in quoted)
     relevance = index.search_index(db_path, "backup strategy", limit=2)
     assert relevance[0]["id"] == "doc:backup-strategy"
+
+    fts_calls: list[str] = []
+    query_fts_rows = index._query_fts_rows
+
+    def counted_query_fts_rows(*args: Any, **kwargs: Any) -> list[Any]:
+        fts_calls.append(str(args[1]))
+        return query_fts_rows(*args, **kwargs)
+
+    def unexpected_metadata_rows(*args: Any, **kwargs: Any) -> list[Any]:
+        raise AssertionError("filled strict results must skip metadata fallback")
+
+    monkeypatch.setattr(index, "_query_fts_rows", counted_query_fts_rows)
+    monkeypatch.setattr(index, "_query_metadata_rows", unexpected_metadata_rows)
+    strict_only = index.search_index(db_path, "needle phrase", limit=1)
+    assert strict_only[0]["id"] == "skill:alpha"
+    assert len(fts_calls) == 1
 
 
 def test_waiting_builder_rebuilds_dirty_update_without_losing_token(tmp_path: Path) -> None:

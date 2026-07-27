@@ -14,12 +14,13 @@ from dataclasses import MISSING, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TextIO, cast
+from typing import Any, TextIO, cast, get_type_hints
 
 import pytest
 
 import hermes_local_knowledge
 from hermes_local_knowledge import cli as lci_cli
+from hermes_local_knowledge import index as lci_index
 from hermes_local_knowledge import indexer, plugin
 
 
@@ -1052,9 +1053,21 @@ def test_public_indexer_api_names_call_shapes_and_model_defaults_are_frozen() ->
 
     positional = inspect.Parameter.POSITIONAL_OR_KEYWORD
     keyword_only = inspect.Parameter.KEYWORD_ONLY
+    assert list(inspect.signature(indexer.build_index).parameters) == [
+        "root",
+        "output_dir",
+        "hermes_home",
+        "settings",
+        "acquire_lock",
+    ]
     for name in ("root", "output_dir", "hermes_home"):
         assert_parameter(indexer.build_index, name, positional)
     assert_parameter(indexer.build_index, "settings", positional, None)
+    assert_parameter(indexer.build_index, "acquire_lock", keyword_only, True)
+    assert get_type_hints(indexer.build_index)["return"] == tuple[
+        list[indexer.Artifact],
+        list[indexer.Edge],
+    ]
     assert_parameter(indexer.search_index, "db_path", positional)
     assert_parameter(indexer.search_index, "query", positional)
     assert_parameter(indexer.search_index, "limit", keyword_only, 10)
@@ -1147,7 +1160,8 @@ def test_public_indexer_api_build_search_get_neighbors_and_jsonl_contract(
     ]
     assert (workspace.state_dir / "index.sqlite").is_file()
     assert (workspace.state_dir / "index.jsonl").is_file()
-    assert (workspace.state_dir / "index_build.lock").is_file()
+    assert (workspace.state_dir / lci_index.INDEX_BUILD_LOCK_NAME).is_file()
+    assert not (workspace.state_dir / lci_index.LEGACY_INDEX_BUILD_LOCK_NAME).exists()
 
     jsonl_rows = [
         json.loads(line)

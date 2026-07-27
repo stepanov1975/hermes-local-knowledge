@@ -11,8 +11,8 @@ implementation lives in focused submodules.
 """
 from __future__ import annotations
 
-from pathlib import Path
 import inspect
+from pathlib import Path
 
 if __package__ in (None, ""):  # pragma: no cover - direct script execution compatibility
     import sys as _sys
@@ -20,7 +20,10 @@ if __package__ in (None, ""):  # pragma: no cover - direct script execution comp
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "hermes_local_knowledge"
 
+from . import index as _index
+from .artifacts import Artifact, Edge, build_edges, collect_artifacts
 from .cli import add_common_db_arg, main as _cli_main, parse_args, print_results
+from .config import IndexSettings
 from .constants import (
     DEFAULT_KNOWN_ENTITIES,
     DEFAULT_ROOT,
@@ -31,7 +34,6 @@ from .constants import (
     SCRIPT_SUFFIXES,
     STOPWORDS,
 )
-from .models import Artifact, Edge, IndexSettings
 from .evaluation import (
     SearchEvaluationReport,
     SearchLabelResult,
@@ -56,8 +58,6 @@ from .paths import (
     stat_key,
 )
 from .scanners import (
-    build_edges,
-    collect_artifacts,
     dedupe_edges,
     doc_type_for_path,
     load_json,
@@ -74,16 +74,9 @@ from .scanners import (
     script_summary,
     skill_support_file_names,
 )
-from .search import search_index
+from .index import connect_readonly, decode_artifact_row, get_artifact, get_neighbors, search_index, sqlite_readonly_uri
 from .storage import (
-    _refuse_newer_index,
     build_sqlite,
-    connect_readonly,
-    decode_artifact_row,
-    get_artifact,
-    get_neighbors,
-    index_build_lock,
-    sqlite_readonly_uri,
     write_jsonl,
 )
 from .text_utils import (
@@ -120,7 +113,7 @@ DEFAULT_OUTPUT_DIR = DEFAULT_ROOT / DEFAULT_STATE_DIR_NAME
 def _collect_artifacts_compat(
     root: Path,
     hermes_home: Path,
-    settings: IndexSettings | None,
+    settings: IndexSettings,
     okf_root: Path,
 ) -> list[Artifact]:
     """Call the monkeypatchable collect seam while preserving old fake signatures."""
@@ -133,6 +126,38 @@ def _collect_artifacts_compat(
     if accepts_okf_root:
         return collect_artifacts(root, hermes_home, settings, okf_root=okf_root)
     return collect_artifacts(root, hermes_home, settings)
+
+
+def _build_index_for_service(
+    root: Path,
+    output_dir: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None = None,
+    *,
+    force: bool,
+    acquire_lock: bool = True,
+) -> tuple[list[Artifact], list[Edge]] | None:
+    """Build through compatibility seams while exposing format-4 force control privately."""
+
+    def collector(
+        source_root: Path,
+        home: Path,
+        resolved_settings: IndexSettings,
+        *,
+        okf_root: Path,
+    ) -> list[Artifact]:
+        return _collect_artifacts_compat(source_root, home, resolved_settings, okf_root)
+
+    return _index._build_index_with_dependencies(
+        root,
+        output_dir,
+        hermes_home,
+        settings,
+        force=force,
+        acquire_lock=acquire_lock,
+        collect_artifacts_fn=collector,
+        build_edges_fn=build_edges,
+    )
 
 
 def build_index(
@@ -150,23 +175,43 @@ def build_index(
     tests/tools that monkeypatch ``indexer.collect_artifacts`` or
     ``indexer.build_edges`` keep working after the module split.
     """
-    if acquire_lock:
-        with index_build_lock(output_dir):
-            return build_index(root, output_dir, hermes_home, settings, acquire_lock=False)
+    result = _build_index_for_service(
+        root,
+        output_dir,
+        hermes_home,
+        settings,
+        force=True,
+        acquire_lock=acquire_lock,
+    )
+    assert result is not None
+    return result
 
-    _refuse_newer_index(output_dir / "index.sqlite")
-    artifacts = _collect_artifacts_compat(root, hermes_home, settings, output_dir / "okfs")
-    edges = build_edges(artifacts)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_jsonl(output_dir / "index.jsonl", artifacts)
-    build_sqlite(output_dir / "index.sqlite", artifacts, edges)
-    return artifacts, edges
+
+def _main_build_index(
+    root: Path,
+    output_dir: Path,
+    hermes_home: Path,
+    settings: IndexSettings | None = None,
+    *,
+    force: bool,
+) -> tuple[list[Artifact], list[Edge]] | None:
+    """Keep forced CLI builds monkeypatchable while giving lookups force-aware builds."""
+
+    if force:
+        return build_index(root, output_dir, hermes_home, settings)
+    return _build_index_for_service(
+        root,
+        output_dir,
+        hermes_home,
+        settings,
+        force=False,
+    )
 
 def main(argv=None) -> int:
     """Run the CLI through this compatibility module's function seams."""
     return _cli_main(
         argv,
-        build_index_fn=build_index,
+        build_index_fn=_main_build_index,
         search_index_fn=search_index,
         get_artifact_fn=get_artifact,
         get_neighbors_fn=get_neighbors,

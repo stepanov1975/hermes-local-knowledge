@@ -11,6 +11,7 @@ import pytest
 
 import hermes_local_knowledge
 from hermes_local_knowledge import cli as lci_cli
+from hermes_local_knowledge import index as lci_index
 from hermes_local_knowledge import indexer as lci
 from hermes_local_knowledge import scanners as lci_scanners
 from hermes_local_knowledge import search as lci_search
@@ -1732,9 +1733,27 @@ def test_indexer_build_index_honors_compatibility_monkeypatches(tmp_path: Path, 
 
     assert artifacts == []
     assert edges == []
-    assert calls == ["collect:root:hermes_home:True", "edges:0"]
+    assert calls == ["collect:root:hermes_home:False", "edges:0"]
     assert (tmp_path / "state" / "index.jsonl").exists()
     assert (tmp_path / "state" / "index.sqlite").exists()
+
+
+def test_indexer_build_index_can_use_caller_owned_lock(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    hermes_home = tmp_path / "hermes-home"
+
+    with lci_index.index_build_lock(state):
+        artifacts, edges = lci.build_index(
+            root,
+            state,
+            hermes_home,
+            acquire_lock=False,
+        )
+
+    assert artifacts == []
+    assert edges == []
+    assert (state / "index.sqlite").is_file()
 
 
 def test_indexer_main_honors_compatibility_build_index_monkeypatch(tmp_path: Path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -2135,48 +2154,22 @@ def test_build_sqlite_exhausted_replace_retries_preserve_existing_db(tmp_path: P
     assert list(db_path.parent.glob(".index.sqlite.*.tmp")) == []
 
 
-def test_index_format_invalidates_pre_mcp_redaction_indexes() -> None:
-    # Format 2 artifacts may contain unsanitized MCP argument metadata.
-    assert lci_storage.INDEX_FORMAT_VERSION == 3
+def test_index_format_4_invalidates_pre_mcp_redaction_indexes() -> None:
+    # Format 2 artifacts may contain unsanitized MCP argument metadata, and the
+    # single current owner publishes the stricter format-4 schema.
+    assert lci_index.INDEX_FORMAT_VERSION == 4
 
 
-def test_build_sqlite_refuses_to_overwrite_newer_index_format(tmp_path: Path) -> None:
-    db_path = tmp_path / "state" / "index.sqlite"
-    current = lci.Artifact(
-        id="skill:current",
-        type="skill",
-        title="Current",
-        path="custom_skills/current/SKILL.md",
-        summary="Current index",
-        search_text="current index",
-    )
-    lci_storage.build_sqlite(db_path, [current], [])
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION + 1}")
-        conn.commit()
-    finally:
-        conn.close()
-    before = db_path.read_bytes()
-
-    with pytest.raises(lci_storage.NewerIndexFormatError) as exc_info:
-        lci_storage.build_sqlite(db_path, [], [])
-
-    assert exc_info.value.expected_version == lci_storage.INDEX_FORMAT_VERSION
-    assert exc_info.value.actual_version == lci_storage.INDEX_FORMAT_VERSION + 1
-    assert db_path.read_bytes() == before
-
-
-@pytest.mark.parametrize("builder", [lci.build_index, lci_storage.build_index])
-def test_build_index_refuses_newer_format_before_publishing_jsonl(tmp_path: Path, builder) -> None:  # type: ignore[no-untyped-def]
+def test_indexer_build_refuses_newer_format_before_publishing_jsonl(tmp_path: Path) -> None:
     root, hermes_home = build_fixture(tmp_path)
     output_dir = tmp_path / "state"
-    builder(root, output_dir, hermes_home)
+    build_result = lci.build_index(root, output_dir, hermes_home)
+    assert build_result is not None
     db_path = output_dir / "index.sqlite"
     jsonl_path = output_dir / "index.jsonl"
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION + 1}")
+        conn.execute(f"PRAGMA user_version = {lci_index.INDEX_FORMAT_VERSION + 1}")
         conn.commit()
     finally:
         conn.close()
@@ -2184,9 +2177,11 @@ def test_build_index_refuses_newer_format_before_publishing_jsonl(tmp_path: Path
     jsonl_before = jsonl_path.read_bytes()
     write(root / "custom_skills" / "new" / "SKILL.md", "# New\n")
 
-    with pytest.raises(lci_storage.NewerIndexFormatError):
-        builder(root, output_dir, hermes_home)
+    with pytest.raises(lci_index.NewerIndexFormatError) as exc_info:
+        lci.build_index(root, output_dir, hermes_home)
 
+    assert exc_info.value.expected_version == lci_index.INDEX_FORMAT_VERSION
+    assert exc_info.value.actual_version == lci_index.INDEX_FORMAT_VERSION + 1
     assert db_path.read_bytes() == db_before
     assert jsonl_path.read_bytes() == jsonl_before
 
@@ -2923,19 +2918,11 @@ Create, update, pause, resume, or remove recurring scheduled jobs.
     )
     db_path = state_dir / "index.sqlite"
     if index_state == "older":
-        stale = lci.Artifact(
-            id="tool_okf:stale-only",
-            type="tool_okf",
-            title="Stale only",
-            path="okfs/tools/stale-only.md",
-            summary="Stale only",
-            triggers=["stale only"],
-            search_text="stale only",
-        )
-        lci_storage.build_sqlite(db_path, [stale], [])
+        build_result = lci.build_index(root, state_dir, hermes_home)
+        assert build_result is not None
         conn = sqlite3.connect(db_path)
         try:
-            conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION - 1}")
+            conn.execute(f"PRAGMA user_version = {lci_index.INDEX_FORMAT_VERSION - 1}")
             conn.commit()
         finally:
             conn.close()
@@ -2959,7 +2946,7 @@ Create, update, pause, resume, or remove recurring scheduled jobs.
     assert lci_cli.main(command) == 0
     payload = json.loads(capsys.readouterr().out)
 
-    assert lci_storage.index_format_version(db_path) == lci_storage.INDEX_FORMAT_VERSION
+    assert lci_index.index_format_version(db_path) == lci_index.INDEX_FORMAT_VERSION
     if lookup == "search":
         assert any(row["id"] == "skill:paperless-review-automation" for row in payload)
         assert all(row["id"] != "tool_okf:cronjob" for row in payload)
@@ -2988,27 +2975,22 @@ def test_cli_lookups_reject_newer_default_index_without_rebuild(
 """,
     )
     db_path = state_dir / "index.sqlite"
-    current = lci.Artifact(
-        id="skill:current",
-        type="skill",
-        title="Current",
-        path="custom_skills/current/SKILL.md",
-        summary="Current index",
-        search_text="current index",
-    )
-    lci_storage.build_sqlite(db_path, [current], [])
+    build_result = lci.build_index(root, state_dir, hermes_home)
+    assert build_result is not None
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute(f"PRAGMA user_version = {lci_storage.INDEX_FORMAT_VERSION + 1}")
+        conn.execute(f"PRAGMA user_version = {lci_index.INDEX_FORMAT_VERSION + 1}")
         conn.commit()
     finally:
         conn.close()
     before = db_path.read_bytes()
-    build_calls: list[str] = []
+    scan_calls: list[str] = []
 
-    def unexpected_build(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-        build_calls.append("build")
-        raise AssertionError("newer indexes must not be rebuilt")
+    def unexpected_scan(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        scan_calls.append("scan")
+        raise AssertionError("newer indexes must be refused before scanning")
+
+    monkeypatch.setattr(lci_index, "collect_artifacts", unexpected_scan)
 
     command = {
         "search": ["search", "current"],
@@ -3017,14 +2999,14 @@ def test_cli_lookups_reject_newer_default_index_without_rebuild(
     }[lookup]
     command.extend(["--from-hermes-config", "--hermes-home", str(hermes_home), "--json"])
 
-    assert lci_cli.main(command, build_index_fn=unexpected_build) == 1
+    assert lci_cli.main(command) == 1
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["success"] is False
     assert payload["error_code"] == "newer_index_format"
-    assert payload["expected_index_format_version"] == lci_storage.INDEX_FORMAT_VERSION
-    assert payload["actual_index_format_version"] == lci_storage.INDEX_FORMAT_VERSION + 1
-    assert build_calls == []
+    assert payload["expected_index_format_version"] == lci_index.INDEX_FORMAT_VERSION
+    assert payload["actual_index_format_version"] == lci_index.INDEX_FORMAT_VERSION + 1
+    assert scan_calls == []
     assert db_path.read_bytes() == before
 
 
