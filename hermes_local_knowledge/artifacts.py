@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator, Protocol, Sequence
+from urllib.parse import unquote_plus
 
 _SCRIPT_SUFFIXES = frozenset({".py", ".sh", ".bash", ".cjs", ".mjs", ".js"})
 _EXCLUDED_DIR_NAMES = frozenset(
@@ -92,6 +93,9 @@ _STOPWORDS = frozenset(
 )
 
 _MCP_URI_AUTHORITY_RE = re.compile(r"(?i)(?P<prefix>[a-z][a-z0-9+.-]*://)(?P<authority>[^/?#\s]*)")
+_MCP_URL_PARAMETER_RE = re.compile(
+    r"(?P<prefix>[?&#;])(?P<name>[^=&#;\s]+)=(?P<value>[^&#;\s]*)"
+)
 _HTTP_URL_SPAN_RE = re.compile(r'https?://[^\s`"<>]+', re.IGNORECASE)
 _LOCAL_PATH_RE = re.compile(
     r"""
@@ -510,8 +514,17 @@ def _iter_files(
             yield path
 
 
-def _candidate(artifact: Artifact, path: Path, *, priority: int = 0) -> _Candidate:
-    return _Candidate(artifact, _source_identity(path), priority)
+def _candidate(
+    artifact: Artifact,
+    path: Path,
+    *,
+    priority: int = 0,
+    identity_scope: str | None = None,
+) -> _Candidate:
+    identity = _source_identity(path)
+    if identity_scope is not None:
+        identity = (*identity, "scope", identity_scope)
+    return _Candidate(artifact, identity, priority)
 
 
 def _dedupe_candidates(candidates: Iterable[_Candidate]) -> list[Artifact]:
@@ -823,7 +836,16 @@ def _script_candidates(root: Path, settings: ScannerSettings) -> list[_Candidate
                     ]
                 ),
             )
-            candidates.append(_candidate(artifact, path))
+            # A configured script root is a logical namespace in the public ID.
+            # _iter_files de-duplicates inode aliases within that namespace;
+            # preserving the scope here keeps separately configured stable IDs.
+            candidates.append(
+                _candidate(
+                    artifact,
+                    path,
+                    identity_scope=f"script-root:{Path(relative_dir).as_posix()}",
+                )
+            )
     return candidates
 
 
@@ -982,11 +1004,21 @@ def _cron_candidates(root: Path, hermes_home: Path, settings: ScannerSettings) -
 def _mcp_secret_name(value: str) -> bool:
     separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value.lstrip("-"))
     parts = re.findall(r"[a-z0-9]+", separated.lower())
-    if parts and parts[-1] in {"url", "uri", "endpoint", "file", "path"}:
-        return False
-    part_set = set(parts)
-    compact = "".join(parts)
-    secret_parts = ("token", "secret", "password", "passwd", "authorization", "credential", "credentials")
+    semantic_parts = parts[:-1] if parts and parts[-1] in {"url", "uri", "endpoint", "file", "path"} else parts
+    part_set = set(semantic_parts)
+    compact = "".join(semantic_parts)
+    secret_parts = (
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "credential",
+        "credentials",
+        "sig",
+        "signature",
+        "cookie",
+    )
     return (
         bool(set(secret_parts) & part_set)
         or {"api", "key"} <= part_set
@@ -1001,14 +1033,22 @@ def _sanitize_mcp_header(value: str) -> str:
     return f"{match.group('name')}: <redacted>"
 
 
-def _sanitize_mcp_url_userinfo(value: str) -> str:
+def _sanitize_mcp_url(value: str) -> str:
     def sanitize_authority(match: re.Match[str]) -> str:
         authority = match.group("authority")
         if "@" not in authority:
             return match.group(0)
         return f"{match.group('prefix')}{authority.rsplit('@', 1)[1]}"
 
-    return _MCP_URI_AUTHORITY_RE.sub(sanitize_authority, value)
+    without_userinfo = _MCP_URI_AUTHORITY_RE.sub(sanitize_authority, value)
+
+    def sanitize_parameter(match: re.Match[str]) -> str:
+        name = match.group("name")
+        if not _mcp_secret_name(unquote_plus(name)):
+            return match.group(0)
+        return f"{match.group('prefix')}{name}=<redacted>"
+
+    return _MCP_URL_PARAMETER_RE.sub(sanitize_parameter, without_userinfo)
 
 
 def _sanitize_mcp_arg_value(value: Any) -> str:
@@ -1021,13 +1061,13 @@ def _sanitize_mcp_arg_value(value: Any) -> str:
             if isinstance(raw_value, (dict, list, tuple, set)) or _mcp_secret_name(name):
                 rendered = "<redacted>"
             elif name in {"--header", "-H"}:
-                rendered = _sanitize_mcp_header(_sanitize_mcp_url_userinfo(str(raw_value)))
+                rendered = _sanitize_mcp_header(_sanitize_mcp_url(str(raw_value)))
             else:
                 rendered = _sanitize_mcp_arg_value(raw_value)
             output.append(f"{name}: {rendered}")
         return " ".join(output)
 
-    text = _sanitize_mcp_url_userinfo(str(value))
+    text = _sanitize_mcp_url(str(value))
     if "=" not in text:
         return _sanitize_mcp_header(text)
 
@@ -1173,7 +1213,7 @@ def _mcp_candidates(root: Path, hermes_home: Path, settings: ScannerSettings) ->
     for name, (raw_data, config_key) in sorted(servers.items()):
         data = raw_data if isinstance(raw_data, dict) else {}
         command = str(data.get("command") or "")
-        url = _sanitize_mcp_url_userinfo(str(data.get("url") or data.get("base_url") or ""))
+        url = _sanitize_mcp_url(str(data.get("url") or data.get("base_url") or ""))
         args_text = _sanitize_mcp_args(data.get("args") or [])
         env = data.get("env") or {}
         env_text = " ".join(str(key) for key in env) if isinstance(env, dict) else ""

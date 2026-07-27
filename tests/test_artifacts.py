@@ -237,11 +237,15 @@ def test_mcp_projection_keeps_routing_names_but_omits_credentials_and_env_values
         """mcp_servers:
   example:
     command: uvx
-    url: https://user-canary:password-canary@example.invalid/api
+    url: "https://user-canary:password-canary@example.invalid/api?token=query-canary&X-Amz-Signature=signed-canary&client%5Fsecret=encoded-canary#client_secret=fragment-canary"
     args:
       - example-mcp-server
       - --token
       - argument-canary
+      - --token-file
+      - /home/example/token-file-canary
+      - --header
+      - "Cookie: session=cookie-canary"
       - --config
       - /home/example/server.json
       - MODE=stdio
@@ -260,12 +264,23 @@ def test_mcp_projection_keeps_routing_names_but_omits_credentials_and_env_values
         "user-canary",
         "password-canary",
         "argument-canary",
+        "query-canary",
+        "fragment-canary",
+        "token-file-canary",
+        "signed-canary",
+        "encoded-canary",
+        "cookie-canary",
         "environment-canary",
         "private-default-canary",
     ):
         assert canary not in serialized
-    assert "https://example.invalid/api" in artifact.summary
+    assert "token=<redacted>" in artifact.summary
+    assert "x-amz-signature=<redacted>" in artifact.summary.lower()
+    assert "client%5fsecret=<redacted>" in artifact.summary.lower()
+    assert "client_secret=<redacted>" in artifact.summary
     assert "--token <redacted>" in artifact.search_text.lower()
+    assert "--token-file <redacted>" in artifact.search_text.lower()
+    assert "cookie: <redacted>" in artifact.search_text.lower()
     assert "example_token" in artifact.search_text.lower()
     assert "routing_mode" in artifact.search_text.lower()
     assert artifact.related == ["/home/example/server.json"]
@@ -342,6 +357,28 @@ def test_traversal_enforces_roots_exclusions_and_inode_deduplication(tmp_path: P
     assert "skill:active" in ids
     assert "skill:retired" not in ids
     assert not any("outside" in artifact.id or "build" in artifact.path for artifact in artifacts)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="hardlink behavior differs on Windows")
+def test_distinct_configured_script_roots_preserve_stable_ids_for_one_source(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes-home"
+    source = root / "scripts" / "session_review.py"
+    alias = root / "hermes_home" / "scripts" / "session_review.py"
+    write(source, '"""Review session memory."""\n')
+    alias.parent.mkdir(parents=True)
+    os.link(source, alias)
+
+    artifacts = collect_artifacts(
+        root,
+        hermes_home,
+        Settings(script_dirs=("scripts", "hermes_home/scripts"), include_markdown_docs=False),
+    )
+
+    assert [artifact.id for artifact in artifacts if artifact.type == "script"] == [
+        "script:hermes-home-scripts-session-review-py",
+        "script:scripts-session-review-py",
+    ]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires elevated Windows setup")
