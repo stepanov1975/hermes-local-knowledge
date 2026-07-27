@@ -636,7 +636,7 @@ def create_current_okf_queue(
                     {
                         "type": "object",
                         "field_count": 1,
-                        "fields": {"query": {"type": "str"}},
+                        "fields": {"field_0": {"type": "str"}},
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -2359,6 +2359,20 @@ def test_registered_finalize_hook_uses_public_okf_worker_log_filename(
         str(hermes_home.resolve()),
     ]
     assert kwargs["cwd"] == str(hermes_home.resolve())
+    env = cast(dict[str, str], kwargs["env"])
+    assert env["HERMES_LOCAL_KNOWLEDGE_OKF_WORKER"] == "1"
+    assert env["HERMES_HOME"] == str(hermes_home.resolve())
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.STDOUT
+    assert kwargs["close_fds"] is True
+    if os.name == "nt":
+        expected_flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP"))
+        expected_flags |= int(getattr(subprocess, "DETACHED_PROCESS"))
+        assert kwargs["creationflags"] & expected_flags == expected_flags
+        assert "start_new_session" not in kwargs
+    else:
+        assert kwargs["start_new_session"] is True
+        assert "creationflags" not in kwargs
     log_handle = cast(TextIO, kwargs["stdout"])
     assert Path(log_handle.name) == state_dir.resolve() / "okf_worker.log"
     assert log_handle.closed is True

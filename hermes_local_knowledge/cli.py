@@ -17,7 +17,6 @@ from . import __version__, index, okf
 from .artifacts import Artifact, Edge
 from .config import Config, IndexSettings, resolve_config
 from .constants import DEFAULT_ROOT
-from .okf_worker import run_worker as run_okf_worker
 from .paths import default_output_dir, hermes_home_from_env
 from .service import LocalKnowledgeService
 from .telemetry import _record_usage
@@ -281,7 +280,7 @@ def handle_hermes_cli(args: argparse.Namespace, *, llm: Any = None) -> int:
     """Dispatch the Hermes-native CLI adapter through the standalone CLI."""
     command = str(args.local_knowledge_command)
     if command == "okf-worker":
-        status = run_okf_worker(llm=llm, hermes_home=args.hermes_home)
+        status = okf.run_worker(llm=llm, hermes_home=args.hermes_home)
         if status:
             raise SystemExit(status)
         return status

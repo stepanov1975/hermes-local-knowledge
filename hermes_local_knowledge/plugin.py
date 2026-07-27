@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from . import handlers as _handlers
-from .hooks import _on_post_tool_call, _on_session_finalize
+from .okf import _on_post_tool_call, _on_session_finalize
 from .runtime import _runtime_config, check_knowledge_available
 from .service import LocalKnowledgeService
 
