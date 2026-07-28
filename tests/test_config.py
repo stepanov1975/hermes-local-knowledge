@@ -22,6 +22,7 @@ def isolated_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
     monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -147,7 +148,7 @@ def test_managed_missing_older_and_corrupt_indexes_auto_rebuild(
     db_path = config.state_dir / "index.sqlite"
     if initial_state == "older":
         config.state_dir.mkdir(parents=True)
-        with sqlite3.connect(db_path) as connection:
+        with closing(sqlite3.connect(db_path)) as connection, connection:
             connection.execute(f"PRAGMA user_version={index.INDEX_FORMAT_VERSION - 1}")
     elif initial_state == "corrupt":
         write(db_path, "not a sqlite database")
@@ -172,7 +173,7 @@ def test_newer_index_is_refused_before_scanning(
     config = make_config(tmp_path)
     config.state_dir.mkdir(parents=True)
     db_path = config.state_dir / "index.sqlite"
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute(f"PRAGMA user_version={index.INDEX_FORMAT_VERSION + 1}")
     before = db_path.read_bytes()
 

@@ -607,6 +607,7 @@ def test_snapshot_symlinks_are_rewritten_to_ref_clones(tmp_path: Path) -> None:
     runtime_clone = tmp_path / "ref" / "home" / ".hermes"
     helper.clone_snapshot(source_base, source_clone)
     helper.clone_snapshot(runtime_base, runtime_clone)
+    (live_hermes / "skills" / "alpha").unlink()
 
     helper.rewrite_clone_symlinks(
         source_clone,
@@ -709,8 +710,9 @@ def test_runtime_config_cron_and_okf_symlinks_are_materialized_without_touching_
     ):
         assert copied.is_file()
         assert not copied.is_symlink()
-    assert stat.S_IMODE((runtime_snapshot / "config.yaml").stat().st_mode) == 0o600
-    assert stat.S_IMODE((okf_snapshot / "demo.md").stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE((runtime_snapshot / "config.yaml").stat().st_mode) == 0o600
+        assert stat.S_IMODE((okf_snapshot / "demo.md").stat().st_mode) == 0o600
     assert {
         path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
         for path in (config_target, cron_target, okf_target)
@@ -860,8 +862,9 @@ def test_private_paths_and_files_are_owner_only(tmp_path: Path) -> None:
     output = private / "details.json"
     helper.write_private_json(output, {"query": "private"})
 
-    assert stat.S_IMODE(private.stat().st_mode) == 0o700
-    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(private.stat().st_mode) == 0o700
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
 def test_compare_helper_cleanup_is_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -1020,9 +1023,10 @@ description: {query} routing skill.
     assert canary not in captured.err
     assert canary not in report_file.read_text(encoding="utf-8")
     assert canary in frozen_cases.read_text(encoding="utf-8")
-    assert stat.S_IMODE(json_work_dir.stat().st_mode) == 0o700
-    assert stat.S_IMODE(report_file.stat().st_mode) == 0o600
-    assert stat.S_IMODE(frozen_cases.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(json_work_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(report_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(frozen_cases.stat().st_mode) == 0o600
 
     markdown_work_dir = tmp_path / "default-markdown"
     assert helper.main(comparison_args(markdown_work_dir)) == 0
@@ -1039,8 +1043,9 @@ description: {query} routing skill.
     assert canary in json.dumps(details_payload["details"])
     assert canary in details_file.read_text(encoding="utf-8")
     assert canary not in (details_work_dir / "report.json").read_text(encoding="utf-8")
-    assert stat.S_IMODE(details_work_dir.stat().st_mode) == 0o700
-    assert stat.S_IMODE(details_file.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(details_work_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(details_file.stat().st_mode) == 0o600
 
     def fail_with_private_value(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError(canary)

@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -181,7 +182,7 @@ def test_build_publishes_valid_format4_index_and_queries_it(tmp_path: Path) -> N
     db_path = state / "index.sqlite"
     assert index.index_format_state(db_path) == ("current", 4)
     assert index.index_needs_rebuild(db_path) is False
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         metadata = dict(connection.execute("SELECT key, value FROM metadata"))
         assert metadata["format_version"] == "4"
@@ -319,33 +320,33 @@ def test_missing_older_and_corrupt_indexes_rebuild_but_newer_is_refused(
     assert index.index_format_state(db_path) == ("current", 4)
 
     db_path.unlink()
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute("PRAGMA user_version=3")
     assert index.index_format_state(db_path) == ("older", 3)
     index.build_index(root, state, hermes_home, settings())
     assert index.index_format_state(db_path) == ("current", 4)
 
     db_path.unlink()
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute("PRAGMA user_version=4")
     assert index.index_format_state(db_path) == ("corrupt", 4)
     assert index.index_needs_rebuild(db_path) is True
     index.build_index(root, state, hermes_home, settings())
     assert index.index_format_state(db_path) == ("current", 4)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute("UPDATE metadata SET value='-1' WHERE key='artifact_count'")
     assert index.index_format_state(db_path) == ("corrupt", 4)
     index.build_index(root, state, hermes_home, settings())
     assert index.index_format_state(db_path) == ("current", 4)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute("DELETE FROM metadata WHERE key='jsonl_sha256'")
     assert index.index_format_state(db_path) == ("corrupt", 4)
     assert index.build_index(root, state, hermes_home, settings(), force=False) is not None
     assert index.index_format_state(db_path) == ("current", 4)
 
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute(
             """
             INSERT INTO artifact_fts (id, type, title, summary, triggers, entities, path, search_text)
@@ -358,7 +359,7 @@ def test_missing_older_and_corrupt_indexes_rebuild_but_newer_is_refused(
     assert index.index_format_state(db_path) == ("current", 4)
 
     db_path.unlink()
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute("PRAGMA user_version=5")
 
     def fail_if_scanned(*args: Any, **kwargs: Any) -> list[Artifact]:
@@ -383,7 +384,7 @@ def test_current_index_requires_an_fts5_virtual_table(tmp_path: Path) -> None:
     )
     index.build_index(root, state, hermes_home, empty_settings)
     db_path = state / "index.sqlite"
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute("DROP TABLE artifact_fts")
         connection.execute(
             """
@@ -404,7 +405,7 @@ def test_current_index_rejects_null_artifact_ids(tmp_path: Path) -> None:
     write(root / "docs" / "guide.md", "# Guide\n\nQuartz operations.\n")
     index.build_index(root, state, hermes_home, settings())
     db_path = state / "index.sqlite"
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute("UPDATE artifacts SET id=NULL")
         connection.execute("UPDATE artifact_fts SET id=NULL")
 
@@ -462,7 +463,7 @@ def test_mcp_credentials_never_reach_persistence_or_public_results(tmp_path: Pat
     assert build_result is not None
     artifacts, _edges = build_result
     db_path = state / "index.sqlite"
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
         persisted = json.dumps(
             {
                 "artifacts": connection.execute("SELECT * FROM artifacts").fetchall(),
