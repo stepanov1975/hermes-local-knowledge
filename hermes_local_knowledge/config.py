@@ -244,7 +244,7 @@ def _section_from_file(hermes_home: Path) -> dict[str, Any]:
 def _load_section(hermes_home: Path, *, explicit_home: bool) -> dict[str, Any]:
     if not explicit_home:
         try:
-            from hermes_cli.config import load_config  # type: ignore[import-not-found]
+            from hermes_cli.config import load_config  # type: ignore[import-not-found,import-untyped]
 
             loaded = load_config()
         except Exception:
@@ -263,7 +263,7 @@ def _base_hermes_home(override: Path | str | None) -> Path:
     if _present(env_home):
         return Path(str(env_home)).expanduser().resolve()
     try:
-        from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
+        from hermes_constants import get_hermes_home  # type: ignore[import-not-found,import-untyped]
 
         return Path(get_hermes_home()).expanduser().resolve()
     except Exception:
