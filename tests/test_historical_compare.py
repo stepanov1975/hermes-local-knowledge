@@ -628,6 +628,48 @@ def test_snapshot_symlinks_are_rewritten_to_ref_clones(tmp_path: Path) -> None:
     assert (runtime_clone / "skills" / "alpha").resolve() == (source_clone / "custom_skills" / "alpha").resolve()
 
 
+def test_relative_snapshot_symlink_nested_under_live_root_is_not_double_remapped(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_source = tmp_path / "live-source"
+    live_hermes = tmp_path / "live-home" / ".hermes"
+    skill = live_source / "custom_skills" / "alpha"
+    write(skill / "SKILL.md", "---\nname: alpha\n---\n")
+    skills = live_hermes / "skills"
+    skills.mkdir(parents=True)
+    relative_target = Path(os.path.relpath(skill, skills))
+    (skills / "alpha").symlink_to(relative_target, target_is_directory=True)
+    source_base = tmp_path / "base" / "source"
+    runtime_base = tmp_path / "base" / "runtime"
+    helper.copy_scanner_snapshot(live_source, source_base, state_root=live_source / "knowledge")
+    helper.copy_runtime_snapshot(live_hermes, runtime_base)
+    clone_root = live_hermes / "cache" / "evaluation" / "ref"
+    source_clone = clone_root / "source"
+    runtime_clone = clone_root / "home" / ".hermes"
+    state_clone = clone_root / "state"
+    helper.clone_snapshot(source_base, source_clone)
+    helper.clone_snapshot(runtime_base, runtime_clone)
+
+    helper.rewrite_clone_symlinks(
+        source_clone,
+        runtime_clone,
+        live_source=live_source,
+        live_hermes_home=live_hermes,
+        clone_source=source_clone,
+        clone_hermes_home=runtime_clone,
+    )
+    helper.assert_isolated_topology(
+        source_clone,
+        runtime_clone,
+        state_clone,
+        {"custom_skill_dirs": ["custom_skills"], "script_dirs": ["scripts"], "memory_dirs": ["memory"], "runbook_dirs": ["docs"]},
+        live_roots=(live_source, live_hermes),
+    )
+
+    rewritten = runtime_clone / "skills" / "alpha"
+    assert rewritten.is_dir()
+    assert rewritten.resolve() == (source_clone / "custom_skills" / "alpha").resolve()
+
+
 def test_runtime_snapshot_fails_closed_for_uncopied_hermes_backed_skill_symlink(tmp_path: Path) -> None:
     helper = load_compare_helper()
     live_hermes = tmp_path / "live" / ".hermes"

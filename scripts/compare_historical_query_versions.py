@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import math
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -1587,14 +1588,15 @@ def rewrite_clone_symlinks(
     for clone_root, live_root in ((source_clone, live_source), (runtime_clone, live_hermes_home)):
         for link in list(_symlink_paths(clone_root)):
             relative_link = link.relative_to(clone_root)
-            mapped = _map_path(link.resolve(strict=False), mappings)
-            if mapped is None:
-                raw_target = os.readlink(link)
+            raw_target = os.readlink(link)
+            if os.path.isabs(raw_target) or ntpath.isabs(raw_target):
+                original_target = link.resolve(strict=False)
+            else:
                 original_target = (live_root / relative_link).parent / raw_target
-                mapped = _map_path(original_target, mappings)
+            mapped = _map_path(original_target, mappings)
             if mapped is None:
                 continue
-            is_directory = link.is_dir()
+            is_directory = mapped.is_dir() if mapped.exists() else link.is_dir()
             link.unlink()
             link.symlink_to(mapped, target_is_directory=is_directory)
 
