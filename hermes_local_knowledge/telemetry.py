@@ -8,8 +8,18 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .runtime import _usage_db_path
-from .schemas import FEEDBACK_RATINGS, NEGATIVE_FEEDBACK_RATINGS
+from .config import resolve_config
+
+FEEDBACK_RATINGS = {
+    "useful",
+    "not_useful",
+    "missing",
+    "noisy",
+    "wrong_artifact",
+    "stale",
+    "other",
+}
+NEGATIVE_FEEDBACK_RATINGS = FEEDBACK_RATINGS - {"useful", "other"}
 
 RECENT_LIVE_ERROR_DAYS = 3
 PROBE_QUERIES = {"demo", "sentinel unlikely", "xxxx"}
@@ -166,7 +176,7 @@ def _usage_connect(root: Path | None, usage_db_path: Path | None = None) -> sqli
     if usage_db_path is None:
         if root is None:
             raise ValueError("root or usage_db_path is required")
-        resolved_usage_db = _usage_db_path(root)
+        resolved_usage_db = resolve_config().state_dir / "usage.sqlite"
     else:
         resolved_usage_db = usage_db_path
     resolved_usage_db.parent.mkdir(parents=True, exist_ok=True)
@@ -273,8 +283,9 @@ def _record_feedback(
     artifact_id: str,
     note: str,
     context: dict[str, str],
+    usage_db_path: Path | None = None,
 ) -> int:
-    conn = _usage_connect(root)
+    conn = _usage_connect(root, usage_db_path)
     try:
         cur = conn.execute(
             """
@@ -387,8 +398,14 @@ def _split_resolved_zero_results(
     return unresolved, resolved
 
 
-def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
-    usage_db = _usage_db_path(root)
+def _usage_report(
+    root: Path,
+    *,
+    days: int,
+    limit: int,
+    usage_db_path: Path | None = None,
+) -> dict[str, Any]:
+    usage_db = usage_db_path if usage_db_path is not None else resolve_config().state_dir / "usage.sqlite"
     now = datetime.now(timezone.utc)
     since_dt = now - timedelta(days=days)
     since = since_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -433,7 +450,7 @@ def _usage_report(root: Path, *, days: int, limit: int) -> dict[str, Any]:
             "improvement_candidates": [],
         }
 
-    conn = _usage_connect(root)
+    conn = _usage_connect(root, usage_db)
     try:
         total_events = conn.execute(
             "SELECT COUNT(*) FROM usage_events WHERE ts >= ?",

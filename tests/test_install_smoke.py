@@ -99,9 +99,19 @@ tags: [demo, reusable]
     installed_plugin = hermes_home / "plugins" / "local_knowledge"
     bundled_skill = installed_plugin / "skills" / "local-knowledge-router" / "SKILL.md"
     assert bundled_skill.exists()
+    skill_env = dict(env)
+    skill_env["PYTHONPATH"] = str(installed_plugin)
+    skill_env["PYTHONNOUSERSITE"] = "1"
     skill_install = run_command(
-        ["hermes", "local-knowledge", "install-router-skill", "--json"],
-        env=env,
+        [
+            sys.executable,
+            "-m",
+            "hermes_local_knowledge.cli",
+            "install-router-skill",
+            "--json",
+        ],
+        env=skill_env,
+        cwd=tmp_path,
     )
     skill_install_payload = json.loads(skill_install.stdout)
     normal_skill = hermes_home / "skills" / "local-knowledge-router" / "SKILL.md"

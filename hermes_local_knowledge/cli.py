@@ -7,33 +7,36 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import __version__
-from .constants import DEFAULT_ROOT
-from .evaluation import evaluate_index_against_feedback_report
-from .models import IndexSettings
-from . import okf
-from .okf_worker import run_worker as run_okf_worker
-from .paths import default_output_dir, hermes_home_from_env
-from .runtime import RuntimeConfig, _runtime_config
-from .search import search_index
-from .storage import (
-    NewerIndexFormatError,
-    artifact_type_counts,
-    build_index,
-    get_artifact,
-    get_neighbors,
-    index_build_lock,
-    index_metadata,
-    index_needs_rebuild,
-)
+from . import __version__, index, okf
+from .artifacts import Artifact, Edge
+from .config import Config, IndexSettings, resolve_config
+from .service import LocalKnowledgeService
 from .telemetry import _record_usage
+
+NewerIndexFormatError = index.NewerIndexFormatError
+build_index = index.build_index
+search_index = index.search_index
+get_artifact = index.get_artifact
+get_neighbors = index.get_neighbors
+index_metadata = index.index_metadata
+artifact_type_counts = index.artifact_type_counts
 
 
 ROUTER_SKILL_RELATIVE_PATH = Path("skills") / "local-knowledge-router" / "SKILL.md"
+_DEFAULT_ROOT = Path.cwd()
+
+
+def _hermes_home_from_env() -> Path:
+    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+
+
+def _default_output_dir(hermes_home: Path | None = None) -> Path:
+    return (hermes_home.expanduser() if hermes_home is not None else _hermes_home_from_env()) / "local_knowledge"
 
 
 def print_results(rows: Sequence[dict[str, Any]]) -> None:
@@ -96,7 +99,7 @@ def _print_warnings(warnings: Sequence[str]) -> None:
         print(f"WARNING: {warning}", file=sys.stderr)
 
 
-def _cfg_metadata(cfg: RuntimeConfig, db_path: Path | None = None) -> dict[str, Any]:
+def _cfg_metadata(cfg: Config, db_path: Path | None = None) -> dict[str, Any]:
     return {
         "plugin_version": __version__,
         "root": str(cfg.source_root),
@@ -113,8 +116,28 @@ def _usage_db_for_state_dir(state_dir: Path) -> Path:
     return state_dir / "usage.sqlite"
 
 
+BuildIndexFn = Callable[..., tuple[list[Artifact], list[Edge]] | None]
+
+
+def _service(
+    cfg: Config,
+    *,
+    build_index_fn: BuildIndexFn = build_index,
+    search_index_fn: Callable[..., list[dict[str, Any]]] = search_index,
+    get_artifact_fn: Callable[..., dict[str, Any] | None] = get_artifact,
+    get_neighbors_fn: Callable[..., list[dict[str, Any]]] = get_neighbors,
+) -> LocalKnowledgeService:
+    return LocalKnowledgeService(
+        cfg,
+        build_index_fn=build_index_fn,
+        search_index_fn=search_index_fn,
+        get_artifact_fn=get_artifact_fn,
+        get_neighbors_fn=get_neighbors_fn,
+    )
+
+
 def _record_cli_usage(
-    cfg: RuntimeConfig | None,
+    cfg: Config | None,
     *,
     tool: str,
     success: bool,
@@ -132,6 +155,7 @@ def _record_cli_usage(
     db_path: Path | None = None,
     index_meta: dict[str, Any] | None = None,
     usage_db_path: Path | None = None,
+    service: LocalKnowledgeService | None = None,
 ) -> int | None:
     root = cfg.source_root if cfg is not None else None
     metadata = _cfg_metadata(cfg, db_path) if cfg is not None else {"plugin_version": __version__}
@@ -141,8 +165,8 @@ def _record_cli_usage(
             usage_db_path = (db_path.parent / "usage.sqlite") if db_path is not None else None
         else:
             usage_db_path = _usage_db_for_state_dir(cfg.state_dir)
-    return _record_usage(
-        root,
+    record = service.record_usage if service is not None else lambda **kwargs: _record_usage(root, **kwargs)
+    return record(
         tool=tool,
         success=success,
         query=query,
@@ -231,7 +255,7 @@ def handle_hermes_cli(args: argparse.Namespace, *, llm: Any = None) -> int:
     """Dispatch the Hermes-native CLI adapter through the standalone CLI."""
     command = str(args.local_knowledge_command)
     if command == "okf-worker":
-        status = run_okf_worker(llm=llm, hermes_home=args.hermes_home)
+        status = okf.run_worker(llm=llm, hermes_home=args.hermes_home)
         if status:
             raise SystemExit(status)
         return status
@@ -346,9 +370,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _build_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
+def _build_config_from_args(args: argparse.Namespace) -> Config:
     if args.from_hermes_config:
-        cfg = _runtime_config(args.hermes_home)
+        cfg = resolve_config(args.hermes_home)
         updates: dict[str, Any] = {}
         if args.root is not None:
             updates["source_root"] = _resolved(args.root)
@@ -362,10 +386,10 @@ def _build_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
             updates["state_dir_source"] = "cli"
         return replace(cfg, **updates) if updates else cfg
 
-    hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env())
-    source_root = _resolved(args.root) if args.root is not None else _resolved(DEFAULT_ROOT)
-    state_dir = _resolved(args.output_dir) if args.output_dir is not None else _resolved(default_output_dir(hermes_home))
-    return RuntimeConfig(
+    hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(_hermes_home_from_env())
+    source_root = _resolved(args.root) if args.root is not None else _resolved(_DEFAULT_ROOT)
+    state_dir = _resolved(args.output_dir) if args.output_dir is not None else _resolved(_default_output_dir(hermes_home))
+    return Config(
         source_root,
         hermes_home,
         state_dir,
@@ -375,17 +399,17 @@ def _build_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
     )
 
 
-def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], RuntimeConfig]:
+def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], Config]:
     if args.from_hermes_config:
-        cfg = _runtime_config(args.hermes_home)
+        cfg = resolve_config(args.hermes_home)
         db_path = _resolved(args.db) if args.db is not None else cfg.state_dir / "index.sqlite"
         if args.db is not None:
             cfg = replace(cfg, state_dir=db_path.parent, state_dir_source="cli")
         return db_path, cfg.warnings, cfg
-    hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env())
-    db_path = _resolved(args.db) if args.db is not None else default_output_dir(hermes_home) / "index.sqlite"
-    cfg = RuntimeConfig(
-        _resolved(DEFAULT_ROOT),
+    hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(_hermes_home_from_env())
+    db_path = _resolved(args.db) if args.db is not None else _default_output_dir(hermes_home) / "index.sqlite"
+    cfg = Config(
+        _resolved(_DEFAULT_ROOT),
         hermes_home,
         db_path.parent,
         IndexSettings(),
@@ -395,38 +419,11 @@ def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], Runt
     return db_path, (), cfg
 
 
-def _build_index_locked(build_index_fn, cfg: RuntimeConfig):  # type: ignore[no-untyped-def]
-    with index_build_lock(cfg.state_dir):
-        return build_index_fn(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
-
-
-def _refresh_default_index_if_dirty(
-    db_path: Path,
-    cfg: RuntimeConfig,
-    *,
-    build_index_fn,
-    explicit_db: bool,
-    configuration_backed: bool,
-) -> bool:  # type: ignore[no-untyped-def]
-    if explicit_db or not configuration_backed:
-        return False
-    default_db_path = (cfg.state_dir / "index.sqlite").resolve()
-    if db_path.resolve() != default_db_path:
-        return False
-    dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
-    if not index_needs_rebuild(db_path) and not dirty_tokens:
-        return False
-    _build_index_locked(build_index_fn, cfg)
-    for token in dirty_tokens:
-        token.unlink(missing_ok=True)
-    return True
-
-
-def _okf_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
-    cfg = _runtime_config(args.hermes_home) if args.from_hermes_config else RuntimeConfig(
-        _resolved(DEFAULT_ROOT),
-        _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env()),
-        default_output_dir(_resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env())),
+def _okf_config_from_args(args: argparse.Namespace) -> Config:
+    cfg = resolve_config(args.hermes_home) if args.from_hermes_config else Config(
+        _resolved(_DEFAULT_ROOT),
+        _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(_hermes_home_from_env()),
+        _default_output_dir(_resolved(args.hermes_home) if args.hermes_home is not None else _resolved(_hermes_home_from_env())),
         IndexSettings(),
         source_root_source="cwd",
         state_dir_source="default",
@@ -547,7 +544,7 @@ def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[di
     }, 0
 
 
-def _okf_status_payload(cfg: RuntimeConfig, *, limit: int) -> dict[str, Any]:
+def _okf_status_payload(cfg: Config, *, limit: int) -> dict[str, Any]:
     pending = okf.pending_candidates(cfg.state_dir, limit=max(1, limit), min_use_count=cfg.okf.min_use_count)
     errors = okf.error_candidates(cfg.state_dir, limit=max(1, limit))
     return {
@@ -627,8 +624,14 @@ def _doctor_payload(
     *,
     build_index_fn=build_index,
     search_index_fn=search_index,
+    service: LocalKnowledgeService | None = None,
 ) -> tuple[dict[str, Any], int]:
-    cfg = _runtime_config(args.hermes_home)
+    cfg = service.config if service is not None else resolve_config(args.hermes_home)
+    service = service or _service(
+        cfg,
+        build_index_fn=build_index_fn,
+        search_index_fn=search_index_fn,
+    )
     db_path = cfg.state_dir / "index.sqlite"
     payload: dict[str, Any] = {
         "success": True,
@@ -699,21 +702,16 @@ def _doctor_payload(
     )
 
     if args.rebuild and not errors:
-        dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
         try:
-            build_started = time.perf_counter()
-            artifacts, edges = _build_index_locked(build_index_fn, cfg)
+            artifacts, edges, build_meta = service.rebuild()
         except Exception as exc:
             payload["rebuilt"] = False
             check("rebuild_failed", False, f"{type(exc).__name__}: {exc}", fatal=True)
         else:
-            payload["rebuilt"] = True
-            payload["build_duration_ms"] = int((time.perf_counter() - build_started) * 1000)
+            payload.update(build_meta)
             payload["artifact_count"] = len(artifacts)
-            payload["artifact_counts_by_type"] = artifact_type_counts(artifacts)
+            payload["artifact_counts_by_type"] = index.artifact_type_counts(artifacts)
             payload["edge_count"] = len(edges)
-            for token in dirty_tokens:
-                token.unlink(missing_ok=True)
             check("index_exists_after_rebuild", db_path.exists(), str(db_path), fatal=True)
     else:
         payload["rebuilt"] = False
@@ -725,7 +723,12 @@ def _doctor_payload(
             payload["warnings"].append(warning)
         elif db_path.exists():
             try:
-                rows = search_index_fn(db_path, query, limit=max(1, min(50, int(args.limit))))
+                rows, _query_meta = service.search(
+                    query,
+                    limit=max(1, min(50, int(args.limit))),
+                    db_path=db_path,
+                    ensure=False,
+                )
             except Exception as exc:
                 check("smoke_search_failed", False, f"{type(exc).__name__}: {exc}", fatal=True)
             else:
@@ -740,7 +743,7 @@ def _doctor_payload(
     if errors:
         payload["success"] = False
         payload["errors"] = errors
-    payload.update(index_metadata(db_path))
+    payload.update(index.index_metadata(db_path))
     return payload, 0 if payload["success"] else 1
 
 
@@ -775,7 +778,7 @@ def main(
 ) -> int:
     args = parse_args(argv)
     if args.command == "install-router-skill":
-        cfg = _runtime_config(args.hermes_home)
+        cfg = resolve_config(args.hermes_home)
         payload, status = _install_router_skill_payload(cfg.hermes_home, force=bool(args.force))
         _emit_payload(payload, json_output=bool(args.json))
         return status
@@ -783,12 +786,18 @@ def main(
         return _handle_okf_command(args)
     if args.command == "build":
         cfg = _build_config_from_args(args)
+        service = _service(
+            cfg,
+            build_index_fn=build_index_fn,
+            search_index_fn=search_index_fn,
+            get_artifact_fn=get_artifact_fn,
+            get_neighbors_fn=get_neighbors_fn,
+        )
         db_path = cfg.state_dir / "index.sqlite"
         started = time.perf_counter()
         _print_warnings(cfg.warnings)
-        dirty_tokens = okf.index_dirty_tokens(cfg.state_dir)
         try:
-            artifacts, edges = _build_index_locked(build_index_fn, cfg)
+            artifacts, edges, meta = service.rebuild()
         except Exception as exc:
             message = f"cli_build failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
@@ -800,23 +809,15 @@ def main(
                 error=message,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
-                index_meta=index_metadata(db_path),
+                index_meta=index.index_metadata(db_path),
+                service=service,
             )
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=False)
                 return 1
             raise
-        build_duration_ms = int((time.perf_counter() - started) * 1000)
-        for token in dirty_tokens:
-            token.unlink(missing_ok=True)
-        counts = artifact_type_counts(artifacts)
-        meta = {
-            **index_metadata(db_path),
-            "artifact_count": len(artifacts),
-            "artifact_counts_by_type": counts,
-            "edge_count": len(edges),
-            "build_duration_ms": build_duration_ms,
-        }
+        build_duration_ms = int(meta.get("build_duration_ms") or (time.perf_counter() - started) * 1000)
+        counts = index.artifact_type_counts(artifacts)
         _record_cli_usage(
             cfg,
             tool="cli_build",
@@ -827,6 +828,7 @@ def main(
             latency_ms=build_duration_ms,
             db_path=db_path,
             index_meta=meta,
+            service=service,
         )
         print(f"Built {len(artifacts)} artifacts and {len(edges)} edges")
         for artifact_type, count in sorted(counts.items()):
@@ -837,17 +839,24 @@ def main(
 
     if args.command == "search":
         db_path, warnings, cfg = _db_from_args(args)
+        service = _service(
+            cfg,
+            build_index_fn=build_index_fn,
+            search_index_fn=search_index_fn,
+            get_artifact_fn=get_artifact_fn,
+            get_neighbors_fn=get_neighbors_fn,
+        )
+        managed = bool(args.from_hermes_config and args.db is None)
         started = time.perf_counter()
         _print_warnings(warnings)
+        meta = {}
         try:
-            _refresh_default_index_if_dirty(
-                db_path,
-                cfg,
-                build_index_fn=build_index_fn,
-                explicit_db=args.db is not None,
-                configuration_backed=args.from_hermes_config,
+            rows, meta = service.search(
+                args.query,
+                limit=args.limit,
+                db_path=None if managed else db_path,
+                ensure=managed,
             )
-            rows = search_index_fn(db_path, args.query, limit=args.limit)
         except Exception as exc:
             message = f"cli_search failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
@@ -859,7 +868,8 @@ def main(
                 error=message,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
-                index_meta=index_metadata(db_path),
+                index_meta=meta or index.index_metadata(db_path),
+                service=service,
             )
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
@@ -871,12 +881,14 @@ def main(
             success=True,
             query=args.query,
             limit_value=args.limit,
+            rebuilt=bool(meta.get("rebuilt")),
             result_count=len(rows),
             top_ids=[str(row.get("id")) for row in rows[:5]],
             top_types=[str(row.get("type")) for row in rows[:5]],
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
-            index_meta=index_metadata(db_path),
+            index_meta=meta,
+            service=service,
         )
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
@@ -886,17 +898,23 @@ def main(
 
     if args.command == "get":
         db_path, warnings, cfg = _db_from_args(args)
+        service = _service(
+            cfg,
+            build_index_fn=build_index_fn,
+            search_index_fn=search_index_fn,
+            get_artifact_fn=get_artifact_fn,
+            get_neighbors_fn=get_neighbors_fn,
+        )
+        managed = bool(args.from_hermes_config and args.db is None)
         started = time.perf_counter()
         _print_warnings(warnings)
+        meta = {}
         try:
-            _refresh_default_index_if_dirty(
-                db_path,
-                cfg,
-                build_index_fn=build_index_fn,
-                explicit_db=args.db is not None,
-                configuration_backed=args.from_hermes_config,
+            row, meta = service.get(
+                args.artifact_id,
+                db_path=None if managed else db_path,
+                ensure=managed,
             )
-            row = get_artifact_fn(db_path, args.artifact_id)
         except Exception as exc:
             message = f"cli_get failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
@@ -907,7 +925,8 @@ def main(
                 error=message,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
-                index_meta=index_metadata(db_path),
+                index_meta=meta or index.index_metadata(db_path),
+                service=service,
             )
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
@@ -919,10 +938,12 @@ def main(
                 tool="knowledge_get",
                 success=False,
                 artifact_id=args.artifact_id,
+                rebuilt=bool(meta.get("rebuilt")),
                 error=f"Artifact not found: {args.artifact_id}",
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
-                index_meta=index_metadata(db_path),
+                index_meta=meta,
+                service=service,
             )
             print(f"Artifact not found: {args.artifact_id}", file=sys.stderr)
             return 1
@@ -931,10 +952,12 @@ def main(
             tool="knowledge_get",
             success=True,
             artifact_id=args.artifact_id,
+            rebuilt=bool(meta.get("rebuilt")),
             result_count=1,
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
-            index_meta=index_metadata(db_path),
+            index_meta=meta,
+            service=service,
         )
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2, sort_keys=True))
@@ -944,17 +967,23 @@ def main(
 
     if args.command == "neighbors":
         db_path, warnings, cfg = _db_from_args(args)
+        service = _service(
+            cfg,
+            build_index_fn=build_index_fn,
+            search_index_fn=search_index_fn,
+            get_artifact_fn=get_artifact_fn,
+            get_neighbors_fn=get_neighbors_fn,
+        )
+        managed = bool(args.from_hermes_config and args.db is None)
         started = time.perf_counter()
         _print_warnings(warnings)
+        meta = {}
         try:
-            _refresh_default_index_if_dirty(
-                db_path,
-                cfg,
-                build_index_fn=build_index_fn,
-                explicit_db=args.db is not None,
-                configuration_backed=args.from_hermes_config,
+            rows, meta = service.neighbors(
+                args.artifact_id,
+                db_path=None if managed else db_path,
+                ensure=managed,
             )
-            rows = get_neighbors_fn(db_path, args.artifact_id)
         except Exception as exc:
             message = f"cli_neighbors failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
@@ -965,7 +994,8 @@ def main(
                 error=message,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
-                index_meta=index_metadata(db_path),
+                index_meta=meta or index.index_metadata(db_path),
+                service=service,
             )
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
@@ -976,12 +1006,14 @@ def main(
             tool="knowledge_neighbors",
             success=True,
             artifact_id=args.artifact_id,
+            rebuilt=bool(meta.get("rebuilt")),
             result_count=len(rows),
             top_ids=[str(row.get("id")) for row in rows[:5]],
             top_types=[str(row.get("type")) for row in rows[:5]],
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
-            index_meta=index_metadata(db_path),
+            index_meta=meta,
+            service=service,
         )
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
@@ -990,10 +1022,17 @@ def main(
         return 0
 
     if args.command == "evaluate":
-        db_path, warnings, _cfg = _db_from_args(args)
+        db_path, warnings, cfg = _db_from_args(args)
+        service = _service(
+            cfg,
+            build_index_fn=build_index_fn,
+            search_index_fn=search_index_fn,
+            get_artifact_fn=get_artifact_fn,
+            get_neighbors_fn=get_neighbors_fn,
+        )
         _print_warnings(warnings)
         usage_db_path = _resolved(args.usage_db) if args.usage_db is not None else db_path.parent / "usage.sqlite"
-        report = evaluate_index_against_feedback_report(db_path, usage_db_path)
+        report = service.evaluate(db_path=db_path, usage_db_path=usage_db_path)
         metrics = report.as_dict() if args.details else report.metrics.as_dict()
         if args.json:
             print(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1020,11 +1059,22 @@ def main(
 
     if args.command in {"doctor", "smoke"}:
         started = time.perf_counter()
+        doctor_cfg: Config | None = None
+        doctor_service: LocalKnowledgeService | None = None
         try:
+            doctor_cfg = resolve_config(args.hermes_home)
+            doctor_service = _service(
+                doctor_cfg,
+                build_index_fn=build_index_fn,
+                search_index_fn=search_index_fn,
+                get_artifact_fn=get_artifact_fn,
+                get_neighbors_fn=get_neighbors_fn,
+            )
             payload, status = _doctor_payload(
                 args,
                 build_index_fn=build_index_fn,
                 search_index_fn=search_index_fn,
+                service=doctor_service,
             )
         except Exception as exc:
             payload = {
@@ -1039,7 +1089,7 @@ def main(
             Path(str(payload["state_dir"])) / "usage.sqlite" if payload.get("state_dir") else None
         )
         _record_cli_usage(
-            None,
+            doctor_cfg,
             tool="cli_doctor",
             success=status == 0,
             query=str(args.query or ""),
@@ -1052,6 +1102,7 @@ def main(
             db_path=doctor_db_path,
             index_meta=payload,
             usage_db_path=doctor_usage_db_path,
+            service=doctor_service,
         )
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))

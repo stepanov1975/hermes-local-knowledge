@@ -1,126 +1,106 @@
-# local_knowledge installed
+# `local_knowledge` installed
 
-Enable the plugin if you did not pass `--enable`:
+## 1. Enable the plugin
+
+Skip this if installation used `--enable`:
 
 ```bash
 hermes plugins enable local_knowledge
 ```
 
-## Required installer conversation: automatic OKF generation
+## 2. Obtain explicit model-token consent
 
-Automatic OKF generation is a **vital part of the plugin's intended functionality**. The plugin can still search existing artifacts when it is disabled, but functionality is degraded: real tool usage is queued without being automatically converted into new tool-routing OKFs, so coverage does not improve automatically.
+Existing-artifact lookup works with automatic tool-OKF generation disabled. Automatic generation is off by default because a detached worker invokes the active Hermes model and consumes additional tokens.
 
-It remains an explicit opt-in because a detached worker invokes the active model after session finalization and consumes additional tokens. The worker passes `max_generation_seconds` as each provider-request timeout; Hermes retry/fallback policy can extend total worker lifetime, but `/new`, `/reset`, session expiry, and CLI exit do not wait for it. An AI agent performing the installation **must not declare the installation complete** until it has:
+Before changing the setting, explain that one worker claims at most `max_candidates_per_session` candidates (default `2`), makes one structured batch call when it has claims, and passes `max_generation_seconds` as the provider-request timeout. Provider retry/fallback policy can extend elapsed time and token use behind that host call, but session finalization does not wait for the worker.
 
-1. explained the degraded behavior when automatic generation is off;
-2. disclosed the bounded background model-token cost; and
-3. asked the user explicitly: **"Enable automatic OKF generation now? (Recommended; uses additional model tokens.)"**
+Ask:
 
-Only after the user agrees, enable it:
+> Enable automatic OKF generation now? (Recommended; uses additional model tokens.)
+
+Only after the user agrees:
 
 ```bash
 hermes config set local_knowledge.okf.enabled true
 hermes config set local_knowledge.okf.auto_generate true
 ```
 
-If it is already enabled, report that fact instead of asking again. If the user declines, leave it disabled and clearly report that the installation is operating in degraded/manual-OKF mode.
+If it is already enabled, report that. If the user declines, leave `auto_generate` disabled and report that search and manual OKF management work, but new routing notes will not be generated automatically.
 
-Install the routing skill too. The plugin registers the `knowledge_*` tools, but a normal installed skill tells Hermes when to use them proactively for local runbooks, scripts, cron jobs, MCP wrappers, and custom skills:
+## 3. Install the proactive router skill
 
 ```bash
-hermes local-knowledge install-router-skill
+hermes local-knowledge install-router-skill --json
 ```
 
-The command is cross-platform, installs the skill bundled with this plugin version, and is safe to rerun. An AI installer should add `--json` and treat `installed` or `current` as success. If it reports `conflict`, stop and review the existing skill; do not use `--force` unless replacing that customized file is intentional.
+`installed` and `current` are successful. If the result is `conflict`, review the existing skill before using `--force`.
 
-The plugin also registers the same file as the read-only namespaced skill `local_knowledge:local-knowledge-router` for explicit `skill_view(...)` loads. That does not replace installing the normal skill above, because plugin skills are not in the proactive available-skill index.
+The namespaced plugin skill `local_knowledge:local-knowledge-router` is available for explicit loads, but it is not in the proactive skill index and does not replace the normal installed skill.
 
-After adding the skill, start a fresh Hermes session or run `/reload-skills` and then `/new`/`/reset` so the router instructions enter the prompt.
+## 4. Configure source and state
 
-Recommended pattern: set `source_root` to a high-signal local operational/customization repo (runbooks, helper scripts, custom skills). The plugin still indexes runtime `$HERMES_HOME/skills`, cron jobs, and MCP config separately, so `source_root` does not need to be the whole Hermes home.
-
-Recommended config in `~/.hermes/config.yaml`:
+Use a high-signal local operations/customization tree as `source_root`; runtime skills, cron jobs, and MCP configuration are still read separately from `$HERMES_HOME`. Keep `state_dir` outside source control.
 
 ```yaml
 local_knowledge:
-  source_root: ~/repos/<your-local-docs-or-customizations>  # high-signal directory to index
-  state_dir: ~/.hermes/local_knowledge                      # generated sqlite/jsonl/usage state
-  custom_skill_dirs: [custom_skills]                         # YAML list
-  script_dirs: [scripts, hermes_home/scripts]                # YAML list
+  source_root: ~/repos/local-operations
+  state_dir: ~/.hermes/local_knowledge
+  custom_skill_dirs: [custom_skills]
+  script_dirs: [scripts, hermes_home/scripts]
   include_markdown_docs: true
-  exclude_dir_names: [build, dist]                            # extra dirs to skip (merged with built-in defaults)
+  exclude_dir_names: [build, dist]
   okf:
     enabled: true
-    auto_generate: true                                      # full automatic OKF functionality; uses model tokens
+    auto_generate: false  # set true only after the consent step
 ```
 
-Full functionality requires `local_knowledge.okf.auto_generate: true`. The runtime default is intentionally `false` so installation does not silently consume model tokens. The installer must follow the required disclosure-and-consent conversation above before changing it. If the user declines, existing-artifact lookup and the manual OKF workflow remain available, but the installation must be reported as degraded/manual-OKF mode because it will not automatically create new tool-routing knowledge from real usage.
-
-CLI-safe equivalent. `hermes config set` stores scalar strings; the plugin accepts comma-separated values for list-like settings:
+CLI-safe scalar/list form:
 
 ```bash
-hermes config set local_knowledge.source_root "$HOME/repos/your-local-docs-or-customizations"
+hermes config set local_knowledge.source_root "$HOME/repos/local-operations"
 hermes config set local_knowledge.state_dir "$HOME/.hermes/local_knowledge"
 hermes config set local_knowledge.custom_skill_dirs custom_skills
 hermes config set local_knowledge.script_dirs scripts,hermes_home/scripts
 hermes config set local_knowledge.include_markdown_docs true
 hermes config set local_knowledge.exclude_dir_names build,dist
-hermes config set local_knowledge.okf.enabled true
-hermes config set local_knowledge.okf.auto_generate true
 ```
 
-You can omit `source_root` to index only this Hermes profile's runtime artifacts under `$HERMES_HOME`. If `$HERMES_HOME/hermes-agent` exists, the plugin warns because broad Hermes-home indexing can be noisy.
+If `source_root` is omitted, it defaults to `$HERMES_HOME`; arbitrary root-level Markdown is then excluded by default to avoid a noisy broad scan.
 
-Create a scheduled rebuild for the index. The tools rebuild automatically only when the database is missing or a lookup uses `rebuild=true`; normal searches reuse the existing index. A cron rebuild keeps local skills, scripts, runbooks, cron jobs, and MCP config fresh for agents that do not know the source tree changed.
-
-```bash
-export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME/scripts"
-cat > "$HERMES_HOME/scripts/rebuild_local_knowledge_index.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-cd "$HERMES_HOME/plugins/local_knowledge"
-python -m hermes_local_knowledge.cli build --from-hermes-config --hermes-home "$HERMES_HOME" >/dev/null
-EOF
-chmod +x "$HERMES_HOME/scripts/rebuild_local_knowledge_index.sh"
-hermes cron create \
-  --name 'local_knowledge index rebuild' \
-  --script rebuild_local_knowledge_index.sh \
-  --no-agent \
-  --deliver local \
-  '0 * * * *'
-```
-
-Successful runs are silent because the script prints nothing; failures still produce a cron alert.
-
-Smoke check the install/config. CLI commands write to the same local `usage.sqlite` telemetry store, so smoke checks show up in `knowledge_usage_report` alongside native tool calls:
+## 5. Run the doctor
 
 ```bash
-hermes local-knowledge doctor
 hermes local-knowledge doctor --json
 hermes local-knowledge doctor --rebuild --query "backup runbook"
 ```
 
-`doctor` keeps missing/full-function options nonfatal, but reports whether the proactive router skill is installed and current and whether automatic OKF generation is enabled. Installer agents should resolve or explicitly explain these warnings before declaring setup complete.
+The doctor treats a missing/outdated router skill and disabled automatic OKF generation as nonfatal warnings. Resolve them or report the deliberate choice before calling installation complete.
 
-Restart the gateway or start a new Hermes session for the tools to appear.
-If you are already talking to Hermes through the gateway, use `/restart`; from a separate shell, run:
-
-```bash
-hermes gateway restart
-```
-
-For public installs, HTTPS does not require GitHub SSH keys:
+From an unregistered source checkout, use:
 
 ```bash
-hermes plugins install https://github.com/stepanov1975/hermes-local-knowledge.git --enable
+python -m hermes_local_knowledge.cli doctor \
+  --hermes-home "${HERMES_HOME:-$HOME/.hermes}" \
+  --rebuild \
+  --query "backup runbook"
 ```
 
-SSH also works when your host has GitHub SSH keys configured:
+## 6. Refresh explicitly when ordinary sources change
+
+Managed lookups rebuild a missing, corrupt, older-format, or OKF-dirty index. They do not detect ordinary source-file, cron-registry, or MCP-config changes.
+
+After such a change, pass `rebuild=true` to a native lookup or run:
 
 ```bash
-hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --enable
+python -m hermes_local_knowledge.cli build --from-hermes-config
 ```
+
+No cron job is required. If an operator needs a fixed freshness interval, that explicit build command may be scheduled as an optional local policy.
+
+## 7. Reload only what changed
+
+- After installing/changing the router skill: run `/reload-skills`, then `/new` or `/reset`, or start a fresh session.
+- After first enabling the plugin or updating loaded plugin code: restart the gateway from outside its running process, or use `/restart` from gateway chat.
+- Configuration edits and index rebuilds do not by themselves require a gateway restart.
 
 The plugin provides `knowledge_search`, `knowledge_get`, `knowledge_neighbors`, `knowledge_feedback`, and `knowledge_usage_report`.

@@ -6,8 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .search import search_index
-from .storage import connect_readonly, decode_artifact_row
+from .index import connect_readonly, decode_artifact_row, search_index
 
 POSITIVE_FEEDBACK_RATINGS = frozenset({"useful", "great"})
 IGNORED_LABEL_VALUES = frozenset({"", "none", "null", "xxxx", "sentinel unlikely", "demo"})
