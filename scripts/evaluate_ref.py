@@ -185,7 +185,7 @@ def _action_materialize_fixture(request: dict[str, Any], ref_root: Path) -> dict
     spec.loader.exec_module(test_module)
     builder = getattr(test_module, "build_fixture", None)
     if not callable(builder):
-        raise AttributeError("pinned tests/test_indexer.py has no build_fixture")
+        raise AttributeError("selected fixture module has no build_fixture")
     source_root, hermes_home = builder(destination)
     return {
         "source_root": str(Path(source_root).resolve()),

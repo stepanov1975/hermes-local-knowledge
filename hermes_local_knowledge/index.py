@@ -2,31 +2,48 @@
 from __future__ import annotations
 
 import getpass
+import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
+import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from collections.abc import Callable
 from typing import Any, Iterator, Literal, Sequence, overload
 
 from . import __version__
 from .artifacts import Artifact, Edge, build_edges, collect_artifacts
 from .config import IndexSettings
 
+try:  # POSIX
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised by platform compatibility checks
+    _fcntl = None  # type: ignore[assignment]
+
+try:  # Windows
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - unavailable on POSIX
+    _msvcrt = None  # type: ignore[assignment]
+
 INDEX_FORMAT_VERSION = 4
-INDEX_BUILD_LOCK_NAME = "index_build.sqlite"
-LEGACY_INDEX_BUILD_LOCK_NAME = "index_build.lock"
+INDEX_BUILD_LOCK_NAME = "index_build.lock"
+INDEX_BUILD_TRANSACTION_LOCK_NAME = "index_build.sqlite"
 INDEX_BUILD_LOCK_WAIT_SECONDS = 120.0
 SQLITE_REPLACE_ATTEMPTS = 20
 SQLITE_REPLACE_RETRY_SECONDS = 0.05
 DIRTY_MARKER_NAME = "okf_index_dirty"
 FTS_BM25_WEIGHTS = "0.0, 0.2, 6.0, 1.0, 3.0, 2.0, 5.0, 0.4"
+_INDEX_BUILD_LOCK_STATE = threading.local()
+_LEGACY_INDEX_BUILD_LOCK_FDS: set[int] = set()
+_SQLITE_INDEX_BUILD_LOCK_CONNECTIONS: dict[int, sqlite3.Connection] = {}
+_INDEX_BUILD_LOCK_RESOURCES_MUTEX = threading.Lock()
 _TABLE_SIGNATURES = {
     "artifacts": (
         ("id", "TEXT", 0, 1),
@@ -189,30 +206,173 @@ def _refuse_newer_index(db_path: Path) -> None:
         raise NewerIndexFormatError(expected_version=INDEX_FORMAT_VERSION, actual_version=version)
 
 
-@contextmanager
-def index_build_lock(output_dir: Path) -> Iterator[Path]:
-    """Serialize builders with SQLite's process-safe transaction lock."""
+def _before_fork() -> None:
+    _INDEX_BUILD_LOCK_RESOURCES_MUTEX.acquire()
 
-    output_dir = output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = output_dir / INDEX_BUILD_LOCK_NAME
-    connection = sqlite3.connect(
-        str(lock_path),
-        timeout=INDEX_BUILD_LOCK_WAIT_SECONDS,
-        isolation_level=None,
+
+def _after_fork_in_parent() -> None:
+    _INDEX_BUILD_LOCK_RESOURCES_MUTEX.release()
+
+
+def _after_fork_in_child() -> None:
+    global _INDEX_BUILD_LOCK_STATE
+    for connection in tuple(_SQLITE_INDEX_BUILD_LOCK_CONNECTIONS.values()):
+        try:
+            connection.close()
+        except sqlite3.Error:
+            pass
+    _SQLITE_INDEX_BUILD_LOCK_CONNECTIONS.clear()
+    for fd in tuple(_LEGACY_INDEX_BUILD_LOCK_FDS):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _LEGACY_INDEX_BUILD_LOCK_FDS.clear()
+    _INDEX_BUILD_LOCK_STATE = threading.local()
+    _INDEX_BUILD_LOCK_RESOURCES_MUTEX.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_in_parent,
+        after_in_child=_after_fork_in_child,
     )
+
+
+def _held_index_build_locks() -> dict[str, int]:
+    held = getattr(_INDEX_BUILD_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        setattr(_INDEX_BUILD_LOCK_STATE, "held", held)
+    return held
+
+
+def _open_legacy_index_build_lock(path: Path) -> int:
+    with _INDEX_BUILD_LOCK_RESOURCES_MUTEX:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        _LEGACY_INDEX_BUILD_LOCK_FDS.add(fd)
+    try:
+        if _fcntl is None and os.fstat(fd).st_size < 1:
+            os.write(fd, b"\0")
+            os.fsync(fd)
+        return fd
+    except BaseException:
+        _close_legacy_index_build_lock(fd)
+        raise
+
+
+def _close_legacy_index_build_lock(fd: int) -> None:
+    with _INDEX_BUILD_LOCK_RESOURCES_MUTEX:
+        if fd not in _LEGACY_INDEX_BUILD_LOCK_FDS:
+            return
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        _LEGACY_INDEX_BUILD_LOCK_FDS.discard(fd)
+
+
+def _try_acquire_legacy_index_build_lock(fd: int) -> bool:
+    if _fcntl is not None:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    if _msvcrt is not None:  # pragma: no cover - Windows-only behavior
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        except OSError:
+            return False
+        return True
+    raise RuntimeError("index build locking is unsupported on this platform")
+
+
+def _release_legacy_index_build_lock(fd: int) -> None:
+    if fd not in _LEGACY_INDEX_BUILD_LOCK_FDS:
+        return
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        elif _msvcrt is not None:  # pragma: no cover - Windows-only behavior
+            os.lseek(fd, 0, os.SEEK_SET)
+            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+    except OSError:
+        # A fork-child reset may already have closed this inherited descriptor.
+        pass
+
+
+@contextmanager
+def _sqlite_index_build_lock(lock_path: Path) -> Iterator[Path]:
+    with _INDEX_BUILD_LOCK_RESOURCES_MUTEX:
+        connection = sqlite3.connect(
+            str(lock_path),
+            timeout=INDEX_BUILD_LOCK_WAIT_SECONDS,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        connection_key = id(connection)
+        _SQLITE_INDEX_BUILD_LOCK_CONNECTIONS[connection_key] = connection
     try:
         lock_path.chmod(0o600)
         connection.execute(f"PRAGMA busy_timeout={int(INDEX_BUILD_LOCK_WAIT_SECONDS * 1000)}")
         connection.execute("CREATE TABLE IF NOT EXISTS lock_state (name TEXT PRIMARY KEY)")
         connection.execute("BEGIN EXCLUSIVE")
         yield lock_path
-        connection.commit()
-    except Exception:
-        connection.rollback()
+        if _SQLITE_INDEX_BUILD_LOCK_CONNECTIONS.get(connection_key) is connection:
+            connection.commit()
+    except BaseException:
+        if _SQLITE_INDEX_BUILD_LOCK_CONNECTIONS.get(connection_key) is connection:
+            connection.rollback()
         raise
     finally:
-        connection.close()
+        with _INDEX_BUILD_LOCK_RESOURCES_MUTEX:
+            if _SQLITE_INDEX_BUILD_LOCK_CONNECTIONS.get(connection_key) is connection:
+                try:
+                    connection.close()
+                finally:
+                    _SQLITE_INDEX_BUILD_LOCK_CONNECTIONS.pop(connection_key, None)
+
+
+@contextmanager
+def index_build_lock(output_dir: Path) -> Iterator[Path]:
+    """Hold the v0.3.12 file gate, then the format-4 SQLite transaction lock."""
+
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    legacy_lock_path = output_dir / INDEX_BUILD_LOCK_NAME
+    sqlite_lock_path = output_dir / INDEX_BUILD_TRANSACTION_LOCK_NAME
+    lock_key = str(legacy_lock_path)
+    held = _held_index_build_locks()
+    if held.get(lock_key, 0):
+        held[lock_key] += 1
+        try:
+            yield sqlite_lock_path
+        finally:
+            held[lock_key] -= 1
+        return
+
+    fd = _open_legacy_index_build_lock(legacy_lock_path)
+    deadline = time.monotonic() + INDEX_BUILD_LOCK_WAIT_SECONDS
+    legacy_acquired = False
+    try:
+        while not _try_acquire_legacy_index_build_lock(fd):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for index build lock: {legacy_lock_path}")
+            time.sleep(0.05)
+        legacy_acquired = True
+        with _sqlite_index_build_lock(sqlite_lock_path):
+            held[lock_key] = 1
+            try:
+                yield sqlite_lock_path
+            finally:
+                held.pop(lock_key, None)
+    finally:
+        if legacy_acquired:
+            _release_legacy_index_build_lock(fd)
+        _close_legacy_index_build_lock(fd)
 
 
 def _dirty_tokens(output_dir: Path) -> tuple[Path, ...]:
@@ -226,6 +386,21 @@ def _temporary_path(output_dir: Path, name: str) -> Path:
     descriptor, raw_path = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=output_dir)
     os.close(descriptor)
     return Path(raw_path)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_file_for_rollback(source: Path, destination: Path) -> None:
+    with source.open("rb") as source_handle, destination.open("wb") as destination_handle:
+        shutil.copyfileobj(source_handle, destination_handle)
+        destination_handle.flush()
+        os.fsync(destination_handle.fileno())
 
 
 def _write_jsonl(path: Path, artifacts: Sequence[Artifact]) -> None:
@@ -245,6 +420,7 @@ def _build_sqlite(
     *,
     source_root: Path,
     build_duration_ms: int,
+    jsonl_sha256: str = "",
 ) -> None:
     connection = sqlite3.connect(str(path))
     try:
@@ -339,6 +515,7 @@ def _build_sqlite(
             "built_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "edge_count": str(len(edges)),
             "format_version": str(INDEX_FORMAT_VERSION),
+            "jsonl_sha256": jsonl_sha256,
             "plugin_version": __version__,
             "source_root": str(source_root),
         }
@@ -368,6 +545,8 @@ def _validate_sqlite(
     path: Path,
     expected_ids: set[str] | None = None,
     expected_edges: int | None = None,
+    *,
+    jsonl_path: Path | None = None,
 ) -> None:
     connection = connect_readonly(path)
     try:
@@ -428,6 +607,7 @@ def _validate_sqlite(
             "built_at",
             "edge_count",
             "format_version",
+            "jsonl_sha256",
             "plugin_version",
             "source_root",
         }
@@ -439,6 +619,14 @@ def _validate_sqlite(
             raise ValueError("SQLite metadata artifact count is incorrect")
         if int(metadata["edge_count"]) != edge_count:
             raise ValueError("SQLite metadata edge count is incorrect")
+        expected_jsonl_hash = metadata["jsonl_sha256"]
+        companion_path = jsonl_path if jsonl_path is not None else path.with_name("index.jsonl")
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", expected_jsonl_hash) is None
+            or not companion_path.is_file()
+            or _sha256_file(companion_path) != expected_jsonl_hash
+        ):
+            raise ValueError("SQLite metadata does not match the companion JSONL")
         if int(metadata["build_duration_ms"]) < 0:
             raise ValueError("SQLite metadata build duration is incorrect")
         if not metadata["built_at"] or not metadata["plugin_version"] or not metadata["source_root"]:
@@ -491,6 +679,7 @@ def _build_locked(
     build_edges_fn: Callable[[Sequence[Artifact]], list[Edge]],
 ) -> tuple[list[Artifact], list[Edge]]:
     db_path = output_dir / "index.sqlite"
+    jsonl_path = output_dir / "index.jsonl"
     _refuse_newer_index(db_path)
     covered_tokens = _dirty_tokens(output_dir)
     started = time.perf_counter()
@@ -509,26 +698,46 @@ def _build_locked(
 
     sqlite_temp = _temporary_path(output_dir, "index.sqlite")
     jsonl_temp = _temporary_path(output_dir, "index.jsonl")
+    jsonl_backup: Path | None = None
     try:
+        _write_jsonl(jsonl_temp, artifacts)
+        _validate_jsonl(jsonl_temp, expected_ids)
+        jsonl_sha256 = _sha256_file(jsonl_temp)
         _build_sqlite(
             sqlite_temp,
             artifacts,
             edges,
             source_root=root,
             build_duration_ms=duration_ms,
+            jsonl_sha256=jsonl_sha256,
         )
-        _write_jsonl(jsonl_temp, artifacts)
-        _validate_sqlite(sqlite_temp, expected_ids, len(edges))
-        _validate_jsonl(jsonl_temp, expected_ids)
+        _validate_sqlite(
+            sqlite_temp,
+            expected_ids,
+            len(edges),
+            jsonl_path=jsonl_temp,
+        )
         _refuse_newer_index(db_path)
-        os.replace(jsonl_temp, output_dir / "index.jsonl")
-        _replace_with_retry(sqlite_temp, db_path)
+        if db_path.is_file() and jsonl_path.is_file():
+            jsonl_backup = _temporary_path(output_dir, "index.jsonl.rollback")
+            _copy_file_for_rollback(jsonl_path, jsonl_backup)
+        os.replace(jsonl_temp, jsonl_path)
+        try:
+            _replace_with_retry(sqlite_temp, db_path)
+        except BaseException:
+            if jsonl_backup is not None:
+                os.replace(jsonl_backup, jsonl_path)
+            else:
+                jsonl_path.unlink(missing_ok=True)
+            raise
         for token in covered_tokens:
             token.unlink(missing_ok=True)
         return artifacts, edges
     finally:
         sqlite_temp.unlink(missing_ok=True)
         jsonl_temp.unlink(missing_ok=True)
+        if jsonl_backup is not None:
+            jsonl_backup.unlink(missing_ok=True)
 
 
 def _build_index_with_dependencies(
@@ -609,7 +818,7 @@ def build_index(
     *,
     force: bool = True,
 ) -> tuple[list[Artifact], list[Edge]] | None:
-    """Collect, validate, and atomically publish a format-4 local index."""
+    """Collect and publish a validated, recoverable format-4 index pair."""
 
     return _build_index_with_dependencies(
         root,

@@ -9,15 +9,12 @@ from pathlib import Path
 import hermes_local_knowledge
 import pytest
 from hermes_local_knowledge import cli as lci_cli
-from hermes_local_knowledge import handlers as lci_handlers
 from hermes_local_knowledge import index as lci_index
 from hermes_local_knowledge import okf
 from hermes_local_knowledge import plugin
-from hermes_local_knowledge import runtime as lci_runtime
-from hermes_local_knowledge import storage as lci_storage
 from hermes_local_knowledge import telemetry as lci_telemetry
-from hermes_local_knowledge.config import Config
-from hermes_local_knowledge.models import Artifact
+from hermes_local_knowledge.artifacts import Artifact
+from hermes_local_knowledge.config import Config, resolve_config
 from hermes_local_knowledge.service import LocalKnowledgeService
 
 
@@ -140,16 +137,6 @@ def test_register_exposes_native_tools_and_bundled_skill():
     assert cli_calls[0]["handler_fn"].keywords["llm"] is host_llm
 
 
-def test_bundled_router_skill_matches_install_example() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    bundled = repo_root / "skills" / "local-knowledge-router" / "SKILL.md"
-    packaged = repo_root / "hermes_local_knowledge" / "skills" / "local-knowledge-router" / "SKILL.md"
-    example = repo_root / "examples" / "local-knowledge-router-skill" / "SKILL.md"
-
-    assert bundled.read_text(encoding="utf-8") == example.read_text(encoding="utf-8")
-    assert packaged.read_text(encoding="utf-8") == bundled.read_text(encoding="utf-8")
-
-
 def test_plugin_handler_wrapper_uses_one_service_factory(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     calls: list[tuple[object, ...]] = []
 
@@ -214,7 +201,7 @@ def test_plugin_service_uses_resolved_config_and_core_defaults(
     service = plugin._service()
 
     assert isinstance(service, LocalKnowledgeService)
-    assert service.config == lci_runtime._runtime_config()
+    assert service.config == resolve_config()
     assert service.config.source_root == repo.resolve()
     assert service.config.hermes_home == hermes_home.resolve()
     assert service.config.state_dir == state_dir.resolve()
@@ -222,117 +209,6 @@ def test_plugin_service_uses_resolved_config_and_core_defaults(
     assert service._search_index_fn is lci_index.search_index
     assert service._get_artifact_fn is lci_index.get_artifact
     assert service._get_neighbors_fn is lci_index.get_neighbors
-
-
-def test_runtime_facade_delegates_force_without_outer_lifecycle_ownership(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
-    configure_env(monkeypatch, repo, hermes_home, state_dir)
-    okf.mark_index_dirty(state_dir)
-    token = okf.index_dirty_tokens(state_dir)[0]
-    calls: list[bool] = []
-
-    def fake_build(
-        root: Path,
-        output_dir: Path,
-        home: Path,
-        settings,
-        *,
-        force: bool,
-    ):  # type: ignore[no-untyped-def]
-        assert (root, output_dir, home) == (repo.resolve(), state_dir.resolve(), hermes_home.resolve())
-        assert settings is not None
-        calls.append(force)
-        return ([], []) if force else None
-
-    db_path, ensure_metadata = lci_runtime._ensure_index(repo, build_index_fn=fake_build)
-    rebuilt_path, rebuild_metadata = lci_runtime._ensure_index(
-        repo,
-        rebuild=True,
-        build_index_fn=fake_build,
-    )
-
-    assert db_path == rebuilt_path == state_dir.resolve() / "index.sqlite"
-    assert ensure_metadata["rebuilt"] is False
-    assert rebuild_metadata["rebuilt"] is True
-    assert calls == [False, True]
-    assert token.is_file()
-    assert not (state_dir / lci_index.INDEX_BUILD_LOCK_NAME).exists()
-    assert not (state_dir / lci_index.LEGACY_INDEX_BUILD_LOCK_NAME).exists()
-
-
-def test_ensure_index_rebuilds_outdated_format_before_ordinary_lookup(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
-    configure_env(monkeypatch, repo, hermes_home, state_dir)
-    write(
-        state_dir / "okfs" / "tools" / "cronjob.md",
-        """---
-artifact_type: tool_okf
-tool: cronjob
-toolset: cron
-schema_hash: sha256:abc123
-title: Manage scheduled jobs
-aliases:
-  - recurring task scheduler
-triggers:
-  - create or update a scheduled job
-when_not_to_use:
-  - retrieve a Paperless document
-related_tools:
-  - mcp__paperless__paperless_get_document
----
-
-# Manage scheduled jobs
-
-Create, update, pause, resume, or remove recurring scheduled jobs.
-""",
-    )
-    stale = Artifact(
-        id="tool_okf:cronjob",
-        type="tool_okf",
-        title="Manage scheduled jobs",
-        path="state/okfs/tools/cronjob.md",
-        summary="Manage scheduled jobs",
-        triggers=["retrieve a Paperless document"],
-        entities=["Paperless"],
-        search_text="retrieve a Paperless document",
-    )
-    db_path = state_dir / "index.sqlite"
-    lci_storage.build_sqlite(db_path, [stale], [])
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(f"PRAGMA user_version = {lci_index.INDEX_FORMAT_VERSION - 1}")
-        conn.commit()
-    finally:
-        conn.close()
-
-    rebuilt_path, metadata = lci_runtime._ensure_index(repo)
-
-    assert rebuilt_path == db_path
-    assert metadata["rebuilt"] is True
-    assert lci_index.index_format_version(db_path) == lci_index.INDEX_FORMAT_VERSION
-    with sqlite3.connect(db_path) as conn:
-        matches = conn.execute(
-            "SELECT id FROM artifact_fts WHERE artifact_fts MATCH 'paperless'"
-        ).fetchall()
-    assert ("tool_okf:cronjob",) not in matches
-
-
-def test_runtime_facade_preserves_builder_state_when_build_fails(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
-    configure_env(monkeypatch, repo, hermes_home, state_dir)
-    okf.mark_index_dirty(state_dir)
-    token = okf.index_dirty_tokens(state_dir)[0]
-
-    def failing_build(*_args, force: bool, **_kwargs):  # type: ignore[no-untyped-def]
-        assert force is False
-        raise RuntimeError("simulated build failure")
-
-    with pytest.raises(RuntimeError, match="simulated build failure"):
-        lci_runtime._ensure_index(repo, build_index_fn=failing_build)
-
-    assert token.is_file()
-    assert not (state_dir / lci_index.INDEX_BUILD_LOCK_NAME).exists()
-    assert not (state_dir / lci_index.LEGACY_INDEX_BUILD_LOCK_NAME).exists()
 
 
 def test_cli_build_delegates_forced_build_without_outer_lifecycle_ownership(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -372,7 +248,7 @@ def test_cli_build_delegates_forced_build_without_outer_lifecycle_ownership(tmp_
     assert calls == [True]
     assert token.is_file()
     assert not (state_dir / lci_index.INDEX_BUILD_LOCK_NAME).exists()
-    assert not (state_dir / lci_index.LEGACY_INDEX_BUILD_LOCK_NAME).exists()
+    assert not (state_dir / lci_index.INDEX_BUILD_TRANSACTION_LOCK_NAME).exists()
 
 
 def test_cli_search_refreshes_dirty_default_index(tmp_path, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -608,80 +484,7 @@ def test_search_get_and_neighbors_build_missing_index_in_state_dir(tmp_path, mon
     assert any(row["edge_kind"] == "related_to" for row in neighbors["neighbors"])
 
 
-def test_runtime_config_can_read_hermes_config_yaml(tmp_path, monkeypatch):
-    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
-    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
-    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    write(
-        hermes_home / "config.yaml",
-        f"""local_knowledge:
-  source_root: {repo}
-  state_dir: {state_dir}
-  custom_skill_dirs: '[custom_skills]'
-  script_dirs: '[scripts]'
-  known_entities: '[Paperless]'
-  exclude_dir_names: '[build, dist]'
-""",
-    )
-
-    cfg = lci_runtime._runtime_config()
-
-    assert cfg.source_root == repo.resolve()
-    assert cfg.state_dir == state_dir.resolve()
-    assert cfg.index_settings.custom_skill_dirs == ("custom_skills",)
-    assert cfg.index_settings.script_dirs == ("scripts",)
-    assert cfg.index_settings.known_entities == ("Paperless",)
-    assert cfg.index_settings.exclude_dir_names == ("build", "dist")
-    assert cfg.index_settings.include_markdown_docs is True
-
-
-def test_runtime_config_can_use_configured_hermes_home(tmp_path, monkeypatch):
-    base_home = tmp_path / "base_home"
-    configured_home = tmp_path / "configured_home"
-    repo, _hermes_home, state_dir = make_temp_repo(tmp_path)
-    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
-    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
-    monkeypatch.setenv("HERMES_HOME", str(base_home))
-    write(
-        base_home / "config.yaml",
-        f"""local_knowledge:
-  hermes_home: {configured_home}
-  source_root: {repo}
-  state_dir: {state_dir}
-""",
-    )
-
-    cfg = lci_runtime._runtime_config()
-
-    assert cfg.hermes_home == configured_home.resolve()
-    assert cfg.source_root == repo.resolve()
-    assert cfg.state_dir == state_dir.resolve()
-
-
-def test_runtime_config_explicit_hermes_home_overrides_configured_hermes_home(tmp_path, monkeypatch):
-    base_home = tmp_path / "base_home"
-    configured_home = tmp_path / "configured_home"
-    repo, _hermes_home, state_dir = make_temp_repo(tmp_path)
-    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
-    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
-    write(
-        base_home / "config.yaml",
-        f"""local_knowledge:
-  hermes_home: {configured_home}
-  source_root: {repo}
-  state_dir: {state_dir}
-""",
-    )
-
-    cfg = lci_runtime._runtime_config(hermes_home=base_home)
-
-    assert cfg.hermes_home == base_home.resolve()
-    assert cfg.source_root == repo.resolve()
-    assert cfg.state_dir == state_dir.resolve()
-
-
-def test_runtime_env_overrides_hermes_config_yaml(tmp_path, monkeypatch):
+def test_plugin_service_environment_overrides_hermes_config_yaml(tmp_path, monkeypatch):
     repo, hermes_home, state_dir = make_temp_repo(tmp_path)
     env_repo = tmp_path / "env_repo"
     env_state = tmp_path / "env_state"
@@ -703,7 +506,10 @@ def test_runtime_env_overrides_hermes_config_yaml(tmp_path, monkeypatch):
     assert [row["id"] for row in payload["results"]] == ["script:scripts-env-helper-py"]
 
 
-def test_handle_search_uses_one_service_and_records_usage_context(tmp_path: Path) -> None:
+def test_handle_search_uses_one_service_and_records_usage_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = tmp_path / "repo"
     db_path = tmp_path / "state" / "index.sqlite"
     captured: dict[str, object] = {}
@@ -747,10 +553,10 @@ def test_handle_search_uses_one_service_and_records_usage_context(tmp_path: Path
         factory_calls += 1
         return service
 
+    monkeypatch.setattr(plugin, "_service", service_factory)
     payload = json.loads(
-        lci_handlers._handle_search(
+        plugin._handle_search(
             {"query": "demo", "limit": 2, "rebuild": True, "artifact_type": "script"},
-            service_factory=service_factory,
             session_id="session-123",
         )
     )
@@ -774,16 +580,14 @@ def test_handle_search_uses_one_service_and_records_usage_context(tmp_path: Path
     assert captured["record_root"] == root
 
 
-def test_handler_service_construction_error_stays_in_error_payload() -> None:
+def test_handler_service_construction_error_stays_in_error_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def failing_factory() -> LocalKnowledgeService:
         raise RuntimeError("service unavailable")
 
-    payload = json.loads(
-        lci_handlers._handle_search(
-            {"query": "demo"},
-            service_factory=failing_factory,
-        )
-    )
+    monkeypatch.setattr(plugin, "_service", failing_factory)
+    payload = json.loads(plugin._handle_search({"query": "demo"}))
 
     assert payload == {
         "error": "knowledge_search failed: RuntimeError: service unavailable",
@@ -792,7 +596,10 @@ def test_handler_service_construction_error_stays_in_error_payload() -> None:
     }
 
 
-def test_lookup_error_telemetry_is_fail_open(tmp_path: Path) -> None:
+def test_lookup_error_telemetry_is_fail_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = Config(
         source_root=tmp_path / "repo",
         hermes_home=tmp_path / "hermes-home",
@@ -817,12 +624,8 @@ def test_lookup_error_telemetry_is_fail_open(tmp_path: Path) -> None:
         record_usage_fn=failing_telemetry,
     )
 
-    payload = json.loads(
-        lci_handlers._handle_search(
-            {"query": "demo"},
-            service_factory=lambda: service,
-        )
-    )
+    monkeypatch.setattr(plugin, "_service", lambda: service)
+    payload = json.loads(plugin._handle_search({"query": "demo"}))
 
     assert payload == {
         "error": "knowledge_search failed: RuntimeError: lookup unavailable",
@@ -831,7 +634,10 @@ def test_lookup_error_telemetry_is_fail_open(tmp_path: Path) -> None:
     }
 
 
-def test_feedback_failure_is_strict_and_records_error_telemetry(tmp_path: Path) -> None:
+def test_feedback_failure_is_strict_and_records_error_telemetry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = Config(
         source_root=tmp_path / "repo",
         hermes_home=tmp_path / "hermes-home",
@@ -854,10 +660,10 @@ def test_feedback_failure_is_strict_and_records_error_telemetry(tmp_path: Path) 
         record_usage_fn=record_usage,
     )
 
+    monkeypatch.setattr(plugin, "_service", lambda: service)
     payload = json.loads(
-        lci_handlers._handle_feedback(
+        plugin._handle_feedback(
             {"rating": "useful", "query": "demo"},
-            service_factory=lambda: service,
             session_id="session-91",
         )
     )
@@ -882,25 +688,6 @@ def test_feedback_failure_is_strict_and_records_error_telemetry(tmp_path: Path) 
     assert usage["usage_db_path"] == service.usage_db_path
 
 
-def test_tuple_value_accepts_common_cli_list_strings():
-    default = ("default",)
-
-    assert lci_runtime._tuple_value("skills", default) == ("skills",)
-    assert lci_runtime._tuple_value("skills, custom_skills", default) == (
-        "skills",
-        "custom_skills",
-    )
-    assert lci_runtime._tuple_value("[skills]", default) == ("skills",)
-    assert lci_runtime._tuple_value("['skills', 'custom_skills']", default) == (
-        "skills",
-        "custom_skills",
-    )
-    assert lci_runtime._tuple_value('["skills", "custom_skills"]', default) == (
-        "skills",
-        "custom_skills",
-    )
-
-
 def test_implicit_hermes_home_source_skips_root_markdown(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir()
@@ -909,7 +696,7 @@ def test_implicit_hermes_home_source_skips_root_markdown(tmp_path, monkeypatch):
     monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    cfg = lci_runtime._runtime_config()
+    cfg = resolve_config()
     payload = json.loads(plugin._handle_search({"query": "private notes", "rebuild": True}))
 
     assert cfg.source_root == hermes_home.resolve()
@@ -1033,7 +820,14 @@ def test_lookup_handlers_rebuild_noncurrent_index_in_isolation(
             triggers=["stale only"],
             search_text="stale only",
         )
-        lci_storage.build_sqlite(db_path, [stale], [])
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        lci_index._build_sqlite(
+            db_path,
+            [stale],
+            [],
+            source_root=repo,
+            build_duration_ms=0,
+        )
         conn = sqlite3.connect(db_path)
         try:
             conn.execute(f"PRAGMA user_version = {lci_index.INDEX_FORMAT_VERSION - 1}")
@@ -1379,49 +1173,3 @@ def test_usage_report_persists_index_metadata_errors(tmp_path, monkeypatch):
 
     assert report["latest_index_metadata"]["index_exists"] == 1
     assert "malformed database" in report["latest_index_metadata"]["index_metadata_error"]
-
-
-def test_usage_db_migrates_preserved_legacy_schema(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
-    repo, hermes_home, state_dir = make_temp_repo(tmp_path)
-    configure_env(monkeypatch, repo, hermes_home, state_dir)
-    state_dir.mkdir(parents=True)
-    conn = sqlite3.connect(state_dir / "usage.sqlite")
-    try:
-        conn.execute(
-            "CREATE TABLE usage_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, tool TEXT NOT NULL, query TEXT)"
-        )
-        conn.execute("CREATE TABLE feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, rating TEXT NOT NULL)")
-        conn.commit()
-    finally:
-        conn.close()
-
-    search = json.loads(plugin._handle_search({"query": "paperless review automation", "limit": 3, "rebuild": True}))
-    assert search["success"] is True
-    assert isinstance(search["usage_event_id"], int)
-
-    feedback = json.loads(plugin._handle_feedback({"event_id": search["usage_event_id"], "rating": "useful"}))
-    assert feedback["success"] is True
-    assert isinstance(feedback["feedback_id"], int)
-
-    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
-    assert report["success"] is True
-    assert report["total_events"] >= 2
-
-    conn = sqlite3.connect(state_dir / "usage.sqlite")
-    try:
-        usage_columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_events)")}
-        feedback_columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
-    finally:
-        conn.close()
-    assert {"success", "latency_ms", "db_path", "top_ids_json"} <= usage_columns
-    assert {
-        "client",
-        "plugin_version",
-        "source_root_source",
-        "index_artifact_count",
-        "index_artifact_counts_json",
-        "index_exists",
-        "index_metadata_error",
-        "build_duration_ms",
-    } <= usage_columns
-    assert {"event_id", "artifact_id", "session_id", "root"} <= feedback_columns

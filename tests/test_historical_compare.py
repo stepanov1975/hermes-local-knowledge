@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from hermes_local_knowledge import index as lci_index
 from hermes_local_knowledge import indexer as lci
 
 
@@ -138,8 +139,14 @@ def build_tiny_index(state_dir: Path, *, title: str = "Alpha", search_text: str 
     ]
     edges = [lci.Edge("skill:alpha", "script:alpha", "related_to", edge_evidence)]
     state_dir.mkdir(parents=True, exist_ok=True)
-    lci.write_jsonl(state_dir / "index.jsonl", artifacts)
-    lci.build_sqlite(state_dir / "index.sqlite", artifacts, edges)
+    lci_index._write_jsonl(state_dir / "index.jsonl", artifacts)
+    lci_index._build_sqlite(
+        state_dir / "index.sqlite",
+        artifacts,
+        edges,
+        source_root=state_dir,
+        build_duration_ms=0,
+    )
 
 
 def test_compare_helper_ref_names_are_collision_resistant() -> None:

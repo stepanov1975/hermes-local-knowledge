@@ -9,7 +9,17 @@ from typing import Any
 
 from . import __version__
 from .config import resolve_config
-from .schemas import FEEDBACK_RATINGS, NEGATIVE_FEEDBACK_RATINGS
+
+FEEDBACK_RATINGS = {
+    "useful",
+    "not_useful",
+    "missing",
+    "noisy",
+    "wrong_artifact",
+    "stale",
+    "other",
+}
+NEGATIVE_FEEDBACK_RATINGS = FEEDBACK_RATINGS - {"useful", "other"}
 
 RECENT_LIVE_ERROR_DAYS = 3
 PROBE_QUERIES = {"demo", "sentinel unlikely", "xxxx"}

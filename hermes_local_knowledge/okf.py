@@ -20,8 +20,6 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config, resolve_config
-from .paths import path_is_relative_to
-from .text_utils import parse_frontmatter, safe_read_text, slugify
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +111,66 @@ _GENERIC_NEGATIVE_GUIDANCE = re.compile(
 )
 
 
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return slug or "artifact"
+
+
+def _safe_read_text(path: Path, *, max_chars: int) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(max_chars)
+    except OSError:
+        return ""
+
+
+def _parse_bracket_list(value: str) -> list[str]:
+    clean = value.strip()
+    if clean.startswith("[") and clean.endswith("]"):
+        clean = clean[1:-1]
+    return [item.strip().strip("'\"") for item in clean.split(",") if item.strip().strip("'\"")]
+
+
+def _parse_frontmatter(text: str) -> dict[str, Any]:
+    if not text.startswith("---"):
+        return {}
+    frontmatter: dict[str, Any] = {}
+    current_key: str | None = None
+    for line in text.splitlines()[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if not stripped or stripped.startswith("#"):
+            continue
+        list_item = re.match(r"^[-*]\s+(.+)$", stripped)
+        if list_item and current_key:
+            current_value = frontmatter.get(current_key)
+            if isinstance(current_value, list):
+                current_value.append(list_item.group(1).strip().strip("'\""))
+            continue
+        match = re.match(r"^([A-Za-z0-9_.-]+):\s*(.*)$", stripped)
+        if not match:
+            continue
+        key, value = match.groups()
+        current_key = key
+        value = value.strip()
+        if not value:
+            frontmatter[key] = []
+        elif value.startswith("[") and value.endswith("]"):
+            frontmatter[key] = _parse_bracket_list(value)
+        else:
+            frontmatter[key] = value.strip("'\"")
+    return frontmatter
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -143,7 +201,7 @@ def okf_dir(state_dir: Path) -> Path:
 
 
 def okf_file_path(state_dir: Path, tool_name: str) -> Path:
-    return okf_dir(state_dir) / f"{slugify(tool_name)}.md"
+    return okf_dir(state_dir) / f"{_slugify(tool_name)}.md"
 
 
 def generation_lease_seconds(max_generation_seconds: int) -> int:
@@ -1411,18 +1469,18 @@ def validate_okf_file(
     allowed_root = okf_dir(resolved_state_dir)
     resolved_path = path.expanduser().resolve()
     resolved_content_path = (_content_path or path).expanduser().resolve()
-    if not path_is_relative_to(resolved_path, allowed_root):
+    if not _path_is_relative_to(resolved_path, allowed_root):
         errors.append(f"path must be under {allowed_root}")
-    if not path_is_relative_to(resolved_content_path, allowed_root):
+    if not _path_is_relative_to(resolved_content_path, allowed_root):
         errors.append(f"content path must be under {allowed_root}")
     if resolved_path.suffix != ".md":
         errors.append("OKF path must use .md suffix")
-    text = safe_read_text(resolved_content_path, max_chars=80_000)
+    text = _safe_read_text(resolved_content_path, max_chars=80_000)
     if not text:
         errors.append("OKF file is missing or empty")
     if _SECRET_ASSIGNMENT.search(text):
         errors.append("OKF file contains secret-like assignment text")
-    frontmatter = parse_frontmatter(text)
+    frontmatter = _parse_frontmatter(text)
     artifact_type = str(frontmatter.get("artifact_type") or "").strip()
     if artifact_type != "tool_okf":
         errors.append("frontmatter artifact_type must be tool_okf")
@@ -1830,7 +1888,7 @@ def _write_and_complete_item(
         nonlocal previous, published
         previous = path.read_bytes() if path.exists() else None
         if previous is not None:
-            existing_frontmatter = parse_frontmatter(previous.decode("utf-8", errors="replace"))
+            existing_frontmatter = _parse_frontmatter(previous.decode("utf-8", errors="replace"))
             existing_tool = str(existing_frontmatter.get("tool") or "").strip()
             if existing_tool and existing_tool != tool_name:
                 raise _OkfPathCollisionError("OKF target path belongs to a different tool")

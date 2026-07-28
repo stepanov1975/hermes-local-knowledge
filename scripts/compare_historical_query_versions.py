@@ -1839,11 +1839,15 @@ def _materialize_synthetic(
 ) -> tuple[dict[str, Path], list[dict[str, Any]], dict[str, Any]]:
     frozen_dir = ensure_private_directory(base_dir / "frozen")
     destination = frozen_dir / "synthetic"
+    fixture_file = baseline_checkout / "scripts" / "evaluation_fixture.py"
+    if not fixture_file.is_file():
+        # Pinned pre-rewrite refs kept the same deterministic builder in this test module.
+        fixture_file = baseline_checkout / "tests" / "test_indexer.py"
     output = _invoke_evaluator(
         baseline_checkout,
         {
             "action": "materialize_fixture",
-            "test_file": str(baseline_checkout / "tests" / "test_indexer.py"),
+            "test_file": str(fixture_file),
             "destination": str(destination),
         },
         base_dir / "requests",

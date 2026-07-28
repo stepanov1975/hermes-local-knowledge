@@ -40,10 +40,10 @@ A good pull request includes:
 - local verification output in the PR checklist.
 
 The version policy is checked in CI. Keep `plugin.yaml`, `pyproject.toml`, and
-`hermes_local_knowledge/__init__.py` synchronized. If a change touches runtime
-or package/plugin surfaces such as `hermes_local_knowledge/**`, `plugin.yaml`,
-`pyproject.toml`, `after-install.md`, or `examples/**`, bump the version in all
-three locations compared with the target branch.
+`hermes_local_knowledge/__init__.py` synchronized. If a change touches a
+release-relevant path—`__init__.py`, `hermes_local_knowledge/**`, `plugin.yaml`,
+`pyproject.toml`, `after-install.md`, `examples/**`, or `skills/**`—bump the
+version in all three locations compared with the target branch.
 
 Generated or local-only files must stay out of commits, including:
 

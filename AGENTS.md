@@ -1,131 +1,89 @@
-# Agent instructions for hermes-local-knowledge
+# Agent instructions for `hermes-local-knowledge`
 
 These instructions apply to the whole repository.
 
-## Start here
+## Before editing
 
-1. Read `README.md`, `CONTRIBUTING.md`, and `memory.md` before changing code.
-2. Check `git status --short --branch` and protect any existing dirty work.
-3. Keep changes focused. This is a small reusable Hermes Agent plugin; avoid speculative abstractions.
-4. Treat generated/local state as off limits for commits.
+1. Read `README.md`, `CONTRIBUTING.md`, and `memory.md`.
+2. Check `git status --short --branch`; preserve unrelated dirty work.
+3. Keep changes focused. Runtime dependencies remain Python standard library only unless a documented product need justifies otherwise.
+4. Never commit generated/local state or secrets.
 
-## Project invariants
+## Documented public boundaries
 
-- The plugin routes local questions to **whole artifacts**. Do not turn it into chunk RAG without an explicit design change.
-- Runtime dependencies should remain Python standard library only unless a strong reason is documented.
-- `indexer.py` and `plugin.py` are compatibility/public entry points. Preserve existing exports, CLI compatibility, and monkeypatch seams unless deliberately breaking them.
-- Handlers should return JSON-compatible success/error payloads for expected bad input; do not let malformed tool args crash normal plugin calls.
-- Config belongs in Hermes `config.yaml`; secrets belong in env/secret stores and must never be indexed or written to docs/tests.
+- Package version is synchronized in `plugin.yaml`, `pyproject.toml`, and `hermes_local_knowledge/__init__.py`.
+- The Python plugin entry point is `local_knowledge = hermes_local_knowledge.plugin`; `plugin.register` is the registration boundary.
+- Registration provides exactly five native tools (`knowledge_search`, `knowledge_get`, `knowledge_neighbors`, `knowledge_feedback`, `knowledge_usage_report`) and two hooks (`post_tool_call`, `on_session_finalize`).
+- `indexer.__all__` is exactly: `Artifact`, `Edge`, `IndexSettings`, `build_index`, `search_index`, `get_artifact`, `get_neighbors`, `main`.
+- `python -m hermes_local_knowledge.cli` is the primary standalone CLI. `python -m hermes_local_knowledge.indexer` is the preserved compatibility entry point. `hermes local-knowledge` is the smaller install/doctor surface; its worker command is host-internal.
+- Preserve documented configuration aliases and defaults. Do not preserve undocumented private call shapes merely because a test once patched them.
+- The three router-skill copies are an intentional packaging/install exception to DRY and must remain byte-identical with one equality assertion in `tests/test_public_contract.py`.
 
-## Files and state to avoid committing
+## Current owners
 
-Do not commit generated or local-only artifacts, including:
+- `config.py`: configuration models and resolution.
+- `artifacts.py`: whole-artifact models, collection, privacy-safe metadata, graph edges.
+- `index.py`: format-4 persistence, cross-version/SQLite build locks, rebuild classification, deterministic retrieval.
+- `telemetry.py`: usage/feedback persistence and reports.
+- `evaluation.py`: read-only feedback replay and metrics.
+- `service.py`: managed index and telemetry lifecycle for one resolved config.
+- `okf.py`: safe OKF queue, hooks, worker, validation, fenced publication.
+- `plugin.py`: Hermes tools/hooks/skill/CLI registration.
+- `cli.py`: standalone and Hermes CLI adapters.
+- `indexer.py`: thin compatibility facade.
+- `__init__.py`: package version.
 
-- `*.sqlite`, `*.sqlite3`, `*.db`, `*.jsonl`;
-- `knowledge/`, `state/`, `logs/`, `tmp/`;
-- `.coverage`, `htmlcov/`, `.pytest_cache/`, `.ruff_cache/`, `.mypy_cache/`;
-- `build/`, `dist/`, `*.egg-info/`;
-- `mutants/`, virtualenvs, `.env*`.
+## Product, ranking, and privacy invariants
 
-## Version policy
+- Route to whole artifacts; do not introduce chunk RAG without an explicit design change.
+- FTS is the primary broad-recall path. Deterministic identity/metadata retrieval is complementary, not a replacement.
+- Operational type promotion is narrow and query-gated. Quoted searches, explicit `artifact_type` filters, skill-parent lifting, and global per-parent support-doc diversity must retain their documented behavior.
+- Parent-equivalent evaluation only relates a `skill_support_doc` to its owning skill; graph neighbors are not evaluation equivalence.
+- Script search text uses routing-safe metadata, never arbitrary body literals.
+- Environment names may be routing signals. Environment values, MCP credential values, raw tool arguments/output, transcripts, OCR/private document text, and secret-like schema values must not enter indexed or generated artifacts.
+- `$HERMES_HOME/skills/.archive` is excluded from active routing.
+- Feedback/evaluation data stays local. Keep public docs/tests free of raw telemetry and private content.
 
-For release-relevant changes, bump all three version locations together:
+## State and concurrency invariants
 
-- `plugin.yaml`
-- `pyproject.toml`
-- `hermes_local_knowledge/__init__.py`
+Generated state includes `index.sqlite`, `index.jsonl`, `usage.sqlite`, `okf_queue.sqlite`, `okfs/tools/*.md`, `okf_worker.log`, the v0.3.12-compatible file gate `index_build.lock`, the SQLite transaction lock `index_build.sqlite`, and `okf_index_dirty/`. Do not commit it.
 
-Release-relevant paths include `hermes_local_knowledge/**`, `plugin.yaml`, `pyproject.toml`, `after-install.md`, `examples/**`, and `skills/**`. The policy is enforced by:
+- Managed lookups rebuild missing, corrupt, older-format, or OKF-dirty indexes. Ordinary source changes require `rebuild=true`, an explicit CLI build, or an optional operator schedule; no schedule is required.
+- Reject newer index formats before publication. Build and validate temporary SQLite/JSONL outputs before publishing them as a recoverable, hash-bound pair under both build locks.
+- OKF automatic generation requires explicit model-token consent. The finalizer only checks and launches; the detached worker uses one fixed lease, one structured batch call when claims exist, and claim/lease-fenced validation/publication.
+- Version 0.4.0 supports the current v0.3.12 queue shape through selected-claim normalization, not a general migration ladder.
+
+## Release policy
+
+A version bump is required when release-relevant paths differ from the base, including:
+
+- `__init__.py`, `plugin.yaml`, `pyproject.toml`, `after-install.md`;
+- `hermes_local_knowledge/**`, `examples/**`, and `skills/**`.
+
+Docs-only edits to `README.md`, `CONTRIBUTING.md`, `memory.md`, or `AGENTS.md` normally do not require a bump unless accompanied by a release-relevant path.
+
+## Verification
+
+Focused public/plugin contract check:
 
 ```bash
-python scripts/check_version_policy.py --base-ref origin/main
+PYTHONDONTWRITEBYTECODE=1 python -m pytest \
+  tests/test_public_contract.py tests/test_plugin.py \
+  -q -p no:cacheprovider
 ```
 
-Docs-only changes such as `README.md`, `CONTRIBUTING.md`, `memory.md`, or `AGENTS.md` normally do not require a version bump.
-
-## Search/indexing rules to preserve
-
-Before touching `scanners.py`, `search.py`, `evaluation.py`, `handlers.py`, or tests, read the detailed rationale in `memory.md`.
-
-Key invariants:
-
-- FTS remains the primary broad-recall path; metadata/identifier retrieval is a deterministic fallback, not a replacement.
-- Script search text must use safe routing metadata only. Do not index arbitrary script body literals.
-- Env **names** may be routing signals; env **values** must not be persisted or searched.
-- Parent-equivalent evaluation is limited to `skill_support_doc <-> owning parent skill` pairs.
-- Operational priority must be narrow and domain-gated. Do not globally promote all non-prose artifacts.
-- Exact/quoted support-doc behavior is important. Pure quoted searches should not be polluted by loose fallback results.
-- `artifact_type` filters must only return the requested type, including `skill_support_doc`.
-- Support-doc diversity is per parent and applied globally after strict + fallback candidates are combined.
-
-## Testing and verification
-
-For code changes, run:
+Full gate:
 
 ```bash
-python -m pytest -q
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider
 python -m ruff check .
 python -m mypy
 python scripts/check_version_policy.py --base-ref origin/main
 git diff --check
 ```
 
-For docs-only changes, at minimum run:
+For ranking/index changes, also run a configured build, read-only evaluation, and doctor smoke. For release/package changes, build and installation-smoke both wheel and sdist.
 
-```bash
-git diff --check
-python scripts/check_version_policy.py --base-ref origin/main
-```
+## Repository safety
 
-For search/ranking/scanner/evaluation changes, also run configured runtime smokes when available:
-
-```bash
-HERMES_HOME=/home/alex/.hermes python -m hermes_local_knowledge.cli build --from-hermes-config
-python -m hermes_local_knowledge.cli evaluate --from-hermes-config --json
-python -m hermes_local_knowledge.cli doctor --hermes-home /home/alex/.hermes --rebuild --query 'paperless review'
-```
-
-If `doctor --from-hermes-config` is rejected by a revision, use `--hermes-home` as above.
-
-For package/release changes, additionally build and inspect the wheel/sdist:
-
-```bash
-python -m build --outdir "$tmpdist"
-python -m twine check "$tmpdist"/*
-python -m venv "$tmpvenv"
-"$tmpvenv/bin/python" -m pip install "$tmpdist"/*.whl
-"$tmpvenv/bin/python" - <<'PY'
-import importlib.metadata as md
-matches = [ep for ep in md.entry_points().select(group='hermes_agent.plugins') if ep.name == 'local_knowledge']
-print([(ep.name, ep.value) for ep in matches])
-module = matches[0].load()
-print('register_callable', callable(getattr(module, 'register', None)))
-PY
-```
-
-## Independent review discipline
-
-When using subagents/reviewers:
-
-- Tell review agents explicitly whether they may edit files. For review-only tasks, say **do not modify files**.
-- A timed-out, cancelled, missing, or partial review is not a PASS.
-- If a review times out, split the review into smaller bounded tasks or report that there is no independent approval.
-- After subagent work, check `git status` and inspect for unintended files.
-
-## Release/deployment notes
-
-- Before release, CI green is not enough if async reviewers may still post. Read back PR reviews/review threads when a PR exists.
-- Verify tag target, GitHub release assets, and GitHub Actions results after publishing.
-- For Alex's installed plugin, update and verify both source and installed SHAs:
-
-```bash
-HERMES_HOME=/home/alex/.hermes hermes plugins update local_knowledge
-git -C /home/alex/repos/hermes-local-knowledge rev-parse --short HEAD
-git -C /home/alex/.hermes/plugins/local_knowledge rev-parse --short HEAD
-```
-
-- A running Hermes gateway may keep old imported plugin code. Restart from outside the gateway process or use `/restart` from chat. Do not run `hermes gateway restart` from inside a gateway-run terminal session.
-
-## Public-safety rules
-
-This is a public reusable plugin repository. Do not write secrets, private document contents, raw local telemetry, or private session transcripts into repository files. Distill behavior and lessons instead.
+Keep `.env*`, databases, JSONL indexes, logs, caches, builds, virtualenvs, mutation workspaces, and local state out of commits. This is a public repository: never add credentials, private document contents, raw session transcripts, or identifying telemetry rows.

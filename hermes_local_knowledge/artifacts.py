@@ -96,7 +96,7 @@ _MCP_URI_AUTHORITY_RE = re.compile(r"(?i)(?P<prefix>[a-z][a-z0-9+.-]*://)(?P<aut
 _MCP_URL_PARAMETER_RE = re.compile(
     r"(?P<prefix>[?&#;])(?P<name>[^=&#;\s]+)=(?P<value>[^&#;\s]*)"
 )
-_HTTP_URL_SPAN_RE = re.compile(r'https?://[^\s`"<>]+', re.IGNORECASE)
+_HTTP_URL_SPAN_RE = re.compile(r'(?:https?://|(?<![\w:])//)[^\s`"<>]+', re.IGNORECASE)
 _LOCAL_PATH_RE = re.compile(
     r"""
     (?P<home>(?<![\w~])~/[^\s`"'<>|?*]+)
@@ -1019,10 +1019,30 @@ def _mcp_secret_name(value: str) -> bool:
         "signature",
         "cookie",
     )
+    credential_key_names = {
+        "key",
+        "accesskey",
+        "accesskeyid",
+        "awsaccesskeyid",
+        "privatekey",
+        "secretkey",
+        "apikey",
+    }
+    credential_key_suffixes = (
+        "accesskey",
+        "accesskeyid",
+        "privatekey",
+        "secretkey",
+        "apikey",
+        "sshkey",
+        "consumerkey",
+        "signingkey",
+    )
     return (
         bool(set(secret_parts) & part_set)
-        or {"api", "key"} <= part_set
-        or compact.endswith((*secret_parts, "apikey"))
+        or "key" in part_set
+        or compact in credential_key_names
+        or compact.endswith((*secret_parts, *credential_key_suffixes))
     )
 
 

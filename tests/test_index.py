@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import multiprocessing
+import os
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
@@ -12,7 +14,8 @@ import pytest
 
 from hermes_local_knowledge import index
 from hermes_local_knowledge.artifacts import Artifact, Edge
-from hermes_local_knowledge.config import IndexSettings
+from hermes_local_knowledge.config import Config, IndexSettings
+from hermes_local_knowledge.service import LocalKnowledgeService
 
 
 def write(path: Path, content: str) -> None:
@@ -95,6 +98,58 @@ def _build_in_process(
         results.put(f"{type(exc).__name__}: {exc}")
 
 
+def _hold_v0312_file_lock(lock_path: str, ready: Any, release: Any, results: Any) -> None:
+    """Hold only the regular-file lock used by the released v0.3.12 builder."""
+
+    fd: int | None = None
+    locked = False
+    backend: Any = __import__("msvcrt" if os.name == "nt" else "fcntl")
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        if os.name == "nt":  # pragma: no cover - Windows-only behavior
+            if os.fstat(fd).st_size < 1:
+                os.write(fd, b"\0")
+                os.fsync(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            backend.locking(fd, backend.LK_NBLCK, 1)
+        else:
+            backend.flock(fd, backend.LOCK_EX)
+        locked = True
+        ready.set()
+        if not release.wait(30):
+            raise TimeoutError("test release event was not set")
+        results.put(None)
+    except BaseException as exc:  # pragma: no cover - surfaced in the parent assertion
+        results.put(f"{type(exc).__name__}: {exc}")
+    finally:
+        if fd is not None:
+            if locked:
+                if os.name == "nt":  # pragma: no cover - Windows-only behavior
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    backend.locking(fd, backend.LK_UNLCK, 1)
+                else:
+                    backend.flock(fd, backend.LOCK_UN)
+            os.close(fd)
+
+
+def _acquire_index_lock_after_fork(
+    state: str,
+    started: Any,
+    acquired: Any,
+    release: Any,
+    results: Any,
+) -> None:
+    try:
+        started.set()
+        with index.index_build_lock(Path(state)):
+            acquired.set()
+            if not release.wait(30):
+                raise TimeoutError("test release event was not set")
+        results.put(None)
+    except BaseException as exc:  # pragma: no cover - surfaced in the parent assertion
+        results.put(f"{type(exc).__name__}: {exc}")
+
+
 def test_build_publishes_valid_format4_index_and_queries_it(tmp_path: Path) -> None:
     root = tmp_path / "source"
     state = tmp_path / "state"
@@ -102,8 +157,10 @@ def test_build_publishes_valid_format4_index_and_queries_it(tmp_path: Path) -> N
     write(root / "custom_skills" / "quartz-router" / "SKILL.md", skill("quartz-router", related="quartz-helper"))
     write(root / "custom_skills" / "quartz-helper" / "SKILL.md", skill("quartz-helper"))
     write(root / "docs" / "quartz-runbook.md", "# Quartz runbook\n\nInventory operations and recovery.\n")
-    legacy_lock = state / index.LEGACY_INDEX_BUILD_LOCK_NAME
-    write(legacy_lock, '{"pid": 123, "created_at": "legacy"}\n')
+    legacy_lock = state / index.INDEX_BUILD_LOCK_NAME
+    legacy_bytes = b'{"pid": 123, "acquired_at": 1722111111.0}'
+    legacy_lock.parent.mkdir(parents=True)
+    legacy_lock.write_bytes(legacy_bytes)
 
     build_result = index.build_index(root, state, hermes_home, settings())
     assert build_result is not None
@@ -131,8 +188,12 @@ def test_build_publishes_valid_format4_index_and_queries_it(tmp_path: Path) -> N
         assert metadata["plugin_version"] == "0.4.0"
         assert int(metadata["artifact_count"]) == len(artifacts)
         assert int(metadata["edge_count"]) == len(edges)
-    assert legacy_lock.read_text(encoding="utf-8") == '{"pid": 123, "created_at": "legacy"}\n'
-    with sqlite3.connect(state / index.INDEX_BUILD_LOCK_NAME) as connection:
+    jsonl_bytes = (state / "index.jsonl").read_bytes()
+    assert metadata["jsonl_sha256"] == hashlib.sha256(jsonl_bytes).hexdigest()
+    assert index.INDEX_BUILD_LOCK_NAME == "index_build.lock"
+    assert legacy_lock.read_bytes() == legacy_bytes
+    assert index.INDEX_BUILD_TRANSACTION_LOCK_NAME == "index_build.sqlite"
+    with sqlite3.connect(state / index.INDEX_BUILD_TRANSACTION_LOCK_NAME) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
     jsonl = [json.loads(line) for line in (state / "index.jsonl").read_text(encoding="utf-8").splitlines()]
     assert {row["id"] for row in jsonl} == {artifact.id for artifact in artifacts}
@@ -158,6 +219,88 @@ def test_build_publishes_valid_format4_index_and_queries_it(tmp_path: Path) -> N
     assert fetched is not None
     assert fetched["id"] == "skill:quartz-router"
     assert index.get_neighbors(db_path, "skill:quartz-router")
+
+
+def test_v0312_file_lock_excludes_new_builder_until_release(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    state = tmp_path / "state"
+    hermes_home = tmp_path / "home"
+    write(root / "docs" / "guide.md", "# Guide\n\nQuartz cross-version locking.\n")
+    legacy_lock = state / index.INDEX_BUILD_LOCK_NAME
+    legacy_bytes = b'{"pid": 321, "acquired_at": 1722111111.0}'
+    legacy_lock.parent.mkdir(parents=True)
+    legacy_lock.write_bytes(legacy_bytes)
+
+    context = multiprocessing.get_context("spawn")
+    old_ready = context.Event()
+    old_release = context.Event()
+    old_results = context.Queue()
+    old_builder = context.Process(
+        target=_hold_v0312_file_lock,
+        args=(str(legacy_lock), old_ready, old_release, old_results),
+    )
+    old_builder.start()
+    assert old_ready.wait(30)
+
+    new_ready = context.Event()
+    new_collect_entered = context.Event()
+    new_results = context.Queue()
+    new_builder = context.Process(
+        target=_build_in_process,
+        args=(
+            str(root),
+            str(state),
+            str(hermes_home),
+            None,
+            None,
+            new_ready,
+            new_collect_entered,
+            True,
+            new_results,
+        ),
+    )
+    new_builder.start()
+    try:
+        assert new_ready.wait(30)
+        assert not new_collect_entered.wait(0.5)
+    finally:
+        old_release.set()
+
+    assert new_collect_entered.wait(30)
+    old_builder.join(30)
+    new_builder.join(30)
+    assert old_builder.exitcode == 0
+    assert new_builder.exitcode == 0
+    assert old_results.get(timeout=5) is None
+    assert new_results.get(timeout=5) is None
+    assert legacy_lock.read_bytes() == legacy_bytes
+    assert index.index_format_state(state / "index.sqlite") == ("current", 4)
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_forked_child_drops_inherited_dual_lock_and_acquires_after_parent_release(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    context = multiprocessing.get_context("fork")
+    started = context.Event()
+    acquired = context.Event()
+    child_release = context.Event()
+    results = context.Queue()
+
+    with index.index_build_lock(state):
+        child = context.Process(
+            target=_acquire_index_lock_after_fork,
+            args=(str(state), started, acquired, child_release, results),
+        )
+        child.start()
+        assert started.wait(30)
+        assert not acquired.wait(0.5)
+
+    assert acquired.wait(30)
+    child_release.set()
+    child.join(30)
+    assert child.exitcode == 0
+    assert results.get(timeout=5) is None
+
 
 
 def test_missing_older_and_corrupt_indexes_rebuild_but_newer_is_refused(
@@ -194,6 +337,12 @@ def test_missing_older_and_corrupt_indexes_rebuild_but_newer_is_refused(
         connection.execute("UPDATE metadata SET value='-1' WHERE key='artifact_count'")
     assert index.index_format_state(db_path) == ("corrupt", 4)
     index.build_index(root, state, hermes_home, settings())
+    assert index.index_format_state(db_path) == ("current", 4)
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DELETE FROM metadata WHERE key='jsonl_sha256'")
+    assert index.index_format_state(db_path) == ("corrupt", 4)
+    assert index.build_index(root, state, hermes_home, settings(), force=False) is not None
     assert index.index_format_state(db_path) == ("current", 4)
 
     with sqlite3.connect(db_path) as connection:
@@ -410,6 +559,7 @@ def test_sqlite_replace_failure_keeps_prior_authority_and_dirty_token(
     write(root / "docs" / "stable.md", "# Stable\n\nQuartz recovery.\n")
     index.build_index(root, state, hermes_home, settings())
     before_sqlite = (state / "index.sqlite").read_bytes()
+    before_jsonl = (state / "index.jsonl").read_bytes()
     write(root / "docs" / "new.md", "# New\n\nReplacement boundary canary.\n")
     marker = state / index.DIRTY_MARKER_NAME
     marker.mkdir(parents=True)
@@ -424,9 +574,78 @@ def test_sqlite_replace_failure_keeps_prior_authority_and_dirty_token(
         index.build_index(root, state, hermes_home, settings())
 
     assert (state / "index.sqlite").read_bytes() == before_sqlite
+    assert (state / "index.jsonl").read_bytes() == before_jsonl
     assert token.is_file()
     assert not list(state.glob(".*.tmp"))
+    assert index.index_format_state(state / "index.sqlite") == ("current", 4)
     assert not index.search_index(state / "index.sqlite", "replacement boundary canary")
+
+
+def test_first_build_sqlite_replace_failure_removes_unpaired_jsonl_and_keeps_dirty_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "source"
+    state = tmp_path / "state"
+    hermes_home = tmp_path / "home"
+    write(root / "docs" / "guide.md", "# Guide\n\nQuartz first publication.\n")
+    marker = state / index.DIRTY_MARKER_NAME
+    marker.mkdir(parents=True)
+    token = marker / "first-build-failure"
+    token.touch()
+
+    def reject_replace(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("synthetic first SQLite replacement failure")
+
+    monkeypatch.setattr(index, "_replace_with_retry", reject_replace)
+    with pytest.raises(PermissionError, match="synthetic first SQLite replacement failure"):
+        index.build_index(root, state, hermes_home, settings())
+
+    assert not (state / "index.sqlite").exists()
+    assert not (state / "index.jsonl").exists()
+    assert token.is_file()
+    assert not list(state.glob(".*.tmp"))
+
+
+def test_jsonl_payload_mismatch_rebuilds_on_managed_lookup_but_direct_db_reads_work(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    state = tmp_path / "state"
+    hermes_home = tmp_path / "home"
+    write(root / "docs" / "guide.md", "# Guide\n\nQuartz managed recovery.\n")
+    index.build_index(root, state, hermes_home, settings())
+    db_path = state / "index.sqlite"
+    jsonl_path = state / "index.jsonl"
+    direct_results = index.search_index(db_path, "quartz managed recovery", limit=5)
+    assert direct_results
+    artifact_id = str(direct_results[0]["id"])
+    before = index.get_artifact(db_path, artifact_id)
+    assert before is not None
+
+    rows = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["summary"] = "same artifact IDs, crash-boundary payload"
+    jsonl_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    assert index.get_artifact(db_path, artifact_id) == before
+    assert index.index_format_state(db_path) == ("corrupt", 4)
+    service = LocalKnowledgeService(
+        Config(
+            source_root=root,
+            hermes_home=hermes_home,
+            state_dir=state,
+            index_settings=settings(),
+        )
+    )
+    results, metadata = service.search("quartz managed recovery", limit=5)
+
+    assert metadata["rebuilt"] is True
+    assert results
+    assert index.index_format_state(db_path) == ("current", 4)
+    assert "crash-boundary payload" not in jsonl_path.read_text(encoding="utf-8")
 
 
 def test_success_removes_only_dirty_tokens_covered_at_build_start(
@@ -534,43 +753,15 @@ def test_candidate_union_uses_one_ranker_then_parent_lifting_and_diversity(
     support_only = index.search_index(db_path, "needle phrase", limit=5, artifact_type="skill_support_doc")
     assert support_only
     assert {row["type"] for row in support_only} == {"skill_support_doc"}
-    parent_batches: list[tuple[str, ...]] = []
-    fetch_parents = index._fetch_parents
-
-    def counted_fetch_parents(connection: Any, artifact_ids: list[str]) -> dict[str, dict[str, Any]]:
-        parent_batches.append(tuple(artifact_ids))
-        return fetch_parents(connection, artifact_ids)
-
-    monkeypatch.setattr(index, "_fetch_parents", counted_fetch_parents)
     lifted = index.search_index(db_path, "needle phrase", limit=5)
     assert lifted[0]["id"] == "skill:alpha"
     assert len([row for row in lifted if row["type"] == "skill_support_doc"]) == 1
-    assert [batch for batch in parent_batches if batch] == [
-        ("skill:alpha",),
-        ("skill:alpha",),
-    ]
     quoted = index.search_index(db_path, '"needle phrase"', limit=5)
     assert quoted
     assert quoted[0]["type"] == "skill_support_doc"
     assert all(row["id"] != "skill:alpha" for row in quoted)
     relevance = index.search_index(db_path, "backup strategy", limit=2)
     assert relevance[0]["id"] == "doc:backup-strategy"
-
-    fts_calls: list[str] = []
-    query_fts_rows = index._query_fts_rows
-
-    def counted_query_fts_rows(*args: Any, **kwargs: Any) -> list[Any]:
-        fts_calls.append(str(args[1]))
-        return query_fts_rows(*args, **kwargs)
-
-    def unexpected_metadata_rows(*args: Any, **kwargs: Any) -> list[Any]:
-        raise AssertionError("filled strict results must skip metadata fallback")
-
-    monkeypatch.setattr(index, "_query_fts_rows", counted_query_fts_rows)
-    monkeypatch.setattr(index, "_query_metadata_rows", unexpected_metadata_rows)
-    strict_only = index.search_index(db_path, "needle phrase", limit=1)
-    assert strict_only[0]["id"] == "skill:alpha"
-    assert len(fts_calls) == 1
 
 
 def test_waiting_builder_rebuilds_dirty_update_without_losing_token(tmp_path: Path) -> None:

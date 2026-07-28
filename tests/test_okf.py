@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from hermes_local_knowledge import okf, plugin
+from hermes_local_knowledge.config import resolve_config
 
 
 def write(path: Path, content: str) -> None:
@@ -66,7 +67,7 @@ def test_safe_arg_shape_does_not_persist_values(tmp_path: Path) -> None:
     assert "/home/alex/private.pdf" not in persisted
 
 
-def test_canonical_arg_shape_migration_is_idempotent(tmp_path: Path) -> None:
+def test_canonical_arg_shape_current_reads_are_idempotent(tmp_path: Path) -> None:
     okf.upsert_tool_candidate(
         tmp_path,
         tool_name="knowledge_search",
@@ -471,7 +472,7 @@ def test_okf_config_reads_nested_config(tmp_path: Path, monkeypatch) -> None:  #
 """,
     )
 
-    cfg = plugin._runtime_config()
+    cfg = resolve_config()
 
     assert cfg.okf.enabled is False
     assert cfg.okf.auto_generate is True

@@ -38,13 +38,13 @@ def make_repo(tmp_path: Path, version: str = "0.1.0") -> Path:
     run_git(repo, "config", "user.name", "Version Policy Test")
     write_versions(repo, version)
     (repo / "README.md").write_text("# test repo\n", encoding="utf-8")
-    (repo / "hermes_local_knowledge" / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (repo / "hermes_local_knowledge" / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
     commit(repo, "base")
     return repo
 
 
 def test_release_relevant_path_classification() -> None:
-    assert version_policy.is_release_relevant_path("hermes_local_knowledge/runtime.py")
+    assert version_policy.is_release_relevant_path("hermes_local_knowledge/service.py")
     assert version_policy.is_release_relevant_path("examples/local-knowledge-router-skill/SKILL.md")
     assert version_policy.is_release_relevant_path("skills/local-knowledge-router/SKILL.md")
     assert version_policy.is_release_relevant_path("plugin.yaml")
@@ -72,8 +72,8 @@ def test_policy_allows_docs_only_change_without_bump(tmp_path: Path) -> None:
 
 def test_policy_rejects_release_relevant_change_without_bump(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
-    (repo / "hermes_local_knowledge" / "runtime.py").write_text("VALUE = 2\n", encoding="utf-8")
-    commit(repo, "runtime change without bump")
+    (repo / "hermes_local_knowledge" / "service.py").write_text("VALUE = 2\n", encoding="utf-8")
+    commit(repo, "service change without bump")
 
     with pytest.raises(version_policy.PolicyError, match="without a plugin version bump"):
         version_policy.check_version_policy(repo, base_ref="HEAD~1")
@@ -81,9 +81,9 @@ def test_policy_rejects_release_relevant_change_without_bump(tmp_path: Path) -> 
 
 def test_policy_allows_release_relevant_change_with_synced_bump(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
-    (repo / "hermes_local_knowledge" / "runtime.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (repo / "hermes_local_knowledge" / "service.py").write_text("VALUE = 2\n", encoding="utf-8")
     write_versions(repo, "0.1.1")
-    commit(repo, "runtime change with bump")
+    commit(repo, "service change with bump")
 
     messages = version_policy.check_version_policy(repo, base_ref="HEAD~1")
 
@@ -92,7 +92,7 @@ def test_policy_allows_release_relevant_change_with_synced_bump(tmp_path: Path) 
 
 def test_policy_includes_dirty_worktree_changes(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
-    (repo / "hermes_local_knowledge" / "runtime.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (repo / "hermes_local_knowledge" / "service.py").write_text("VALUE = 2\n", encoding="utf-8")
     write_versions(repo, "0.1.1")
 
     messages = version_policy.check_version_policy(repo, base_ref="HEAD")

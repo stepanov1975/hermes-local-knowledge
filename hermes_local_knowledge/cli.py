@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import os
 import sys
@@ -16,14 +15,10 @@ from typing import Any, Sequence
 from . import __version__, index, okf
 from .artifacts import Artifact, Edge
 from .config import Config, IndexSettings, resolve_config
-from .constants import DEFAULT_ROOT
-from .paths import default_output_dir, hermes_home_from_env
 from .service import LocalKnowledgeService
 from .telemetry import _record_usage
 
-RuntimeConfig = Config
 NewerIndexFormatError = index.NewerIndexFormatError
-_runtime_config = resolve_config
 build_index = index.build_index
 search_index = index.search_index
 get_artifact = index.get_artifact
@@ -33,6 +28,15 @@ artifact_type_counts = index.artifact_type_counts
 
 
 ROUTER_SKILL_RELATIVE_PATH = Path("skills") / "local-knowledge-router" / "SKILL.md"
+_DEFAULT_ROOT = Path.cwd()
+
+
+def _hermes_home_from_env() -> Path:
+    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+
+
+def _default_output_dir(hermes_home: Path | None = None) -> Path:
+    return (hermes_home.expanduser() if hermes_home is not None else _hermes_home_from_env()) / "local_knowledge"
 
 
 def print_results(rows: Sequence[dict[str, Any]]) -> None:
@@ -95,7 +99,7 @@ def _print_warnings(warnings: Sequence[str]) -> None:
         print(f"WARNING: {warning}", file=sys.stderr)
 
 
-def _cfg_metadata(cfg: RuntimeConfig, db_path: Path | None = None) -> dict[str, Any]:
+def _cfg_metadata(cfg: Config, db_path: Path | None = None) -> dict[str, Any]:
     return {
         "plugin_version": __version__,
         "root": str(cfg.source_root),
@@ -115,37 +119,8 @@ def _usage_db_for_state_dir(state_dir: Path) -> Path:
 BuildIndexFn = Callable[..., tuple[list[Artifact], list[Edge]] | None]
 
 
-def _adapt_build_index(build_index_fn: BuildIndexFn) -> BuildIndexFn:
-    """Adapt legacy four-argument CLI injections without owning lifecycle."""
-
-    try:
-        parameters = inspect.signature(build_index_fn).parameters.values()
-    except (TypeError, ValueError):
-        accepts_force = False
-    else:
-        accepts_force = any(
-            parameter.name == "force" or parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
-    if accepts_force:
-        return build_index_fn
-
-    def adapted(
-        root: Path,
-        output_dir: Path,
-        hermes_home: Path,
-        settings: IndexSettings,
-        *,
-        force: bool,
-    ) -> tuple[list[Artifact], list[Edge]] | None:
-        del force
-        return build_index_fn(root, output_dir, hermes_home, settings)
-
-    return adapted
-
-
 def _service(
-    cfg: RuntimeConfig,
+    cfg: Config,
     *,
     build_index_fn: BuildIndexFn = build_index,
     search_index_fn: Callable[..., list[dict[str, Any]]] = search_index,
@@ -154,7 +129,7 @@ def _service(
 ) -> LocalKnowledgeService:
     return LocalKnowledgeService(
         cfg,
-        build_index_fn=_adapt_build_index(build_index_fn),
+        build_index_fn=build_index_fn,
         search_index_fn=search_index_fn,
         get_artifact_fn=get_artifact_fn,
         get_neighbors_fn=get_neighbors_fn,
@@ -162,7 +137,7 @@ def _service(
 
 
 def _record_cli_usage(
-    cfg: RuntimeConfig | None,
+    cfg: Config | None,
     *,
     tool: str,
     success: bool,
@@ -395,9 +370,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _build_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
+def _build_config_from_args(args: argparse.Namespace) -> Config:
     if args.from_hermes_config:
-        cfg = _runtime_config(args.hermes_home)
+        cfg = resolve_config(args.hermes_home)
         updates: dict[str, Any] = {}
         if args.root is not None:
             updates["source_root"] = _resolved(args.root)
@@ -411,10 +386,10 @@ def _build_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
             updates["state_dir_source"] = "cli"
         return replace(cfg, **updates) if updates else cfg
 
-    hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env())
-    source_root = _resolved(args.root) if args.root is not None else _resolved(DEFAULT_ROOT)
-    state_dir = _resolved(args.output_dir) if args.output_dir is not None else _resolved(default_output_dir(hermes_home))
-    return RuntimeConfig(
+    hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(_hermes_home_from_env())
+    source_root = _resolved(args.root) if args.root is not None else _resolved(_DEFAULT_ROOT)
+    state_dir = _resolved(args.output_dir) if args.output_dir is not None else _resolved(_default_output_dir(hermes_home))
+    return Config(
         source_root,
         hermes_home,
         state_dir,
@@ -424,17 +399,17 @@ def _build_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
     )
 
 
-def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], RuntimeConfig]:
+def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], Config]:
     if args.from_hermes_config:
-        cfg = _runtime_config(args.hermes_home)
+        cfg = resolve_config(args.hermes_home)
         db_path = _resolved(args.db) if args.db is not None else cfg.state_dir / "index.sqlite"
         if args.db is not None:
             cfg = replace(cfg, state_dir=db_path.parent, state_dir_source="cli")
         return db_path, cfg.warnings, cfg
-    hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env())
-    db_path = _resolved(args.db) if args.db is not None else default_output_dir(hermes_home) / "index.sqlite"
-    cfg = RuntimeConfig(
-        _resolved(DEFAULT_ROOT),
+    hermes_home = _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(_hermes_home_from_env())
+    db_path = _resolved(args.db) if args.db is not None else _default_output_dir(hermes_home) / "index.sqlite"
+    cfg = Config(
+        _resolved(_DEFAULT_ROOT),
         hermes_home,
         db_path.parent,
         IndexSettings(),
@@ -444,11 +419,11 @@ def _db_from_args(args: argparse.Namespace) -> tuple[Path, tuple[str, ...], Runt
     return db_path, (), cfg
 
 
-def _okf_config_from_args(args: argparse.Namespace) -> RuntimeConfig:
-    cfg = _runtime_config(args.hermes_home) if args.from_hermes_config else RuntimeConfig(
-        _resolved(DEFAULT_ROOT),
-        _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env()),
-        default_output_dir(_resolved(args.hermes_home) if args.hermes_home is not None else _resolved(hermes_home_from_env())),
+def _okf_config_from_args(args: argparse.Namespace) -> Config:
+    cfg = resolve_config(args.hermes_home) if args.from_hermes_config else Config(
+        _resolved(_DEFAULT_ROOT),
+        _resolved(args.hermes_home) if args.hermes_home is not None else _resolved(_hermes_home_from_env()),
+        _default_output_dir(_resolved(args.hermes_home) if args.hermes_home is not None else _resolved(_hermes_home_from_env())),
         IndexSettings(),
         source_root_source="cwd",
         state_dir_source="default",
@@ -569,7 +544,7 @@ def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[di
     }, 0
 
 
-def _okf_status_payload(cfg: RuntimeConfig, *, limit: int) -> dict[str, Any]:
+def _okf_status_payload(cfg: Config, *, limit: int) -> dict[str, Any]:
     pending = okf.pending_candidates(cfg.state_dir, limit=max(1, limit), min_use_count=cfg.okf.min_use_count)
     errors = okf.error_candidates(cfg.state_dir, limit=max(1, limit))
     return {
@@ -651,7 +626,7 @@ def _doctor_payload(
     search_index_fn=search_index,
     service: LocalKnowledgeService | None = None,
 ) -> tuple[dict[str, Any], int]:
-    cfg = service.config if service is not None else _runtime_config(args.hermes_home)
+    cfg = service.config if service is not None else resolve_config(args.hermes_home)
     service = service or _service(
         cfg,
         build_index_fn=build_index_fn,
@@ -803,7 +778,7 @@ def main(
 ) -> int:
     args = parse_args(argv)
     if args.command == "install-router-skill":
-        cfg = _runtime_config(args.hermes_home)
+        cfg = resolve_config(args.hermes_home)
         payload, status = _install_router_skill_payload(cfg.hermes_home, force=bool(args.force))
         _emit_payload(payload, json_output=bool(args.json))
         return status
@@ -1084,10 +1059,10 @@ def main(
 
     if args.command in {"doctor", "smoke"}:
         started = time.perf_counter()
-        doctor_cfg: RuntimeConfig | None = None
+        doctor_cfg: Config | None = None
         doctor_service: LocalKnowledgeService | None = None
         try:
-            doctor_cfg = _runtime_config(args.hermes_home)
+            doctor_cfg = resolve_config(args.hermes_home)
             doctor_service = _service(
                 doctor_cfg,
                 build_index_fn=build_index_fn,

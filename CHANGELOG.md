@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0] - 2026-07-27
+
+### Changed
+
+- Consolidated configuration, artifact collection, format-4 persistence/search, telemetry, evaluation, service orchestration, OKF generation, plugin registration, and CLI behavior into their final owner modules, with `indexer` retained as a thin eight-export compatibility facade.
+- Advanced the persisted index to format 4, retained `index_build.lock` as the v0.3.12-compatible file gate, and added `index_build.sqlite` for new-process transaction locking. SQLite and JSONL are validated and hash-bound so failed publication rolls back and crash-split pairs rebuild.
+- Simplified automatic OKF execution to one fixed lease with no heartbeat or renewal, one structured batch call when claims exist, and token/lease-fenced validation and publication.
+- Kept current v0.3.12 OKF queue data readable through selected-claim schema normalization without adding a general historical migration ladder.
+
+### Removed
+
+- Deleted all eleven superseded compatibility and layering modules after their documented product behavior moved to the final owners.
+
+[0.4.0]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.3.12...v0.4.0
+
 ## [0.3.12] - 2026-07-26
 
 ### Changed

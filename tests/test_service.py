@@ -6,11 +6,9 @@ from typing import Any
 
 import pytest
 
-from hermes_local_knowledge import cli as cli_module
 from hermes_local_knowledge import index
-from hermes_local_knowledge import runtime as runtime_module
 from hermes_local_knowledge.artifacts import Artifact, Edge
-from hermes_local_knowledge.config import Config, IndexSettings, OKFSettings
+from hermes_local_knowledge.config import Config, IndexSettings
 from hermes_local_knowledge.service import LocalKnowledgeService
 
 
@@ -308,6 +306,7 @@ def test_caller_owned_db_never_ensures_or_consumes_managed_tokens(tmp_path: Path
     assert neighbors
     assert token.is_file()
     assert not (config.state_dir / index.INDEX_BUILD_LOCK_NAME).exists()
+    assert not (config.state_dir / index.INDEX_BUILD_TRANSACTION_LOCK_NAME).exists()
 
 
 def test_query_dependency_injection_and_configured_paths_are_stable(
@@ -479,133 +478,4 @@ def test_feedback_report_and_evaluation_injections_receive_configured_paths(tmp_
         ("feedback", config.source_root, service.usage_db_path),
         ("report", config.source_root, service.usage_db_path, 7, 3),
         ("evaluate", service.db_path, service.usage_db_path),
-    ]
-
-
-def test_runtime_adapts_legacy_and_force_aware_builders(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = make_config(tmp_path)
-    monkeypatch.setattr(runtime_module, "_runtime_config", lambda: config)
-    calls: list[tuple[str, bool | None]] = []
-
-    def legacy_builder(
-        root: Path,
-        output_dir: Path,
-        hermes_home: Path,
-        settings: IndexSettings,
-    ) -> tuple[list[Artifact], list[Edge]]:
-        assert (root, output_dir, hermes_home, settings) == (
-            config.source_root,
-            config.state_dir,
-            config.hermes_home,
-            config.index_settings,
-        )
-        calls.append(("legacy", None))
-        return [], []
-
-    def modern_builder(
-        root: Path,
-        output_dir: Path,
-        hermes_home: Path,
-        settings: IndexSettings,
-        *,
-        force: bool,
-    ) -> tuple[list[Artifact], list[Edge]]:
-        calls.append(("modern", force))
-        return [], []
-
-    def generic_wrapper(*args: Any, **kwargs: Any) -> tuple[list[Artifact], list[Edge]]:
-        calls.append(("generic", kwargs.get("force")))
-        return [], []
-
-    assert runtime_module._ensure_index(config.source_root, build_index_fn=legacy_builder)[1][
-        "rebuilt"
-    ] is True
-    assert runtime_module._ensure_index(config.source_root, build_index_fn=modern_builder)[1][
-        "rebuilt"
-    ] is True
-    assert runtime_module._ensure_index(config.source_root, build_index_fn=generic_wrapper)[1][
-        "rebuilt"
-    ] is True
-    assert runtime_module._ensure_index(
-        config.source_root,
-        rebuild=True,
-        build_index_fn=modern_builder,
-    )[1]["rebuilt"] is True
-    assert calls == [
-        ("legacy", None),
-        ("modern", False),
-        ("generic", False),
-        ("modern", True),
-    ]
-
-
-def test_cli_force_adapter_recognizes_generic_keyword_wrapper(tmp_path: Path) -> None:
-    calls: list[bool | None] = []
-
-    def generic_wrapper(*args: Any, **kwargs: Any) -> tuple[list[Artifact], list[Edge]]:
-        calls.append(kwargs.get("force"))
-        return [], []
-
-    adapted = cli_module._adapt_build_index(generic_wrapper)
-    adapted(
-        tmp_path / "root",
-        tmp_path / "state",
-        tmp_path / "home",
-        IndexSettings(),
-        force=False,
-    )
-
-    assert calls == [False]
-
-
-def test_runtime_is_a_config_and_service_compatibility_facade(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = make_config(tmp_path)
-    assert runtime_module.RuntimeConfig is Config
-    assert runtime_module.OKFConfig is OKFSettings
-    assert runtime_module.IndexSettings is IndexSettings
-    resolve_calls: list[Path | str | None] = []
-
-    def resolve(home: Path | str | None = None) -> Config:
-        resolve_calls.append(home)
-        return config
-
-    monkeypatch.setattr(runtime_module, "resolve_config", resolve)
-    assert runtime_module._runtime_config("chosen-home") is config
-    assert resolve_calls == ["chosen-home"]
-
-    service_calls: list[tuple[Any, ...]] = []
-
-    class FakeService:
-        def __init__(self, received: Config, **kwargs: Any) -> None:
-            service_calls.append(("init", received, kwargs.get("build_index_fn")))
-            self.db_path = received.state_dir / "index.sqlite"
-
-        def ensure_index(self) -> tuple[Path, dict[str, Any]]:
-            service_calls.append(("ensure",))
-            return self.db_path, {"rebuilt": False}
-
-        def rebuild(self) -> tuple[list[Artifact], list[Edge], dict[str, Any]]:
-            service_calls.append(("rebuild",))
-            return [], [], {"rebuilt": True}
-
-    monkeypatch.setattr(runtime_module, "LocalKnowledgeService", FakeService)
-    assert runtime_module._ensure_index(config.source_root) == (
-        config.state_dir / "index.sqlite",
-        {"rebuilt": False},
-    )
-    assert runtime_module._ensure_index(config.source_root, rebuild=True) == (
-        config.state_dir / "index.sqlite",
-        {"rebuilt": True},
-    )
-    assert service_calls == [
-        ("init", config, None),
-        ("ensure",),
-        ("init", config, None),
-        ("rebuild",),
     ]

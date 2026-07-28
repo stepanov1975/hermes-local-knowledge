@@ -4,11 +4,14 @@ import argparse
 import inspect
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import textwrap
 import tomllib
+import zipfile
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import MISSING, dataclass, fields
 from datetime import datetime, timedelta, timezone
@@ -19,7 +22,9 @@ from typing import Any, TextIO, cast, get_type_hints
 import pytest
 
 import hermes_local_knowledge
+from hermes_local_knowledge import artifacts as lci_artifacts
 from hermes_local_knowledge import cli as lci_cli
+from hermes_local_knowledge import config as lci_config
 from hermes_local_knowledge import index as lci_index
 from hermes_local_knowledge import indexer, plugin
 
@@ -1039,7 +1044,16 @@ def test_standalone_cli_parse_errors_exit_two(
 
 
 def test_public_indexer_api_names_call_shapes_and_model_defaults_are_frozen() -> None:
+    assert indexer.__all__ == list(PUBLIC_INDEXER_API)
     assert all(hasattr(indexer, name) for name in PUBLIC_INDEXER_API)
+    assert indexer.Artifact is lci_artifacts.Artifact
+    assert indexer.Edge is lci_artifacts.Edge
+    assert indexer.IndexSettings is lci_config.IndexSettings
+    assert indexer.build_index is lci_index.build_index
+    assert indexer.search_index is lci_index.search_index
+    assert indexer.get_artifact is lci_index.get_artifact
+    assert indexer.get_neighbors is lci_index.get_neighbors
+    assert indexer.main is lci_cli.main
 
     def assert_parameter(
         callable_obj: Callable[..., Any],
@@ -1058,16 +1072,15 @@ def test_public_indexer_api_names_call_shapes_and_model_defaults_are_frozen() ->
         "output_dir",
         "hermes_home",
         "settings",
-        "acquire_lock",
+        "force",
     ]
     for name in ("root", "output_dir", "hermes_home"):
         assert_parameter(indexer.build_index, name, positional)
     assert_parameter(indexer.build_index, "settings", positional, None)
-    assert_parameter(indexer.build_index, "acquire_lock", keyword_only, True)
-    assert get_type_hints(indexer.build_index)["return"] == tuple[
-        list[indexer.Artifact],
-        list[indexer.Edge],
-    ]
+    assert_parameter(indexer.build_index, "force", keyword_only, True)
+    assert get_type_hints(indexer.build_index)["return"] == (
+        tuple[list[indexer.Artifact], list[indexer.Edge]] | None
+    )
     assert_parameter(indexer.search_index, "db_path", positional)
     assert_parameter(indexer.search_index, "query", positional)
     assert_parameter(indexer.search_index, "limit", keyword_only, 10)
@@ -1160,8 +1173,10 @@ def test_public_indexer_api_build_search_get_neighbors_and_jsonl_contract(
     ]
     assert (workspace.state_dir / "index.sqlite").is_file()
     assert (workspace.state_dir / "index.jsonl").is_file()
+    assert lci_index.INDEX_BUILD_LOCK_NAME == "index_build.lock"
     assert (workspace.state_dir / lci_index.INDEX_BUILD_LOCK_NAME).is_file()
-    assert not (workspace.state_dir / lci_index.LEGACY_INDEX_BUILD_LOCK_NAME).exists()
+    assert lci_index.INDEX_BUILD_TRANSACTION_LOCK_NAME == "index_build.sqlite"
+    assert (workspace.state_dir / lci_index.INDEX_BUILD_TRANSACTION_LOCK_NAME).is_file()
 
     jsonl_rows = [
         json.loads(line)
@@ -1441,7 +1456,7 @@ def test_hermes_native_adapter_surface_and_okf_worker_exit_behavior(
     assert worker_exit.value.code == 2
 
 
-def test_package_entrypoint_manifest_and_bundled_skill_contract() -> None:
+def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) -> None:
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     project = pyproject["project"]
     assert project["name"] == "hermes-local-knowledge"
@@ -1478,9 +1493,114 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract() -> None:
         / "local-knowledge-router"
         / "SKILL.md"
     )
-    assert root_skill.read_bytes() == package_skill.read_bytes()
+    example_skill = (
+        REPO_ROOT
+        / "examples"
+        / "local-knowledge-router-skill"
+        / "SKILL.md"
+    )
+    root_bytes = root_skill.read_bytes()
+    assert package_skill.read_bytes() == root_bytes
+    assert example_skill.read_bytes() == root_bytes
     ctx = registered_surface()
     assert ctx.skills == [("local-knowledge-router", root_skill)]
+
+    expected_sdist_files = {
+        "scripts/compare_historical_query_versions.py",
+        "scripts/evaluate_ref.py",
+        "scripts/evaluation_fixture.py",
+        "tests/search_regression_cases.json",
+    }
+    manifest_entries = {
+        line.removeprefix("include ").strip()
+        for line in (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+        if line.startswith("include ")
+    }
+    assert expected_sdist_files <= manifest_entries
+
+    source_copy = tmp_path / "source"
+    dist_dir = tmp_path / "dist"
+    shutil.copytree(
+        REPO_ROOT,
+        source_copy,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+            "*.egg-info",
+            "*.pyc",
+            "build",
+            "dist",
+        ),
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--no-isolation",
+            "--sdist",
+            "--wheel",
+            "--outdir",
+            str(dist_dir),
+        ],
+        cwd=source_copy,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    [sdist_path] = list(dist_dir.glob("*.tar.gz"))
+    [wheel_path] = list(dist_dir.glob("*.whl"))
+
+    with tarfile.open(sdist_path, "r:gz") as sdist_archive:
+        sdist_names = {
+            member.name.split("/", 1)[1]
+            for member in sdist_archive.getmembers()
+            if "/" in member.name
+        }
+    assert expected_sdist_files <= sdist_names
+
+    with zipfile.ZipFile(wheel_path) as wheel_archive:
+        wheel_names = set(wheel_archive.namelist())
+    assert "hermes_local_knowledge/skills/local-knowledge-router/SKILL.md" in wheel_names
+    wheel_modules = {
+        name.removeprefix("hermes_local_knowledge/")
+        for name in wheel_names
+        if name.startswith("hermes_local_knowledge/")
+        and name.count("/") == 1
+        and name.endswith(".py")
+    }
+    assert wheel_modules == {
+        "__init__.py",
+        "artifacts.py",
+        "cli.py",
+        "config.py",
+        "evaluation.py",
+        "index.py",
+        "indexer.py",
+        "okf.py",
+        "plugin.py",
+        "service.py",
+        "telemetry.py",
+    }
+    retired_modules = {
+        "constants.py",
+        "handlers.py",
+        "models.py",
+        "paths.py",
+        "runtime.py",
+        "scanners.py",
+        "schemas.py",
+        "search.py",
+        "storage.py",
+        "text_utils.py",
+        "tooling.py",
+    }
+    assert wheel_modules.isdisjoint(retired_modules)
 
 
 def test_directory_plugin_root_shim_supports_namespaced_import_without_install(

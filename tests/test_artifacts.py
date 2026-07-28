@@ -4,10 +4,11 @@ import json
 import os
 import sys
 from dataclasses import asdict, dataclass, fields, replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
+from hermes_local_knowledge import artifacts as artifacts_module
 from hermes_local_knowledge.artifacts import (
     Artifact,
     Edge,
@@ -18,6 +19,8 @@ from hermes_local_knowledge.artifacts import (
     scan_source_artifacts,
     scan_tool_okfs,
 )
+from hermes_local_knowledge.config import IndexSettings
+from hermes_local_knowledge.index import build_index, get_artifact, search_index
 
 
 @dataclass(frozen=True)
@@ -80,7 +83,16 @@ description: Review GitHub pull requests.
     )
     write(root / "memory" / "facts.md", "# Backup facts\n\nHome Assistant backup retention notes.\n")
     write(root / "docs" / "upgrade.md", "# Upgrade runbook\n\nBack up Home Assistant before upgrading.\n")
-    write(root / "notes.md", "# General notes\n\nGeneral local routing notes.\n")
+    write(
+        root / "notes.md",
+        """---
+owner: local-knowledge
+---
+# General notes
+
+General local routing notes.
+""",
+    )
     write(
         hermes_home / "cron" / "jobs.json",
         json.dumps(
@@ -189,6 +201,7 @@ def test_four_scanner_families_preserve_stable_ids_and_model_fields(tmp_path: Pa
     assert custom_support.related == ["skill:backup-flow"]
     assert runtime_support.related == ["skill:github-workflows"]
     assert runtime_support.source == "runtime_skill_support_doc"
+    assert by_id["doc:notes"].summary == "General notes"
     assert by_id["cron:nightly-backup"].related[:2] == ["skill:backup-flow", "scripts/backup.py"]
     assert by_id["mcp:github"].path.endswith("#mcp_servers.github")
     assert by_id["tool_okf:mcp-paperless-find-latest"].updated_at == "2026-07-27T00:00:00Z"
@@ -214,11 +227,16 @@ def test_script_search_metadata_excludes_body_literals_and_values(tmp_path: Path
         '    print("body-literal-canary")\n'
         '    option = "--health-check"\n',
     )
+    write(root / "scripts" / "generic" / "plain.py", "ha = object()\nprint(ha)\n")
 
     artifacts = scan_source_artifacts(root, Settings(include_markdown_docs=False))
 
-    assert [artifact.id for artifact in artifacts] == ["script:scripts-ha-mcp-run-py"]
-    artifact = artifacts[0]
+    assert [artifact.id for artifact in artifacts] == [
+        "script:scripts-generic-plain-py",
+        "script:scripts-ha-mcp-run-py",
+    ]
+    by_id = {artifact.id: artifact for artifact in artifacts}
+    artifact = by_id["script:scripts-ha-mcp-run-py"]
     serialized = json.dumps(asdict(artifact)).lower()
     assert "script-value-canary" not in serialized
     assert "body-literal-canary" not in serialized
@@ -227,6 +245,8 @@ def test_script_search_metadata_excludes_body_literals_and_values(tmp_path: Path
     assert "start_bridge" in artifact.search_text.lower()
     assert "health-check" in artifact.search_text.lower()
     assert {"home", "assistant", "homeassistant", "mcp"} <= set(artifact.triggers)
+    assert "assistant" not in by_id["script:scripts-generic-plain-py"].triggers
+    assert "homeassistant" not in by_id["script:scripts-generic-plain-py"].triggers
 
 
 def test_mcp_projection_keeps_routing_names_but_omits_credentials_and_env_values(tmp_path: Path) -> None:
@@ -284,6 +304,231 @@ def test_mcp_projection_keeps_routing_names_but_omits_credentials_and_env_values
     assert "example_token" in artifact.search_text.lower()
     assert "routing_mode" in artifact.search_text.lower()
     assert artifact.related == ["/home/example/server.json"]
+
+
+def test_mcp_common_key_credentials_never_reach_persisted_or_public_artifacts(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes-home"
+    state_dir = tmp_path / "state"
+    root.mkdir()
+
+    structured_names = (
+        "key",
+        "access_key",
+        "aws_access_key_id",
+        "AWS_ACCESS_KEY_ID",
+        "private_key",
+        "secret_key",
+        "api_key",
+        "api-key",
+        "API_KEY",
+        "apikey",
+        "ssh_key",
+        "consumer_key",
+        "accesskeyid",
+        "awsaccesskeyid",
+        "sshprivatekey",
+        "consumerkey",
+        "signingkey",
+    )
+    inline_names = ("key", "accessKey", "privateKey", "secretKey", "apiKey")
+    url_names = (*structured_names, *inline_names)
+    env_names = ("KEY", "ACCESS_KEY", "AWS_ACCESS_KEY_ID", "PRIVATE_KEY", "SECRET_KEY", "API_KEY")
+
+    def values(prefix: str, names: tuple[str, ...]) -> dict[str, str]:
+        return {
+            name: f"McpSecretCanary{prefix}{index:02d}"
+            for index, name in enumerate(names, start=1)
+        }
+
+    structured = values("Structured", structured_names)
+    inline = values("Inline", inline_names)
+    url_parameters = values("Url", url_names)
+    environment = values("Environment", env_names)
+    canaries = [*structured.values(), *inline.values(), *url_parameters.values(), *environment.values()]
+
+    structured_args = ["privacy-structured-server"]
+    for index, (name, canary) in enumerate(structured.items()):
+        if index % 2:
+            structured_args.append(f"--{name}={canary}")
+        else:
+            structured_args.extend((f"--{name}", canary))
+    structured_args.extend(("--keyboard", "mechanical-layout", "--keymap=vim-keymap"))
+
+    inline_args: list[str] = ["privacy-inline-server"]
+    for index, (name, canary) in enumerate(inline.items()):
+        if index % 2:
+            inline_args.append(f"--{name}={canary}")
+        else:
+            inline_args.extend((f"--{name}", canary))
+    inline_args.extend(("--keyboard", "ortholinear-layout", "--keymap=colemak-keymap"))
+
+    url_query = "&".join(f"{name}={canary}" for name, canary in url_parameters.items())
+    config = {
+        "mcp_servers": {
+            "privacy-structured": {
+                "command": "uvx",
+                "args": structured_args,
+            },
+            "privacy-inline": {
+                "command": "uvx",
+                "args": f"[{', '.join(inline_args)}]",
+            },
+            "privacy-url-env": {
+                "command": "uvx",
+                "url": f"https://example.invalid/mcp?{url_query}&keyboard=ansi-layout&keymap=emacs-keymap",
+                "env": environment,
+            },
+        }
+    }
+    write(hermes_home / "config.yaml", json.dumps(config))
+
+    artifacts = scan_runtime_artifacts(root, hermes_home, IndexSettings())
+    built = build_index(root, state_dir, hermes_home, IndexSettings())
+    assert built is not None
+    built_artifacts, _edges = built
+    assert {artifact.id for artifact in artifacts} == {
+        "mcp:privacy-inline",
+        "mcp:privacy-structured",
+        "mcp:privacy-url-env",
+    }
+    assert [artifact.id for artifact in built_artifacts] == sorted(artifact.id for artifact in artifacts)
+
+    db_path = state_dir / "index.sqlite"
+    public_search = search_index(db_path, "privacy mcp", limit=10)
+    public_get = [get_artifact(db_path, artifact.id) for artifact in artifacts]
+    text_sinks = {
+        "artifact fields": json.dumps([asdict(artifact) for artifact in built_artifacts], sort_keys=True).lower(),
+        "jsonl": (state_dir / "index.jsonl").read_text(encoding="utf-8").lower(),
+        "public search": json.dumps(public_search, sort_keys=True).lower(),
+        "public get": json.dumps(public_get, sort_keys=True).lower(),
+    }
+    sqlite_bytes = db_path.read_bytes().lower()
+    leaks = {
+        canary: [
+            *[name for name, payload in text_sinks.items() if canary.lower() in payload],
+            *(["sqlite"] if canary.lower().encode() in sqlite_bytes else []),
+        ]
+        for canary in canaries
+    }
+    assert {canary: sinks for canary, sinks in leaks.items() if sinks} == {}
+    assert {row["id"] for row in public_search} == {artifact.id for artifact in artifacts}
+    assert all(item is not None for item in public_get)
+
+    routing_text = text_sinks["artifact fields"]
+    for safe_value in (
+        "mechanical-layout",
+        "vim-keymap",
+        "ortholinear-layout",
+        "colemak-keymap",
+        "ansi-layout",
+        "emacs-keymap",
+    ):
+        assert safe_value in routing_text
+
+
+def test_cron_and_mcp_related_paths_are_portable_and_exclude_url_components(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes-home"
+    windows_backslash = str(PureWindowsPath("C:/Users/Alex/Hermes/run.ps1"))
+    windows_forward = "D:/Hermes/scripts/rebuild.cmd"
+    unc = str(PureWindowsPath("//fileserver/Hermes/scripts/sync.ps1"))
+    posix = "/opt/hermes/bin/worker.sh"
+    home = "~/.hermes/scripts/rebuild.py"
+    url = "https://example.invalid/owner's/C:/tool?next=~/run#/opt/job"
+    root.mkdir()
+
+    target_artifacts = [
+        Artifact(
+            id=f"script:portable-{index}",
+            type="script",
+            title=filename,
+            path=f"scripts/{filename}",
+            summary=f"Portable target {filename}.",
+        )
+        for index, filename in enumerate(
+            ("run.ps1", "rebuild.cmd", "sync.ps1", "worker.sh", "rebuild.py"),
+            start=1,
+        )
+    ]
+    write(
+        hermes_home / "cron" / "jobs.json",
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "portable-paths",
+                        "name": "portable-paths",
+                        "prompt": (
+                            f"Run {posix}, {home}, {windows_backslash}, {windows_forward}, and {unc}. "
+                            f"Ignore {url} and //example.invalid/download/C:/ignored.ps1."
+                        ),
+                    }
+                ]
+            }
+        ),
+    )
+    write(
+        hermes_home / "config.yaml",
+        json.dumps(
+            {
+                "mcp_servers": {
+                    "portable-paths": {
+                        "command": "uvx",
+                        "args": [
+                            "portable-server",
+                            "--config",
+                            windows_backslash,
+                            "--sync-script",
+                            unc,
+                            "--worker",
+                            posix,
+                            "--endpoint",
+                            url,
+                        ],
+                    }
+                }
+            }
+        ),
+    )
+
+    runtime = {artifact.id: artifact for artifact in scan_runtime_artifacts(root, hermes_home, Settings())}
+
+    assert set(runtime["cron:portable-paths"].related) == {
+        posix,
+        home,
+        windows_backslash,
+        windows_forward,
+        unc,
+    }
+    assert set(runtime["mcp:portable-paths"].related) == {windows_backslash, unc, posix}
+    assert not {"C:/tool", "~/run", "/opt/job", "C:/ignored.ps1"} & {
+        related
+        for artifact in runtime.values()
+        for related in artifact.related
+    }
+
+    edges = build_edges([*runtime.values(), *target_artifacts])
+    targets_by_source = {
+        source_id: {
+            edge.target
+            for edge in edges
+            if edge.source == source_id and edge.kind == "related_to"
+        }
+        for source_id in runtime
+    }
+    assert targets_by_source["cron:portable-paths"] == {
+        "script:portable-1",
+        "script:portable-2",
+        "script:portable-3",
+        "script:portable-4",
+        "script:portable-5",
+    }
+    assert targets_by_source["mcp:portable-paths"] == {
+        "script:portable-1",
+        "script:portable-3",
+        "script:portable-4",
+    }
 
 
 def test_tool_okf_uses_only_positive_structured_routing_metadata(tmp_path: Path) -> None:
@@ -464,3 +709,132 @@ def test_explicit_and_inverted_keyword_edges_are_deterministic() -> None:
         edge.evidence for edge in forward if edge.source == "skill:backup" and edge.kind == "keyword_overlap"
     }
     assert overlap_evidence == {"backup,database"}
+
+
+@pytest.mark.parametrize("force_fallback", [False, True], ids=["yaml", "stdlib-fallback"])
+def test_legacy_mcp_config_is_sanitized_with_yaml_or_fallback_parser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force_fallback: bool,
+) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes-home"
+    write(
+        hermes_home / "config.yaml",
+        """mcp:
+  servers:
+    github:
+      command: uvx
+      base_url: http://user-canary:password-canary@localhost:9000
+      args: [github-mcp-server, --token, argument-canary, --config, /home/example/server.json]
+      env:
+        GITHUB_TOKEN: environment-canary
+""",
+    )
+    if force_fallback:
+        monkeypatch.setattr(artifacts_module, "_load_yaml", lambda _text: None)
+
+    artifacts = scan_runtime_artifacts(root, hermes_home, Settings())
+
+    assert [artifact.id for artifact in artifacts] == ["mcp:github"]
+    artifact = artifacts[0]
+    serialized = json.dumps(asdict(artifact)).lower()
+    assert artifact.path.endswith("#mcp.servers.github")
+    assert "url http://localhost:9000" in artifact.summary
+    assert "github-mcp-server" in artifact.summary
+    assert "--token <redacted>" in artifact.summary.lower()
+    assert artifact.related == ["/home/example/server.json"]
+    for canary in ("user-canary", "password-canary", "argument-canary", "environment-canary"):
+        assert canary not in serialized
+
+
+def test_mcp_config_read_is_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes-home"
+    write(
+        hermes_home / "config.yaml",
+        ("x" * 200_000) + "\nmcp_servers:\n  beyond-bound:\n    command: uvx\n",
+    )
+
+    assert scan_runtime_artifacts(root, hermes_home, Settings()) == []
+
+
+def test_cron_registry_legacy_and_missing_name_shapes_remain_product_inputs(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes-home"
+    registry = hermes_home / "cron" / "jobs.json"
+    write(registry, json.dumps({}))
+    assert scan_runtime_artifacts(root, hermes_home, Settings()) == []
+
+    write(
+        registry,
+        json.dumps(
+            [
+                "ignored",
+                {
+                    "id": "job1",
+                    "name": "nightly-backup",
+                    "prompt": "Run scripts/backup.py before updates.",
+                    "schedule": "0 3 * * *",
+                    "script": "scripts/backup.py",
+                    "skills": ["backup-flow"],
+                },
+            ]
+        ),
+    )
+    [legacy] = scan_runtime_artifacts(root, hermes_home, Settings())
+    assert legacy.id == "cron:nightly-backup"
+    assert legacy.related == ["skill:backup-flow", "scripts/backup.py"]
+
+    write(
+        registry,
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "daily-review",
+                        "prompt": "Run ~/bin/review.py and summarize changed artifacts.",
+                        "schedule_display": "every 2h",
+                        "script": "~/bin/review.py",
+                        "skills": ["review-flow"],
+                        "enabled_toolsets": ["terminal"],
+                        "state": "scheduled",
+                        "last_status": "ok",
+                    }
+                ]
+            }
+        ),
+    )
+    [current] = scan_runtime_artifacts(root, hermes_home, Settings())
+    assert current.id == "cron:daily-review"
+    assert current.title == "daily-review"
+    assert current.path.endswith("#daily-review")
+    assert current.related == ["skill:review-flow", "~/bin/review.py"]
+    assert "Schedule: every 2h." in current.summary
+    assert "State: scheduled." in current.summary
+    assert "Last status: ok." in current.summary
+    assert "terminal" in current.triggers
+
+
+def test_nested_tool_okf_is_not_duplicated_as_source_markdown(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    hermes_home = tmp_path / "hermes-home"
+    okf_root = root / "local_knowledge" / "okfs" / "tools"
+    write(
+        okf_root / "cron.md",
+        """---
+artifact_type: tool_okf
+tool: cronjob
+toolset: cron
+schema_hash: sha256:abc123
+title: Manage scheduled jobs
+aliases: [recurring task scheduler]
+triggers: [create a scheduled job]
+---
+Human context only.
+""",
+    )
+
+    artifacts = collect_artifacts(root, hermes_home, Settings(), okf_root=okf_root)
+
+    assert [artifact.id for artifact in artifacts] == ["tool_okf:cronjob"]
