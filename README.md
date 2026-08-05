@@ -219,9 +219,11 @@ Version 0.4.0 reads the current v0.3.12 queue shape by normalizing a selected cl
 
 Lookup telemetry and feedback stay in `<state_dir>/usage.sqlite`. Tool handlers fail open for telemetry-only errors; explicit `knowledge_feedback` writes remain strict so callers know whether feedback was recorded. Do not put secrets or private document text in queries or feedback notes.
 
+Managed searches may use one deterministic feedback prior when the index was built for the configured source root. Only the latest significant explicit rating for a query/artifact pair is eligible, only `useful` is positive, and a newer rejection for that route or matching current query suppresses an older overlap route. A matching artifact already present in current results may move to rank one. If it is absent, the plugin performs at most one retry with an accepted query no longer than the current query and the mapped artifact type, and promotes only the exact artifact when that live retry rediscovers it. Searches against an explicit caller-owned `--db` remain unassisted.
+
 `knowledge_usage_report` summarizes recent activity before changing ranking, triggers, source coverage, or graph edges.
 
-`evaluate` is read-only. It replays positive local feedback against the current index and reports exact Hit@k/MRR plus parent-equivalent metrics. Parent equivalence is deliberately limited to a `skill_support_doc` and its owning skill; generic graph neighbors are not treated as successful equivalents.
+`evaluate` is read-only and intentionally measures the unassisted index ranking to avoid training/evaluation leakage. It replays positive local feedback against the current index and reports exact Hit@k/MRR plus parent-equivalent metrics. Parent equivalence is deliberately limited to a `skill_support_doc` and its owning skill; generic graph neighbors are not treated as successful equivalents.
 
 For historical comparisons from a source checkout:
 
@@ -262,6 +264,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and [`do
 - `artifacts.py` — whole-artifact models, source collection, privacy-safe metadata extraction, and graph edges.
 - `index.py` — format-4 SQLite/JSONL publication, cross-version and SQLite build locking, managed rebuild classification, and deterministic search/get/neighbors.
 - `telemetry.py` — local usage and feedback persistence/reporting.
+- `routing.py` — bounded live-root feedback matching, promotion, and one verified typed retry.
 - `evaluation.py` — read-only feedback-label replay and exact/parent-equivalent metrics.
 - `service.py` — one resolved configuration's managed index and telemetry lifecycle.
 - `okf.py` — privacy-safe OKF queue, hooks, detached worker, validation, and fenced publication.

@@ -88,7 +88,9 @@ Automatic generation is optional and defaults off because it spends model tokens
 - Lookup usage, failures, zero-result queries, and explicit ratings stay in `usage.sqlite` and are summarized locally before changing ranking or source coverage.
 - Telemetry-only failures must not break lookup. Explicit feedback writes remain strict so callers know whether a rating was stored.
 - Evaluation is read-only and must not emit usage events or mutate feedback.
-- Positive feedback is an evaluation oracle, not permanent truth. Ignore stale labels whose artifacts no longer exist.
+- Explicit useful feedback may provide one bounded current-index-root routing prior, but it is not permanent truth. The newest significant query/artifact rating wins; a newer rejection for the route or matching current query vetoes an older overlap route. A retry must be no longer than the current query, must use the artifact's mapped type, and must rediscover the exact artifact before promotion. Explicit caller-owned indexes remain unassisted.
+- Keep feedback lookup bounded and fail-open: scan only a recent capped window through the root/order index and use a short read timeout so optional routing cannot add multi-second lock delays.
+- Evaluation deliberately uses the unassisted index ranking so the same feedback rows are not both training data and evaluation labels. Ignore stale labels whose artifacts no longer exist.
 - Report exact Hit@k/MRR and parent-equivalent metrics. Parent equivalence is limited to a `skill_support_doc` and its owning skill; peer skills, cron/script links, keyword overlap, and other graph edges are context rather than equivalence.
 - `*_at_10` metrics use an actual top-10 window regardless of a larger retrieval limit.
 - Curated regression cases protect exact/quoted behavior, identity recovery, operational intent, support-document diversity, type filters, privacy boundaries, and known historical routing wins.

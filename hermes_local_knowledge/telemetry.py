@@ -171,6 +171,7 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_query ON usage_events(query)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_root_id ON feedback(root, id DESC)")
 
 def _usage_connect(root: Path | None, usage_db_path: Path | None = None) -> sqlite3.Connection:
     if usage_db_path is None:

@@ -873,6 +873,24 @@ def index_metadata(db_path: Path) -> dict[str, Any]:
     return metadata
 
 
+def index_source_root(db_path: Path) -> str | None:
+    """Read the source root persisted in one current index, if available."""
+
+    if not db_path.is_file():
+        return None
+    try:
+        connection = connect_readonly(db_path)
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='source_root'"
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return None
+    return str(row[0]) if row is not None else None
+
+
 def decode_artifact_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     output = dict(row)
     for field in ("type_priority", "metadata_score", "source_tier", "strict_candidate", "search_text"):

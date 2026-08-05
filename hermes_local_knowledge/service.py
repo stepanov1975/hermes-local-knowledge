@@ -11,6 +11,7 @@ from . import __version__, index
 from .artifacts import Artifact, Edge
 from .config import Config
 from .evaluation import SearchEvaluationReport, evaluate_index_against_feedback_report
+from .routing import apply_feedback_route, best_feedback_route
 from .telemetry import _record_feedback, _record_usage, _usage_report
 
 BuildIndexFn = Callable[..., tuple[list[Artifact], list[Edge]] | None]
@@ -18,6 +19,7 @@ SearchIndexFn = Callable[..., list[dict[str, Any]]]
 GetArtifactFn = Callable[..., dict[str, Any] | None]
 GetNeighborsFn = Callable[..., list[dict[str, Any]]]
 IndexMetadataFn = Callable[[Path], dict[str, Any]]
+IndexSourceRootFn = Callable[[Path], str | None]
 RecordUsageFn = Callable[..., int | None]
 RecordFeedbackFn = Callable[..., int]
 UsageReportFn = Callable[..., dict[str, Any]]
@@ -36,6 +38,7 @@ class LocalKnowledgeService:
         get_artifact_fn: GetArtifactFn | None = None,
         get_neighbors_fn: GetNeighborsFn | None = None,
         index_metadata_fn: IndexMetadataFn | None = None,
+        index_source_root_fn: IndexSourceRootFn | None = None,
         record_usage_fn: RecordUsageFn | None = None,
         record_feedback_fn: RecordFeedbackFn | None = None,
         usage_report_fn: UsageReportFn | None = None,
@@ -47,6 +50,7 @@ class LocalKnowledgeService:
         self._get_artifact_fn = get_artifact_fn or index.get_artifact
         self._get_neighbors_fn = get_neighbors_fn or index.get_neighbors
         self._index_metadata_fn = index_metadata_fn or index.index_metadata
+        self._index_source_root_fn = index_source_root_fn or index.index_source_root
         self._record_usage_fn = record_usage_fn or _record_usage
         self._record_feedback_fn = record_feedback_fn or _record_feedback
         self._usage_report_fn = usage_report_fn or _usage_report
@@ -161,6 +165,22 @@ class LocalKnowledgeService:
             limit=limit,
             artifact_type=artifact_type,
         )
+        index_source_root = self._index_source_root_fn(target)
+        if db_path is None and index_source_root == str(self.config.source_root):
+            route = best_feedback_route(
+                self.usage_db_path,
+                root=self.config.source_root,
+                query=query,
+                artifact_type=artifact_type,
+            )
+            if route is not None:
+                rows = apply_feedback_route(
+                    rows,
+                    route=route,
+                    db_path=target,
+                    limit=limit,
+                    search_index_fn=self._search_index_fn,
+                )
         return rows, metadata
 
     def get(

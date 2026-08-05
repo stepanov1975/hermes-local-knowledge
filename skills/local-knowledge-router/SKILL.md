@@ -1,7 +1,7 @@
 ---
 name: local-knowledge-router
 description: Route local operational questions to indexed skills, scripts, runbooks, cron jobs, MCP servers, and docs before guessing paths or doing broad file search.
-version: 1.0.0
+version: 1.0.1
 author: Hermes Local Knowledge
 license: MIT
 requires_toolsets: [local_knowledge]
@@ -64,7 +64,9 @@ The plugin indexes whole artifacts. It identifies the first artifact to inspect;
 
    `knowledge_get` and `knowledge_neighbors` also accept `rebuild=true`. An operator may optionally schedule the plugin's explicit CLI build command to enforce a freshness interval, but no schedule is required.
 
-5. Record clear lookup outcomes:
+5. If mixed results look weak, retry once with a shorter core-intent query and the likely `artifact_type`. Current plugin revisions can perform one such retry automatically when a matching explicit `useful` route exists and its accepted query is no longer than the current query; the remembered artifact still has to be rediscovered in the live index. A newer matching rejection vetoes an older overlap route.
+
+6. Record clear lookup outcomes:
 
    ```text
    knowledge_feedback(event_id=<usage_event_id>, rating="useful", artifact_id="skill:example-skill")

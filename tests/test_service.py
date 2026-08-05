@@ -335,6 +335,7 @@ def test_query_dependency_injection_and_configured_paths_are_stable(
         get_artifact_fn=get_fn,
         get_neighbors_fn=neighbors_fn,
         index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
     )
     monkeypatch.setenv("LOCAL_KNOWLEDGE_STATE_DIR", str(tmp_path / "changed-state"))
 
@@ -350,6 +351,446 @@ def test_query_dependency_injection_and_configured_paths_are_stable(
         ("get", service.db_path, "skill:injected"),
         ("neighbors", service.db_path, "skill:injected"),
     ]
+
+
+def test_search_promotes_explicit_useful_route_via_concise_typed_retry(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    target_id = "skill_support_doc:daily-diary-cron-evidence-patterns"
+    broad_query = "daily diary sqlite3 fallback cron json parsing evidence"
+    accepted_query = "daily diary cron evidence patterns"
+    calls: list[tuple[str, int, str | None]] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append((query, limit, artifact_type))
+        if query == accepted_query:
+            return [
+                {"id": target_id, "type": "skill_support_doc"},
+                {"id": "skill_support_doc:other", "type": "skill_support_doc"},
+            ]
+        return [{"id": "runbook:noise", "type": "runbook"}]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+    service.feedback(
+        rating="useful",
+        event_id=None,
+        query=accepted_query,
+        artifact_id=target_id,
+        note="accepted route",
+        context={},
+    )
+
+    rows, _metadata = service.search(broad_query, limit=3, ensure=False)
+
+    assert [row["id"] for row in rows] == [target_id, "runbook:noise"]
+    assert calls == [
+        (broad_query, 3, None),
+        (accepted_query, 10, "skill_support_doc"),
+    ]
+
+
+def test_search_moves_an_explicit_useful_candidate_to_rank_one_without_retry(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    target_id = "runbook:application-release-versions"
+    calls: list[tuple[str, int, str | None]] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append((query, limit, artifact_type))
+        return [
+            {"id": "skill:self-hosted-application-operations", "type": "skill"},
+            {"id": target_id, "type": "runbook"},
+        ]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+    service.feedback(
+        rating="useful",
+        event_id=None,
+        query="docker image version report",
+        artifact_id=target_id,
+        note="accepted route",
+        context={},
+    )
+
+    rows, _metadata = service.search("docker image version report needs update", limit=2, ensure=False)
+
+    assert [row["id"] for row in rows] == [
+        target_id,
+        "skill:self-hosted-application-operations",
+    ]
+    assert calls == [("docker image version report needs update", 2, None)]
+
+
+def test_search_ignores_route_after_newer_negative_feedback(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    target_id = "skill_support_doc:daily-diary-cron-evidence-patterns"
+    calls: list[tuple[str, int, str | None]] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append((query, limit, artifact_type))
+        return [{"id": "runbook:noise", "type": "runbook"}]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+    for rating in ("useful", "wrong_artifact"):
+        service.feedback(
+            rating=rating,
+            event_id=None,
+            query="daily diary cron evidence patterns",
+            artifact_id=target_id,
+            note="route judgment",
+            context={},
+        )
+
+    rows, _metadata = service.search(
+        "daily diary sqlite3 fallback cron json parsing evidence",
+        limit=3,
+        ensure=False,
+    )
+
+    assert [row["id"] for row in rows] == ["runbook:noise"]
+    assert calls == [("daily diary sqlite3 fallback cron json parsing evidence", 3, None)]
+
+
+def test_search_feedback_prior_respects_explicit_type_and_managed_index_scope(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    target_id = "runbook:application-release-versions"
+    calls: list[tuple[Path, str, int, str | None]] = []
+
+    def search_fn(
+        db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append((db_path, query, limit, artifact_type))
+        return [{"id": "script:baseline", "type": "script"}]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+    service.feedback(
+        rating="useful",
+        event_id=None,
+        query="docker image version report",
+        artifact_id=target_id,
+        note="accepted route",
+        context={},
+    )
+
+    filtered, _ = service.search(
+        "docker image version report needs update",
+        limit=2,
+        artifact_type="script",
+        ensure=False,
+    )
+    caller_db = tmp_path / "caller" / "index.sqlite"
+    caller_owned, _ = service.search(
+        "docker image version report needs update",
+        limit=2,
+        db_path=caller_db,
+        ensure=False,
+    )
+
+    assert filtered == [{"id": "script:baseline", "type": "script"}]
+    assert caller_owned == [{"id": "script:baseline", "type": "script"}]
+    assert calls == [
+        (service.db_path, "docker image version report needs update", 2, "script"),
+        (caller_db, "docker image version report needs update", 2, None),
+    ]
+
+
+def test_search_feedback_prior_is_fail_open_for_corrupt_usage_db(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    config.state_dir.mkdir(parents=True)
+    config.state_dir.joinpath("usage.sqlite").write_text("not sqlite", encoding="utf-8")
+    calls: list[str] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append(query)
+        return [{"id": "runbook:baseline", "type": "runbook"}]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+
+    rows, _metadata = service.search("ordinary query", limit=3, ensure=False)
+
+    assert rows == [{"id": "runbook:baseline", "type": "runbook"}]
+    assert calls == ["ordinary query"]
+
+
+def test_search_feedback_prior_preserves_different_quoted_phrase_order(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    target_id = "runbook:quoted-order"
+    calls: list[str] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append(query)
+        return [
+            {"id": "runbook:strict-baseline", "type": "runbook"},
+            {"id": target_id, "type": "runbook"},
+        ]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+    service.feedback(
+        rating="useful",
+        event_id=None,
+        query='"unique exact phrase"',
+        artifact_id=target_id,
+        note="accepted route",
+        context={},
+    )
+
+    service.feedback(
+        rating="wrong_artifact",
+        event_id=None,
+        query='"phrase exact unique"',
+        artifact_id=target_id,
+        note="rejected reordered phrase",
+        context={},
+    )
+
+    reordered_rows, _metadata = service.search('"phrase exact unique"', limit=2, ensure=False)
+    accepted_rows, _metadata = service.search('"unique exact phrase"', limit=2, ensure=False)
+
+    assert [row["id"] for row in reordered_rows] == ["runbook:strict-baseline", target_id]
+    assert [row["id"] for row in accepted_rows] == [target_id, "runbook:strict-baseline"]
+    assert calls == ['"phrase exact unique"', '"unique exact phrase"']
+
+
+def test_search_feedback_prior_does_not_inject_an_unverified_artifact(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    target_id = "runbook:accepted-but-stale"
+    accepted_query = "docker image version report"
+    calls: list[tuple[str, str | None]] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append((query, artifact_type))
+        if query == accepted_query:
+            return [{"id": "runbook:replacement", "type": "runbook"}]
+        return [{"id": "skill:baseline", "type": "skill"}]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+    service.feedback(
+        rating="useful",
+        event_id=None,
+        query=accepted_query,
+        artifact_id=target_id,
+        note="accepted route",
+        context={},
+    )
+
+    rows, _metadata = service.search(
+        "docker image version report needs update",
+        limit=3,
+        ensure=False,
+    )
+
+    assert rows == [{"id": "skill:baseline", "type": "skill"}]
+    assert calls == [
+        ("docker image version report needs update", None),
+        (accepted_query, "runbook"),
+    ]
+
+
+def test_search_feedback_retry_failure_returns_the_baseline_results(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    accepted_query = "docker image version report"
+    calls: list[str] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append(query)
+        if query == accepted_query:
+            raise RuntimeError("optional retry failed")
+        return [{"id": "skill:baseline", "type": "skill"}]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+    service.feedback(
+        rating="useful",
+        event_id=None,
+        query=accepted_query,
+        artifact_id="runbook:accepted",
+        note="accepted route",
+        context={},
+    )
+
+    rows, _metadata = service.search(
+        "docker image version report needs update",
+        limit=3,
+        ensure=False,
+    )
+
+    assert rows == [{"id": "skill:baseline", "type": "skill"}]
+    assert calls == ["docker image version report needs update", accepted_query]
+
+
+@pytest.mark.parametrize("stored_root_state", ["missing", "different"])
+def test_search_feedback_prior_requires_a_matching_index_source_root(
+    tmp_path: Path,
+    stored_root_state: str,
+) -> None:
+    config = make_config(tmp_path)
+    target_id = "runbook:accepted"
+    calls: list[str] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append(query)
+        return [
+            {"id": "runbook:baseline", "type": "runbook"},
+            {"id": target_id, "type": "runbook"},
+        ]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {
+            "index_exists": True,
+        },
+        index_source_root_fn=lambda _path: (
+            None if stored_root_state == "missing" else str(tmp_path / "other-root")
+        ),
+    )
+    service.feedback(
+        rating="useful",
+        event_id=None,
+        query="docker image version report",
+        artifact_id=target_id,
+        note="accepted route",
+        context={},
+    )
+
+    rows, _metadata = service.search(
+        "docker image version report needs update",
+        limit=2,
+        ensure=False,
+    )
+
+    assert [row["id"] for row in rows] == ["runbook:baseline", target_id]
+    assert calls == ["docker image version report needs update"]
+
+
+def test_search_feedback_prior_ignores_feedback_from_another_root(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    calls: list[str] = []
+
+    def search_fn(
+        _db_path: Path,
+        query: str,
+        *,
+        limit: int,
+        artifact_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        calls.append(query)
+        return [{"id": "runbook:baseline", "type": "runbook"}]
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=search_fn,
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+    )
+    service.feedback(
+        rating="useful",
+        event_id=None,
+        query="docker image version report",
+        artifact_id="runbook:accepted",
+        note="accepted route",
+        context={},
+    )
+    with closing(sqlite3.connect(service.usage_db_path)) as connection, connection:
+        connection.execute("UPDATE feedback SET root = ?", (str(tmp_path / "other-root"),))
+
+    rows, _metadata = service.search(
+        "docker image version report needs update",
+        limit=3,
+        ensure=False,
+    )
+
+    assert rows == [{"id": "runbook:baseline", "type": "runbook"}]
+    assert calls == ["docker image version report needs update"]
 
 
 def test_usage_success_error_and_failures_are_best_effort(tmp_path: Path) -> None:

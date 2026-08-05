@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.1] - 2026-08-05
+
+### Added
+
+- Added a bounded deterministic search prior learned only from explicit useful feedback for the configured live source root. A matching accepted artifact is promoted only when it still appears in current index results.
+- Added one concise, artifact-type-scoped retry when an accepted route is absent from the initial results; the remembered artifact must be rediscovered by that live retry before promotion.
+
+### Changed
+
+- Kept read-only evaluation on the unassisted index ranking so feedback labels do not train and score the same replay.
+
+### Fixed
+
+- Made newer matching rejections veto older overlap routes and prevented a retry from expanding to a longer accepted query.
+- Mapped artifact-ID prefixes such as `mcp:` and `cron:` to their actual artifact types before the typed verification retry.
+- Scoped feedback assistance to the source root stored in the current index, encoded read-only feedback database URIs, and bounded locked-database fallback with a root/order lookup index and short timeout.
+
+[0.4.1]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.0...v0.4.1
+
 ## [0.4.0] - 2026-07-27
 
 ### Changed

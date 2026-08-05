@@ -1584,6 +1584,7 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
         "indexer.py",
         "okf.py",
         "plugin.py",
+        "routing.py",
         "service.py",
         "telemetry.py",
     }

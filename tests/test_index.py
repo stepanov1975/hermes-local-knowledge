@@ -186,9 +186,10 @@ def test_build_publishes_valid_format4_index_and_queries_it(tmp_path: Path) -> N
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         metadata = dict(connection.execute("SELECT key, value FROM metadata"))
         assert metadata["format_version"] == "4"
-        assert metadata["plugin_version"] == "0.4.0"
+        assert metadata["plugin_version"] == "0.4.1"
         assert int(metadata["artifact_count"]) == len(artifacts)
         assert int(metadata["edge_count"]) == len(edges)
+    assert index.index_source_root(db_path) == str(root.resolve())
     jsonl_bytes = (state / "index.jsonl").read_bytes()
     assert metadata["jsonl_sha256"] == hashlib.sha256(jsonl_bytes).hexdigest()
     assert index.INDEX_BUILD_LOCK_NAME == "index_build.lock"
