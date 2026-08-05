@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -57,6 +58,25 @@ def test_route_maps_nonmatching_id_prefix_and_requires_a_concise_retry(tmp_path:
     assert route is not None
     assert route.artifact_type == "mcp_server"
     assert non_concise is None
+
+
+def test_route_length_counts_repeated_query_tokens(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    usage_db_path = tmp_path / "state" / "usage.sqlite"
+    _feedback(
+        usage_db_path,
+        root,
+        rating="useful",
+        query="find find find docker image version report",
+        artifact_id="runbook:accepted",
+    )
+
+    assert best_feedback_route(
+        usage_db_path,
+        root=root,
+        query="find docker image version report",
+        artifact_type=None,
+    ) is None
 
 
 def test_feedback_schema_has_a_bounded_route_lookup_index(tmp_path: Path) -> None:
@@ -141,7 +161,19 @@ def test_newer_current_query_rejection_suppresses_an_older_overlap_route(
     assert route is None
 
 
-@pytest.mark.parametrize("marker", ["?", "#"])
+@pytest.mark.parametrize(
+    "marker",
+    [
+        pytest.param(
+            "?",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason="question marks are not valid Windows path characters",
+            ),
+        ),
+        "#",
+    ],
+)
 def test_readonly_feedback_lookup_handles_uri_reserved_path_characters(
     tmp_path: Path,
     marker: str,

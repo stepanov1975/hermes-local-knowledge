@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ ARTIFACT_TYPE_BY_ID_PREFIX = {
     "cron": "cron_job",
     "mcp": "mcp_server",
 }
+QUERY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]{2,}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +65,10 @@ def _normalized_query(query: str) -> str:
     return " ".join(query.casefold().split())
 
 
+def _query_token_count(query: str) -> int:
+    return len(QUERY_TOKEN_PATTERN.findall(query))
+
+
 def _feedback_query_key(query: str, terms: frozenset[str]) -> str:
     if '"' in query:
         return f"quoted:{_normalized_query(query)}"
@@ -80,7 +86,7 @@ def _match_score(
         return None
     if len(route.terms) < MIN_ROUTE_TERMS:
         return None
-    if len(route.terms) > len(query_terms):
+    if _query_token_count(route.query) > _query_token_count(query):
         return None
     overlap = len(route.terms & query_terms)
     if overlap < MIN_OVERLAP_TERMS:
