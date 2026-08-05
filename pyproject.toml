@@ -26,7 +26,7 @@ test = [
     "mypy>=1.18,<3",
     "pytest>=8,<10",
     "PyYAML>=6,<7",
-    "ruff>=0.15,<0.16",
+    "ruff>=0.15,<0.17",
     "setuptools>=70.1",
 ]
 mutation = [
