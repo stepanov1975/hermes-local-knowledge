@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from functools import partial
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 from . import index
 from .config import resolve_config
 from .okf import _on_post_tool_call, _on_session_finalize
+from .routing import ROUTING_TRACE_METADATA_KEY, SearchRoutingTrace
 from .service import LocalKnowledgeService
 from .telemetry import FEEDBACK_RATINGS, FeedbackDatabaseLockedError, _usage_context
 
@@ -35,6 +37,61 @@ def check_knowledge_available() -> bool:
 
 def _tool_result(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
+
+
+_URL_USERINFO_PATTERN = re.compile(
+    r"(?i)(\b[a-z][a-z0-9+.-]*://)([^/@\s\"\\]+)@"
+)
+_CREDENTIAL_KEY = (
+    r"(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
+    r"password|passwd|pwd|secret|token)"
+)
+_CREDENTIAL_DOUBLE_QUOTED_PATTERN = re.compile(
+    rf"(?i)((?:\\?\")?{_CREDENTIAL_KEY}(?:\\?\")?\s*[:=]\s*\\?\")"
+    r"([^\"\\]*)(\\?\")"
+)
+_CREDENTIAL_SINGLE_QUOTED_PATTERN = re.compile(
+    rf"(?i)((?:\\?\")?{_CREDENTIAL_KEY}(?:\\?\")?\s*[:=]\s*')([^']*)(')"
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    rf"(?i)(\b{_CREDENTIAL_KEY}\s*[:=]\s*)([^\s,;&\"'\\]+)"
+)
+_AUTHORIZATION_VALUE_DOUBLE_QUOTED_PATTERN = re.compile(
+    r"(?i)((?:\\?\")?authorization(?:\\?\")?\s*[:=]\s*\\?\")"
+    r"([^\"\\]*)(\\?\")"
+)
+_AUTHORIZATION_VALUE_SINGLE_QUOTED_PATTERN = re.compile(
+    r"(?i)((?:\\?\")?authorization(?:\\?\")?\s*[:=]\s*')([^']*)(')"
+)
+_AUTHORIZATION_DOUBLE_QUOTED_PATTERN = re.compile(
+    r"(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic)\s+\\?\")"
+    r"([^\"\\]*)(\\?\")"
+)
+_AUTHORIZATION_SINGLE_QUOTED_PATTERN = re.compile(
+    r"(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic)\s+')([^']*)(')"
+)
+_AUTHORIZATION_PATTERN = re.compile(
+    r"(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic)\s+)([^\s,;&\"'\\]+)"
+)
+
+
+def _model_safe_usage_report_result(payload: dict[str, Any]) -> str:
+    """Serialize a report while masking only obvious model-facing credentials."""
+
+    serialized = json.dumps(payload, ensure_ascii=False)
+    serialized = _URL_USERINFO_PATTERN.sub(r"\1<redacted>@", serialized)
+    serialized = _CREDENTIAL_DOUBLE_QUOTED_PATTERN.sub(r"\1<redacted>\3", serialized)
+    serialized = _CREDENTIAL_SINGLE_QUOTED_PATTERN.sub(r"\1<redacted>\3", serialized)
+    serialized = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(r"\1<redacted>", serialized)
+    serialized = _AUTHORIZATION_VALUE_DOUBLE_QUOTED_PATTERN.sub(
+        r"\1<redacted>\3", serialized
+    )
+    serialized = _AUTHORIZATION_VALUE_SINGLE_QUOTED_PATTERN.sub(
+        r"\1<redacted>\3", serialized
+    )
+    serialized = _AUTHORIZATION_DOUBLE_QUOTED_PATTERN.sub(r"\1<redacted>\3", serialized)
+    serialized = _AUTHORIZATION_SINGLE_QUOTED_PATTERN.sub(r"\1<redacted>\3", serialized)
+    return _AUTHORIZATION_PATTERN.sub(r"\1<redacted>", serialized)
 
 
 def _tool_error(message: object, **extra: Any) -> str:
@@ -113,7 +170,22 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
             artifact_type=artifact_type or None,
             rebuild=rebuild,
         )
+        routing_trace = meta.pop(ROUTING_TRACE_METADATA_KEY, None)
         rows = rows[:limit]
+        final_ids = [str(row.get("id")) for row in rows]
+        if isinstance(routing_trace, SearchRoutingTrace):
+            baseline_ids = list(routing_trace.baseline_ids)
+            route_decision = routing_trace.decision
+            route_feedback_id = route_decision.feedback_id
+            route_artifact_id = route_decision.artifact_id
+            route_outcome = route_decision.outcome.value
+            feedback_max_id = route_decision.feedback_max_id
+        else:
+            baseline_ids = final_ids
+            route_feedback_id = None
+            route_artifact_id = None
+            route_outcome = "none"
+            feedback_max_id = None
         event_id = service.record_usage(
             tool="knowledge_search",
             success=True,
@@ -123,8 +195,13 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
             rebuild_requested=rebuild,
             rebuilt=bool(meta.get("rebuilt")),
             result_count=len(rows),
-            top_ids=[str(row.get("id")) for row in rows],
+            top_ids=final_ids,
             top_types=[str(row.get("type")) for row in rows],
+            baseline_top_ids=baseline_ids,
+            route_feedback_id=route_feedback_id,
+            route_artifact_id=route_artifact_id,
+            route_outcome=route_outcome,
+            feedback_max_id=feedback_max_id,
             latency_ms=_latency_ms(started),
             db_path=db_path,
             context=context,
@@ -446,7 +523,7 @@ def _handle_usage_report(args: Any, **kwargs: Any) -> str:
             context=context,
         )
         report["usage_event_id"] = usage_event_id
-        return _tool_result(report)
+        return _model_safe_usage_report_result(report)
     except Exception as exc:
         message = f"knowledge_usage_report failed: {type(exc).__name__}: {exc}"
         usage_event_id = _record_handler_usage(

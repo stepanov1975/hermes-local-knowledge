@@ -6,6 +6,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ ARTIFACT_TYPE_BY_ID_PREFIX = {
     "mcp": "mcp_server",
 }
 QUERY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]{2,}")
+ROUTING_TRACE_METADATA_KEY = "_routing_trace"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +42,35 @@ class FeedbackRoute:
     artifact_type: str
     terms: frozenset[str]
     feedback_id: int
+
+
+class RouteOutcome(str, Enum):
+    """Persisted outcome of applying one feedback route decision."""
+
+    NONE = "none"
+    ALREADY_FIRST = "already_first"
+    PROMOTED_EXISTING = "promoted_existing"
+    PROMOTED_RETRY = "promoted_retry"
+    VERIFICATION_FAILED = "verification_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class RouteDecision:
+    """Typed final routing result and replay provenance for one search."""
+
+    rows: list[dict[str, Any]]
+    outcome: RouteOutcome
+    feedback_id: int | None
+    artifact_id: str | None
+    feedback_max_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class SearchRoutingTrace:
+    """Internal service-to-adapter trace removed before user-visible output."""
+
+    baseline_ids: tuple[str, ...]
+    decision: RouteDecision
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,29 +128,36 @@ def _match_score(
     return (1, int(coverage * 1000), overlap, route.feedback_id)
 
 
-def best_feedback_route(
+def _feedback_route_snapshot(
     usage_db_path: Path,
     *,
     root: Path,
     query: str,
     artifact_type: str | None,
-) -> FeedbackRoute | None:
-    """Return the strongest live route matching ``query``, or fail open.
+) -> tuple[FeedbackRoute | None, int | None]:
+    """Read one root-scoped feedback snapshot and select its strongest route.
 
     Only the latest significant feedback for each normalized query/artifact pair
     is authoritative. Neutral ``other`` feedback is ignored. Results are scoped
     to the configured source root so test/probe telemetry cannot train live
-    routing.
+    routing. The high-water includes every feedback row for this root, even rows
+    irrelevant to today's matcher.
     """
 
     current_terms = frozenset(_query_terms(query))
-    if not current_terms or not usage_db_path.is_file():
-        return None
+    if not usage_db_path.is_file():
+        return None, None
 
     try:
         connection = _connect_readonly(usage_db_path)
         connection.row_factory = sqlite3.Row
         try:
+            connection.execute("BEGIN")
+            high_water_row = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM feedback WHERE root = ?",
+                (str(root),),
+            ).fetchone()
+            feedback_max_id = int(high_water_row[0])
             rows = connection.execute(
                 """
                 SELECT f.id,
@@ -139,11 +177,11 @@ def best_feedback_route(
                     *sorted(SIGNIFICANT_FEEDBACK_RATINGS),
                     FEEDBACK_SCAN_LIMIT,
                 ),
-            ).fetchall()
+            ).fetchall() if current_terms else []
         finally:
             connection.close()
     except (OSError, sqlite3.Error):
-        return None
+        return None, None
 
     latest: dict[tuple[str, str], FeedbackRoute | NegativeFeedback] = {}
     for row in rows:
@@ -197,27 +235,67 @@ def best_feedback_route(
         if score is not None:
             scored.append((score, route))
     if not scored:
-        return None
+        return None, feedback_max_id
     scored.sort(key=lambda item: item[0], reverse=True)
-    return scored[0][1]
+    return scored[0][1], feedback_max_id
+
+
+def best_feedback_route(
+    usage_db_path: Path,
+    *,
+    root: Path,
+    query: str,
+    artifact_type: str | None,
+) -> FeedbackRoute | None:
+    """Return the strongest live route matching ``query``, or fail open."""
+
+    route, _feedback_max_id = _feedback_route_snapshot(
+        usage_db_path,
+        root=root,
+        query=query,
+        artifact_type=artifact_type,
+    )
+    return route
 
 
 def apply_feedback_route(
     rows: list[dict[str, Any]],
     *,
-    route: FeedbackRoute,
+    route: FeedbackRoute | None,
+    feedback_max_id: int | None,
     db_path: Path,
     limit: int,
     search_index_fn: SearchIndexFn,
-) -> list[dict[str, Any]]:
-    """Promote one verified route, retrying its accepted typed query if needed."""
+) -> RouteDecision:
+    """Promote one verified route and return complete typed provenance."""
+
+    if route is None:
+        return RouteDecision(
+            rows=rows,
+            outcome=RouteOutcome.NONE,
+            feedback_id=None,
+            artifact_id=None,
+            feedback_max_id=feedback_max_id,
+        )
 
     for position, row in enumerate(rows):
         if str(row.get("id") or "") != route.artifact_id:
             continue
         if position == 0:
-            return rows
-        return [row, *rows[:position], *rows[position + 1 :]][:limit]
+            return RouteDecision(
+                rows=rows,
+                outcome=RouteOutcome.ALREADY_FIRST,
+                feedback_id=route.feedback_id,
+                artifact_id=route.artifact_id,
+                feedback_max_id=feedback_max_id,
+            )
+        return RouteDecision(
+            rows=[row, *rows[:position], *rows[position + 1 :]][:limit],
+            outcome=RouteOutcome.PROMOTED_EXISTING,
+            feedback_id=route.feedback_id,
+            artifact_id=route.artifact_id,
+            feedback_max_id=feedback_max_id,
+        )
 
     try:
         retry_rows = search_index_fn(
@@ -227,7 +305,13 @@ def apply_feedback_route(
             artifact_type=route.artifact_type,
         )
     except Exception:
-        return rows
+        return RouteDecision(
+            rows=rows,
+            outcome=RouteOutcome.VERIFICATION_FAILED,
+            feedback_id=route.feedback_id,
+            artifact_id=route.artifact_id,
+            feedback_max_id=feedback_max_id,
+        )
     verified = next(
         (
             row
@@ -237,8 +321,49 @@ def apply_feedback_route(
         None,
     )
     if verified is None:
-        return rows
-    return [
-        verified,
-        *(row for row in rows if str(row.get("id") or "") != route.artifact_id),
-    ][:limit]
+        return RouteDecision(
+            rows=rows,
+            outcome=RouteOutcome.VERIFICATION_FAILED,
+            feedback_id=route.feedback_id,
+            artifact_id=route.artifact_id,
+            feedback_max_id=feedback_max_id,
+        )
+    return RouteDecision(
+        rows=[
+            verified,
+            *(row for row in rows if str(row.get("id") or "") != route.artifact_id),
+        ][:limit],
+        outcome=RouteOutcome.PROMOTED_RETRY,
+        feedback_id=route.feedback_id,
+        artifact_id=route.artifact_id,
+        feedback_max_id=feedback_max_id,
+    )
+
+
+def decide_feedback_route(
+    rows: list[dict[str, Any]],
+    *,
+    usage_db_path: Path,
+    root: Path,
+    query: str,
+    artifact_type: str | None,
+    db_path: Path,
+    limit: int,
+    search_index_fn: SearchIndexFn,
+) -> RouteDecision:
+    """Read and apply one route while retaining the route snapshot high-water."""
+
+    route, feedback_max_id = _feedback_route_snapshot(
+        usage_db_path,
+        root=root,
+        query=query,
+        artifact_type=artifact_type,
+    )
+    return apply_feedback_route(
+        rows,
+        route=route,
+        feedback_max_id=feedback_max_id,
+        db_path=db_path,
+        limit=limit,
+        search_index_fn=search_index_fn,
+    )

@@ -15,6 +15,12 @@ from hermes_local_knowledge import plugin
 from hermes_local_knowledge import telemetry as lci_telemetry
 from hermes_local_knowledge.artifacts import Artifact
 from hermes_local_knowledge.config import Config, resolve_config
+from hermes_local_knowledge.routing import (
+    ROUTING_TRACE_METADATA_KEY,
+    RouteDecision,
+    RouteOutcome,
+    SearchRoutingTrace,
+)
 from hermes_local_knowledge.service import LocalKnowledgeService
 
 
@@ -199,7 +205,24 @@ def test_native_search_telemetry_keeps_the_complete_bounded_page(
         def search(self, query: str, **kwargs):  # type: ignore[no-untyped-def]
             assert query == "exact  spacing"
             assert kwargs["limit"] == 30
-            return rows, {"rebuilt": False}
+            return rows, {
+                "rebuilt": False,
+                "jsonl_sha256": "native-hash",
+                "index_format_version": 4,
+                ROUTING_TRACE_METADATA_KEY: SearchRoutingTrace(
+                    baseline_ids=(
+                        "skill:baseline",
+                        *tuple(row["id"] for row in rows[1:]),
+                    ),
+                    decision=RouteDecision(
+                        rows=rows,
+                        outcome=RouteOutcome.PROMOTED_RETRY,
+                        feedback_id=41,
+                        artifact_id="skill:item-1",
+                        feedback_max_id=44,
+                    ),
+                ),
+            }
 
         def record_usage(self, **kwargs):  # type: ignore[no-untyped-def]
             captured.update(kwargs)
@@ -214,6 +237,18 @@ def test_native_search_telemetry_keeps_the_complete_bounded_page(
     assert captured["query"] == "exact  spacing"
     assert captured["top_ids"] == [row["id"] for row in rows]
     assert captured["top_types"] == [row["type"] for row in rows]
+    assert captured["baseline_top_ids"] == [
+        "skill:baseline",
+        *[row["id"] for row in rows[1:]],
+    ]
+    assert captured["route_feedback_id"] == 41
+    assert captured["route_artifact_id"] == "skill:item-1"
+    assert captured["route_outcome"] == "promoted_retry"
+    assert captured["feedback_max_id"] == 44
+    assert ROUTING_TRACE_METADATA_KEY not in payload
+    index_metadata = captured["index_metadata"]
+    assert isinstance(index_metadata, dict)
+    assert ROUTING_TRACE_METADATA_KEY not in index_metadata
 
 
 def test_cli_search_telemetry_keeps_the_complete_page_and_explicit_limit(
@@ -231,7 +266,21 @@ def test_cli_search_telemetry_keeps_the_complete_page_and_explicit_limit(
         def search(self, query: str, **kwargs):  # type: ignore[no-untyped-def]
             assert query == "cli query"
             assert kwargs["limit"] == 999
-            return rows, {"rebuilt": False}
+            return rows, {
+                "rebuilt": False,
+                "jsonl_sha256": "cli-hash",
+                "index_format_version": 4,
+                ROUTING_TRACE_METADATA_KEY: SearchRoutingTrace(
+                    baseline_ids=tuple(row["id"] for row in rows),
+                    decision=RouteDecision(
+                        rows=rows,
+                        outcome=RouteOutcome.NONE,
+                        feedback_id=None,
+                        artifact_id=None,
+                        feedback_max_id=12,
+                    ),
+                ),
+            }
 
         def record_usage(self, **kwargs):  # type: ignore[no-untyped-def]
             captured.update(kwargs)
@@ -249,6 +298,14 @@ def test_cli_search_telemetry_keeps_the_complete_page_and_explicit_limit(
     assert captured["limit_value"] == 999
     assert captured["top_ids"] == [row["id"] for row in rows]
     assert captured["top_types"] == [row["type"] for row in rows]
+    assert captured["baseline_top_ids"] == [row["id"] for row in rows]
+    assert captured["route_feedback_id"] is None
+    assert captured["route_artifact_id"] is None
+    assert captured["route_outcome"] == "none"
+    assert captured["feedback_max_id"] == 12
+    index_metadata = captured["index_metadata"]
+    assert isinstance(index_metadata, dict)
+    assert ROUTING_TRACE_METADATA_KEY not in index_metadata
 
 
 def test_plugin_handler_wrapper_uses_one_service_factory(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -1237,7 +1294,7 @@ def test_usage_report_suppresses_negative_feedback_after_later_useful_feedback(t
         query="stale feedback query",
         result_count=2,
     )
-    lci_telemetry._record_feedback(
+    negative_feedback_id, _ = lci_telemetry._record_feedback(
         repo,
         rating="noisy",
         event_id=old_event,
@@ -1246,6 +1303,12 @@ def test_usage_report_suppresses_negative_feedback_after_later_useful_feedback(t
         note="old ranking was noisy",
         context={},
     )
+    # The timestamp-only suppression rule is retained solely for migrated rows.
+    with sqlite3.connect(state_dir / "usage.sqlite") as conn:
+        conn.execute(
+            "UPDATE feedback SET linkage_status='legacy' WHERE id=?",
+            (negative_feedback_id,),
+        )
     useful_event = lci_telemetry._record_usage(
         repo,
         tool="knowledge_search",
@@ -1329,3 +1392,57 @@ def test_usage_report_persists_index_metadata_errors(tmp_path, monkeypatch):
 
     assert report["latest_index_metadata"]["index_exists"] == 1
     assert "malformed database" in report["latest_index_metadata"]["index_metadata_error"]
+
+
+def test_usage_report_masks_obvious_credentials_only_at_model_boundary(monkeypatch):
+    raw_report = {
+        "success": True,
+        "total_events": 1,
+        "improvement_candidates": [
+            {
+                "id": 73,
+                "query": (
+                    "open https://alex:hunter2@example.test/run "
+                    "with api_key=sk-local api_key=\"quoted-local\" "
+                    "password='single-local' {\"api_key\":\"json-local\"} "
+                    "Authorization: Bearer bare-auth "
+                    "Authorization: Bearer \"quoted-auth\" "
+                    "Authorization: Bearer 'single-auth' "
+                    '{"Authorization":"Bearer json-auth"}'
+                ),
+                "artifact_id": "skill:keep-stable-identity",
+            }
+        ],
+    }
+
+    class FakeService:
+        usage_db_path = Path("/tmp/usage.sqlite")
+
+        def usage_report(self, *, days: int, limit: int) -> dict[str, object]:
+            assert (days, limit) == (30, 10)
+            return raw_report
+
+        def record_usage(self, **kwargs: object) -> int:
+            return 91
+
+    monkeypatch.setattr(plugin, "_service", lambda: FakeService())
+
+    serialized = plugin._handle_usage_report({"days": 30, "limit": 10})
+    payload = json.loads(serialized)
+
+    for private_marker in (
+        "hunter2",
+        "sk-local",
+        "quoted-local",
+        "single-local",
+        "json-local",
+        "bare-auth",
+        "quoted-auth",
+        "single-auth",
+        "json-auth",
+    ):
+        assert private_marker not in serialized
+    assert "https://" + "<" + "redacted" + ">@example.test/run" in serialized
+    assert payload["improvement_candidates"][0]["id"] == 73
+    assert payload["improvement_candidates"][0]["artifact_id"] == "skill:keep-stable-identity"
+    assert "hunter2" in raw_report["improvement_candidates"][0]["query"]

@@ -266,6 +266,11 @@ def _record_usage(
     result_count: int | None = None,
     top_ids: list[str] | None = None,
     top_types: list[str] | None = None,
+    baseline_top_ids: list[str] | None = None,
+    route_feedback_id: int | None = None,
+    route_artifact_id: str | None = None,
+    route_outcome: str = "none",
+    feedback_max_id: int | None = -1,
     latency_ms: int | None = None,
     db_path: Path | None = None,
     context: dict[str, str] | None = None,
@@ -289,13 +294,15 @@ def _record_usage(
                     ts, tool, client, session_id, task_id, tool_call_id, query,
                     artifact_id, artifact_type, limit_value, rebuild_requested,
                     rebuilt, success, error, result_count, top_ids_json,
-                    top_types_json, latency_ms, plugin_version, source_root_source,
-                    state_dir_source, include_markdown_docs_source, index_exists,
-                    index_mtime, index_age_seconds, index_artifact_count,
-                    index_edge_count, index_artifact_counts_json,
-                    index_metadata_error, build_duration_ms, root, db_path,
-                    index_jsonl_sha256, index_format_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    top_types_json, baseline_top_ids_json, route_feedback_id,
+                    route_artifact_id, route_outcome, feedback_max_id, latency_ms,
+                    plugin_version, source_root_source, state_dir_source,
+                    include_markdown_docs_source, index_exists, index_mtime,
+                    index_age_seconds, index_artifact_count, index_edge_count,
+                    index_artifact_counts_json, index_metadata_error,
+                    build_duration_ms, root, db_path, index_jsonl_sha256,
+                    index_format_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now(),
@@ -315,6 +322,11 @@ def _record_usage(
                     result_count,
                     _json_list(top_ids),
                     _json_list(top_types),
+                    _json_list(baseline_top_ids),
+                    route_feedback_id,
+                    _exact_text(route_artifact_id) or None,
+                    _clean_text(route_outcome, limit=40) or "none",
+                    feedback_max_id,
                     latency_ms,
                     _clean_text(index_metadata.get("plugin_version") or __version__, limit=80) or None,
                     _clean_text(index_metadata.get("source_root_source"), limit=80) or None,
@@ -454,10 +466,11 @@ def _record_feedback(
                 raise ValueError(f"accepted artifact does not exist in the current index: {artifact_id}")
             negative = conn.execute(
                 """
-                SELECT f.id, f.rating, f.root, f.query, f.expected_artifact_id,
-                       f.linkage_status, f.event_id,
+                SELECT f.id, f.rating, f.root, f.query, f.artifact_id,
+                       f.expected_artifact_id, f.linkage_status, f.event_id,
                        e.tool AS event_tool, e.success AS event_success,
-                       e.root AS event_root
+                       e.root AS event_root, e.query AS event_query,
+                       e.top_ids_json AS event_top_ids_json
                 FROM feedback AS f
                 LEFT JOIN usage_events AS e ON e.id = f.event_id
                 WHERE f.id = ?
@@ -471,11 +484,15 @@ def _record_feedback(
             parent_linkage = str(negative["linkage_status"] or "")
             parent_query = _exact_text(negative["query"]).strip()
             if parent_linkage == "verified_event":
-                parent_is_replayable = (
-                    str(negative["event_tool"] or "") == "knowledge_search"
-                    and int(negative["event_success"] or 0) == 1
-                    and str(negative["event_root"] or "") == root_text
-                    and bool(parent_query)
+                parent_is_replayable = bool(parent_query) and _verified_search_link(
+                    feedback_query=negative["query"],
+                    feedback_artifact_id=negative["artifact_id"],
+                    event_tool=negative["event_tool"],
+                    event_success=negative["event_success"],
+                    event_root=negative["event_root"],
+                    event_query=negative["event_query"],
+                    event_top_ids_json=negative["event_top_ids_json"],
+                    root=root_text,
                 )
             else:
                 parent_is_replayable = (
@@ -583,6 +600,48 @@ def _decode_json_object(text: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _decode_json_string_list(text: Any) -> list[str] | None:
+    try:
+        value = json.loads(str(text or "[]"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return value
+
+
+def _event_succeeded(value: Any) -> bool:
+    try:
+        return int(value or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _verified_search_link(
+    *,
+    feedback_query: Any,
+    feedback_artifact_id: Any,
+    event_tool: Any,
+    event_success: Any,
+    event_root: Any,
+    event_query: Any,
+    event_top_ids_json: Any,
+    root: str,
+) -> bool:
+    if (
+        str(event_tool or "") != "knowledge_search"
+        or not _event_succeeded(event_success)
+        or str(event_root or "") != root
+        or _exact_text(feedback_query) != _exact_text(event_query)
+    ):
+        return False
+    returned_ids = _decode_json_string_list(event_top_ids_json)
+    if returned_ids is None:
+        return False
+    artifact_id = str(feedback_artifact_id or "")
+    return not artifact_id or artifact_id in returned_ids
+
+
 def _normalize_index_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         row["index_artifact_counts"] = _decode_json_object(row.pop("index_artifact_counts_json", None))
@@ -620,20 +679,137 @@ def _is_probe_query(query: Any) -> bool:
     return str(query or "").strip().lower() in PROBE_QUERIES
 
 
+def _feedback_linkage_quality(row: dict[str, Any]) -> str:
+    """Classify one feedback/event relationship without trusting stored labels."""
+
+    if row.get("event_id") is not None:
+        if row.get("event_exists") is None:
+            return "orphaned_event"
+        if str(row.get("feedback_root") or "") != str(row.get("event_root") or ""):
+            return "root_mismatch"
+    status = str(row.get("linkage_status") or "legacy")
+    if status == "verified_event":
+        if _verified_search_link(
+            feedback_query=row.get("feedback_query"),
+            feedback_artifact_id=row.get("artifact_id"),
+            event_tool=row.get("event_tool"),
+            event_success=row.get("event_success"),
+            event_root=row.get("event_root"),
+            event_query=row.get("event_query"),
+            event_top_ids_json=row.get("event_top_ids_json"),
+            root=str(row.get("feedback_root") or ""),
+        ):
+            return "verified_event"
+        if str(row.get("feedback_query") or "").strip():
+            return "legacy"
+        if str(row.get("artifact_id") or "").strip():
+            return "artifact_only"
+        return "unscoped"
+    if status == "direct_query":
+        return "direct_query" if str(row.get("feedback_query") or "").strip() else "unscoped"
+    if status in {"artifact_only", "unscoped", "legacy"}:
+        return status
+    return "legacy"
+
+
+def _has_replayable_search_intent(row: dict[str, Any]) -> bool:
+    quality = str(row.get("linkage_quality") or "")
+    query = str(row.get("effective_query") or "").strip()
+    if not query or quality in {"orphaned_event", "root_mismatch"}:
+        return False
+    if quality == "verified_event":
+        return (
+            str(row.get("event_tool") or "") == "knowledge_search"
+            and _event_succeeded(row.get("event_success"))
+        )
+    if quality == "direct_query":
+        return row.get("event_id") is None
+    if quality == "legacy":
+        return row.get("event_id") is None or (
+            str(row.get("event_tool") or "") == "knowledge_search"
+            and _event_succeeded(row.get("event_success"))
+        )
+    return False
+
+
+def _has_valid_explicit_resolution(row: dict[str, Any]) -> bool:
+    accepted_id = str(row.get("accepted_artifact_id") or "").strip()
+    expected_id = str(row.get("expected_artifact_id") or "").strip()
+    if (
+        row.get("resolution_feedback_id") is None
+        or str(row.get("resolution_rating") or "") != "useful"
+        or not accepted_id
+        or str(row.get("resolution_root") or "") != str(row.get("feedback_root") or "")
+        or str(row.get("resolution_linkage_status") or "") != "verified_event"
+        or row.get("resolution_event_exists") is None
+        or (expected_id and expected_id != accepted_id)
+    ):
+        return False
+    return _verified_search_link(
+        feedback_query=row.get("resolution_query"),
+        feedback_artifact_id=accepted_id,
+        event_tool=row.get("resolution_event_tool"),
+        event_success=row.get("resolution_event_success"),
+        event_root=row.get("resolution_event_root"),
+        event_query=row.get("resolution_event_query"),
+        event_top_ids_json=row.get("resolution_event_top_ids_json"),
+        root=str(row.get("feedback_root") or ""),
+    )
+
+
 def _split_resolved_feedback(
     feedback_rows: list[dict[str, Any]], positive_rows: list[dict[str, Any]]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    latest_positive = {row["effective_query"]: row for row in positive_rows if row.get("effective_query")}
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Prefer explicit resolutions; retain the old query heuristic for legacy rows only."""
+
+    latest_positive = {
+        row["effective_query"]: row
+        for row in positive_rows
+        if row.get("effective_query")
+    }
     unresolved: list[dict[str, Any]] = []
     resolved: list[dict[str, Any]] = []
-    for row in feedback_rows:
+    explicit_resolutions: list[dict[str, Any]] = []
+    for source_row in feedback_rows:
+        row = dict(source_row)
+        row["linkage_quality"] = _feedback_linkage_quality(row)
+        row["replayable_search_intent"] = _has_replayable_search_intent(row)
+        if _has_valid_explicit_resolution(row):
+            resolved_row = {
+                **row,
+                "resolution_kind": "explicit",
+                "resolved_at": row.get("resolution_ts"),
+            }
+            resolved.append(resolved_row)
+            explicit_resolutions.append(
+                {
+                    "feedback_id": row["id"],
+                    "resolution_feedback_id": row["resolution_feedback_id"],
+                    "resolved_at": row.get("resolution_ts"),
+                    "accepted_artifact_id": row.get("accepted_artifact_id"),
+                    "accepted_query": row.get("accepted_query"),
+                }
+            )
+            continue
+
         query = row.get("effective_query") or row.get("query")
         positive = latest_positive.get(query)
-        if positive and positive.get("last_positive_feedback") and positive["last_positive_feedback"] > row["ts"]:
-            resolved.append({**row, "resolved_at": positive["last_positive_feedback"]})
+        if (
+            row["linkage_quality"] == "legacy"
+            and positive
+            and positive.get("last_positive_feedback")
+            and positive["last_positive_feedback"] > row["ts"]
+        ):
+            resolved.append(
+                {
+                    **row,
+                    "resolution_kind": "legacy_query_heuristic",
+                    "resolved_at": positive["last_positive_feedback"],
+                }
+            )
         else:
             unresolved.append(row)
-    return unresolved, resolved
+    return unresolved, resolved, explicit_resolutions
 
 
 def _split_resolved_zero_results(
@@ -702,8 +878,30 @@ def _usage_report(
             "unknown_feedback_ratings": [],
             "recent_negative_feedback": [],
             "live_recent_negative_feedback": [],
+            "feedback_linkage_quality": [],
+            "feedback_linkage_counts": {},
+            "feedback_resolution_quality": [],
+            "feedback_resolution_counts": {},
             "unresolved_negative_feedback": [],
+            "unresolved_verified_or_direct_negative_feedback": [],
+            "unresolved_negative_with_expected_target": [],
+            "unresolved_negative_without_expected_target": [],
             "resolved_negative_feedback": [],
+            "explicit_resolutions": [],
+            "explicit_resolution_count": 0,
+            "route_outcomes": [],
+            "route_verification_failures": [],
+            "replay_ready_label_counts": {
+                "explicit_resolution": 0,
+                "verified_event": 0,
+                "direct_or_legacy": 0,
+                "total": 0,
+            },
+            "search_issue_candidates": [],
+            "unresolved_negative_with_current_expected_target": [],
+            "unresolved_negative_without_current_expected_target": [],
+            "behaviorally_resolved_negative_feedback": [],
+            "correction_candidates": [],
             "latest_index_metadata": None,
             "recent_builds": [],
             "improvement_candidates": [],
@@ -890,13 +1088,123 @@ def _usage_report(
             (since, limit),
         )
         feedback_rating_buckets, unknown_feedback_ratings = _rating_buckets(feedback_by_rating)
+        feedback_linkage_rows = _rows(
+            conn,
+            """
+            SELECT f.ts, f.event_id, f.query AS feedback_query, f.artifact_id,
+                   f.root AS feedback_root, f.linkage_status,
+                   e.id AS event_exists, e.root AS event_root, e.tool AS event_tool,
+                   e.success AS event_success, e.query AS event_query,
+                   e.top_ids_json AS event_top_ids_json
+            FROM feedback AS f
+            LEFT JOIN usage_events AS e ON e.id = f.event_id
+            WHERE f.ts >= ?
+            """,
+            (since,),
+        )
+        linkage_buckets: dict[str, dict[str, Any]] = {}
+        for row in feedback_linkage_rows:
+            quality = _feedback_linkage_quality(row)
+            bucket = linkage_buckets.setdefault(
+                quality,
+                {"linkage_quality": quality, "count": 0, "last_seen": None},
+            )
+            bucket["count"] += 1
+            if row.get("ts") and (
+                bucket["last_seen"] is None or row["ts"] > bucket["last_seen"]
+            ):
+                bucket["last_seen"] = row["ts"]
+        feedback_linkage_quality = sorted(
+            linkage_buckets.values(),
+            key=lambda row: (-int(row["count"]), str(row["linkage_quality"])),
+        )
+        feedback_linkage_counts = {
+            str(row["linkage_quality"]): int(row["count"])
+            for row in feedback_linkage_quality
+        }
+        feedback_resolution_quality = _rows(
+            conn,
+            f"""
+            SELECT resolution_quality, COUNT(*) AS count, MAX(ts) AS last_seen
+            FROM (
+                SELECT f.ts,
+                       CASE
+                           WHEN f.resolves_feedback_id IS NOT NULL
+                                AND f.rating = 'useful'
+                                AND parent.id IS NOT NULL AND parent.root = f.root
+                                AND parent.rating IN ({','.join('?' for _ in NEGATIVE_FEEDBACK_RATINGS)})
+                                AND COALESCE(f.artifact_id, '') <> ''
+                                AND f.linkage_status = 'verified_event'
+                                AND e.id IS NOT NULL AND e.root = f.root
+                                AND e.tool = 'knowledge_search' AND e.success = 1
+                                AND COALESCE(f.query, '') = COALESCE(e.query, '')
+                                AND json_valid(COALESCE(e.top_ids_json, '')) = 1
+                                AND EXISTS (
+                                    SELECT 1 FROM json_each(e.top_ids_json) AS result
+                                    WHERE CAST(result.value AS TEXT) = f.artifact_id
+                                )
+                                AND (
+                                    COALESCE(parent.expected_artifact_id, '') = ''
+                                    OR parent.expected_artifact_id = f.artifact_id
+                                )
+                               THEN 'explicit_resolution'
+                           WHEN f.resolves_feedback_id IS NOT NULL
+                               THEN 'invalid_resolution'
+                           WHEN f.rating IN ({','.join('?' for _ in NEGATIVE_FEEDBACK_RATINGS)})
+                                AND EXISTS (
+                                    SELECT 1
+                                    FROM feedback AS r
+                                    JOIN usage_events AS re ON re.id = r.event_id
+                                    WHERE r.resolves_feedback_id = f.id
+                                      AND r.rating = 'useful' AND r.root = f.root
+                                      AND COALESCE(r.artifact_id, '') <> ''
+                                      AND r.linkage_status = 'verified_event'
+                                      AND re.root = r.root
+                                      AND re.tool = 'knowledge_search' AND re.success = 1
+                                      AND COALESCE(r.query, '') = COALESCE(re.query, '')
+                                      AND json_valid(COALESCE(re.top_ids_json, '')) = 1
+                                      AND EXISTS (
+                                          SELECT 1 FROM json_each(re.top_ids_json) AS result
+                                          WHERE CAST(result.value AS TEXT) = r.artifact_id
+                                      )
+                                      AND (
+                                          COALESCE(f.expected_artifact_id, '') = ''
+                                          OR f.expected_artifact_id = r.artifact_id
+                                      )
+                                )
+                               THEN 'explicitly_resolved_negative'
+                           WHEN f.rating IN ({','.join('?' for _ in NEGATIVE_FEEDBACK_RATINGS)})
+                               THEN 'negative_without_explicit_resolution'
+                           WHEN f.rating = 'useful' THEN 'standalone_positive'
+                           ELSE 'other'
+                       END AS resolution_quality
+                FROM feedback AS f
+                LEFT JOIN feedback AS parent ON parent.id = f.resolves_feedback_id
+                LEFT JOIN usage_events AS e ON e.id = f.event_id
+                WHERE f.ts >= ?
+            )
+            GROUP BY resolution_quality
+            ORDER BY count DESC, resolution_quality
+            """,
+            (
+                *sorted(NEGATIVE_FEEDBACK_RATINGS),
+                *sorted(NEGATIVE_FEEDBACK_RATINGS),
+                *sorted(NEGATIVE_FEEDBACK_RATINGS),
+                since,
+            ),
+        )
+        feedback_resolution_counts = {
+            str(row["resolution_quality"]): int(row["count"])
+            for row in feedback_resolution_quality
+        }
         recent_negative_feedback = _rows(
             conn,
             f"""
-            SELECT id, ts, rating, event_id, query, artifact_id, note
+            SELECT id, ts, rating, event_id, query, artifact_id, note,
+                   expected_artifact_id, linkage_status
             FROM feedback
             WHERE ts >= ? AND rating IN ({','.join('?' for _ in NEGATIVE_FEEDBACK_RATINGS)})
-            ORDER BY ts DESC
+            ORDER BY ts DESC, id DESC
             LIMIT ?
             """,
             (since, *sorted(NEGATIVE_FEEDBACK_RATINGS), limit),
@@ -904,12 +1212,33 @@ def _usage_report(
         live_recent_negative_feedback = _rows(
             conn,
             f"""
-            SELECT f.id, f.ts, f.rating, f.event_id, f.query, f.artifact_id, f.note,
-                   COALESCE(NULLIF(f.query, ''), e.query) AS effective_query
-            FROM feedback f
-            LEFT JOIN usage_events e ON f.event_id = e.id
-            WHERE f.ts >= ? AND f.root = ? AND f.rating IN ({','.join('?' for _ in NEGATIVE_FEEDBACK_RATINGS)})
-            ORDER BY f.ts DESC
+            SELECT f.id, f.ts, f.rating, f.event_id, f.query,
+                   f.query AS feedback_query, f.artifact_id,
+                   f.note, f.expected_artifact_id, f.linkage_status,
+                   f.root AS feedback_root,
+                   COALESCE(NULLIF(f.query, ''), e.query) AS effective_query,
+                   e.id AS event_exists, e.root AS event_root, e.tool AS event_tool,
+                   e.success AS event_success, e.query AS event_query,
+                   e.top_ids_json AS event_top_ids_json,
+                   e.artifact_type AS artifact_type,
+                   r.id AS resolution_feedback_id, r.ts AS resolution_ts,
+                   r.rating AS resolution_rating, r.artifact_id AS accepted_artifact_id,
+                   COALESCE(NULLIF(r.query, ''), re.query) AS accepted_query,
+                   r.query AS resolution_query, r.root AS resolution_root,
+                   r.linkage_status AS resolution_linkage_status,
+                   re.id AS resolution_event_exists,
+                   re.root AS resolution_event_root,
+                   re.tool AS resolution_event_tool,
+                   re.success AS resolution_event_success,
+                   re.query AS resolution_event_query,
+                   re.top_ids_json AS resolution_event_top_ids_json
+            FROM feedback AS f
+            LEFT JOIN usage_events AS e ON f.event_id = e.id
+            LEFT JOIN feedback AS r ON r.resolves_feedback_id = f.id
+            LEFT JOIN usage_events AS re ON r.event_id = re.id
+            WHERE f.ts >= ? AND f.root = ?
+              AND f.rating IN ({','.join('?' for _ in NEGATIVE_FEEDBACK_RATINGS)})
+            ORDER BY f.ts DESC, f.id DESC
             LIMIT ?
             """,
             (since, root_text, *sorted(NEGATIVE_FEEDBACK_RATINGS), limit),
@@ -922,14 +1251,131 @@ def _usage_report(
             FROM feedback f
             LEFT JOIN usage_events e ON f.event_id = e.id
             WHERE f.ts >= ? AND f.root = ? AND f.rating = 'useful'
+              AND f.resolves_feedback_id IS NULL
             GROUP BY effective_query
             """,
             (since, root_text),
         )
-        unresolved_negative_feedback, resolved_negative_feedback = _split_resolved_feedback(
+        (
+            unresolved_negative_feedback,
+            resolved_negative_feedback,
+            explicit_resolutions,
+        ) = _split_resolved_feedback(
             live_recent_negative_feedback,
             live_positive_feedback_queries,
         )
+        unresolved_verified_or_direct_negative_feedback = [
+            row
+            for row in unresolved_negative_feedback
+            if row["linkage_quality"] in {"verified_event", "direct_query"}
+            and bool(row["replayable_search_intent"])
+            and not _is_probe_query(row["effective_query"])
+        ]
+        unresolved_negative_with_expected_target = [
+            row
+            for row in unresolved_verified_or_direct_negative_feedback
+            if str(row.get("expected_artifact_id") or "").strip()
+        ]
+        unresolved_negative_without_expected_target = [
+            row
+            for row in unresolved_verified_or_direct_negative_feedback
+            if not str(row.get("expected_artifact_id") or "").strip()
+        ]
+        search_issue_candidates = unresolved_verified_or_direct_negative_feedback[:limit]
+        route_outcomes = _rows(
+            conn,
+            """
+            SELECT route_outcome, COUNT(*) AS count, MAX(ts) AS last_seen
+            FROM usage_events
+            WHERE ts >= ? AND root = ? AND tool = 'knowledge_search'
+              AND success = 1 AND route_outcome <> 'none'
+            GROUP BY route_outcome
+            ORDER BY count DESC, route_outcome
+            """,
+            (since, root_text),
+        )
+        route_verification_failures = _rows(
+            conn,
+            """
+            SELECT id AS usage_event_id, ts, query, artifact_type,
+                   route_feedback_id, route_artifact_id, route_outcome
+            FROM usage_events
+            WHERE ts >= ? AND root = ? AND tool = 'knowledge_search'
+              AND success = 1 AND route_outcome = 'verification_failed'
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+            """,
+            (since, root_text, limit),
+        )
+        replay_ready_row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN f.rating = 'useful'
+                              AND f.resolves_feedback_id IS NOT NULL
+                              AND parent.id IS NOT NULL AND parent.root = f.root
+                              AND parent.rating IN (
+                                  'missing', 'noisy', 'not_useful', 'stale', 'wrong_artifact'
+                              )
+                              AND COALESCE(f.artifact_id, '') <> ''
+                              AND f.linkage_status = 'verified_event'
+                              AND e.id IS NOT NULL AND e.root = f.root
+                              AND e.tool = 'knowledge_search' AND e.success = 1
+                              AND COALESCE(f.query, '') = COALESCE(e.query, '')
+                              AND json_valid(COALESCE(e.top_ids_json, '')) = 1
+                              AND EXISTS (
+                                  SELECT 1 FROM json_each(e.top_ids_json) AS result
+                                  WHERE CAST(result.value AS TEXT) = f.artifact_id
+                              )
+                              AND (
+                                  COALESCE(parent.expected_artifact_id, '') = ''
+                                  OR parent.expected_artifact_id = f.artifact_id
+                              )
+                         THEN 1 ELSE 0 END) AS explicit_resolution,
+                SUM(CASE WHEN f.rating = 'useful'
+                              AND f.resolves_feedback_id IS NULL
+                              AND COALESCE(f.artifact_id, '') <> ''
+                              AND COALESCE(NULLIF(f.query, ''), e.query) IS NOT NULL
+                              AND f.linkage_status = 'verified_event'
+                              AND e.id IS NOT NULL AND e.root = f.root
+                              AND e.tool = 'knowledge_search' AND e.success = 1
+                              AND COALESCE(f.query, '') = COALESCE(e.query, '')
+                              AND json_valid(COALESCE(e.top_ids_json, '')) = 1
+                              AND EXISTS (
+                                  SELECT 1 FROM json_each(e.top_ids_json) AS result
+                                  WHERE CAST(result.value AS TEXT) = f.artifact_id
+                              )
+                         THEN 1 ELSE 0 END) AS verified_event,
+                SUM(CASE WHEN f.rating = 'useful'
+                              AND f.resolves_feedback_id IS NULL
+                              AND COALESCE(f.artifact_id, '') <> ''
+                              AND COALESCE(NULLIF(f.query, ''), e.query) IS NOT NULL
+                              AND (
+                                  (f.linkage_status = 'direct_query' AND f.event_id IS NULL)
+                                  OR (
+                                      f.linkage_status = 'legacy'
+                                      AND (
+                                          f.event_id IS NULL
+                                          OR (
+                                              e.id IS NOT NULL AND e.root = f.root
+                                              AND e.tool = 'knowledge_search' AND e.success = 1
+                                          )
+                                      )
+                                  )
+                              )
+                         THEN 1 ELSE 0 END) AS direct_or_legacy
+            FROM feedback AS f
+            LEFT JOIN usage_events AS e ON e.id = f.event_id
+            LEFT JOIN feedback AS parent ON parent.id = f.resolves_feedback_id
+            WHERE f.ts >= ? AND f.root = ?
+            """,
+            (since, root_text),
+        ).fetchone()
+        replay_ready_label_counts = {
+            "explicit_resolution": int(replay_ready_row["explicit_resolution"] or 0),
+            "verified_event": int(replay_ready_row["verified_event"] or 0),
+            "direct_or_legacy": int(replay_ready_row["direct_or_legacy"] or 0),
+        }
+        replay_ready_label_counts["total"] = sum(replay_ready_label_counts.values())
         latest_index_rows = _normalize_index_rows(
             _rows(
                 conn,
@@ -970,7 +1416,7 @@ def _usage_report(
     improvement_candidates: list[dict[str, Any]] = []
     for row in active_zero_result_queries[:limit]:
         improvement_candidates.append({"type": "zero_result_query", **row})
-    for row in unresolved_negative_feedback[:limit]:
+    for row in search_issue_candidates[:limit]:
         improvement_candidates.append({"type": f"feedback_{row['rating']}", **row})
     for row in recent_live_errors[:limit]:
         improvement_candidates.append({"type": "tool_error", **row})
@@ -1006,8 +1452,31 @@ def _usage_report(
         "unknown_feedback_ratings": unknown_feedback_ratings,
         "recent_negative_feedback": recent_negative_feedback,
         "live_recent_negative_feedback": live_recent_negative_feedback,
+        "feedback_linkage_quality": feedback_linkage_quality,
+        "feedback_linkage_counts": feedback_linkage_counts,
+        "feedback_resolution_quality": feedback_resolution_quality,
+        "feedback_resolution_counts": feedback_resolution_counts,
         "unresolved_negative_feedback": unresolved_negative_feedback,
+        "unresolved_verified_or_direct_negative_feedback": (
+            unresolved_verified_or_direct_negative_feedback[:limit]
+        ),
+        "unresolved_negative_with_expected_target": (
+            unresolved_negative_with_expected_target[:limit]
+        ),
+        "unresolved_negative_without_expected_target": (
+            unresolved_negative_without_expected_target[:limit]
+        ),
         "resolved_negative_feedback": resolved_negative_feedback,
+        "explicit_resolutions": explicit_resolutions[:limit],
+        "explicit_resolution_count": feedback_resolution_counts.get("explicit_resolution", 0),
+        "route_outcomes": route_outcomes,
+        "route_verification_failures": route_verification_failures,
+        "replay_ready_label_counts": replay_ready_label_counts,
+        "search_issue_candidates": search_issue_candidates,
+        "unresolved_negative_with_current_expected_target": [],
+        "unresolved_negative_without_current_expected_target": search_issue_candidates,
+        "behaviorally_resolved_negative_feedback": [],
+        "correction_candidates": [],
         "latest_index_metadata": latest_index_rows[0] if latest_index_rows else None,
         "recent_builds": recent_builds,
         "improvement_candidates": improvement_candidates[:limit],

@@ -15,6 +15,7 @@ from typing import Any, Sequence
 from . import __version__, index, okf
 from .artifacts import Artifact, Edge
 from .config import Config, IndexSettings, resolve_config
+from .routing import ROUTING_TRACE_METADATA_KEY, SearchRoutingTrace
 from .service import LocalKnowledgeService
 from .telemetry import _record_usage
 
@@ -151,6 +152,11 @@ def _record_cli_usage(
     result_count: int | None = None,
     top_ids: list[str] | None = None,
     top_types: list[str] | None = None,
+    baseline_top_ids: list[str] | None = None,
+    route_feedback_id: int | None = None,
+    route_artifact_id: str | None = None,
+    route_outcome: str = "none",
+    feedback_max_id: int | None = -1,
     latency_ms: int | None = None,
     db_path: Path | None = None,
     index_meta: dict[str, Any] | None = None,
@@ -179,6 +185,11 @@ def _record_cli_usage(
         result_count=result_count,
         top_ids=top_ids,
         top_types=top_types,
+        baseline_top_ids=baseline_top_ids,
+        route_feedback_id=route_feedback_id,
+        route_artifact_id=route_artifact_id,
+        route_outcome=route_outcome,
+        feedback_max_id=feedback_max_id,
         latency_ms=latency_ms,
         db_path=db_path,
         client="cli",
@@ -860,6 +871,7 @@ def main(
                 db_path=None if managed else db_path,
                 ensure=managed,
             )
+            routing_trace = meta.pop(ROUTING_TRACE_METADATA_KEY, None)
         except Exception as exc:
             message = f"cli_search failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
@@ -878,6 +890,20 @@ def main(
                 _emit_newer_index_error(exc, json_output=args.json)
                 return 1
             raise
+        final_ids = [str(row.get("id")) for row in rows]
+        if isinstance(routing_trace, SearchRoutingTrace):
+            baseline_ids = list(routing_trace.baseline_ids)
+            route_decision = routing_trace.decision
+            route_feedback_id = route_decision.feedback_id
+            route_artifact_id = route_decision.artifact_id
+            route_outcome = route_decision.outcome.value
+            feedback_max_id = route_decision.feedback_max_id
+        else:
+            baseline_ids = final_ids
+            route_feedback_id = None
+            route_artifact_id = None
+            route_outcome = "none"
+            feedback_max_id = None
         _record_cli_usage(
             cfg,
             tool="knowledge_search",
@@ -886,8 +912,13 @@ def main(
             limit_value=search_limit,
             rebuilt=bool(meta.get("rebuilt")),
             result_count=len(rows),
-            top_ids=[str(row.get("id")) for row in rows],
+            top_ids=final_ids,
             top_types=[str(row.get("type")) for row in rows],
+            baseline_top_ids=baseline_ids,
+            route_feedback_id=route_feedback_id,
+            route_artifact_id=route_artifact_id,
+            route_outcome=route_outcome,
+            feedback_max_id=feedback_max_id,
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             index_meta=meta,

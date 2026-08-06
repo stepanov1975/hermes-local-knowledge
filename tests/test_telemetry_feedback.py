@@ -589,6 +589,224 @@ def test_v042_schema_migrates_additively_and_rollback_writer_gets_legacy_default
     assert rollback == (-1, "[]", "none")
 
 
+def test_usage_report_classifies_linkage_explicit_resolution_and_candidate_quality(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    other_root = tmp_path / "other"
+    db_path = tmp_path / "usage.sqlite"
+    root.mkdir()
+    other_root.mkdir()
+
+    negative_event = _event(
+        root,
+        db_path,
+        query="find correct runbook",
+        ids=["skill:wrong"],
+    )
+    negative_id, _ = telemetry._record_feedback(
+        root,
+        rating="wrong_artifact",
+        event_id=negative_event,
+        query="find correct runbook",
+        artifact_id="skill:wrong",
+        expected_artifact_id="skill:target",
+        note="wrong result",
+        context={},
+        artifact_exists=lambda artifact_id: artifact_id == "skill:target",
+        usage_db_path=db_path,
+    )
+    ordinary_positive_event = _event(
+        root,
+        db_path,
+        query="find correct runbook",
+        ids=["skill:target"],
+    )
+    telemetry._record_feedback(
+        root,
+        rating="useful",
+        event_id=ordinary_positive_event,
+        query="find correct runbook",
+        artifact_id="skill:target",
+        note="ordinary positive must not resolve a verified negative",
+        context={},
+        usage_db_path=db_path,
+    )
+    unresolved_report = telemetry._usage_report(root, days=30, limit=20, usage_db_path=db_path)
+    assert [row["id"] for row in unresolved_report["unresolved_negative_feedback"]] == [
+        negative_id
+    ]
+
+    resolution_event = _event(
+        root,
+        db_path,
+        query="find correct runbook",
+        ids=["skill:target"],
+    )
+    resolution_id, _ = telemetry._record_feedback(
+        root,
+        rating="useful",
+        event_id=resolution_event,
+        query="find correct runbook",
+        artifact_id="skill:target",
+        note="accepted correction",
+        context={},
+        resolves_feedback_id=negative_id,
+        artifact_exists=lambda artifact_id: artifact_id == "skill:target",
+        usage_db_path=db_path,
+    )
+    direct_id, _ = telemetry._record_feedback(
+        root,
+        rating="missing",
+        event_id=None,
+        query="missing capability",
+        artifact_id="",
+        note="needs coverage triage",
+        context={},
+        usage_db_path=db_path,
+    )
+    telemetry._record_feedback(
+        root,
+        rating="noisy",
+        event_id=None,
+        query="XXXX",
+        artifact_id="",
+        note="probe noise",
+        context={},
+        usage_db_path=db_path,
+    )
+    telemetry._record_feedback(
+        root,
+        rating="not_useful",
+        event_id=None,
+        query="",
+        artifact_id="skill:wrong",
+        note="artifact-only",
+        context={},
+        usage_db_path=db_path,
+    )
+    other_event = _event(other_root, db_path, query="cross root", ids=["skill:wrong"])
+    failed_event = _event(root, db_path, query="failed lookup", success=False)
+    now = telemetry._utc_now()
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO feedback (
+                ts, rating, event_id, root, query, artifact_id, note,
+                linkage_status
+            ) VALUES (?, 'missing', ?, ?, ?, '', '', 'verified_event')
+            """,
+            [
+                (now, 999_999, str(root), "orphaned lookup"),
+                (now, other_event, str(root), "cross root"),
+                (now, failed_event, str(root), "failed lookup"),
+            ],
+        )
+
+    report = telemetry._usage_report(root, days=30, limit=20, usage_db_path=db_path)
+
+    assert report["explicit_resolutions"] == [
+        {
+            "feedback_id": negative_id,
+            "resolution_feedback_id": resolution_id,
+            "resolved_at": report["explicit_resolutions"][0]["resolved_at"],
+            "accepted_artifact_id": "skill:target",
+            "accepted_query": "find correct runbook",
+        }
+    ]
+    assert report["resolved_negative_feedback"][0]["resolution_kind"] == "explicit"
+    assert [row["id"] for row in report["search_issue_candidates"]] == [direct_id]
+    assert report["feedback_linkage_counts"]["orphaned_event"] == 1
+    assert report["feedback_linkage_counts"]["root_mismatch"] == 1
+    assert report["feedback_linkage_counts"]["artifact_only"] == 1
+    assert sum(report["feedback_linkage_counts"].values()) == report["feedback_count"]
+    assert sum(report["feedback_resolution_counts"].values()) == report["feedback_count"]
+    assert report["feedback_resolution_counts"]["explicit_resolution"] == 1
+    assert report["feedback_resolution_counts"]["explicitly_resolved_negative"] == 1
+    assert report["replay_ready_label_counts"]["explicit_resolution"] == 1
+    assert all(row["effective_query"] != "failed lookup" for row in report["search_issue_candidates"])
+
+
+def test_usage_report_rejects_malformed_verified_feedback_as_a_correction_candidate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    db_path = tmp_path / "usage.sqlite"
+    root.mkdir()
+    event_id = _event(root, db_path, query="claimed search", ids=["skill:shown"])
+    now = telemetry._utc_now()
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO feedback (
+                ts, rating, event_id, root, query, artifact_id, note,
+                expected_artifact_id, linkage_status
+            ) VALUES (?, 'wrong_artifact', ?, ?, ?, ?, '', ?, 'verified_event')
+            """,
+            (
+                now,
+                event_id,
+                str(root),
+                "claimed search",
+                "skill:not-shown",
+                "skill:target",
+            ),
+        )
+        feedback_id = int(cursor.lastrowid or 0)
+
+    report = telemetry._usage_report(root, days=30, limit=20, usage_db_path=db_path)
+
+    assert report["feedback_linkage_counts"].get("verified_event", 0) == 0
+    assert feedback_id not in {row["id"] for row in report["search_issue_candidates"]}
+
+
+def test_usage_report_rejects_resolution_when_target_was_not_returned(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    db_path = tmp_path / "usage.sqlite"
+    root.mkdir()
+    negative_event = _event(root, db_path, query="broken route", ids=["skill:wrong"])
+    negative_id, _ = telemetry._record_feedback(
+        root,
+        rating="wrong_artifact",
+        event_id=negative_event,
+        query="broken route",
+        artifact_id="skill:wrong",
+        expected_artifact_id="skill:target",
+        note="wrong result",
+        context={},
+        artifact_exists=lambda artifact_id: artifact_id == "skill:target",
+        usage_db_path=db_path,
+    )
+    resolution_event = _event(root, db_path, query="correct route", ids=["skill:target"])
+    telemetry._record_feedback(
+        root,
+        rating="useful",
+        event_id=resolution_event,
+        query="correct route",
+        artifact_id="skill:target",
+        note="accepted target",
+        context={},
+        resolves_feedback_id=negative_id,
+        artifact_exists=lambda artifact_id: artifact_id == "skill:target",
+        usage_db_path=db_path,
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE usage_events SET top_ids_json = ? WHERE id = ?",
+            ('["skill:other"]', resolution_event),
+        )
+
+    report = telemetry._usage_report(root, days=30, limit=20, usage_db_path=db_path)
+
+    assert report["explicit_resolutions"] == []
+    assert report["explicit_resolution_count"] == 0
+    assert report["replay_ready_label_counts"]["explicit_resolution"] == 0
+    assert [row["id"] for row in report["unresolved_negative_feedback"]] == [negative_id]
+    assert [row["id"] for row in report["search_issue_candidates"]] == [negative_id]
+
+
 def test_usage_metadata_persists_jsonl_hash_and_index_format(tmp_path: Path) -> None:
     db_path = tmp_path / "usage.sqlite"
     telemetry._record_usage(

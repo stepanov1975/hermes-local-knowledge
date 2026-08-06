@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,12 @@ from . import __version__, index
 from .artifacts import Artifact, Edge
 from .config import Config
 from .evaluation import SearchEvaluationReport, evaluate_index_against_feedback_report
-from .routing import apply_feedback_route, best_feedback_route
+from .routing import (
+    ROUTING_TRACE_METADATA_KEY,
+    SearchRoutingTrace,
+    apply_feedback_route,
+    decide_feedback_route,
+)
 from .telemetry import _record_feedback, _record_usage, _usage_report
 
 BuildIndexFn = Callable[..., tuple[list[Artifact], list[Edge]] | None]
@@ -159,7 +165,7 @@ class LocalKnowledgeService:
             db_path=db_path,
             ensure=ensure,
         )
-        rows = self._search_index_fn(
+        baseline_rows = self._search_index_fn(
             target,
             query,
             limit=limit,
@@ -167,21 +173,30 @@ class LocalKnowledgeService:
         )
         index_source_root = self._index_source_root_fn(target)
         if db_path is None and index_source_root == str(self.config.source_root):
-            route = best_feedback_route(
-                self.usage_db_path,
+            decision = decide_feedback_route(
+                baseline_rows,
+                usage_db_path=self.usage_db_path,
                 root=self.config.source_root,
                 query=query,
                 artifact_type=artifact_type,
+                db_path=target,
+                limit=limit,
+                search_index_fn=self._search_index_fn,
             )
-            if route is not None:
-                rows = apply_feedback_route(
-                    rows,
-                    route=route,
-                    db_path=target,
-                    limit=limit,
-                    search_index_fn=self._search_index_fn,
-                )
-        return rows, metadata
+        else:
+            decision = apply_feedback_route(
+                baseline_rows,
+                route=None,
+                feedback_max_id=None,
+                db_path=target,
+                limit=limit,
+                search_index_fn=self._search_index_fn,
+            )
+        metadata[ROUTING_TRACE_METADATA_KEY] = SearchRoutingTrace(
+            baseline_ids=tuple(str(row.get("id")) for row in baseline_rows),
+            decision=decision,
+        )
+        return decision.rows, metadata
 
     def get(
         self,
@@ -267,13 +282,118 @@ class LocalKnowledgeService:
             usage_db_path=self.usage_db_path,
         )
 
+    def _enrich_usage_report_search_issues(
+        self,
+        report: dict[str, Any],
+        *,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Re-check bounded live search issues without rebuilding or recording telemetry."""
+
+        raw_candidates = report.get("search_issue_candidates")
+        if raw_candidates is None:
+            return report
+        if not isinstance(raw_candidates, list):
+            raw_candidates = []
+        candidates = [row for row in raw_candidates[:limit] if isinstance(row, dict)]
+        preserved_candidates = [
+            row
+            for row in report.get("improvement_candidates", [])
+            if isinstance(row, dict) and not str(row.get("type") or "").startswith("feedback_")
+        ]
+        current_target: list[dict[str, Any]] = []
+        without_current_target: list[dict[str, Any]] = []
+        behaviorally_resolved: list[dict[str, Any]] = []
+        correction_candidates: list[dict[str, Any]] = []
+        active_feedback_candidates: list[dict[str, Any]] = []
+
+        index_available = False
+        try:
+            index_available = (
+                self.db_path.is_file()
+                and self._index_source_root_fn(self.db_path) == str(self.config.source_root)
+            )
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
+            index_available = False
+
+        for source_row in candidates:
+            row = dict(source_row)
+            expected_id = str(row.get("expected_artifact_id") or "").strip()
+            query = str(row.get("effective_query") or row.get("query") or "").strip()
+            artifact_type = str(row.get("artifact_type") or "").strip() or None
+            row.update(
+                {
+                    "current_replay_status": "unavailable",
+                    "current_top_artifact_id": None,
+                    "expected_artifact_current": None,
+                }
+            )
+            if index_available and query:
+                try:
+                    expected_current = bool(
+                        expected_id and self._get_artifact_fn(self.db_path, expected_id) is not None
+                    )
+                    current_rows = self._search_index_fn(
+                        self.db_path,
+                        query,
+                        artifact_type=artifact_type,
+                        limit=1,
+                    )
+                    current_top_id = (
+                        str(current_rows[0].get("id") or "") if current_rows else None
+                    )
+                    row["expected_artifact_current"] = expected_current
+                    row["current_top_artifact_id"] = current_top_id
+                    row["current_replay_status"] = "checked"
+                except (OSError, RuntimeError, sqlite3.Error, ValueError):
+                    pass
+
+            expected_current = row["expected_artifact_current"] is True
+            is_rank_one = expected_current and row["current_top_artifact_id"] == expected_id
+            if is_rank_one:
+                row["current_replay_status"] = "behaviorally_resolved"
+                behaviorally_resolved.append(row)
+                continue
+            if expected_current:
+                current_target.append(row)
+            else:
+                without_current_target.append(row)
+
+            if (
+                expected_current
+                and row.get("linkage_quality") == "verified_event"
+                and row["current_replay_status"] == "checked"
+            ):
+                row["candidate_kind"] = "correction_candidate"
+                row["type"] = "correction_candidate"
+                correction_candidates.append(row)
+            else:
+                row["candidate_kind"] = (
+                    "current_state_unavailable"
+                    if row["current_replay_status"] == "unavailable"
+                    else "coverage_or_ranking_triage"
+                )
+                row["type"] = f"feedback_{row.get('rating', 'negative')}"
+            active_feedback_candidates.append(row)
+
+        report["unresolved_negative_with_current_expected_target"] = current_target
+        report["unresolved_negative_without_current_expected_target"] = without_current_target
+        report["behaviorally_resolved_negative_feedback"] = behaviorally_resolved
+        report["correction_candidates"] = correction_candidates
+        report["improvement_candidates"] = (
+            preserved_candidates + active_feedback_candidates
+        )[:limit]
+        report.pop("search_issue_candidates", None)
+        return report
+
     def usage_report(self, *, days: int, limit: int) -> dict[str, Any]:
-        return self._usage_report_fn(
+        report = self._usage_report_fn(
             self.config.source_root,
             days=days,
             limit=limit,
             usage_db_path=self.usage_db_path,
         )
+        return self._enrich_usage_report_search_issues(report, limit=limit)
 
     def evaluate(
         self,

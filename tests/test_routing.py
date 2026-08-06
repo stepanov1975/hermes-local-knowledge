@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from hermes_local_knowledge.routing import best_feedback_route
+from hermes_local_knowledge.routing import (
+    FeedbackRoute,
+    RouteOutcome,
+    apply_feedback_route,
+    best_feedback_route,
+    decide_feedback_route,
+)
 from hermes_local_knowledge.telemetry import _record_feedback
 
 
@@ -197,3 +203,126 @@ def test_readonly_feedback_lookup_handles_uri_reserved_path_characters(
 
     assert route is not None
     assert route.artifact_id == "runbook:target"
+
+
+def test_route_outcome_values_match_the_persisted_contract() -> None:
+    assert [outcome.value for outcome in RouteOutcome] == [
+        "none",
+        "already_first",
+        "promoted_existing",
+        "promoted_retry",
+        "verification_failed",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("baseline", "retry_rows", "expected_ids", "expected_outcome"),
+    [
+        (
+            [{"id": "runbook:target"}, {"id": "runbook:other"}],
+            [],
+            ["runbook:target", "runbook:other"],
+            RouteOutcome.ALREADY_FIRST,
+        ),
+        (
+            [{"id": "runbook:other"}, {"id": "runbook:target"}],
+            [],
+            ["runbook:target", "runbook:other"],
+            RouteOutcome.PROMOTED_EXISTING,
+        ),
+        (
+            [{"id": "runbook:other"}],
+            [{"id": "runbook:target"}],
+            ["runbook:target", "runbook:other"],
+            RouteOutcome.PROMOTED_RETRY,
+        ),
+        (
+            [{"id": "runbook:other"}],
+            [{"id": "runbook:still-other"}],
+            ["runbook:other"],
+            RouteOutcome.VERIFICATION_FAILED,
+        ),
+    ],
+)
+def test_apply_feedback_route_returns_typed_provenance_for_each_matched_outcome(
+    tmp_path: Path,
+    baseline: list[dict[str, str]],
+    retry_rows: list[dict[str, str]],
+    expected_ids: list[str],
+    expected_outcome: RouteOutcome,
+) -> None:
+    route = FeedbackRoute(
+        query="accepted concise query",
+        artifact_id="runbook:target",
+        artifact_type="runbook",
+        terms=frozenset({"accepted", "concise", "query"}),
+        feedback_id=17,
+    )
+
+    decision = apply_feedback_route(
+        baseline,
+        route=route,
+        feedback_max_id=23,
+        db_path=tmp_path / "index.sqlite",
+        limit=3,
+        search_index_fn=lambda *_args, **_kwargs: retry_rows,
+    )
+
+    assert [str(row["id"]) for row in decision.rows] == expected_ids
+    assert decision.outcome is expected_outcome
+    assert decision.feedback_id == 17
+    assert decision.artifact_id == "runbook:target"
+    assert decision.feedback_max_id == 23
+
+
+def test_no_route_lookup_returns_typed_decision_and_advances_irrelevant_high_water(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    usage_db_path = tmp_path / "state" / "usage.sqlite"
+    _feedback(
+        usage_db_path,
+        root,
+        rating="other",
+        query="irrelevant neutral feedback",
+        artifact_id="runbook:irrelevant",
+    )
+    baseline = [{"id": "runbook:baseline", "type": "runbook"}]
+
+    decision = decide_feedback_route(
+        baseline,
+        usage_db_path=usage_db_path,
+        root=root,
+        query="today matcher query",
+        artifact_type=None,
+        db_path=tmp_path / "index.sqlite",
+        limit=3,
+        search_index_fn=lambda *_args, **_kwargs: pytest.fail("no retry expected"),
+    )
+
+    assert decision.rows is baseline
+    assert decision.outcome is RouteOutcome.NONE
+    assert decision.feedback_id is None
+    assert decision.artifact_id is None
+    assert decision.feedback_max_id == 1
+
+
+def test_unavailable_feedback_database_returns_typed_none_with_null_high_water(
+    tmp_path: Path,
+) -> None:
+    baseline = [{"id": "runbook:baseline", "type": "runbook"}]
+
+    decision = decide_feedback_route(
+        baseline,
+        usage_db_path=tmp_path / "missing" / "usage.sqlite",
+        root=tmp_path / "root",
+        query="today matcher query",
+        artifact_type=None,
+        db_path=tmp_path / "index.sqlite",
+        limit=3,
+        search_index_fn=lambda *_args, **_kwargs: pytest.fail("no retry expected"),
+    )
+
+    assert decision.rows is baseline
+    assert decision.outcome is RouteOutcome.NONE
+    assert decision.feedback_max_id is None
