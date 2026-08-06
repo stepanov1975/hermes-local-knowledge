@@ -21,7 +21,7 @@ GetNeighborsFn = Callable[..., list[dict[str, Any]]]
 IndexMetadataFn = Callable[[Path], dict[str, Any]]
 IndexSourceRootFn = Callable[[Path], str | None]
 RecordUsageFn = Callable[..., int | None]
-RecordFeedbackFn = Callable[..., int]
+RecordFeedbackFn = Callable[..., tuple[int, int]]
 UsageReportFn = Callable[..., dict[str, Any]]
 EvaluateFn = Callable[[Path, Path], SearchEvaluationReport]
 
@@ -237,8 +237,20 @@ class LocalKnowledgeService:
         artifact_id: str,
         note: str,
         context: dict[str, str],
-    ) -> int:
-        """Record strict user feedback in this service's usage database."""
+        expected_artifact_id: str = "",
+        resolves_feedback_id: int | None = None,
+        usage_started_at: float | None = None,
+    ) -> tuple[int, int]:
+        """Record strict feedback and its success event in one transaction."""
+
+        artifact_exists_fn: Callable[[str], bool] | None = None
+        if expected_artifact_id or resolves_feedback_id is not None:
+            target, _metadata = self.ensure_index()
+
+            def artifact_exists(candidate_id: str) -> bool:
+                return self._get_artifact_fn(target, candidate_id) is not None
+
+            artifact_exists_fn = artifact_exists
 
         return self._record_feedback_fn(
             self.config.source_root,
@@ -248,6 +260,10 @@ class LocalKnowledgeService:
             artifact_id=artifact_id,
             note=note,
             context=context,
+            expected_artifact_id=expected_artifact_id,
+            resolves_feedback_id=resolves_feedback_id,
+            artifact_exists=artifact_exists_fn,
+            usage_started_at=usage_started_at,
             usage_db_path=self.usage_db_path,
         )
 

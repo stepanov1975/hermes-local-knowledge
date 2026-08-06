@@ -848,12 +848,15 @@ def main(
         )
         managed = bool(args.from_hermes_config and args.db is None)
         started = time.perf_counter()
+        # Preserve the full CLI page selected by the caller. Unlike the native
+        # tool, the CLI has no schema-level 30-result maximum.
+        search_limit = int(args.limit)
         _print_warnings(warnings)
         meta = {}
         try:
             rows, meta = service.search(
                 args.query,
-                limit=args.limit,
+                limit=search_limit,
                 db_path=None if managed else db_path,
                 ensure=managed,
             )
@@ -864,7 +867,7 @@ def main(
                 tool="knowledge_search",
                 success=False,
                 query=args.query,
-                limit_value=args.limit,
+                limit_value=search_limit,
                 error=message,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
@@ -880,11 +883,11 @@ def main(
             tool="knowledge_search",
             success=True,
             query=args.query,
-            limit_value=args.limit,
+            limit_value=search_limit,
             rebuilt=bool(meta.get("rebuilt")),
             result_count=len(rows),
-            top_ids=[str(row.get("id")) for row in rows[:5]],
-            top_types=[str(row.get("type")) for row in rows[:5]],
+            top_ids=[str(row.get("id")) for row in rows],
+            top_types=[str(row.get("type")) for row in rows],
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             index_meta=meta,

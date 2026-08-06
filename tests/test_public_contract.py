@@ -191,6 +191,24 @@ EXPECTED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "Do not include secrets."
                     ),
                 },
+                "expected_artifact_id": {
+                    "type": "string",
+                    "description": (
+                        "Verified artifact id that should have been returned for this "
+                        "query. Use only after confirming the artifact exists. When set "
+                        "on a negative parent, a resolution must accept this artifact."
+                    ),
+                },
+                "resolves_feedback_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Feedback id of an unresolved negative parent to close. The new "
+                        "rating must be useful, event_id must reference a successful "
+                        "knowledge_search whose returned page contains artifact_id, and "
+                        "the query is canonicalized to that search event."
+                    ),
+                },
             },
             "required": ["rating"],
             "additionalProperties": False,
@@ -264,6 +282,7 @@ PERSISTED_INDEX_METADATA_KEYS = {
     "artifact_counts_by_type",
     "edge_count",
     "index_format_version",
+    "jsonl_sha256",
 }
 USAGE_REPORT_KEYS = {
     "success",

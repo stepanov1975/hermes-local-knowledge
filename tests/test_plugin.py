@@ -32,6 +32,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
+    assert hermes_local_knowledge.__version__ == "0.4.3"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
@@ -127,6 +128,13 @@ def test_register_exposes_native_tools_and_bundled_skill():
     assert {call["toolset"] for call in tool_calls} == {"local_knowledge"}
     assert all(call["schema"]["parameters"]["type"] == "object" for call in tool_calls)
     assert all(call["check_fn"] is plugin.check_knowledge_available for call in tool_calls)
+    feedback_call = next(call for call in tool_calls if call["name"] == "knowledge_feedback")
+    feedback_properties = feedback_call["schema"]["parameters"]["properties"]
+    assert feedback_properties["expected_artifact_id"]["type"] == "string"
+    assert feedback_properties["resolves_feedback_id"]["type"] == "integer"
+    assert feedback_properties["resolves_feedback_id"]["minimum"] == 1
+    assert "expected_artifact_id" not in feedback_call["schema"]["parameters"]["required"]
+    assert "resolves_feedback_id" not in feedback_call["schema"]["parameters"]["required"]
     expected_skill = Path(__file__).resolve().parents[1] / "skills" / "local-knowledge-router" / "SKILL.md"
     assert skill_calls == [("local-knowledge-router", expected_skill)]
     assert skill_calls[0][1].is_file()
@@ -135,6 +143,112 @@ def test_register_exposes_native_tools_and_bundled_skill():
     assert callable(cli_calls[0]["setup_fn"])
     assert callable(cli_calls[0]["handler_fn"])
     assert cli_calls[0]["handler_fn"].keywords["llm"] is host_llm
+
+
+def test_feedback_handler_forwards_verified_fields_and_uses_atomic_usage_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeService:
+        usage_db_path = tmp_path / "usage.sqlite"
+
+        def feedback(self, **kwargs):  # type: ignore[no-untyped-def]
+            captured.update(kwargs)
+            return 41, 42
+
+        def record_usage(self, **_kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("successful feedback telemetry must be atomic")
+
+    monkeypatch.setattr(plugin, "_service", FakeService)
+
+    payload = json.loads(
+        plugin._handle_feedback(
+            {
+                "rating": "useful",
+                "event_id": 7,
+                "query": "  exact  internal spacing  ",
+                "artifact_id": "skill:accepted",
+                "expected_artifact_id": "skill:accepted",
+                "resolves_feedback_id": 9,
+            }
+        )
+    )
+
+    assert payload["feedback_id"] == 41
+    assert payload["usage_event_id"] == 42
+    assert captured["expected_artifact_id"] == "skill:accepted"
+    assert captured["resolves_feedback_id"] == 9
+    assert isinstance(captured["usage_started_at"], float)
+
+
+def test_native_search_telemetry_keeps_the_complete_bounded_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    rows = [
+        {"id": f"skill:item-{position}", "type": "skill"}
+        for position in range(1, 31)
+    ]
+
+    class FakeService:
+        db_path = tmp_path / "index.sqlite"
+
+        def search(self, query: str, **kwargs):  # type: ignore[no-untyped-def]
+            assert query == "exact  spacing"
+            assert kwargs["limit"] == 30
+            return rows, {"rebuilt": False}
+
+        def record_usage(self, **kwargs):  # type: ignore[no-untyped-def]
+            captured.update(kwargs)
+            return 88
+
+    monkeypatch.setattr(plugin, "_service", FakeService)
+
+    payload = json.loads(plugin._handle_search({"query": "  exact  spacing  ", "limit": 999}))
+
+    assert payload["limit"] == 30
+    assert len(payload["results"]) == 30
+    assert captured["query"] == "exact  spacing"
+    assert captured["top_ids"] == [row["id"] for row in rows]
+    assert captured["top_types"] == [row["type"] for row in rows]
+
+
+def test_cli_search_telemetry_keeps_the_complete_page_and_explicit_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+    rows = [
+        {"id": f"skill:item-{position}", "type": "skill"}
+        for position in range(1, 51)
+    ]
+
+    class FakeService:
+        def search(self, query: str, **kwargs):  # type: ignore[no-untyped-def]
+            assert query == "cli query"
+            assert kwargs["limit"] == 999
+            return rows, {"rebuilt": False}
+
+        def record_usage(self, **kwargs):  # type: ignore[no-untyped-def]
+            captured.update(kwargs)
+            return 89
+
+    service = FakeService()
+    monkeypatch.setattr(lci_cli, "_service", lambda *_args, **_kwargs: service)
+
+    status = lci_cli.main(
+        ["search", "cli query", "--limit", "999", "--db", str(tmp_path / "index.sqlite"), "--json"]
+    )
+
+    assert status == 0
+    assert len(json.loads(capsys.readouterr().out)) == 50
+    assert captured["limit_value"] == 999
+    assert captured["top_ids"] == [row["id"] for row in rows]
+    assert captured["top_types"] == [row["type"] for row in rows]
 
 
 def test_plugin_handler_wrapper_uses_one_service_factory(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -634,7 +748,7 @@ def test_lookup_error_telemetry_is_fail_open(
     }
 
 
-def test_feedback_failure_is_strict_and_records_error_telemetry(
+def test_feedback_nonlock_failure_retains_best_effort_error_telemetry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -686,6 +800,48 @@ def test_feedback_failure_is_strict_and_records_error_telemetry(
         "tool_call_id": "",
     }
     assert usage["usage_db_path"] == service.usage_db_path
+
+
+def test_feedback_lock_failure_does_not_open_a_second_telemetry_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Config(
+        source_root=tmp_path / "repo",
+        hermes_home=tmp_path / "hermes-home",
+        state_dir=tmp_path / "state",
+        index_settings=lci_index.IndexSettings(),
+    )
+    record_calls = 0
+
+    def locked_feedback(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise lci_telemetry.FeedbackDatabaseLockedError(
+            "feedback database is temporarily locked; try again"
+        )
+
+    def record_usage(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal record_calls
+        record_calls += 1
+        return 91
+
+    service = LocalKnowledgeService(
+        config,
+        record_feedback_fn=locked_feedback,
+        record_usage_fn=record_usage,
+    )
+    monkeypatch.setattr(plugin, "_service", lambda: service)
+
+    payload = json.loads(plugin._handle_feedback({"rating": "useful", "query": "demo"}))
+
+    assert payload == {
+        "error": (
+            "knowledge_feedback failed: FeedbackDatabaseLockedError: "
+            "feedback database is temporarily locked; try again"
+        ),
+        "success": False,
+        "usage_event_id": None,
+    }
+    assert record_calls == 0
 
 
 def test_implicit_hermes_home_source_skips_root_markdown(tmp_path, monkeypatch):

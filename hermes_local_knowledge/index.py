@@ -858,12 +858,19 @@ def index_metadata(db_path: Path) -> dict[str, Any]:
                 str(row[0]): int(row[1])
                 for row in connection.execute("SELECT type, COUNT(*) FROM artifacts GROUP BY type")
             }
+            persisted_metadata = {
+                str(row[0]): str(row[1])
+                for row in connection.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('jsonl_sha256', 'format_version')"
+                )
+            }
             metadata.update(
                 {
                     "artifact_count": sum(counts.values()),
                     "artifact_counts_by_type": dict(sorted(counts.items())),
                     "edge_count": int(connection.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
                     "index_format_version": int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                    "jsonl_sha256": persisted_metadata.get("jsonl_sha256"),
                 }
             )
         finally:

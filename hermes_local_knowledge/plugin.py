@@ -12,7 +12,7 @@ from . import index
 from .config import resolve_config
 from .okf import _on_post_tool_call, _on_session_finalize
 from .service import LocalKnowledgeService
-from .telemetry import FEEDBACK_RATINGS, _usage_context
+from .telemetry import FEEDBACK_RATINGS, FeedbackDatabaseLockedError, _usage_context
 
 __all__ = ["register"]
 
@@ -123,8 +123,8 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
             rebuild_requested=rebuild,
             rebuilt=bool(meta.get("rebuilt")),
             result_count=len(rows),
-            top_ids=[str(row.get("id")) for row in rows[:5]],
-            top_types=[str(row.get("type")) for row in rows[:5]],
+            top_ids=[str(row.get("id")) for row in rows],
+            top_types=[str(row.get("type")) for row in rows],
             latency_ms=_latency_ms(started),
             db_path=db_path,
             context=context,
@@ -304,8 +304,8 @@ def _handle_neighbors(args: Any, **kwargs: Any) -> str:
             rebuild_requested=rebuild,
             rebuilt=bool(meta.get("rebuilt")),
             result_count=len(rows),
-            top_ids=[str(row.get("id")) for row in rows[:5]],
-            top_types=[str(row.get("type")) for row in rows[:5]],
+            top_ids=[str(row.get("id")) for row in rows],
+            top_types=[str(row.get("type")) for row in rows],
             latency_ms=_latency_ms(started),
             db_path=db_path,
             context=context,
@@ -364,26 +364,32 @@ def _handle_feedback(args: Any, **kwargs: Any) -> str:
     query = str(args.get("query") or "")
     artifact_id = str(args.get("artifact_id") or "")
     note = str(args.get("note") or "")
+    expected_artifact_id = str(args.get("expected_artifact_id") or "")
+    resolves_feedback_id_raw = args.get("resolves_feedback_id")
+    try:
+        resolves_feedback_id = (
+            int(resolves_feedback_id_raw)
+            if resolves_feedback_id_raw is not None
+            else None
+        )
+    except Exception:
+        return _tool_error(
+            "resolves_feedback_id must be an integer when provided",
+            success=False,
+        )
     service: LocalKnowledgeService | None = None
     try:
         service = _service()
-        feedback_id = service.feedback(
+        feedback_id, usage_event_id = service.feedback(
             rating=rating,
             event_id=event_id,
             query=query,
             artifact_id=artifact_id,
             note=note,
             context=context,
-        )
-        usage_event_id = service.record_usage(
-            tool="knowledge_feedback",
-            success=True,
-            query=query,
-            artifact_id=artifact_id,
-            result_count=1,
-            latency_ms=_latency_ms(started),
-            db_path=service.usage_db_path,
-            context=context,
+            expected_artifact_id=expected_artifact_id,
+            resolves_feedback_id=resolves_feedback_id,
+            usage_started_at=started,
         )
         return _tool_result(
             {
@@ -397,17 +403,26 @@ def _handle_feedback(args: Any, **kwargs: Any) -> str:
         )
     except Exception as exc:
         message = f"knowledge_feedback failed: {type(exc).__name__}: {exc}"
-        usage_event_id = _record_handler_usage(
-            service,
-            tool="knowledge_feedback",
+        # A lock failure already consumed the handler's bounded wait. Opening a
+        # second connection would double that budget. Other argument/schema
+        # failures retain the established best-effort failure event.
+        failed_usage_event_id: int | None = None
+        if not isinstance(exc, FeedbackDatabaseLockedError):
+            failed_usage_event_id = _record_handler_usage(
+                service,
+                tool="knowledge_feedback",
+                success=False,
+                query=query,
+                artifact_id=artifact_id,
+                error=message,
+                latency_ms=_latency_ms(started),
+                context=context,
+            )
+        return _tool_error(
+            message,
             success=False,
-            query=query,
-            artifact_id=artifact_id,
-            error=message,
-            latency_ms=_latency_ms(started),
-            context=context,
+            usage_event_id=failed_usage_event_id,
         )
-        return _tool_error(message, success=False, usage_event_id=usage_event_id)
 
 
 def _handle_usage_report(args: Any, **kwargs: Any) -> str:
@@ -678,6 +693,24 @@ def register(ctx: Any) -> None:
                             "description": (
                                 "Short concrete note about what worked or what should improve. "
                                 "Do not include secrets."
+                            ),
+                        },
+                        "expected_artifact_id": {
+                            "type": "string",
+                            "description": (
+                                "Verified artifact id that should have been returned for this "
+                                "query. Use only after confirming the artifact exists. When set "
+                                "on a negative parent, a resolution must accept this artifact."
+                            ),
+                        },
+                        "resolves_feedback_id": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Feedback id of an unresolved negative parent to close. The new "
+                                "rating must be useful, event_id must reference a successful "
+                                "knowledge_search whose returned page contains artifact_id, and "
+                                "the query is canonicalized to that search event."
                             ),
                         },
                     },

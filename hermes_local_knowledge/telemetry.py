@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import __version__
 from .config import resolve_config
@@ -20,9 +21,15 @@ FEEDBACK_RATINGS = {
     "other",
 }
 NEGATIVE_FEEDBACK_RATINGS = FEEDBACK_RATINGS - {"useful", "other"}
+LOOKUP_TOOLS = {"knowledge_search", "knowledge_get", "knowledge_neighbors"}
+GENERAL_TELEMETRY_TIMEOUT_SECONDS = 1.0
 
 RECENT_LIVE_ERROR_DAYS = 3
 PROBE_QUERIES = {"demo", "sentinel unlikely", "xxxx"}
+
+
+class FeedbackDatabaseLockedError(RuntimeError):
+    """Raised when strict feedback cannot acquire its one bounded write lock."""
 
 
 def _utc_now() -> str:
@@ -34,6 +41,12 @@ def _clean_text(value: Any, *, limit: int = 1000) -> str:
     if len(text) > limit:
         return text[: limit - 1] + "…"
     return text
+
+
+def _exact_text(value: Any) -> str:
+    """Preserve local replay values without collapsing whitespace or truncating."""
+
+    return str(value or "")
 
 def _json_list(values: list[str] | None) -> str:
     return json.dumps(values or [], ensure_ascii=False)
@@ -65,6 +78,13 @@ USAGE_EVENT_COLUMNS: dict[str, str] = {
     "result_count": "INTEGER",
     "top_ids_json": "TEXT NOT NULL DEFAULT '[]'",
     "top_types_json": "TEXT NOT NULL DEFAULT '[]'",
+    "baseline_top_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+    "route_feedback_id": "INTEGER",
+    "route_artifact_id": "TEXT",
+    "route_outcome": "TEXT NOT NULL DEFAULT 'none'",
+    "index_jsonl_sha256": "TEXT",
+    "index_format_version": "INTEGER",
+    "feedback_max_id": "INTEGER DEFAULT -1",
     "latency_ms": "INTEGER",
     "plugin_version": "TEXT",
     "source_root_source": "TEXT",
@@ -91,14 +111,32 @@ FEEDBACK_COLUMNS: dict[str, str] = {
     "task_id": "TEXT",
     "tool_call_id": "TEXT",
     "root": "TEXT",
+    "expected_artifact_id": "TEXT",
+    "resolves_feedback_id": "INTEGER",
+    "linkage_status": "TEXT NOT NULL DEFAULT 'legacy'",
 }
 
 
 def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
-    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-    for name, definition in columns.items():
+    existing = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, declaration in columns.items():
         if name not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            except sqlite3.OperationalError as exc:
+                # Concurrent first-use connections can both observe the old
+                # schema. SQLite serializes the ALTERs, so the loser sees a
+                # duplicate after the winner commits. Recheck rather than
+                # dropping an otherwise valid telemetry write.
+                if "duplicate column name" not in str(exc).casefold():
+                    raise
+                current = {
+                    str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+                }
+                if name not in current:
+                    raise
+                existing.update(current)
+            existing.add(name)
 
 def _usage_context(kwargs: dict[str, Any]) -> dict[str, str]:
     return {
@@ -129,6 +167,13 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             result_count INTEGER,
             top_ids_json TEXT NOT NULL DEFAULT '[]',
             top_types_json TEXT NOT NULL DEFAULT '[]',
+            baseline_top_ids_json TEXT NOT NULL DEFAULT '[]',
+            route_feedback_id INTEGER,
+            route_artifact_id TEXT,
+            route_outcome TEXT NOT NULL DEFAULT 'none',
+            index_jsonl_sha256 TEXT,
+            index_format_version INTEGER,
+            feedback_max_id INTEGER DEFAULT -1,
             latency_ms INTEGER,
             plugin_version TEXT,
             source_root_source TEXT,
@@ -160,7 +205,10 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             session_id TEXT,
             task_id TEXT,
             tool_call_id TEXT,
-            root TEXT
+            root TEXT,
+            expected_artifact_id TEXT,
+            resolves_feedback_id INTEGER,
+            linkage_status TEXT NOT NULL DEFAULT 'legacy'
         )
         """
     )
@@ -172,8 +220,22 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_root_id ON feedback(root, id DESC)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_resolution_unique "
+        "ON feedback(resolves_feedback_id) WHERE resolves_feedback_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feedback_route_lookup "
+        "ON feedback(root, linkage_status, rating, id DESC)"
+    )
 
-def _usage_connect(root: Path | None, usage_db_path: Path | None = None) -> sqlite3.Connection:
+
+def _usage_connect(
+    root: Path | None,
+    usage_db_path: Path | None = None,
+    *,
+    initialize: bool = True,
+) -> sqlite3.Connection:
     if usage_db_path is None:
         if root is None:
             raise ValueError("root or usage_db_path is required")
@@ -181,10 +243,12 @@ def _usage_connect(root: Path | None, usage_db_path: Path | None = None) -> sqli
     else:
         resolved_usage_db = usage_db_path
     resolved_usage_db.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(resolved_usage_db), timeout=10.0)
+    conn = sqlite3.connect(str(resolved_usage_db), timeout=GENERAL_TELEMETRY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 10000")
-    _init_usage_db(conn)
+    conn.execute(f"PRAGMA busy_timeout = {int(GENERAL_TELEMETRY_TIMEOUT_SECONDS * 1000)}")
+    if initialize:
+        _init_usage_db(conn)
+        conn.commit()
     return conn
 
 def _record_usage(
@@ -215,8 +279,10 @@ def _record_usage(
         context = context or {}
         index_metadata = index_metadata or {}
         artifact_counts = index_metadata.get("artifact_counts_by_type")
-        conn = _usage_connect(root, usage_db_path)
+        conn = _usage_connect(root, usage_db_path, initialize=False)
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            _init_usage_db(conn)
             cur = conn.execute(
                 """
                 INSERT INTO usage_events (
@@ -227,8 +293,9 @@ def _record_usage(
                     state_dir_source, include_markdown_docs_source, index_exists,
                     index_mtime, index_age_seconds, index_artifact_count,
                     index_edge_count, index_artifact_counts_json,
-                    index_metadata_error, build_duration_ms, root, db_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    index_metadata_error, build_duration_ms, root, db_path,
+                    index_jsonl_sha256, index_format_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now(),
@@ -237,8 +304,8 @@ def _record_usage(
                     context.get("session_id") or None,
                     context.get("task_id") or None,
                     context.get("tool_call_id") or None,
-                    _clean_text(query, limit=1000) or None,
-                    _clean_text(artifact_id, limit=300) or None,
+                    _exact_text(query) or None,
+                    _exact_text(artifact_id) or None,
                     _clean_text(artifact_type, limit=80) or None,
                     limit_value,
                     1 if rebuild_requested else 0,
@@ -265,6 +332,8 @@ def _record_usage(
                     if root is not None
                     else (_clean_text(index_metadata.get("root") or index_metadata.get("source_root"), limit=1000) or None),
                     str(db_path) if db_path else None,
+                    _clean_text(index_metadata.get("jsonl_sha256"), limit=80) or None,
+                    _int_or_none(index_metadata.get("index_format_version")),
                 ),
             )
             conn.commit()
@@ -284,34 +353,223 @@ def _record_feedback(
     artifact_id: str,
     note: str,
     context: dict[str, str],
+    expected_artifact_id: str = "",
+    resolves_feedback_id: int | None = None,
+    artifact_exists: Callable[[str], bool] | None = None,
+    usage_started_at: float | None = None,
     usage_db_path: Path | None = None,
-) -> int:
-    conn = _usage_connect(root, usage_db_path)
+) -> tuple[int, int]:
+    root_text = str(root)
+    canonical_query = _exact_text(query).strip()
+    artifact_id = _exact_text(artifact_id).strip()
+    expected_artifact_id = _exact_text(expected_artifact_id).strip()
+    note = _exact_text(note)
+    conn: sqlite3.Connection | None = None
     try:
-        cur = conn.execute(
+        conn = _usage_connect(root, usage_db_path, initialize=False)
+        conn.execute("BEGIN IMMEDIATE")
+        _init_usage_db(conn)
+
+        event: sqlite3.Row | None = None
+        if event_id is not None:
+            event = conn.execute("SELECT * FROM usage_events WHERE id = ?", (event_id,)).fetchone()
+            if event is None:
+                raise ValueError(f"usage event does not exist: {event_id}")
+            if str(event["root"] or "") != root_text:
+                raise ValueError("usage event does not belong to the current root")
+            event_tool = str(event["tool"] or "")
+            if event_tool not in LOOKUP_TOOLS:
+                raise ValueError("usage event tool is not a supported lookup tool")
+            if int(event["success"] or 0) != 1:
+                raise ValueError("usage event is not a successful lookup")
+            # Search handlers remove outer whitespace before execution. Mirror
+            # that canonical form for legacy/directly-recorded events while
+            # preserving every internal whitespace character.
+            event_query = str(event["query"] or "").strip()
+            if canonical_query and canonical_query != event_query:
+                raise ValueError("query does not match the referenced usage event")
+            if event_tool == "knowledge_search":
+                canonical_query = event_query
+                try:
+                    returned_ids = json.loads(str(event["top_ids_json"] or "[]"))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("referenced search result IDs are invalid") from exc
+                if not isinstance(returned_ids, list):
+                    raise ValueError("referenced search result IDs are invalid")
+                if artifact_id and artifact_id not in {str(value) for value in returned_ids}:
+                    raise ValueError("artifact_id is absent from the recorded result page")
+            elif event_tool == "knowledge_get":
+                if artifact_id and artifact_id != str(event["artifact_id"] or ""):
+                    raise ValueError("artifact_id does not match the referenced artifact lookup")
+                if expected_artifact_id or resolves_feedback_id is not None:
+                    raise ValueError(
+                        "expected_artifact_id and resolves_feedback_id require search feedback"
+                    )
+            else:
+                try:
+                    neighbor_ids = json.loads(str(event["top_ids_json"] or "[]"))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("referenced neighbor result IDs are invalid") from exc
+                if not isinstance(neighbor_ids, list):
+                    raise ValueError("referenced neighbor result IDs are invalid")
+                valid_neighbor_ids = {str(value) for value in neighbor_ids}
+                valid_neighbor_ids.add(str(event["artifact_id"] or ""))
+                if artifact_id and artifact_id not in valid_neighbor_ids:
+                    raise ValueError("artifact_id is absent from the referenced neighbor lookup")
+                if expected_artifact_id or resolves_feedback_id is not None:
+                    raise ValueError(
+                        "expected_artifact_id and resolves_feedback_id require search feedback"
+                    )
+            linkage_status = "verified_event"
+        elif canonical_query:
+            linkage_status = "direct_query"
+        elif artifact_id:
+            linkage_status = "artifact_only"
+        else:
+            linkage_status = "unscoped"
+
+        if linkage_status in {"artifact_only", "unscoped"} and (
+            expected_artifact_id or resolves_feedback_id is not None
+        ):
+            raise ValueError(
+                "expected_artifact_id and resolves_feedback_id require replayable search feedback"
+            )
+        if expected_artifact_id:
+            if rating not in NEGATIVE_FEEDBACK_RATINGS:
+                raise ValueError("expected_artifact_id requires a negative search-quality rating")
+            if artifact_exists is None or not artifact_exists(expected_artifact_id):
+                raise ValueError(
+                    "expected artifact does not exist in the current managed index: "
+                    f"{expected_artifact_id}"
+                )
+
+        if resolves_feedback_id is not None:
+            if rating != "useful":
+                raise ValueError("resolves_feedback_id requires rating='useful'")
+            if not artifact_id:
+                raise ValueError("resolves_feedback_id requires artifact_id")
+            if event is None or str(event["tool"] or "") != "knowledge_search":
+                raise ValueError("resolves_feedback_id requires a successful search event")
+            if artifact_exists is None or not artifact_exists(artifact_id):
+                raise ValueError(f"accepted artifact does not exist in the current index: {artifact_id}")
+            negative = conn.execute(
+                """
+                SELECT f.id, f.rating, f.root, f.query, f.expected_artifact_id,
+                       f.linkage_status, f.event_id,
+                       e.tool AS event_tool, e.success AS event_success,
+                       e.root AS event_root
+                FROM feedback AS f
+                LEFT JOIN usage_events AS e ON e.id = f.event_id
+                WHERE f.id = ?
+                """,
+                (resolves_feedback_id,),
+            ).fetchone()
+            if negative is None:
+                raise ValueError(f"feedback row does not exist: {resolves_feedback_id}")
+            if str(negative["root"] or "") != root_text:
+                raise ValueError("resolved feedback belongs to a different configured root")
+            parent_linkage = str(negative["linkage_status"] or "")
+            parent_query = _exact_text(negative["query"]).strip()
+            if parent_linkage == "verified_event":
+                parent_is_replayable = (
+                    str(negative["event_tool"] or "") == "knowledge_search"
+                    and int(negative["event_success"] or 0) == 1
+                    and str(negative["event_root"] or "") == root_text
+                    and bool(parent_query)
+                )
+            else:
+                parent_is_replayable = (
+                    parent_linkage in {"direct_query", "legacy"} and bool(parent_query)
+                )
+            if not parent_is_replayable:
+                raise ValueError("resolved feedback row has no replayable search intent")
+            if str(negative["rating"] or "") not in NEGATIVE_FEEDBACK_RATINGS:
+                raise ValueError("resolved feedback row is not negative")
+            expected = str(negative["expected_artifact_id"] or "")
+            if expected and expected != artifact_id:
+                raise ValueError("accepted artifact does not match the expected artifact target")
+            already_resolved = conn.execute(
+                "SELECT id FROM feedback WHERE resolves_feedback_id = ? LIMIT 1",
+                (resolves_feedback_id,),
+            ).fetchone()
+            if already_resolved is not None:
+                raise ValueError("feedback row is already explicitly resolved")
+
+        timestamp = _utc_now()
+        feedback_cur = conn.execute(
             """
             INSERT INTO feedback (
                 ts, event_id, rating, query, artifact_id, note,
-                session_id, task_id, tool_call_id, root
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                session_id, task_id, tool_call_id, root, expected_artifact_id,
+                resolves_feedback_id, linkage_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _utc_now(),
+                timestamp,
                 event_id,
                 rating,
-                _clean_text(query, limit=1000) or None,
-                _clean_text(artifact_id, limit=300) or None,
-                _clean_text(note, limit=2000) or None,
+                canonical_query or None,
+                artifact_id or None,
+                note or None,
                 context.get("session_id") or None,
                 context.get("task_id") or None,
                 context.get("tool_call_id") or None,
-                str(root),
+                root_text,
+                expected_artifact_id or None,
+                resolves_feedback_id,
+                linkage_status,
+            ),
+        )
+        latency_ms = (
+            int((time.perf_counter() - usage_started_at) * 1000)
+            if usage_started_at is not None
+            else None
+        )
+        usage_cur = conn.execute(
+            """
+            INSERT INTO usage_events (
+                ts, tool, client, session_id, task_id, tool_call_id, query,
+                artifact_id, success, result_count, latency_ms, plugin_version,
+                root, db_path
+            ) VALUES (?, 'knowledge_feedback', 'native', ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                context.get("session_id") or None,
+                context.get("task_id") or None,
+                context.get("tool_call_id") or None,
+                canonical_query or None,
+                artifact_id or None,
+                latency_ms,
+                __version__,
+                root_text,
+                str(usage_db_path) if usage_db_path is not None else None,
             ),
         )
         conn.commit()
-        return int(cur.lastrowid or 0)
+        return int(feedback_cur.lastrowid or 0), int(usage_cur.lastrowid or 0)
+    except sqlite3.IntegrityError as exc:
+        if conn is not None:
+            conn.rollback()
+        if resolves_feedback_id is not None:
+            raise ValueError("feedback row is already explicitly resolved") from exc
+        raise
+    except sqlite3.OperationalError as exc:
+        if conn is not None:
+            conn.rollback()
+        message = str(exc).casefold()
+        if "locked" in message or "busy" in message:
+            raise FeedbackDatabaseLockedError(
+                "feedback database is temporarily locked; try again"
+            ) from exc
+        raise
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 def _rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
     return [dict(row) for row in conn.execute(sql, params).fetchall()]

@@ -827,7 +827,7 @@ def test_usage_success_error_and_failures_are_best_effort(tmp_path: Path) -> Non
 def test_feedback_failures_remain_strict(tmp_path: Path) -> None:
     config = make_config(tmp_path)
 
-    def fail_feedback(*args: Any, **kwargs: Any) -> int:
+    def fail_feedback(*args: Any, **kwargs: Any) -> tuple[int, int]:
         raise sqlite3.OperationalError("feedback unavailable")
 
     service = LocalKnowledgeService(config, record_feedback_fn=fail_feedback)
@@ -857,7 +857,7 @@ def test_feedback_report_and_evaluation_preserve_paths_and_behavior(tmp_path: Pa
     )
     assert isinstance(usage_event_id, int)
 
-    feedback_id = service.feedback(
+    feedback_id, feedback_usage_event_id = service.feedback(
         rating="useful",
         event_id=usage_event_id,
         query="quartz inventory",
@@ -874,8 +874,9 @@ def test_feedback_report_and_evaluation_preserve_paths_and_behavior(tmp_path: Pa
     after_evaluation = service.usage_report(days=30, limit=10)
 
     assert isinstance(feedback_id, int)
+    assert isinstance(feedback_usage_event_id, int)
     assert report["usage_db_path"] == str(service.usage_db_path)
-    assert before_evaluation == (1, 1)
+    assert before_evaluation == (2, 1)
     assert evaluation.metrics.query_count == 1
     assert evaluation.metrics.hit_at_1 == 1.0
     assert evaluation.metrics.parent_equiv_hit_at_10 == 1.0
@@ -887,9 +888,9 @@ def test_feedback_report_and_evaluation_injections_receive_configured_paths(tmp_
     calls: list[tuple[Any, ...]] = []
     expected_report = object()
 
-    def feedback_fn(root: Path, **kwargs: Any) -> int:
+    def feedback_fn(root: Path, **kwargs: Any) -> tuple[int, int]:
         calls.append(("feedback", root, kwargs["usage_db_path"]))
-        return 41
+        return 41, 42
 
     def report_fn(root: Path, **kwargs: Any) -> dict[str, Any]:
         calls.append(("report", root, kwargs["usage_db_path"], kwargs["days"], kwargs["limit"]))
@@ -913,7 +914,7 @@ def test_feedback_report_and_evaluation_injections_receive_configured_paths(tmp_
         artifact_id="",
         note="",
         context={},
-    ) == 41
+    ) == (41, 42)
     assert service.usage_report(days=7, limit=3) == {"success": True}
     assert service.evaluate() is expected_report
     assert calls == [
