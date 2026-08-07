@@ -1640,7 +1640,11 @@ description: Unconfigured custom router skill.
     assert cfg.router_skill_path is None
     assert cfg.router_skill_path_source == "default"
     assert doctor["router_skill_mode"] == "bundled"
-    assert doctor["router_skill_path"].endswith("skills/local-knowledge-router/SKILL.md")
+    assert Path(doctor["router_skill_path"]).parts[-3:] == (
+        "skills",
+        "local-knowledge-router",
+        "SKILL.md",
+    )
     checks = {row["name"]: row for row in doctor["checks"]}
     assert checks["router_skill_installed"]["ok"] is False
     assert "router_skill_identity" not in checks
