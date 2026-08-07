@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.5] - 2026-08-07
+
+### Changed
+
+- Expanded the supported Ruff test-tool range through 0.16 while explicitly preserving the pre-0.16 default lint rule set.
+
+[0.4.5]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.4...v0.4.5
+
 ## [0.4.4] - 2026-08-07
 
 ### Added

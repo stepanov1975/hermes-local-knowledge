@@ -305,10 +305,10 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
 
 
 def test_repository_release_notes_exclude_changelog_reference_definition() -> None:
-    rendered = render_release_notes(REPO_ROOT / "CHANGELOG.md", "0.4.4")
-    assert "[0.4.4]:" not in rendered
-    assert "local_knowledge.router_skill_path" in rendered
+    rendered = render_release_notes(REPO_ROOT / "CHANGELOG.md", "0.4.5")
+    assert "[0.4.5]:" not in rendered
+    assert "preserving the pre-0.16 default lint rule set" in rendered
     assert rendered.endswith(
-        "**Full changelog:** [v0.4.3...v0.4.4]"
-        "(https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.3...v0.4.4)\n"
+        "**Full changelog:** [v0.4.4...v0.4.5]"
+        "(https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.4...v0.4.5)\n"
     )
