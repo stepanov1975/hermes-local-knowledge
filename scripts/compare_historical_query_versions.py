@@ -27,10 +27,23 @@ import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from hermes_local_knowledge.index import _query_terms  # noqa: E402
+from hermes_local_knowledge.routing import (  # noqa: E402
+    ARTIFACT_TYPE_BY_ID_PREFIX,
+    FeedbackRoute,
+    _feedback_query_key,
+    _match_score,
+)
+
 EVALUATOR = REPO_ROOT / "scripts" / "evaluate_ref.py"
 DEFAULT_API_MODULE = "hermes_local_knowledge.indexer"
 POSITIVE_RATINGS = {"useful", "great"}
-NEGATIVE_RATINGS = {"not_useful", "noisy", "wrong_artifact", "stale"}
+HIGH_CONFIDENCE_POSITIVE_RATINGS = {"useful"}
+NEGATIVE_RATINGS = {"missing", "not_useful", "noisy", "wrong_artifact", "stale"}
+LABEL_QUALITY_TIERS = ("explicit_resolution", "verified_event", "direct_or_legacy")
 IGNORED_LABEL_VALUES = {"", "none", "null", "xxxx", "sentinel unlikely", "demo"}
 JSON_LIST_FIELDS = ("triggers", "entities", "related")
 ARTIFACT_FIELDS = (
@@ -108,6 +121,17 @@ class ReplaySearchCase:
     limit: int | None
     artifact_type: str | None
     rebuild_requested: bool
+    event_id: int | None = None
+    plugin_version: str | None = None
+    config_fingerprint: str | None = None
+    index_jsonl_sha256: str | None = None
+    index_format_version: str | None = None
+    baseline_top_ids: tuple[str, ...] = ()
+    recorded_top_ids: tuple[str, ...] = ()
+    route_feedback_id: int | None = None
+    route_artifact_id: str | None = None
+    route_outcome: str = "none"
+    feedback_max_id: int | None = -1
 
 
 @dataclass(frozen=True)
@@ -132,6 +156,9 @@ class RawUsageCorpus:
     replay_search: tuple[ReplaySearchCase, ...]
     replay_get: tuple[ReplayGetCase, ...]
     replay_neighbors: tuple[ReplayNeighborCase, ...]
+    quality_labels: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    label_provenance: tuple[dict[str, Any], ...] = ()
+    route_vetoes: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -141,6 +168,9 @@ class FrozenUsageCorpus:
     replay_search: tuple[ReplaySearchCase, ...]
     replay_get: tuple[ReplayGetCase, ...]
     replay_neighbors: tuple[ReplayNeighborCase, ...]
+    quality_labels: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    label_provenance: tuple[dict[str, Any], ...] = ()
+    route_vetoes: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -187,8 +217,10 @@ class RefEvaluation:
     positive: MetricEvaluation
     negative: MetricEvaluation
     replay: dict[str, dict[str, Any]]
+    production_replay: dict[str, dict[str, Any]]
     synthetic: dict[str, Any]
     evaluator_output: dict[str, Any]
+    quality: dict[str, MetricEvaluation] = field(default_factory=dict)
     failures: list[str] = field(default_factory=list)
     accepted: bool = True
 
@@ -430,6 +462,221 @@ def snapshot_usage_database(source: Path, destination: Path) -> UsageSnapshot:
     return UsageSnapshot(before, after, query_only, destination)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _production_state_key(feedback_max_id: int | None) -> str:
+    if feedback_max_id is None:
+        return "unavailable"
+    if feedback_max_id < 0:
+        return "legacy"
+    return f"bound-{feedback_max_id}"
+
+
+def _canonical_usage_digest(path: Path, *, root: Path) -> str:
+    root_text = str(root.resolve())
+    conn = _readonly_connection(path)
+    try:
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        payload: dict[str, list[dict[str, Any]]] = {}
+        for table in tables:
+            columns = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({_quoted_identifier(table)})")]
+            rows: list[dict[str, Any]] = []
+            for raw in conn.execute(f"SELECT * FROM {_quoted_identifier(table)} ORDER BY rowid"):
+                row: dict[str, Any] = {}
+                for column, value in zip(columns, raw):
+                    if isinstance(value, str) and value == root_text:
+                        value = "<REF_ROOT>"
+                    elif (
+                        isinstance(value, str)
+                        and column != "root"
+                        and value.startswith(root_text + os.sep)
+                    ):
+                        value = "<REF_ROOT>" + value[len(root_text) :]
+                    elif isinstance(value, bytes):
+                        value = {"bytes_sha256": _sha256_bytes(value)}
+                    row[column] = value
+                rows.append(row)
+            payload[table] = rows
+    finally:
+        conn.close()
+    return hash_json(payload)
+
+
+def _usage_link_counts(path: Path) -> dict[str, int]:
+    conn = _readonly_connection(path)
+    try:
+        counts = {
+            "feedback_event_rows": int(
+                conn.execute("SELECT COUNT(*) FROM feedback WHERE event_id IS NOT NULL").fetchone()[0]
+            ),
+            "feedback_event_links": int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM feedback f
+                    JOIN usage_events e ON e.id = f.event_id
+                    WHERE f.event_id IS NOT NULL
+                    """
+                ).fetchone()[0]
+            ),
+        }
+        if "resolves_feedback_id" in _table_columns(conn, "feedback"):
+            counts["feedback_resolution_rows"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM feedback WHERE resolves_feedback_id IS NOT NULL"
+                ).fetchone()[0]
+            )
+            counts["feedback_resolution_links"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM feedback child
+                    JOIN feedback parent ON parent.id = child.resolves_feedback_id
+                    WHERE child.resolves_feedback_id IS NOT NULL
+                    """
+                ).fetchone()[0]
+            )
+        if "route_feedback_id" in _table_columns(conn, "usage_events"):
+            counts["usage_route_rows"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM usage_events WHERE route_feedback_id IS NOT NULL"
+                ).fetchone()[0]
+            )
+            counts["usage_route_links"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM usage_events e
+                    JOIN feedback f ON f.id = e.route_feedback_id
+                    WHERE e.route_feedback_id IS NOT NULL
+                    """
+                ).fetchone()[0]
+            )
+        return counts
+    finally:
+        conn.close()
+
+
+def _delete_feedback_after_bound(
+    conn: sqlite3.Connection, *, feedback_max_id: int, root: Path
+) -> bool:
+    feedback_columns = _table_columns(conn, "feedback")
+    if "id" not in feedback_columns:
+        return False
+    root_text = str(root)
+    if "root" in feedback_columns:
+        if feedback_max_id > 0 and conn.execute(
+            "SELECT 1 FROM feedback WHERE id = ? AND root = ?",
+            (feedback_max_id, root_text),
+        ).fetchone() is None:
+            return False
+        conn.execute(
+            "DELETE FROM feedback WHERE id > ? AND root = ?",
+            (feedback_max_id, root_text),
+        )
+        return True
+    event_columns = _table_columns(conn, "usage_events")
+    if "event_id" in feedback_columns and {"id", "root"}.issubset(event_columns):
+        if feedback_max_id > 0 and conn.execute(
+            """
+            SELECT 1 FROM feedback f
+            JOIN usage_events e ON e.id = f.event_id
+            WHERE f.id = ? AND e.root = ?
+            """,
+            (feedback_max_id, root_text),
+        ).fetchone() is None:
+            return False
+        conn.execute(
+            """
+            DELETE FROM feedback
+            WHERE id > ? AND event_id IN (
+                SELECT id FROM usage_events WHERE root = ?
+            )
+            """,
+            (feedback_max_id, root_text),
+        )
+        return True
+    return False
+
+
+def _prepare_production_states(
+    layout: RefLayout,
+    usage_snapshot: Path,
+    live_root: Path,
+    cases: Sequence[ReplaySearchCase],
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    states_root = ensure_private_directory(layout.state_dir.parent / "production-replay")
+    state_paths: dict[str, str] = {}
+    evidence: dict[str, dict[str, Any]] = {}
+    for feedback_max_id in sorted(
+        {case.feedback_max_id for case in cases},
+        key=lambda value: (value is None, -2 if value is None else value),
+    ):
+        state_key = _production_state_key(feedback_max_id)
+        state_dir = ensure_private_directory(states_root / state_key)
+        for name in ("index.sqlite", "index.jsonl"):
+            shutil.copy2(layout.state_dir / name, state_dir / name)
+            (state_dir / name).chmod(0o600)
+        usage_db = state_dir / "usage.sqlite"
+        feedback_bound_available = False
+        if feedback_max_id is not None:
+            shutil.copy2(usage_snapshot, usage_db)
+            usage_db.chmod(0o600)
+            conn = sqlite3.connect(str(usage_db))
+            try:
+                for table in ("usage_events", "feedback", "index_builds"):
+                    columns = _table_columns(conn, table)
+                    if "root" in columns:
+                        conn.execute(
+                            f"""
+                            UPDATE {_quoted_identifier(table)}
+                            SET root = ?
+                            WHERE root = ?
+                            """,
+                            (str(layout.source_root), str(live_root)),
+                        )
+                if feedback_max_id >= 0:
+                    feedback_bound_available = _delete_feedback_after_bound(
+                        conn,
+                        feedback_max_id=feedback_max_id,
+                        root=layout.source_root,
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            evidence[state_key] = {
+                "feedback_max_id": feedback_max_id,
+                "feedback_bound": feedback_max_id,
+                "feedback_bound_available": feedback_bound_available,
+                "usage_sha256": _sha256_file(usage_db),
+                "canonical_usage_sha256": _canonical_usage_digest(
+                    usage_db, root=layout.source_root
+                ),
+                "table_counts": sqlite_table_counts(usage_db),
+                "link_counts": _usage_link_counts(usage_db),
+            }
+        else:
+            evidence[state_key] = {
+                "feedback_max_id": None,
+                "feedback_bound": None,
+                "feedback_bound_available": False,
+                "usage_sha256": None,
+                "canonical_usage_sha256": None,
+                "table_counts": {},
+                "link_counts": {},
+            }
+        state_paths[state_key] = str(state_dir)
+    return state_paths, evidence
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({_quoted_identifier(table)})").fetchall()}
 
@@ -463,10 +710,22 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
         rating = _column("f", feedback_columns, "rating", "''")
         feedback_rows = conn.execute(
             f"""
-            SELECT {rating} AS rating,
-                   COALESCE(NULLIF({feedback_query}, ''), {event_query}) AS effective_query,
+            SELECT f.id AS feedback_id,
+                   {rating} AS rating,
+                   {feedback_query} AS feedback_query,
+                   COALESCE({feedback_query}, {event_query}) AS effective_query,
                    {feedback_artifact} AS artifact_id,
-                   COALESCE(NULLIF({feedback_root}, ''), {event_root}) AS effective_root
+                   {_column('f', feedback_columns, 'expected_artifact_id')} AS expected_artifact_id,
+                   {feedback_root} AS feedback_root,
+                   COALESCE({feedback_root}, {event_root}) AS effective_root,
+                   {_column('f', feedback_columns, 'event_id')} AS event_id,
+                   {_column('f', feedback_columns, 'linkage_status', "'legacy'")} AS linkage_status,
+                   {_column('f', feedback_columns, 'resolves_feedback_id')} AS resolves_feedback_id,
+                   {_column('e', event_columns, 'tool')} AS event_tool,
+                   {_column('e', event_columns, 'success', '0')} AS event_success,
+                   {event_root} AS event_root,
+                   {event_query} AS event_query,
+                   {_column('e', event_columns, 'top_ids_json', "'[]'")} AS event_top_ids_json
             FROM feedback f
             LEFT JOIN usage_events e ON e.id = {feedback_event}
             """
@@ -474,39 +733,145 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
         root_text = str(live_root.expanduser().resolve())
         positives: set[tuple[str, str]] = set()
         negatives: set[tuple[str, str]] = set()
+        quality_labels: dict[str, dict[str, set[str]]] = {
+            tier: {} for tier in LABEL_QUALITY_TIERS
+        }
+        label_provenance: list[dict[str, Any]] = []
+        route_vetoes: list[dict[str, Any]] = []
+        feedback_by_id = {int(row["feedback_id"]): row for row in feedback_rows}
+        resolution_counts: dict[int, int] = {}
+        for row in feedback_rows:
+            parent_id = row["resolves_feedback_id"]
+            if parent_id is not None:
+                resolved_parent_id = int(parent_id)
+                resolution_counts[resolved_parent_id] = (
+                    resolution_counts.get(resolved_parent_id, 0) + 1
+                )
+
+        def valid_event_link(row: sqlite3.Row, expected_root: str) -> bool:
+            top_ids, valid_top_ids = _decode_json_list(row["event_top_ids_json"])
+            return (
+                str(row["linkage_status"] or "") == "verified_event"
+                and row["event_id"] is not None
+                and str(row["event_tool"] or "") == "knowledge_search"
+                and int(row["event_success"] or 0) == 1
+                and str(row["feedback_root"] or "") == expected_root
+                and str(row["event_root"] or "") == expected_root
+                and _clean_label_text(row["feedback_query"]) == _clean_label_text(row["event_query"])
+                and valid_top_ids
+                and _clean_label_text(row["artifact_id"]) in top_ids
+            )
+
         for row in feedback_rows:
             if str(row["effective_root"] or "") != root_text:
                 continue
             query = _clean_label_text(row["effective_query"])
             artifact_id = _clean_label_text(row["artifact_id"])
             rating_text = _clean_label_text(row["rating"]).lower()
-            if not query or not artifact_id:
+            if not query:
+                continue
+            if rating_text in NEGATIVE_RATINGS:
+                route_vetoes.append(
+                    {
+                        "query": query,
+                        "feedback_id": int(row["feedback_id"]),
+                        "artifact_id": artifact_id,
+                    }
+                )
+                if artifact_id:
+                    negatives.add((query, artifact_id))
+                continue
+            if not artifact_id:
                 continue
             if rating_text in POSITIVE_RATINGS:
                 positives.add((query, artifact_id))
-            elif rating_text in NEGATIVE_RATINGS:
-                negatives.add((query, artifact_id))
+                if rating_text not in HIGH_CONFIDENCE_POSITIVE_RATINGS:
+                    continue
+                tier: str | None = "direct_or_legacy"
+                tier_query = query
+                trigger_query: str | None = None
+                resolves_feedback_id = row["resolves_feedback_id"]
+                linkage_status = str(row["linkage_status"] or "legacy")
+                if resolves_feedback_id is not None:
+                    parent = feedback_by_id.get(int(resolves_feedback_id))
+                    trigger_query = (
+                        _clean_label_text(parent["event_query"]) if parent is not None else ""
+                    )
+                    parent_linkage = (
+                        str(parent["linkage_status"] or "legacy") if parent is not None else ""
+                    )
+                    parent_valid = (
+                        parent is not None
+                        and str(parent["effective_root"] or "") == root_text
+                        and _clean_label_text(parent["rating"]).lower() in NEGATIVE_RATINGS
+                        and _clean_label_text(parent["expected_artifact_id"]) in {"", artifact_id}
+                        and resolution_counts.get(int(resolves_feedback_id)) == 1
+                        and parent_linkage == "verified_event"
+                        and valid_event_link(parent, root_text)
+                    )
+                    if valid_event_link(row, root_text) and parent_valid and trigger_query:
+                        tier = "explicit_resolution"
+                        tier_query = trigger_query
+                    else:
+                        tier = None
+                elif linkage_status == "verified_event":
+                    tier = "verified_event" if valid_event_link(row, root_text) else None
+                elif linkage_status not in {"direct_query", "legacy"}:
+                    tier = None
+                if tier is not None:
+                    quality_labels[tier].setdefault(tier_query, set()).add(artifact_id)
+                    label_provenance.append(
+                        {
+                            "query": tier_query,
+                            "quality_tier": tier,
+                            "feedback_id": int(row["feedback_id"]),
+                            "artifact_id": artifact_id,
+                            "linkage_status": linkage_status,
+                            "resolves_feedback_id": (
+                                None if resolves_feedback_id is None else int(resolves_feedback_id)
+                            ),
+                            "trigger_query": trigger_query or None,
+                            "verification_query": (
+                                _clean_label_text(row["event_query"])
+                                if tier == "explicit_resolution"
+                                else None
+                            ),
+                        }
+                    )
+
 
         def event_value(name: str, default: str = "NULL") -> str:
             return _column("e", event_columns, name, default)
 
         event_rows = conn.execute(
             f"""
-            SELECT {event_value('tool', "''")} AS tool,
+            SELECT {event_value('id')} AS event_id,
+                   {event_value('tool', "''")} AS tool,
                    {event_value('query')} AS query,
                    {event_value('artifact_id')} AS artifact_id,
                    {event_value('artifact_type')} AS artifact_type,
                    {event_value('limit_value')} AS limit_value,
                    {event_value('rebuild_requested', '0')} AS rebuild_requested,
                    {event_value('success', '0')} AS success,
-                   {event_value('root')} AS root
+                   {event_value('root')} AS root,
+                   {event_value('plugin_version')} AS plugin_version,
+                   {event_value('config_fingerprint')} AS config_fingerprint,
+                   {event_value('index_jsonl_sha256')} AS index_jsonl_sha256,
+                   {event_value('index_format_version')} AS index_format_version,
+                   {event_value('baseline_top_ids_json', "'[]'")} AS baseline_top_ids_json,
+                   {event_value('top_ids_json', "'[]'")} AS top_ids_json,
+                   {event_value('route_feedback_id')} AS route_feedback_id,
+                   {event_value('route_artifact_id')} AS route_artifact_id,
+                   {event_value('route_outcome', "'none'")} AS route_outcome,
+                   {event_value('feedback_max_id', '-1')} AS feedback_max_id
             FROM usage_events e
+            ORDER BY event_id
             """
         ).fetchall()
     finally:
         conn.close()
 
-    search_cases: dict[tuple[str, int | None, str | None], ReplaySearchCase] = {}
+    search_cases: dict[tuple[Any, ...], ReplaySearchCase] = {}
     get_cases: dict[str, ReplayGetCase] = {}
     neighbor_cases: dict[tuple[str, int | None], ReplayNeighborCase] = {}
     for row in event_rows:
@@ -521,11 +886,41 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
             if not query:
                 continue
             artifact_type = str(row["artifact_type"] or "").strip() or None
-            search_key = (query, limit, artifact_type)
-            search_previous = search_cases.get(search_key)
-            rebuild = rebuild or (search_previous.rebuild_requested if search_previous is not None else False)
+            baseline_top_ids = tuple(_decode_json_list(row["baseline_top_ids_json"])[0])
+            recorded_top_ids = tuple(_decode_json_list(row["top_ids_json"])[0])
+            feedback_max_id = None if row["feedback_max_id"] is None else int(row["feedback_max_id"])
+            provenance = (
+                str(row["plugin_version"] or "") or None,
+                str(row["config_fingerprint"] or "") or None,
+                str(row["index_jsonl_sha256"] or "") or None,
+                str(row["index_format_version"] or "") or None,
+                baseline_top_ids,
+                recorded_top_ids,
+                row["route_feedback_id"],
+                str(row["route_artifact_id"] or "") or None,
+                str(row["route_outcome"] or "none"),
+                feedback_max_id,
+            )
+            event_id = None if row["event_id"] is None else int(row["event_id"])
+            event_identity: Any = event_id if event_id is not None else (provenance, rebuild)
+            search_key = (query, limit, artifact_type, event_identity)
             search_cases[search_key] = ReplaySearchCase(
-                _case_id("search", search_key), query, limit, artifact_type, rebuild
+                _case_id("search", search_key),
+                query,
+                limit,
+                artifact_type,
+                rebuild,
+                event_id=event_id,
+                plugin_version=provenance[0],
+                config_fingerprint=provenance[1],
+                index_jsonl_sha256=provenance[2],
+                index_format_version=provenance[3],
+                baseline_top_ids=baseline_top_ids,
+                recorded_top_ids=recorded_top_ids,
+                route_feedback_id=(None if row["route_feedback_id"] is None else int(row["route_feedback_id"])),
+                route_artifact_id=provenance[7],
+                route_outcome=str(provenance[8]),
+                feedback_max_id=feedback_max_id,
             )
         elif tool == "knowledge_get":
             artifact_id = str(row["artifact_id"] or "").strip()
@@ -552,6 +947,9 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
         tuple(search_cases[key] for key in sorted(search_cases, key=lambda item: _canonical_json(item))),
         tuple(get_cases[key] for key in sorted(get_cases, key=lambda item: _canonical_json(item))),
         tuple(neighbor_cases[key] for key in sorted(neighbor_cases, key=lambda item: _canonical_json(item))),
+        quality_labels,
+        tuple(sorted(label_provenance, key=_canonical_json)),
+        tuple(sorted(route_vetoes, key=_canonical_json)),
     )
 
 
@@ -565,12 +963,26 @@ def freeze_usage_corpus(raw: RawUsageCorpus, baseline_ids: set[str]) -> FrozenUs
         for query, artifact_id in raw.negative_rows
         if artifact_id in baseline_ids
     )
+    quality_labels = {
+        tier: {
+            query: {artifact_id for artifact_id in artifact_ids if artifact_id in baseline_ids}
+            for query, artifact_ids in raw.quality_labels.get(tier, {}).items()
+            if any(artifact_id in baseline_ids for artifact_id in artifact_ids)
+        }
+        for tier in LABEL_QUALITY_TIERS
+    }
+    label_provenance = tuple(
+        row for row in raw.label_provenance if str(row.get("artifact_id") or "") in baseline_ids
+    )
     return FrozenUsageCorpus(
         dict(sorted(labels.items())),
         negative_pairs,
         raw.replay_search,
         raw.replay_get,
         raw.replay_neighbors,
+        quality_labels,
+        label_provenance,
+        raw.route_vetoes,
     )
 
 
@@ -2103,6 +2515,17 @@ def _case_file_payload(frozen: FrozenUsageCorpus, regression: Sequence[Mapping[s
         }
         for query, artifact_id in frozen.negative_pairs
     ]
+    quality = {
+        tier: [
+            {
+                "query_id": sha256_text(query),
+                "query": query,
+                "accepted_ids": sorted(accepted),
+            }
+            for query, accepted in frozen.quality_labels.get(tier, {}).items()
+        ]
+        for tier in LABEL_QUALITY_TIERS
+    }
     replay = {
         "search": [asdict(case) for case in frozen.replay_search],
         "get": [asdict(case) for case in frozen.replay_get],
@@ -2114,21 +2537,43 @@ def _case_file_payload(frozen: FrozenUsageCorpus, regression: Sequence[Mapping[s
         copied["case_id"] = sha256_text(str(case.get("name") or case.get("query") or "case"))
         synthetic_cases.append(copied)
     return {
-        "labels": {"positive": positive, "negative": negative},
+        "labels": {"positive": positive, "negative": negative, "quality": quality},
         "replay": replay,
         "synthetic": synthetic_cases,
     }
 
 
-def _evaluate_ref(layout: RefLayout, case_file: Path, request_dir: Path) -> dict[str, Any]:
-    return _invoke_evaluator(
+def _evaluate_ref(
+    layout: RefLayout,
+    case_file: Path,
+    request_dir: Path,
+    *,
+    production_states: Mapping[str, str] | None = None,
+    production_evidence: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "action": "evaluate",
+        "case_file": str(case_file),
+        "full_db": str(layout.state_dir / "index.sqlite"),
+        "synthetic_db": str(layout.synthetic_state_dir / "index.sqlite"),
+    }
+    if production_states is not None:
+        request["production"] = {
+            "states": dict(production_states),
+            "source_root": str(layout.source_root),
+            "hermes_home": str(layout.hermes_home),
+            "evidence": {
+                key: {
+                    "feedback_bound_available": bool(
+                        value.get("feedback_bound_available")
+                    )
+                }
+                for key, value in (production_evidence or {}).items()
+            },
+        }
+    output = _invoke_evaluator(
         layout.checkout,
-        {
-            "action": "evaluate",
-            "case_file": str(case_file),
-            "full_db": str(layout.state_dir / "index.sqlite"),
-            "synthetic_db": str(layout.synthetic_state_dir / "index.sqlite"),
-        },
+        request,
         request_dir,
         api_module=layout.api_module,
         home=layout.home,
@@ -2136,6 +2581,15 @@ def _evaluate_ref(layout: RefLayout, case_file: Path, request_dir: Path) -> dict
         source_root=layout.source_root,
         state_dir=layout.state_dir,
     )
+    if production_evidence is not None:
+        for state_key, state_dir_text in (production_states or {}).items():
+            usage_db = Path(state_dir_text) / "usage.sqlite"
+            expected_hash = production_evidence[state_key].get("usage_sha256")
+            actual_hash = _sha256_file(usage_db) if usage_db.is_file() else None
+            if actual_hash != expected_hash:
+                raise RuntimeError(f"production replay mutated working usage database: {state_key}")
+        output["_production_evidence"] = {key: dict(value) for key, value in production_evidence.items()}
+    return output
 
 
 def _label_results(
@@ -2146,6 +2600,8 @@ def _label_results(
     results: dict[str, list[str]] = {}
     errors: set[str] = set()
     queries = set(frozen.positive_labels) | {query for query, _artifact_id in frozen.negative_pairs}
+    for labels in frozen.quality_labels.values():
+        queries.update(labels)
     for query in queries:
         outcome = raw_results.get(sha256_text(query), {}) if isinstance(raw_results, dict) else {}
         if not isinstance(outcome, dict) or outcome.get("status") != "ok":
@@ -2187,9 +2643,25 @@ def _build_ref_evaluation(
         search_results,
         errors=search_errors,
     )
+    quality = {
+        tier: compute_positive_evaluation(
+            frozen.quality_labels.get(tier, {}),
+            search_results,
+            parent_equivalents=equivalents,
+            errors={
+                query
+                for query in search_errors
+                if query in frozen.quality_labels.get(tier, {})
+            },
+        )
+        for tier in LABEL_QUALITY_TIERS
+    }
     replay = evaluator_output.get("replay", {})
     if not isinstance(replay, dict):
         replay = {"search": {}, "get": {}, "neighbors": {}}
+    production_replay = evaluator_output.get("production_replay", {})
+    if not isinstance(production_replay, dict):
+        production_replay = {}
     synthetic_outcomes = evaluator_output.get("synthetic", {})
     if not isinstance(synthetic_outcomes, dict):
         synthetic_outcomes = {}
@@ -2209,8 +2681,10 @@ def _build_ref_evaluation(
         positive,
         negative,
         replay,
+        production_replay,
         synthetic,
         evaluator_output,
+        quality,
         failures,
         not failures,
     )
@@ -2286,11 +2760,86 @@ def _accepted_labeled_order_changes(
     return sorted(accepted)
 
 
+def _current_explicit_route(
+    case: ReplaySearchCase,
+    history_by_query: Mapping[str, Sequence[tuple[int, str]]],
+    vetoes_by_query: Mapping[str, Sequence[tuple[int, str]]] | None = None,
+    artifacts: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[int, str] | None:
+    if case.feedback_max_id is None:
+        return None
+    current_terms = frozenset(_query_terms(case.query))
+    current_query_key = _feedback_query_key(case.query, current_terms)
+    vetoes = (vetoes_by_query or {}).get(current_query_key, ())
+    if case.feedback_max_id >= 0:
+        vetoes = [row for row in vetoes if row[0] <= case.feedback_max_id]
+
+    scored: list[tuple[tuple[int, int, int, int], tuple[int, str]]] = []
+    for accepted_query, history in history_by_query.items():
+        accepted_terms = frozenset(_query_terms(accepted_query))
+        for feedback_id, artifact_id in history:
+            if case.feedback_max_id >= 0 and feedback_id > case.feedback_max_id:
+                continue
+            if any(
+                veto_id > feedback_id
+                and (not veto_artifact_id or veto_artifact_id == artifact_id)
+                for veto_id, veto_artifact_id in vetoes
+            ):
+                continue
+            prefix, separator, _name = artifact_id.partition(":")
+            artifact_type = str((artifacts or {}).get(artifact_id, {}).get("type") or "")
+            if not artifact_type and separator:
+                artifact_type = ARTIFACT_TYPE_BY_ID_PREFIX.get(prefix, prefix)
+            if case.artifact_type is not None and artifact_type != case.artifact_type:
+                continue
+            route = FeedbackRoute(
+                query=accepted_query,
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                terms=accepted_terms,
+                feedback_id=feedback_id,
+            )
+            score = _match_score(route, case.query, current_terms)
+            if score is not None:
+                scored.append((score, (feedback_id, artifact_id)))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def _comparison_assessment(
+    *,
+    accepted: bool,
+    accepted_production_changes: Sequence[str],
+    quality_improvements: Mapping[str, Sequence[str]],
+) -> str:
+    if not accepted:
+        return "rejected"
+    high_confidence_improved = any(
+        quality_improvements.get(tier)
+        for tier in ("verified_event", "explicit_resolution")
+    )
+    if accepted_production_changes or high_confidence_improved:
+        return "accepted_improved"
+    return "accepted_unchanged_or_insufficient_evidence"
+
+
 def _candidate_comparison(baseline: RefEvaluation, candidate: RefEvaluation, frozen: FrozenUsageCorpus) -> dict[str, Any]:
     structure = compare_index_oracles(baseline.oracle, candidate.oracle)
     positive = _compare_metric_evaluations(baseline.positive, candidate.positive, positive=True)
     negative = _compare_metric_evaluations(baseline.negative, candidate.negative, positive=False)
+    quality = {
+        tier: _compare_metric_evaluations(
+            baseline.quality[tier], candidate.quality[tier], positive=True
+        )
+        for tier in LABEL_QUALITY_TIERS
+    }
     replay = compare_replay_outputs(baseline.replay, candidate.replay)
+    production = compare_replay_outputs(
+        {"search": baseline.production_replay, "get": {}, "neighbors": {}},
+        {"search": candidate.production_replay, "get": {}, "neighbors": {}},
+    )
 
     improved_query_ids = _positive_improved_queries(baseline.positive, candidate.positive)
     accepted_order_changes = _accepted_labeled_order_changes(
@@ -2309,25 +2858,172 @@ def _candidate_comparison(baseline: RefEvaluation, candidate: RefEvaluation, fro
     }
     replay["accepted_order_changes"] = sorted(accepted_order_changes)
     replay["accepted"] = not any(replay_blockers.values())
+    cases = {case.case_id: case for case in frozen.replay_search}
+    explicit_history: dict[str, list[tuple[int, str]]] = {}
+    for row in frozen.label_provenance:
+        if row.get("quality_tier") != "explicit_resolution" or row.get("feedback_id") is None:
+            continue
+        accepted_query = str(row.get("query") or "")
+        explicit_history.setdefault(accepted_query, []).append(
+            (int(row["feedback_id"]), str(row.get("artifact_id") or ""))
+        )
+    for history in explicit_history.values():
+        history.sort()
+    veto_history: dict[str, list[tuple[int, str]]] = {}
+    for row in frozen.route_vetoes:
+        veto_query = str(row.get("query") or "")
+        query_key = _feedback_query_key(veto_query, frozenset(_query_terms(veto_query)))
+        veto_history.setdefault(query_key, []).append(
+            (int(row["feedback_id"]), str(row.get("artifact_id") or ""))
+        )
+    for history in veto_history.values():
+        history.sort()
+
+    explicit_rank_one_failures: list[str] = []
+    for replay_case in frozen.replay_search:
+        current_route = _current_explicit_route(
+            replay_case,
+            explicit_history,
+            veto_history,
+            candidate.oracle.artifacts,
+        )
+        if current_route is None:
+            continue
+        _feedback_id, current_target = current_route
+        outcome = candidate.production_replay.get(replay_case.case_id, {})
+        ids = (
+            [str(value) for value in outcome.get("ids", [])]
+            if isinstance(outcome, Mapping)
+            else []
+        )
+        if not ids or ids[0] != current_target:
+            explicit_rank_one_failures.append(replay_case.case_id)
+
+    accepted_production_changes: list[str] = []
+    for case_id in [*production["order_changes"], *production["new_nonempty"]]:
+        case = cases.get(case_id)
+        outcome = candidate.production_replay.get(case_id, {})
+        if not isinstance(outcome, Mapping):
+            continue
+        ids = [str(value) for value in outcome.get("ids", [])]
+        route_artifact_id = str(outcome.get("route_artifact_id") or "")
+        route_feedback_id = outcome.get("route_feedback_id")
+        current_route = (
+            _current_explicit_route(
+                case,
+                explicit_history,
+                veto_history,
+                candidate.oracle.artifacts,
+            )
+            if case is not None
+            else None
+        )
+        route_key = (
+            int(route_feedback_id) if route_feedback_id is not None else -1,
+            route_artifact_id,
+        )
+        if (
+            case is not None
+            and ids
+            and outcome.get("route_outcome") in {"promoted_existing", "promoted_retry"}
+            and ids[0] == route_artifact_id
+            and current_route is not None
+            and route_key == current_route
+        ):
+            accepted_production_changes.append(case_id)
+    routed_cases = set(accepted_production_changes)
+    accepted_order_changes = [
+        case_id for case_id in accepted_order_changes if case_id not in routed_cases
+    ]
+    replay_blockers["order_changes"] = [
+        case_id for case_id in replay["order_changes"] if case_id not in accepted_order_changes
+    ]
+    replay_blockers["new_nonempty"] = [
+        case_id for case_id in replay["new_nonempty"] if case_id not in accepted_order_changes
+    ]
+    replay["accepted_order_changes"] = sorted(accepted_order_changes)
+    replay["unaccepted_order_changes"] = replay_blockers["order_changes"]
+    replay["accepted"] = not any(replay_blockers.values())
+    production_blockers = {
+        "order_changes": [
+            value for value in production["order_changes"] if value not in accepted_production_changes
+        ],
+        "new_nonempty": [
+            value for value in production["new_nonempty"] if value not in accepted_production_changes
+        ],
+        "new_empty": production["new_empty"],
+        "candidate_errors": production["candidate_errors"],
+        "baseline_errors": production["baseline_errors"],
+        "get_changes": production["get_changes"],
+        "neighbor_changes": production["neighbor_changes"],
+        "explicit_rank_one_failures": sorted(explicit_rank_one_failures),
+    }
+    production["explicit_rank_one_failures"] = sorted(explicit_rank_one_failures)
+    production["accepted_order_changes"] = sorted(accepted_production_changes)
+    production["unaccepted_order_changes"] = production_blockers["order_changes"]
+    production["accepted"] = not any(production_blockers.values())
     accepted = (
         structure["equal"]
         and positive["accepted"]
         and negative["accepted"]
+        and all(comparison["accepted"] for comparison in quality.values())
         and replay["accepted"]
+        and production["accepted"]
         and candidate.synthetic["failed"] == 0
         and not candidate.failures
+    )
+    quality_improvements = {
+        tier: sorted(_positive_improved_queries(baseline.quality[tier], candidate.quality[tier]))
+        for tier in LABEL_QUALITY_TIERS
+    }
+    assessment = _comparison_assessment(
+        accepted=accepted,
+        accepted_production_changes=accepted_production_changes,
+        quality_improvements=quality_improvements,
     )
     return {
         "baseline_ref": baseline.ref,
         "candidate_ref": candidate.ref,
         "candidate_key": candidate.ref_key,
         "accepted": accepted,
+        "assessment": assessment,
+        "quality_improved_query_ids": quality_improvements,
         "structure": structure,
         "positive": positive,
         "negative": negative,
+        "quality_tiers": quality,
         "replay": replay,
+        "production_replay": production,
         "synthetic": candidate.synthetic,
     }
+
+
+def _production_evidence_summary(outcomes: Mapping[str, Any]) -> dict[str, int]:
+    summary = {
+        "event_time_exact": 0,
+        "exact_input_counterfactual": 0,
+        "fixed_capture_legacy": 0,
+        "feedback_unavailable": 0,
+        "bounded_input_mismatch": 0,
+        "bounded_ref_unverified": 0,
+        "errors": 0,
+    }
+    for outcome in outcomes.values():
+        if not isinstance(outcome, dict) or outcome.get("status") != "ok":
+            summary["errors"] += 1
+        elif outcome.get("event_time_exact") is True:
+            summary["event_time_exact"] += 1
+        elif outcome.get("event_inputs_exact") is True:
+            summary["exact_input_counterfactual"] += 1
+        elif outcome.get("feedback_bound_kind") == "legacy":
+            summary["fixed_capture_legacy"] += 1
+        elif outcome.get("feedback_bound_kind") == "unavailable":
+            summary["feedback_unavailable"] += 1
+        elif outcome.get("corpus_match") is False:
+            summary["bounded_input_mismatch"] += 1
+        else:
+            summary["bounded_ref_unverified"] += 1
+    return summary
 
 
 def _ref_report(result: RefEvaluation) -> dict[str, Any]:
@@ -2340,6 +3036,9 @@ def _ref_report(result: RefEvaluation) -> dict[str, Any]:
         "structure": result.oracle.summary,
         "positive": result.positive.metrics,
         "negative": result.negative.metrics,
+        "quality_tiers": {
+            tier: evaluation.metrics for tier, evaluation in result.quality.items()
+        },
         "timing": timing_summary(result.evaluator_output),
         "synthetic": result.synthetic,
         "replay": {
@@ -2353,6 +3052,15 @@ def _ref_report(result: RefEvaluation) -> dict[str, Any]:
                 for outcome in group.values()
                 if isinstance(outcome, dict) and outcome.get("status") != "ok"
             ),
+        },
+        "production_replay": {
+            "search_count": len(result.production_replay),
+            "error_count": sum(
+                1
+                for outcome in result.production_replay.values()
+                if isinstance(outcome, dict) and outcome.get("status") != "ok"
+            ),
+            "evidence": _production_evidence_summary(result.production_replay),
         },
         "failures": list(result.failures),
     }
@@ -2380,7 +3088,9 @@ def _details_for_ref(
         "ref": result.ref,
         "positive_cases": positive_cases,
         "negative_cases": negative_cases,
+        "label_provenance": list(frozen.label_provenance),
         "replay": result.replay,
+        "production_replay": result.production_replay,
         "synthetic": result.evaluator_output.get("synthetic", {}),
     }
 
@@ -2416,6 +3126,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
             args.usage_db.expanduser().resolve(),
             base_dir / "frozen" / "usage.sqlite",
         )
+        usage_snapshot_sha256 = _sha256_file(usage_snapshot.backup_path)
         raw_usage = read_usage_corpus(usage_snapshot.backup_path, live_source)
         synthetic_paths, regression, synthetic_manifest = _materialize_synthetic(
             baseline_checkout,
@@ -2447,7 +3158,19 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
         case_payload = _case_file_payload(frozen_usage, regression)
         case_file = base_dir / "frozen" / "cases.json"
         write_private_json(case_file, case_payload)
-        baseline_output = _evaluate_ref(baseline_layout, case_file, base_dir / "requests")
+        baseline_states, baseline_evidence = _prepare_production_states(
+            baseline_layout,
+            usage_snapshot.backup_path,
+            live_source,
+            frozen_usage.replay_search,
+        )
+        baseline_output = _evaluate_ref(
+            baseline_layout,
+            case_file,
+            base_dir / "requests",
+            production_states=baseline_states,
+            production_evidence=baseline_evidence,
+        )
         baseline_output["_builds"] = baseline_build.get("builds", {})
         baseline = _build_ref_evaluation(
             baseline_layout,
@@ -2482,7 +3205,27 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
             layouts.append(layout)
             candidate_build = _build_ref(layout, base_dir / "requests")
             oracle = inspect_index(layout.state_dir)
-            output = _evaluate_ref(layout, case_file, base_dir / "requests")
+            production_states, production_evidence = _prepare_production_states(
+                layout,
+                usage_snapshot.backup_path,
+                live_source,
+                frozen_usage.replay_search,
+            )
+            baseline_canonical = {
+                key: value["canonical_usage_sha256"] for key, value in baseline_evidence.items()
+            }
+            candidate_canonical = {
+                key: value["canonical_usage_sha256"] for key, value in production_evidence.items()
+            }
+            if candidate_canonical != baseline_canonical:
+                raise RuntimeError("baseline and candidate production replay evidence differ")
+            output = _evaluate_ref(
+                layout,
+                case_file,
+                base_dir / "requests",
+                production_states=production_states,
+                production_evidence=production_evidence,
+            )
             output["_builds"] = candidate_build.get("builds", {})
             evaluations.append(
                 _build_ref_evaluation(layout, oracle, frozen_usage, case_payload, output)
@@ -2509,6 +3252,11 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
                 "usage_source_query_only": usage_snapshot.query_only,
                 "usage_source_counts_unchanged": usage_snapshot.before_counts == usage_snapshot.after_counts,
                 "usage_table_counts": usage_snapshot.before_counts,
+                "usage_snapshot_sha256_unchanged": _sha256_file(usage_snapshot.backup_path)
+                == usage_snapshot_sha256,
+                "production_evidence_sha256": {
+                    key: value["canonical_usage_sha256"] for key, value in baseline_evidence.items()
+                },
             },
             "frozen_cases": {
                 "positive_query_count": len(frozen_usage.positive_labels),
@@ -2596,6 +3344,13 @@ def print_markdown(report: Mapping[str, Any], *, base_dir: Path | None = None) -
         }
         print("| " + " | ".join(format_float(row[key]) for key, _label in columns) + " |")
     print(f"\nAcceptance: {'PASS' if report.get('accepted') else 'FAIL'}")
+    for comparison in report.get("comparisons", []):
+        if isinstance(comparison, Mapping):
+            print(
+                "Assessment "
+                f"{comparison.get('baseline_ref')} -> {comparison.get('candidate_ref')}: "
+                f"{comparison.get('assessment')}"
+            )
     if base_dir is not None:
         print(f"Private evaluation directory: {base_dir}")
 

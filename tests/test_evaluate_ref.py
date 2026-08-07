@@ -5,6 +5,7 @@ import importlib.util
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 from typing import Any
 
@@ -53,6 +54,37 @@ class FakeLookupModule:
     def get_neighbors(self, _db_path: Path, _artifact_id: str, limit: int | None = None) -> Any:
         del limit
         return self.neighbor_result
+
+
+def test_case_query_rows_includes_quality_only_queries() -> None:
+    evaluator = load_evaluator()
+
+    rows = evaluator._case_query_rows(
+        {
+            "labels": {
+                "positive": [
+                    {"query_id": "aggregate", "query": "aggregate query", "accepted_ids": ["skill:aggregate"]}
+                ],
+                "negative": [],
+                "quality": {
+                    "explicit_resolution": [
+                        {
+                            "query_id": "quality-only",
+                            "query": "correction trigger",
+                            "accepted_ids": ["skill:target"],
+                        }
+                    ],
+                    "verified_event": [],
+                    "direct_or_legacy": [],
+                },
+            }
+        }
+    )
+
+    assert {row["query_id"]: row["query"] for row in rows} == {
+        "aggregate": "aggregate query",
+        "quality-only": "correction trigger",
+    }
 
 
 def test_normal_lookup_results_accept_nested_json_values() -> None:
@@ -201,3 +233,89 @@ def test_main_emits_one_json_object_for_lookup_payload_error(
     assert error["status"] == "error"
     assert error["error_type"] == "LookupPayloadError"
     assert secret not in stdout
+
+
+def test_production_search_is_read_only_and_emits_route_provenance(tmp_path: Path) -> None:
+    evaluator = load_evaluator()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    index_jsonl = state_dir / "index.jsonl"
+    index_jsonl.write_text('{"id":"skill:target"}\n', encoding="utf-8")
+    usage_db = state_dir / "usage.sqlite"
+    usage_db.write_bytes(b"immutable-usage")
+    usage_before = usage_db.read_bytes()
+    calls: list[dict[str, Any]] = []
+
+    class FakeService:
+        config = SimpleNamespace(state_dir=state_dir)
+
+        def search(self, query: str, **kwargs: Any) -> tuple[list[dict[str, str]], dict[str, Any]]:
+            calls.append({"query": query, **kwargs})
+            decision = SimpleNamespace(
+                outcome=SimpleNamespace(value="promoted_existing"),
+                feedback_id=7,
+                artifact_id="skill:target",
+                feedback_max_id=9,
+            )
+            trace = SimpleNamespace(baseline_ids=("skill:other",), decision=decision)
+            return [{"id": "skill:target"}], {
+                "trace": trace,
+                "format_version": "3",
+                "plugin_version": "0.4.3",
+            }
+
+    service_module = SimpleNamespace(ROUTING_TRACE_METADATA_KEY="trace")
+    row = {
+        "query": "repair route",
+        "limit": 5,
+        "artifact_type": None,
+        "feedback_max_id": 9,
+        "index_jsonl_sha256": evaluator._sha256_file(index_jsonl),
+        "index_format_version": "3",
+        "plugin_version": "0.4.3",
+        "baseline_top_ids": ["skill:other"],
+        "recorded_top_ids": ["skill:target"],
+        "route_outcome": "promoted_existing",
+        "route_feedback_id": 7,
+        "route_artifact_id": "skill:target",
+    }
+    output = evaluator._production_search(
+        FakeService(), service_module, row, feedback_bound_available=True
+    )
+
+    assert calls == [
+        {"query": "repair route", "limit": 5, "artifact_type": None, "rebuild": False, "ensure": False}
+    ]
+    assert usage_db.read_bytes() == usage_before
+    assert output["ids"] == ["skill:target"]
+    assert output["baseline_ids"] == ["skill:other"]
+    assert output["route_outcome"] == "promoted_existing"
+    assert output["route_feedback_id"] == 7
+    assert output["route_artifact_id"] == "skill:target"
+    assert output["feedback_max_id"] == 9
+    assert output["event_inputs_exact"] is True
+    assert output["plugin_version_match"] is True
+    assert output["index_format_match"] is True
+    assert output["recorded_output_match"] is True
+    assert output["recorded_route_match"] is True
+    assert output["event_time_exact"] is True
+
+    mismatched = evaluator._production_search(
+        FakeService(),
+        service_module,
+        {**row, "plugin_version": "0.4.2"},
+        feedback_bound_available=True,
+    )
+    assert mismatched["event_inputs_exact"] is True
+    assert mismatched["plugin_version_match"] is False
+    assert mismatched["event_time_exact"] is False
+
+    changed_output = evaluator._production_search(
+        FakeService(),
+        service_module,
+        {**row, "recorded_top_ids": ["skill:different"]},
+        feedback_bound_available=True,
+    )
+    assert changed_output["event_inputs_exact"] is True
+    assert changed_output["recorded_output_match"] is False
+    assert changed_output["event_time_exact"] is False

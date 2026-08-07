@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stdout
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 import hashlib
 import importlib
 import importlib.util
@@ -37,6 +37,20 @@ class LookupPayloadError(TypeError):
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _optional_sha256_file(path: Path) -> str | None:
+    return _sha256_file(path) if path.is_file() else None
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -294,10 +308,20 @@ def _case_query_rows(cases: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(labels, dict):
         raise TypeError("labels must be an object")
     rows: dict[str, dict[str, Any]] = {}
+    groups: list[list[Any]] = []
     for group_name in ("positive", "negative"):
         group = labels.get(group_name, [])
         if not isinstance(group, list):
             raise TypeError(f"labels.{group_name} must be a list")
+        groups.append(group)
+    quality = labels.get("quality", {})
+    if not isinstance(quality, dict):
+        raise TypeError("labels.quality must be an object")
+    for tier, group in quality.items():
+        if not isinstance(group, list):
+            raise TypeError(f"labels.quality.{tier} must be a list")
+        groups.append(group)
+    for group in groups:
         for row in group:
             if not isinstance(row, dict):
                 raise TypeError("label case must be an object")
@@ -314,6 +338,171 @@ def _truncate_search_outcome(outcome: dict[str, Any], limit: int | None) -> dict
     return output
 
 
+def _production_state_key(raw_bound: Any) -> str:
+    if raw_bound is None:
+        return "unavailable"
+    bound = int(raw_bound)
+    return "legacy" if bound < 0 else f"bound-{bound}"
+
+
+def _routing_provenance(metadata: Mapping[str, Any], service_module: Any) -> dict[str, Any]:
+    key = str(getattr(service_module, "ROUTING_TRACE_METADATA_KEY", "_local_knowledge_routing_trace"))
+    trace = metadata.get(key)
+    decision = getattr(trace, "decision", None)
+    outcome = getattr(decision, "outcome", None)
+    if hasattr(outcome, "value"):
+        outcome = getattr(outcome, "value")
+    return {
+        "baseline_ids": [str(value) for value in getattr(trace, "baseline_ids", ())],
+        "route_outcome": str(outcome) if outcome is not None else None,
+        "route_feedback_id": getattr(decision, "feedback_id", None),
+        "route_artifact_id": getattr(decision, "artifact_id", None),
+        "feedback_max_id": getattr(decision, "feedback_max_id", None),
+    }
+
+
+def _production_services(
+    module: Any,
+    request: Mapping[str, Any],
+    ref_root: Path,
+) -> tuple[dict[str, Any], Any]:
+    production = request.get("production")
+    if not isinstance(production, dict):
+        return {}, None
+    raw_states = production.get("states")
+    if not isinstance(raw_states, dict):
+        raise TypeError("production.states must be an object")
+    package_name = str(module.__name__).split(".", 1)[0]
+    service_module = importlib.import_module(f"{package_name}.service")
+    _module_path(service_module, ref_root)
+    service_type = getattr(service_module, "LocalKnowledgeService", None)
+    if not callable(service_type):
+        raise AttributeError("selected ref has no LocalKnowledgeService")
+    resolver = _config_resolver(package_name, ref_root)
+    source_root = Path(str(production["source_root"])).resolve()
+    hermes_home = Path(str(production["hermes_home"])).resolve()
+    services: dict[str, Any] = {}
+    for state_key, raw_state_dir in raw_states.items():
+        state_dir = Path(str(raw_state_dir)).resolve()
+        os.environ["LOCAL_KNOWLEDGE_ROOT"] = str(source_root)
+        os.environ["LOCAL_KNOWLEDGE_STATE_DIR"] = str(state_dir)
+        os.environ["HERMES_HOME"] = str(hermes_home)
+        config = resolver(hermes_home)
+        if is_dataclass(config):
+            config = replace(cast(Any, config), source_root=source_root, state_dir=state_dir)
+        services[str(state_key)] = service_type(config)
+    return services, service_module
+
+
+def _production_search(
+    service: Any,
+    service_module: Any,
+    row: Mapping[str, Any],
+    *,
+    feedback_bound_available: bool = False,
+) -> dict[str, Any]:
+    recorded_limit = None if row.get("limit") is None else int(row["limit"])
+    companion_hash = _sha256_file(Path(str(service.config.state_dir)) / "index.jsonl")
+
+    def call() -> dict[str, Any]:
+        rows, metadata = service.search(
+            str(row["query"]),
+            limit=10 if recorded_limit is None else recorded_limit,
+            artifact_type=str(row.get("artifact_type") or "") or None,
+            rebuild=False,
+            ensure=False,
+        )
+        rows = _lookup_json_value(rows)
+        if type(rows) is not list:
+            raise TypeError("LocalKnowledgeService.search did not return a list")
+        ids: list[str] = []
+        for result in rows:
+            if type(result) is not dict or type(result.get("id")) is not str:
+                raise LookupPayloadError("LocalKnowledgeService.search returned a row without a string id")
+            ids.append(str(result["id"]))
+        metadata = cast(Mapping[str, Any], metadata)
+        recorded_hash = str(row.get("index_jsonl_sha256") or "") or None
+        recorded_plugin_version = str(row.get("plugin_version") or "") or None
+        replay_plugin_version = str(metadata.get("plugin_version") or "") or None
+        recorded_format_version = str(row.get("index_format_version") or "") or None
+        replay_format_version = str(metadata.get("format_version") or "") or None
+        feedback_max_id = row.get("feedback_max_id", -1)
+        corpus_match = None if recorded_hash is None else recorded_hash == companion_hash
+        event_inputs_exact = (
+            feedback_bound_available
+            and feedback_max_id is not None
+            and int(feedback_max_id) >= 0
+            and corpus_match is True
+        )
+        plugin_version_match = (
+            None
+            if recorded_plugin_version is None
+            else recorded_plugin_version == replay_plugin_version
+        )
+        index_format_match = (
+            None
+            if recorded_format_version is None
+            else recorded_format_version == replay_format_version
+        )
+        provenance = _routing_provenance(metadata, service_module)
+        recorded_baseline_ids = [str(value) for value in row.get("baseline_top_ids", [])]
+        recorded_final_ids = [str(value) for value in row.get("recorded_top_ids", [])]
+        recorded_output_match = (
+            None
+            if not event_inputs_exact
+            else (
+                list(provenance.get("baseline_ids", [])) == recorded_baseline_ids
+                and ids == recorded_final_ids
+            )
+        )
+        recorded_route_match = (
+            None
+            if not event_inputs_exact
+            else (
+                str(provenance.get("route_outcome") or "none")
+                == str(row.get("route_outcome") or "none")
+                and provenance.get("route_feedback_id") == row.get("route_feedback_id")
+                and provenance.get("route_artifact_id") == row.get("route_artifact_id")
+                and provenance.get("feedback_max_id") == feedback_max_id
+            )
+        )
+        return {
+            "ids": ids,
+            **provenance,
+            "index_jsonl_sha256": companion_hash,
+            "index_format_version": metadata.get("format_version"),
+            "recorded_index_jsonl_sha256": recorded_hash,
+            "corpus_match": corpus_match,
+            "corpus_match_basis": "index_jsonl_sha256",
+            "recorded_plugin_version": recorded_plugin_version,
+            "replay_plugin_version": replay_plugin_version,
+            "plugin_version_match": plugin_version_match,
+            "recorded_index_format_version": recorded_format_version,
+            "index_format_match": index_format_match,
+            "event_inputs_exact": event_inputs_exact,
+            "recorded_output_match": recorded_output_match,
+            "recorded_route_match": recorded_route_match,
+            "event_time_exact": (
+                event_inputs_exact
+                and plugin_version_match is True
+                and index_format_match is True
+                and recorded_output_match is True
+                and recorded_route_match is True
+            ),
+            "feedback_bound_kind": _production_state_key(feedback_max_id),
+        }
+
+    started = time.perf_counter()
+    outcome = _safe_call(call)
+    outcome["duration_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+    if outcome["status"] == "ok":
+        value = cast(dict[str, Any], outcome.pop("value"))
+        outcome.update(value)
+        comparison_limit = min(10, 10 if recorded_limit is None else max(0, recorded_limit))
+        outcome["ids"] = list(outcome.get("ids") or [])[:comparison_limit]
+    return outcome
+
+
 def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
     cases = _load_cases(Path(str(request["case_file"])))
     full_db = Path(str(request["full_db"])).resolve()
@@ -327,6 +516,24 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(replay, dict):
         raise TypeError("replay must be an object")
     replay_results: dict[str, dict[str, Any]] = {"search": {}, "get": {}, "neighbors": {}}
+    production_services, service_module = _production_services(
+        module,
+        request,
+        Path(str(request.get("ref_root") or Path.cwd())).resolve(),
+    )
+    production_request = request.get("production", {})
+    production_evidence = (
+        production_request.get("evidence", {})
+        if isinstance(production_request, dict)
+        else {}
+    )
+    if not isinstance(production_evidence, dict):
+        raise TypeError("production evidence must be an object")
+    production_results: dict[str, Any] = {}
+    usage_hashes_before = {
+        key: _optional_sha256_file(Path(str(service.config.state_dir)) / "usage.sqlite")
+        for key, service in production_services.items()
+    }
     for row in replay.get("search", []):
         case_id = str(row["case_id"])
         recorded_limit = None if row.get("limit") is None else int(row["limit"])
@@ -338,6 +545,21 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
             str(row.get("artifact_type") or "") or None,
         )
         replay_results["search"][case_id] = _truncate_search_outcome(outcome, recorded_limit)
+        if production_services:
+            state_key = _production_state_key(row.get("feedback_max_id", -1))
+            if state_key not in production_services:
+                raise KeyError(f"missing production replay state: {state_key}")
+            production_results[case_id] = _production_search(
+                production_services[state_key],
+                service_module,
+                row,
+                feedback_bound_available=bool(
+                    production_evidence.get(state_key, {}).get(
+                        "feedback_bound_available",
+                        False,
+                    )
+                ),
+            )
     for row in replay.get("get", []):
         case_id = str(row["case_id"])
         replay_results["get"][case_id] = _get(module, full_db, str(row["artifact_id"]))
@@ -367,6 +589,16 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
     return {
         "label_search": label_results,
         "replay": replay_results,
+        "production_replay": production_results,
+        "production_usage_hashes": {
+            key: {
+                "before": before,
+                "after": _optional_sha256_file(
+                    Path(str(production_services[key].config.state_dir)) / "usage.sqlite"
+                ),
+            }
+            for key, before in usage_hashes_before.items()
+        },
         "synthetic": synthetic_results,
     }
 
@@ -380,6 +612,8 @@ def _dispatch(module: Any, request: dict[str, Any], ref_root: Path) -> dict[str,
     if action == "build":
         return _action_build(module, request)
     if action == "evaluate":
+        request = dict(request)
+        request["ref_root"] = str(ref_root)
         return _action_evaluate(module, request)
     raise ValueError(f"unsupported evaluator action: {action}")
 

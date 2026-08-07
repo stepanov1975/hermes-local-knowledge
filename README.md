@@ -230,8 +230,12 @@ For historical comparisons from a source checkout:
 ```bash
 python scripts/compare_historical_query_versions.py \
   --usage-db ~/.hermes/local_knowledge/usage.sqlite \
-  v0.3.12 WORKTREE
+  v0.4.2 WORKTREE
 ```
+
+The comparator opens live telemetry read-only, freezes one private source/runtime/OKF corpus, and builds each ref with that ref's own code. A nonnegative recorded feedback boundary plus a matching index-corpus hash proves that the recorded event inputs are available. The report calls a ref replay event-time exact only when that ref's plugin version and index format also match the recorded event and the replay reproduces its recorded baseline/final pages plus route provenance; a changed candidate otherwise remains a counterfactual replay over exact inputs, not historical output. Migrated legacy rows use one fixed captured feedback state, while missing boundaries or input/ref/output mismatches remain explicitly non-exact best-effort evidence. The machine report counts these evidence classes without exposing raw queries.
+
+Correction-route acceptance uses `explicit_resolution` Hit@1 as the primary outcome, then `verified_event` Hit@1/MRR, while requiring no increase in negative-artifact exposure, no unaccepted production ordering changes, and no replay errors. The comparison assessment distinguishes `rejected`, `accepted_improved`, and `accepted_unchanged_or_insufficient_evidence`. Direct/legacy aggregate metrics remain useful coverage and trend signals, but are not sufficient by themselves to prove a correction. Raw queries and artifact IDs appear only with `--details` inside the owner-only evaluation directory.
 
 ## Verification
 

@@ -112,6 +112,188 @@ def create_usage_db(path: Path, live_root: Path) -> None:
         conn.close()
 
 
+def create_provenance_usage_db(path: Path, live_root: Path, unrelated_root: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY,
+                ts TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                query TEXT,
+                success INTEGER NOT NULL,
+                root TEXT,
+                baseline_top_ids_json TEXT NOT NULL DEFAULT '[]',
+                top_ids_json TEXT NOT NULL DEFAULT '[]',
+                route_feedback_id INTEGER,
+                route_artifact_id TEXT,
+                feedback_max_id INTEGER
+            );
+            CREATE TABLE feedback (
+                id INTEGER PRIMARY KEY,
+                ts TEXT NOT NULL,
+                event_id INTEGER,
+                rating TEXT NOT NULL,
+                query TEXT,
+                artifact_id TEXT,
+                root TEXT,
+                expected_artifact_id TEXT,
+                resolves_feedback_id INTEGER,
+                linkage_status TEXT
+            );
+            CREATE TABLE index_builds (
+                id INTEGER PRIMARY KEY,
+                ts TEXT NOT NULL,
+                root TEXT
+            );
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO usage_events (
+                id, ts, tool, query, success, root, baseline_top_ids_json,
+                top_ids_json, route_feedback_id, route_artifact_id, feedback_max_id
+            ) VALUES (?, ?, 'knowledge_search', ?, 1, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    1,
+                    "2026-01-01T00:00:00Z",
+                    "alpha",
+                    str(live_root),
+                    '["skill:old"]',
+                    '["skill:old"]',
+                    1,
+                    "skill:old",
+                    1,
+                ),
+                (
+                    2,
+                    "2026-01-01T00:01:00Z",
+                    "beta",
+                    str(live_root),
+                    '["skill:old"]',
+                    '["skill:new"]',
+                    2,
+                    "skill:new",
+                    2,
+                ),
+                (
+                    3,
+                    "2026-01-01T00:02:00Z",
+                    "other",
+                    str(unrelated_root),
+                    "[]",
+                    "[]",
+                    None,
+                    None,
+                    3,
+                ),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO feedback (
+                id, ts, event_id, rating, query, artifact_id, root,
+                expected_artifact_id, resolves_feedback_id, linkage_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    1,
+                    "2026-01-01T00:00:01Z",
+                    1,
+                    "not_useful",
+                    "alpha",
+                    "skill:old",
+                    str(live_root),
+                    "skill:new",
+                    None,
+                    "verified_event",
+                ),
+                (
+                    2,
+                    "2026-01-01T00:01:01Z",
+                    2,
+                    "useful",
+                    "beta",
+                    "skill:new",
+                    str(live_root),
+                    None,
+                    1,
+                    "verified_event",
+                ),
+                (
+                    3,
+                    "2026-01-01T00:02:01Z",
+                    2,
+                    "not_useful",
+                    "later",
+                    "skill:new",
+                    str(live_root),
+                    None,
+                    None,
+                    "direct_query",
+                ),
+                (
+                    4,
+                    "2026-01-01T00:03:01Z",
+                    3,
+                    "useful",
+                    "other",
+                    "skill:other",
+                    str(unrelated_root),
+                    None,
+                    None,
+                    "direct_query",
+                ),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO index_builds (id, ts, root) VALUES (1, '2026-01-01T00:00:00Z', ?)",
+            (str(live_root),),
+        )
+
+
+def make_ref_layout(helper: Any, base: Path, name: str) -> Any:
+    checkout = base / name / "checkout"
+    source_root = base / name / "source"
+    home = base / name / "home"
+    hermes_home = home / ".hermes"
+    state_dir = base / name / "state"
+    synthetic_root = base / name / "synthetic" / "source"
+    synthetic_home = base / name / "synthetic" / "home"
+    synthetic_hermes_home = synthetic_home / ".hermes"
+    synthetic_state_dir = base / name / "synthetic" / "state"
+    for directory in (
+        checkout,
+        source_root,
+        hermes_home,
+        state_dir,
+        synthetic_root,
+        synthetic_hermes_home,
+        synthetic_state_dir,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    return helper.RefLayout(
+        name,
+        name,
+        checkout,
+        "hermes_local_knowledge.indexer",
+        source_root,
+        home,
+        hermes_home,
+        state_dir,
+        synthetic_root,
+        synthetic_home,
+        synthetic_hermes_home,
+        synthetic_state_dir,
+        {},
+        {},
+    )
+
+
 def build_tiny_index(state_dir: Path, *, title: str = "Alpha", search_text: str = "alpha route", edge_evidence: str = "alpha") -> None:
     artifacts = [
         lci.Artifact(
@@ -331,6 +513,249 @@ def test_usage_snapshot_is_read_only_and_private_backup_has_same_counts(tmp_path
         conn.close()
 
 
+def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live_root"
+    # A descendant path can be an independently configured production root.
+    unrelated_root = live_root / "nested"
+    source = tmp_path / "live-usage.sqlite"
+    create_provenance_usage_db(source, live_root, unrelated_root)
+    frozen = helper.snapshot_usage_database(source, tmp_path / "frozen" / "usage.sqlite")
+    frozen_hash = helper._sha256_file(frozen.backup_path)
+    baseline = make_ref_layout(helper, tmp_path / "refs", "baseline")
+    candidate = make_ref_layout(helper, tmp_path / "refs", "candidate")
+    build_tiny_index(baseline.state_dir)
+    build_tiny_index(candidate.state_dir)
+    cases = (
+        helper.ReplaySearchCase("unavailable", "alpha", 10, None, False, feedback_max_id=None),
+        helper.ReplaySearchCase("legacy", "alpha", 10, None, False, feedback_max_id=-1),
+        helper.ReplaySearchCase("bound-zero", "alpha", 10, None, False, feedback_max_id=0),
+        helper.ReplaySearchCase("bound-two", "beta", 10, None, False, feedback_max_id=2),
+    )
+
+    baseline_states, baseline_evidence = helper._prepare_production_states(
+        baseline, frozen.backup_path, live_root, cases
+    )
+    candidate_states, candidate_evidence = helper._prepare_production_states(
+        candidate, frozen.backup_path, live_root, cases
+    )
+
+    assert set(baseline_states) == {"unavailable", "legacy", "bound-0", "bound-2"}
+    assert not (Path(baseline_states["unavailable"]) / "usage.sqlite").exists()
+    assert baseline_evidence["unavailable"] == {
+        "feedback_max_id": None,
+        "feedback_bound": None,
+        "feedback_bound_available": False,
+        "usage_sha256": None,
+        "canonical_usage_sha256": None,
+        "table_counts": {},
+        "link_counts": {},
+    }
+    assert baseline_evidence["legacy"]["feedback_bound_available"] is False
+    assert baseline_evidence["bound-0"]["feedback_bound_available"] is True
+    assert baseline_evidence["bound-2"]["feedback_bound_available"] is True
+    assert {
+        key: value["canonical_usage_sha256"] for key, value in baseline_evidence.items()
+    } == {
+        key: value["canonical_usage_sha256"] for key, value in candidate_evidence.items()
+    }
+    assert {
+        key: value["link_counts"] for key, value in baseline_evidence.items()
+    } == {
+        key: value["link_counts"] for key, value in candidate_evidence.items()
+    }
+
+    with sqlite3.connect(Path(baseline_states["bound-0"]) / "usage.sqlite") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (3,)
+        assert conn.execute("SELECT id FROM feedback ORDER BY id").fetchall() == [(4,)]
+    with sqlite3.connect(Path(baseline_states["bound-2"]) / "usage.sqlite") as conn:
+        assert conn.execute("SELECT id FROM usage_events ORDER BY id").fetchall() == [(1,), (2,), (3,)]
+        assert conn.execute("SELECT id FROM feedback ORDER BY id").fetchall() == [(1,), (2,), (4,)]
+        assert conn.execute("SELECT root FROM usage_events WHERE id=1").fetchone() == (
+            str(baseline.source_root),
+        )
+        assert conn.execute("SELECT root FROM usage_events WHERE id=2").fetchone() == (
+            str(baseline.source_root),
+        )
+        assert conn.execute("SELECT root FROM usage_events WHERE id=3").fetchone() == (
+            str(unrelated_root),
+        )
+        assert conn.execute("SELECT root FROM index_builds WHERE id=1").fetchone() == (
+            str(baseline.source_root),
+        )
+    with sqlite3.connect(Path(candidate_states["bound-2"]) / "usage.sqlite") as conn:
+        assert conn.execute("SELECT root FROM usage_events WHERE id=1").fetchone() == (
+            str(candidate.source_root),
+        )
+        assert conn.execute("SELECT root FROM usage_events WHERE id=3").fetchone() == (
+            str(unrelated_root),
+        )
+
+    assert baseline_evidence["bound-2"]["link_counts"] == {
+        "feedback_event_rows": 3,
+        "feedback_event_links": 3,
+        "feedback_resolution_rows": 1,
+        "feedback_resolution_links": 1,
+        "usage_route_rows": 2,
+        "usage_route_links": 2,
+    }
+    assert helper._sha256_file(frozen.backup_path) == frozen_hash
+
+
+def test_canonical_usage_digest_does_not_hide_descendant_root_changes(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    left_root = tmp_path / "left"
+    right_root = tmp_path / "right"
+    left_db = tmp_path / "left.sqlite"
+    right_db = tmp_path / "right.sqlite"
+    for path, root in ((left_db, left_root), (right_db, right_root)):
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE usage_events (id INTEGER PRIMARY KEY, root TEXT)")
+            conn.execute("INSERT INTO usage_events VALUES (1, ?)", (str(root / "nested"),))
+
+    assert helper._canonical_usage_digest(left_db, root=left_root) != helper._canonical_usage_digest(
+        right_db,
+        root=right_root,
+    )
+
+
+def test_prepared_bound_is_compatible_with_unmodified_v042_schema(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "root"
+    frozen = tmp_path / "frozen.sqlite"
+    create_usage_db(frozen, live_root)
+    layout = make_ref_layout(helper, tmp_path / "refs", "v0.4.2")
+    build_tiny_index(layout.state_dir)
+    cases = (helper.ReplaySearchCase("bounded", "alpha", 10, None, False, feedback_max_id=1),)
+
+    states, evidence = helper._prepare_production_states(layout, frozen, live_root, cases)
+    working_db = Path(states["bound-1"]) / "usage.sqlite"
+
+    with sqlite3.connect(working_db) as conn:
+        assert conn.execute("SELECT id FROM feedback ORDER BY id").fetchall() == [(1,), (7,)]
+        assert conn.execute("SELECT id FROM usage_events ORDER BY id").fetchall() == [
+            (1,),
+            (2,),
+            (3,),
+            (4,),
+            (5,),
+            (6,),
+            (7,),
+        ]
+        feedback_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(feedback)")}
+        usage_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(usage_events)")}
+    assert "resolves_feedback_id" not in feedback_columns
+    assert "feedback_max_id" not in usage_columns
+    assert evidence["bound-1"]["feedback_bound_available"] is True
+
+
+def test_missing_positive_feedback_boundary_is_not_exact(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    usage_db = tmp_path / "usage.sqlite"
+    root = tmp_path / "root"
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("CREATE TABLE feedback (id INTEGER PRIMARY KEY, root TEXT)")
+        conn.executemany(
+            "INSERT INTO feedback (id, root) VALUES (?, ?)",
+            [(1, str(root)), (2, str(tmp_path / "other")), (3, str(root))],
+        )
+        assert helper._delete_feedback_after_bound(
+            conn,
+            feedback_max_id=2,
+            root=root,
+        ) is False
+
+
+def test_production_evidence_summary_separates_exact_and_best_effort_classes() -> None:
+    helper = load_compare_helper()
+
+    assert helper._production_evidence_summary(
+        {
+            "exact": {"status": "ok", "event_time_exact": True, "feedback_bound_kind": "bound-2"},
+            "counterfactual": {
+                "status": "ok",
+                "event_time_exact": False,
+                "event_inputs_exact": True,
+                "feedback_bound_kind": "bound-2",
+            },
+            "legacy": {"status": "ok", "event_time_exact": False, "feedback_bound_kind": "legacy", "corpus_match": None},
+            "unavailable": {"status": "ok", "event_time_exact": False, "feedback_bound_kind": "unavailable", "corpus_match": None},
+            "mismatch": {"status": "ok", "event_time_exact": False, "feedback_bound_kind": "bound-5", "corpus_match": False},
+            "unverified": {"status": "ok", "event_time_exact": False, "feedback_bound_kind": "bound-6", "corpus_match": None},
+            "error": {"status": "error", "error": "boom"},
+        }
+    ) == {
+        "event_time_exact": 1,
+        "exact_input_counterfactual": 1,
+        "fixed_capture_legacy": 1,
+        "feedback_unavailable": 1,
+        "bounded_input_mismatch": 1,
+        "bounded_ref_unverified": 1,
+        "errors": 1,
+    }
+
+
+def test_production_corpus_match_uses_companion_jsonl_not_sqlite_bytes(tmp_path: Path) -> None:
+    evaluator = load_evaluator()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    jsonl = state_dir / "index.jsonl"
+    sqlite_file = state_dir / "index.sqlite"
+    jsonl.write_bytes(b'{"id":"skill:alpha"}\n')
+    sqlite_file.write_bytes(b"sqlite-build-one")
+    recorded_hash = evaluator._sha256_file(jsonl)
+
+    class FakeService:
+        config = SimpleNamespace(state_dir=state_dir)
+
+        @staticmethod
+        def search(*_args: Any, **_kwargs: Any) -> tuple[list[dict[str, str]], dict[str, str]]:
+            return [{"id": "skill:alpha"}], {"format_version": "4"}
+
+    row = {
+        "query": "alpha",
+        "limit": 10,
+        "artifact_type": None,
+        "index_jsonl_sha256": recorded_hash,
+        "feedback_max_id": 0,
+    }
+    first = evaluator._production_search(
+        FakeService(), SimpleNamespace(), row, feedback_bound_available=True
+    )
+    sqlite_file.write_bytes(b"sqlite-build-two")
+    second = evaluator._production_search(
+        FakeService(), SimpleNamespace(), row, feedback_bound_available=True
+    )
+
+    assert first["corpus_match"] is True
+    assert second["corpus_match"] is True
+    assert second["corpus_match_basis"] == "index_jsonl_sha256"
+    assert second["event_inputs_exact"] is True
+    assert second["event_time_exact"] is False
+    assert second["plugin_version_match"] is None
+    assert second["index_format_match"] is None
+
+    jsonl.write_bytes(b'{"id":"skill:beta"}\n')
+    changed = evaluator._production_search(
+        FakeService(), SimpleNamespace(), row, feedback_bound_available=True
+    )
+    assert changed["corpus_match"] is False
+    assert changed["event_time_exact"] is False
+
+    current_hash = evaluator._sha256_file(jsonl)
+    for bound, state_key in ((None, "unavailable"), (-1, "legacy")):
+        legacy = evaluator._production_search(
+            FakeService(),
+            SimpleNamespace(),
+            {**row, "index_jsonl_sha256": current_hash, "feedback_max_id": bound},
+        )
+        assert legacy["corpus_match"] is True
+        assert legacy["event_time_exact"] is False
+        assert legacy["feedback_bound_kind"] == state_key
+        assert legacy["route_outcome"] is None
+        assert legacy["route_feedback_id"] is None
+
+
 def test_label_exclusions_apply_to_queries_and_artifact_ids(tmp_path: Path) -> None:
     helper = load_compare_helper()
     live_root = tmp_path / "root"
@@ -387,8 +812,10 @@ def test_frozen_labels_are_live_root_scoped_and_baseline_id_stable(tmp_path: Pat
 
     assert frozen.positive_labels == {"alpha": {"skill:alpha", "skill:parent"}}
     assert frozen.negative_pairs == (("alpha", "skill:bad"),)
-    assert len(frozen.replay_search) == 3  # rebuild variants coalesce into the same public input tuple
-    assert next(case for case in frozen.replay_search if case.query == "alpha").rebuild_requested is True
+    assert len(frozen.replay_search) == 4
+    alpha_cases = [case for case in frozen.replay_search if case.query == "alpha"]
+    assert {case.event_id for case in alpha_cases} == {1, 8}
+    assert {case.rebuild_requested for case in alpha_cases} == {False, True}
     assert len(frozen.replay_get) == 1
     assert frozen.replay_get[0].rebuild_requested is True
     assert len(frozen.replay_neighbors) == 1
@@ -402,6 +829,202 @@ def test_frozen_labels_are_live_root_scoped_and_baseline_id_stable(tmp_path: Pat
     assert candidate.metrics["query_count"] == 1
     assert candidate.metrics["label_count"] == 2
     assert candidate.cases[0]["exact_rank"] is None
+
+
+def test_historical_loader_preserves_legacy_empty_query_exclusion(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live"
+    usage_db = tmp_path / "usage.sqlite"
+    create_usage_db(usage_db, live_root)
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("DELETE FROM feedback WHERE id <> 1")
+        conn.execute("UPDATE feedback SET query = '' WHERE id = 1")
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+
+    assert raw.positive_rows == ()
+
+
+def test_historical_search_fallback_identity_includes_rebuild_request(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live"
+    usage_db = tmp_path / "usage.sqlite"
+    with sqlite3.connect(usage_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE usage_events (
+                id INTEGER,
+                tool TEXT,
+                query TEXT,
+                artifact_id TEXT,
+                artifact_type TEXT,
+                limit_value INTEGER,
+                rebuild_requested INTEGER,
+                success INTEGER,
+                root TEXT
+            );
+            CREATE TABLE feedback (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER,
+                rating TEXT,
+                query TEXT,
+                artifact_id TEXT,
+                root TEXT
+            );
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO usage_events (
+                id, tool, query, artifact_id, artifact_type,
+                limit_value, rebuild_requested, success, root
+            ) VALUES (NULL, 'knowledge_search', 'same query', NULL, NULL, 10, ?, 1, ?)
+            """,
+            [(0, str(live_root)), (1, str(live_root))],
+        )
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+
+    assert len(raw.replay_search) == 2
+    assert {case.rebuild_requested for case in raw.replay_search} == {False, True}
+
+
+def test_historical_loader_keeps_query_level_route_vetoes(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute(
+            "INSERT INTO feedback (id, ts, rating, query, artifact_id, root, linkage_status) VALUES (20, '2026-01-01T00:02:00Z', 'not_useful', 'alpha', NULL, ?, 'direct_query')",
+            (str(live_root),),
+        )
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+
+    assert {"query": "alpha", "feedback_id": 20, "artifact_id": ""} in raw.route_vetoes
+
+
+def test_historical_explicit_resolution_allows_parent_without_predeclared_target(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("UPDATE usage_events SET root = ? WHERE id = 2", (str(live_root),))
+        conn.execute("UPDATE feedback SET root = ? WHERE id = 2", (str(live_root),))
+        conn.execute("UPDATE feedback SET expected_artifact_id = NULL WHERE id = 1")
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+
+    assert raw.quality_labels["explicit_resolution"] == {"alpha": {"skill:new"}}
+
+
+def test_historical_explicit_resolution_requires_expected_target_match(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("UPDATE usage_events SET root = ? WHERE id = 2", (str(live_root),))
+        conn.execute("UPDATE feedback SET root = ? WHERE id = 2", (str(live_root),))
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+    assert raw.quality_labels["explicit_resolution"] == {"alpha": {"skill:new"}}
+
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute(
+            "UPDATE feedback SET expected_artifact_id = 'skill:different' WHERE id = 1"
+        )
+    malformed = helper.read_usage_corpus(usage_db, live_root)
+    assert malformed.quality_labels["explicit_resolution"] == {}
+
+
+def test_historical_explicit_resolution_requires_verified_unique_parent_link(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("UPDATE feedback SET linkage_status = 'legacy' WHERE id = 1")
+
+    unverified = helper.read_usage_corpus(usage_db, live_root)
+    assert unverified.quality_labels["explicit_resolution"] == {}
+
+    duplicate_db = tmp_path / "duplicate-usage.sqlite"
+    create_provenance_usage_db(duplicate_db, live_root, tmp_path / "other")
+    with sqlite3.connect(duplicate_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO feedback (
+                id, ts, event_id, rating, query, artifact_id, root,
+                expected_artifact_id, resolves_feedback_id, linkage_status
+            ) VALUES (5, '2026-01-01T00:04:01Z', 2, 'useful', 'beta', 'skill:new', ?, NULL, 1, 'verified_event')
+            """,
+            (str(live_root),),
+        )
+
+    duplicate = helper.read_usage_corpus(duplicate_db, live_root)
+    assert duplicate.quality_labels["explicit_resolution"] == {}
+
+
+def test_case_file_payload_materializes_quality_only_queries() -> None:
+    helper = load_compare_helper()
+    frozen = helper.FrozenUsageCorpus(
+        positive_labels={"aggregate query": {"skill:aggregate"}},
+        negative_pairs=(),
+        replay_search=(),
+        replay_get=(),
+        replay_neighbors=(),
+        quality_labels={
+            "explicit_resolution": {"correction trigger": {"skill:target"}},
+            "verified_event": {},
+            "direct_or_legacy": {},
+        },
+    )
+
+    payload = helper._case_file_payload(frozen, ())
+
+    assert payload["labels"]["quality"]["explicit_resolution"] == [
+        {
+            "query_id": helper.sha256_text("correction trigger"),
+            "query": "correction trigger",
+            "accepted_ids": ["skill:target"],
+        }
+    ]
+
+
+def test_label_results_retain_quality_only_query_outcomes() -> None:
+    helper = load_compare_helper()
+    query = "quality-only correction"
+    frozen = helper.FrozenUsageCorpus(
+        {}, (), (), (), (),
+        {"direct_or_legacy": {}, "verified_event": {}, "explicit_resolution": {query: {"skill:target"}}},
+        (),
+    )
+    output = {
+        "label_search": {
+            helper.sha256_text(query): {"status": "ok", "ids": ["skill:target"]}
+        }
+    }
+
+    results, errors = helper._label_results(frozen, output)
+
+    assert results == {query: ["skill:target"]}
+    assert errors == set()
+
+
+def test_historical_great_rating_is_aggregate_only(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("UPDATE usage_events SET root = ? WHERE id = 2", (str(live_root),))
+        conn.execute("UPDATE feedback SET root = ?, rating = 'great' WHERE id = 2", (str(live_root),))
+    raw = helper.read_usage_corpus(usage_db, live_root)
+    assert ("beta", "skill:new") in raw.positive_rows
+    assert raw.quality_labels["explicit_resolution"] == {}
 
 
 def test_positive_and_negative_rank_infinity_semantics() -> None:
@@ -549,6 +1172,297 @@ def test_labeled_order_waiver_applies_only_to_exact_unfiltered_top_ten_tuple() -
     )
 
     assert accepted == ["default", "exact"]
+
+
+@pytest.mark.parametrize(
+    ("feedback_max_id", "expected"),
+    [
+        (None, None),
+        (0, None),
+        (10, (10, "skill:first")),
+        (19, (10, "skill:first")),
+        (20, (20, "skill:current")),
+        (-1, (20, "skill:current")),
+    ],
+)
+def test_current_explicit_route_respects_event_time_and_latest_target(
+    feedback_max_id: int | None, expected: tuple[int, str] | None
+) -> None:
+    helper = load_compare_helper()
+    case = helper.ReplaySearchCase(
+        "case", "repair", 10, None, False, feedback_max_id=feedback_max_id
+    )
+    history = {"repair": [(10, "skill:first"), (20, "skill:current")]}
+
+    assert helper._current_explicit_route(case, history) == expected
+
+
+def test_current_explicit_route_applies_later_query_and_target_vetoes() -> None:
+    helper = load_compare_helper()
+    case = helper.ReplaySearchCase(
+        "case", "  REPAIR  ", 10, None, False, feedback_max_id=30
+    )
+    history = {"repair": [(10, "skill:first"), (20, "skill:current")]}
+
+    assert helper._current_explicit_route(
+        case, history, {"terms:repair": [(25, "skill:current")]}
+    ) == (10, "skill:first")
+    assert helper._current_explicit_route(
+        case, history, {"terms:repair": [(25, "")]}
+    ) is None
+
+
+def test_current_explicit_route_uses_production_matching_and_type_filter() -> None:
+    helper = load_compare_helper()
+    history = {"backup restore runbook": [(20, "skill:target")]}
+    artifacts = {"skill:target": {"type": "skill"}}
+
+    assert helper._current_explicit_route(
+        helper.ReplaySearchCase("skill", "backup restore runbook procedure", 10, "skill", False),
+        history,
+        artifacts=artifacts,
+    ) == (20, "skill:target")
+    assert helper._current_explicit_route(
+        helper.ReplaySearchCase("script", "backup restore runbook procedure", 10, "script", False),
+        history,
+        artifacts=artifacts,
+    ) is None
+
+
+def test_comparison_assessment_requires_high_confidence_or_validated_route_change() -> None:
+    helper = load_compare_helper()
+
+    direct_only = {
+        "direct_or_legacy": ["query-hash"],
+        "verified_event": [],
+        "explicit_resolution": [],
+    }
+    verified = {**direct_only, "verified_event": ["verified-query-hash"]}
+
+    assert helper._comparison_assessment(
+        accepted=False,
+        accepted_production_changes=(),
+        quality_improvements=direct_only,
+    ) == "rejected"
+    assert helper._comparison_assessment(
+        accepted=True,
+        accepted_production_changes=(),
+        quality_improvements=direct_only,
+    ) == "accepted_unchanged_or_insufficient_evidence"
+    assert helper._comparison_assessment(
+        accepted=True,
+        accepted_production_changes=(),
+        quality_improvements=verified,
+    ) == "accepted_improved"
+    assert helper._comparison_assessment(
+        accepted=True,
+        accepted_production_changes=("case-hash",),
+        quality_improvements=direct_only,
+    ) == "accepted_improved"
+
+
+def test_production_order_waiver_requires_the_recorded_explicit_correction_route() -> None:
+    helper = load_compare_helper()
+    query = "correct alpha"
+    target = "skill:target"
+    case_id = "correction-case"
+    oracle = helper.IndexOracle(True, (), {}, {}, {}, set(), {})
+    positive = helper.compute_positive_evaluation(
+        {query: {target}}, {query: [target]}, parent_equivalents={}
+    )
+    negative = helper.compute_negative_evaluation((), {})
+    quality = {
+        tier: helper.compute_positive_evaluation(
+            {query: {target}} if tier == "explicit_resolution" else {},
+            {query: [target]},
+            parent_equivalents={},
+        )
+        for tier in helper.LABEL_QUALITY_TIERS
+    }
+    raw_replay = {
+        "search": {case_id: {"status": "ok", "ids": ["skill:old", target]}},
+        "get": {},
+        "neighbors": {},
+    }
+    baseline_production = {
+        case_id: {
+            "status": "ok",
+            "ids": ["skill:old", target],
+            "route_outcome": "none",
+            "route_feedback_id": None,
+            "route_artifact_id": None,
+        }
+    }
+    frozen = helper.FrozenUsageCorpus(
+        {query: {target}},
+        (),
+        (helper.ReplaySearchCase(case_id, query, 10, None, False, feedback_max_id=12),),
+        (),
+        (),
+        {"explicit_resolution": {query: {target}}},
+        (
+            {
+                "query": query,
+                "quality_tier": "explicit_resolution",
+                "feedback_id": 12,
+                "artifact_id": target,
+            },
+        ),
+    )
+
+    def evaluation(ref: str, production: dict[str, dict[str, Any]]) -> Any:
+        return helper.RefEvaluation(
+            ref,
+            ref,
+            "hermes_local_knowledge.indexer",
+            oracle,
+            positive,
+            negative,
+            raw_replay,
+            production,
+            {"failed": 0},
+            {},
+            quality,
+        )
+
+    baseline = evaluation("baseline", baseline_production)
+    unresolved_candidate = evaluation("unresolved", baseline_production)
+    routed_candidate = evaluation(
+        "routed",
+        {
+            case_id: {
+                "status": "ok",
+                "ids": [target, "skill:old"],
+                "route_outcome": "promoted_existing",
+                "route_feedback_id": 12,
+                "route_artifact_id": target,
+            }
+        },
+    )
+    unrelated_candidate = evaluation(
+        "unrelated",
+        {
+            case_id: {
+                "status": "ok",
+                "ids": [target, "skill:old"],
+                "route_outcome": "none",
+                "route_feedback_id": None,
+                "route_artifact_id": None,
+            }
+        },
+    )
+
+    unresolved = helper._candidate_comparison(baseline, unresolved_candidate, frozen)
+    routed = helper._candidate_comparison(baseline, routed_candidate, frozen)
+    unrelated = helper._candidate_comparison(baseline, unrelated_candidate, frozen)
+    empty_frozen = helper.FrozenUsageCorpus(
+        {},
+        (),
+        (),
+        (),
+        (),
+        {tier: {} for tier in helper.LABEL_QUALITY_TIERS},
+        (),
+    )
+    unchanged = helper._candidate_comparison(baseline, baseline, empty_frozen)
+
+    assert unchanged["accepted"] is True
+    assert unchanged["assessment"] == "accepted_unchanged_or_insufficient_evidence"
+    assert unresolved["accepted"] is False
+    assert unresolved["assessment"] == "rejected"
+    assert unresolved["production_replay"]["explicit_rank_one_failures"] == [case_id]
+    assert routed["accepted"] is True
+    assert routed["assessment"] == "accepted_improved"
+    assert routed["production_replay"]["accepted_order_changes"] == [case_id]
+    assert unrelated["accepted"] is False
+    assert unrelated["assessment"] == "rejected"
+    assert unrelated["production_replay"]["unaccepted_order_changes"] == [case_id]
+
+
+def test_raw_replay_order_is_not_waived_by_an_explicit_production_correction() -> None:
+    helper = load_compare_helper()
+    query = "correct alpha"
+    target = "skill:target"
+    case_id = "correction-case"
+    oracle = helper.IndexOracle(True, (), {}, {}, {}, set(), {})
+    negative = helper.compute_negative_evaluation((), {})
+    empty_quality = {
+        tier: helper.compute_positive_evaluation({}, {}, parent_equivalents={})
+        for tier in helper.LABEL_QUALITY_TIERS
+    }
+    baseline_positive = helper.compute_positive_evaluation(
+        {query: {target}}, {query: ["skill:old", target]}, parent_equivalents={}
+    )
+    candidate_positive = helper.compute_positive_evaluation(
+        {query: {target}}, {query: [target, "skill:old"]}, parent_equivalents={}
+    )
+    frozen = helper.FrozenUsageCorpus(
+        {query: {target}},
+        (),
+        (helper.ReplaySearchCase(case_id, query, 10, None, False, feedback_max_id=12),),
+        (),
+        (),
+        {"explicit_resolution": {query: {target}}},
+        (
+            {
+                "query": query,
+                "quality_tier": "explicit_resolution",
+                "feedback_id": 12,
+                "artifact_id": target,
+            },
+        ),
+    )
+
+    def evaluation(
+        ref: str,
+        positive: Any,
+        raw_ids: list[str],
+        production_ids: list[str],
+        *,
+        routed: bool,
+    ) -> Any:
+        return helper.RefEvaluation(
+            ref,
+            ref,
+            "hermes_local_knowledge.indexer",
+            oracle,
+            positive,
+            negative,
+            {"search": {case_id: {"status": "ok", "ids": raw_ids}}, "get": {}, "neighbors": {}},
+            {
+                case_id: {
+                    "status": "ok",
+                    "ids": production_ids,
+                    "route_outcome": "promoted_existing" if routed else "none",
+                    "route_feedback_id": 12 if routed else None,
+                    "route_artifact_id": target if routed else None,
+                }
+            },
+            {"failed": 0},
+            {},
+            empty_quality,
+        )
+
+    baseline = evaluation(
+        "baseline",
+        baseline_positive,
+        ["skill:old", target],
+        ["skill:old", target],
+        routed=False,
+    )
+    candidate = evaluation(
+        "candidate",
+        candidate_positive,
+        [target, "skill:old"],
+        [target, "skill:old"],
+        routed=True,
+    )
+
+    comparison = helper._candidate_comparison(baseline, candidate, frozen)
+
+    assert comparison["production_replay"]["accepted_order_changes"] == [case_id]
+    assert comparison["replay"]["unaccepted_order_changes"] == [case_id]
+    assert comparison["accepted"] is False
 
 
 def test_snapshot_copy_keeps_only_scanner_inputs_and_name_only_skill_support(tmp_path: Path) -> None:
