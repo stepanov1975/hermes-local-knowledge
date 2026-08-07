@@ -1436,6 +1436,307 @@ def test_cli_doctor_and_router_skill_install_status_and_exit_contract(
     assert target.read_bytes() == Path(overwritten["source"]).read_bytes()
 
 
+def test_cli_doctor_accepts_explicit_custom_router_skill_path(
+    workspace: Workspace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = workspace.hermes_home / "skills" / "note-taking" / "local-knowledge-router" / "SKILL.md"
+    custom_content = """---
+name: "local-knowledge-router"  # customized deployment
+description: Route local operational questions through Alex's customized policy.
+---
+# Custom Local Knowledge Router
+"""
+    write(target, custom_content)
+    write(
+        workspace.hermes_home / "config.yaml",
+        """local_knowledge:
+  router_skill_path: skills/note-taking/local-knowledge-router/SKILL.md
+""",
+    )
+
+    cfg = lci_config.resolve_config(workspace.hermes_home)
+    assert cfg.router_skill_path == target
+    assert cfg.router_skill_path_source == "config"
+
+    status, doctor = run_cli_json(
+        capsys,
+        ["doctor", "--hermes-home", str(workspace.hermes_home), "--json"],
+    )
+    assert status == 0
+    assert doctor["router_skill_mode"] == "custom"
+    assert doctor["router_skill_path"] == str(target)
+    checks = {row["name"]: row for row in doctor["checks"]}
+    assert checks["router_skill_installed"]["ok"] is True
+    assert checks["router_skill_identity"]["ok"] is True
+    assert checks["router_skill_matches_plugin"]["ok"] is True
+    assert "byte equality is intentionally not required" in checks[
+        "router_skill_matches_plugin"
+    ]["detail"]
+
+    status, install = run_cli_json(
+        capsys,
+        [
+            "install-router-skill",
+            "--hermes-home",
+            str(workspace.hermes_home),
+            "--force",
+            "--json",
+        ],
+    )
+    assert status == 0
+    assert install["success"] is True
+    assert install["status"] == "current"
+    assert install["router_skill_mode"] == "custom"
+    assert install["target"] == str(target)
+    assert install["overwritten"] is False
+    assert target.read_text(encoding="utf-8") == custom_content
+
+    before = target.stat().st_mtime_ns
+    status, forced = run_cli_json(
+        capsys,
+        [
+            "install-router-skill",
+            "--hermes-home",
+            str(workspace.hermes_home),
+            "--force",
+            "--json",
+        ],
+    )
+    assert status == 0
+    assert forced["status"] == "current"
+    assert forced["router_skill_mode"] == "custom"
+    assert forced["overwritten"] is False
+    assert target.stat().st_mtime_ns == before
+    assert target.read_text(encoding="utf-8") == custom_content
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "expected"),
+    [
+        ("name: local-knowledge-router # deployed", "local-knowledge-router"),
+        ('name: "local-knowledge\\u002drouter"', "local-knowledge-router"),
+        ('name: "\'local-knowledge-router\'"', "'local-knowledge-router'"),
+        ("name: local-knowledge-router\nname: local-knowledge-router", None),
+        ("name:\nname: local-knowledge-router", None),
+        ('name: "local-knowledge-router', None),
+    ],
+)
+def test_custom_router_frontmatter_name_uses_fail_closed_scalar_semantics(
+    tmp_path: Path,
+    frontmatter: str,
+    expected: str | None,
+) -> None:
+    skill = tmp_path / "SKILL.md"
+    skill.write_text(f"---\n{frontmatter}\n---\n", encoding="utf-8")
+    assert lci_cli._router_skill_frontmatter_name(skill) == expected
+
+
+def test_cli_doctor_accepts_symlinked_custom_router_skill_path(
+    workspace: Workspace,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "custom-router-source"
+    write(
+        source / "SKILL.md",
+        """---
+name: local-knowledge-router
+description: Symlinked custom router skill.
+---
+# Symlinked Router
+""",
+    )
+    link = workspace.hermes_home / "skills" / "note-taking" / "local-knowledge-router"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(source, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+    write(
+        workspace.hermes_home / "config.yaml",
+        """local_knowledge:
+  router_skill_path: skills/note-taking/local-knowledge-router/SKILL.md
+""",
+    )
+
+    status, doctor = run_cli_json(
+        capsys,
+        ["doctor", "--hermes-home", str(workspace.hermes_home), "--json"],
+    )
+    assert status == 0
+    checks = {row["name"]: row for row in doctor["checks"]}
+    assert checks["router_skill_path_enrolled"]["ok"] is True
+    assert checks["router_skill_installed"]["ok"] is True
+    assert checks["router_skill_identity"]["ok"] is True
+
+
+def test_cli_rejects_custom_router_runtime_path_outside_hermes_skills(
+    workspace: Workspace,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    outside = tmp_path / "outside" / "SKILL.md"
+    write(
+        outside,
+        """---
+name: local-knowledge-router
+---
+# Outside Router
+""",
+    )
+    write(
+        workspace.hermes_home / "config.yaml",
+        f"""local_knowledge:
+  router_skill_path: {outside}
+""",
+    )
+
+    status, doctor = run_cli_json(
+        capsys,
+        ["doctor", "--hermes-home", str(workspace.hermes_home), "--json"],
+    )
+    assert status == 0
+    checks = {row["name"]: row for row in doctor["checks"]}
+    assert checks["router_skill_path_enrolled"]["ok"] is False
+    assert "must be under HERMES_HOME/skills" in checks["router_skill_path_enrolled"][
+        "detail"
+    ]
+
+    status, install = run_cli_json(
+        capsys,
+        ["install-router-skill", "--hermes-home", str(workspace.hermes_home), "--json"],
+    )
+    assert status == 1
+    assert install["success"] is False
+    assert install["status"] == "custom_invalid"
+    assert outside.read_text(encoding="utf-8").endswith("# Outside Router\n")
+
+
+def test_cli_doctor_does_not_scan_for_unconfigured_custom_router_skill(
+    workspace: Workspace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write(
+        workspace.hermes_home
+        / "skills"
+        / "note-taking"
+        / "local-knowledge-router"
+        / "SKILL.md",
+        """---
+name: local-knowledge-router
+description: Unconfigured custom router skill.
+---
+# Custom Router
+""",
+    )
+
+    status, doctor = run_cli_json(
+        capsys,
+        ["doctor", "--hermes-home", str(workspace.hermes_home), "--json"],
+    )
+    assert status == 0
+    cfg = lci_config.resolve_config(workspace.hermes_home)
+    assert cfg.router_skill_path is None
+    assert cfg.router_skill_path_source == "default"
+    assert doctor["router_skill_mode"] == "bundled"
+    assert doctor["router_skill_path"].endswith("skills/local-knowledge-router/SKILL.md")
+    checks = {row["name"]: row for row in doctor["checks"]}
+    assert checks["router_skill_installed"]["ok"] is False
+    assert "router_skill_identity" not in checks
+
+
+def test_cli_reports_missing_configured_custom_router_skill_without_default_fallback(
+    workspace: Workspace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write(
+        workspace.hermes_home / "config.yaml",
+        """local_knowledge:
+  router_skill_path: skills/note-taking/local-knowledge-router/SKILL.md
+""",
+    )
+
+    status, doctor = run_cli_json(
+        capsys,
+        ["doctor", "--hermes-home", str(workspace.hermes_home), "--json"],
+    )
+    assert status == 0
+    assert doctor["router_skill_mode"] == "custom"
+    checks = {row["name"]: row for row in doctor["checks"]}
+    assert checks["router_skill_path_enrolled"]["ok"] is True
+    assert checks["router_skill_installed"]["ok"] is False
+    assert checks["router_skill_identity"]["ok"] is False
+    assert checks["router_skill_matches_plugin"]["ok"] is False
+
+    status, install = run_cli_json(
+        capsys,
+        [
+            "install-router-skill",
+            "--hermes-home",
+            str(workspace.hermes_home),
+            "--json",
+        ],
+    )
+    assert status == 1
+    assert install["success"] is False
+    assert install["status"] == "custom_missing"
+    assert not (
+        workspace.hermes_home / "skills" / "local-knowledge-router" / "SKILL.md"
+    ).exists()
+
+
+def test_cli_doctor_rejects_invalid_configured_router_skill_identity(
+    workspace: Workspace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = workspace.hermes_home / "skills" / "custom-router" / "SKILL.md"
+    write(
+        target,
+        """---
+name: another-router
+description: Wrong skill identity.
+---
+# Wrong Router
+""",
+    )
+    write(
+        workspace.hermes_home / "config.yaml",
+        """local_knowledge:
+  router_skill_path: skills/custom-router/SKILL.md
+""",
+    )
+
+    status, doctor = run_cli_json(
+        capsys,
+        ["doctor", "--hermes-home", str(workspace.hermes_home), "--json"],
+    )
+    assert status == 0
+    checks = {row["name"]: row for row in doctor["checks"]}
+    assert checks["router_skill_installed"]["ok"] is True
+    assert checks["router_skill_identity"]["ok"] is False
+    assert checks["router_skill_matches_plugin"]["ok"] is False
+    assert "expected frontmatter name 'local-knowledge-router'" in checks[
+        "router_skill_identity"
+    ]["detail"]
+
+    before = target.read_bytes()
+    status, install = run_cli_json(
+        capsys,
+        [
+            "install-router-skill",
+            "--hermes-home",
+            str(workspace.hermes_home),
+            "--force",
+            "--json",
+        ],
+    )
+    assert status == 1
+    assert install["success"] is False
+    assert install["status"] == "custom_invalid"
+    assert target.read_bytes() == before
+
+
 def test_hermes_native_adapter_surface_and_okf_worker_exit_behavior(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

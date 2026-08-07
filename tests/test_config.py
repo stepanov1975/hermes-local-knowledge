@@ -54,6 +54,8 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
         "state_dir_source",
         "include_markdown_docs_source",
         "warnings",
+        "router_skill_path",
+        "router_skill_path_source",
     ]
     assert resolved == Config(
         source_root=hermes_home.resolve(),
@@ -65,6 +67,8 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
     assert resolved.state_dir_source == "default"
     assert resolved.include_markdown_docs_source == "default"
     assert resolved.warnings == ()
+    assert resolved.router_skill_path is None
+    assert resolved.router_skill_path_source == "default"
     assert IndexSettings() == IndexSettings(
         custom_skill_dirs=("custom_skills",),
         script_dirs=("scripts", "hermes_home/scripts"),
@@ -84,6 +88,31 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
     assert resolved.okf.max_worker_seconds == 120
     with pytest.raises(FrozenInstanceError):
         resolved.state_dir = tmp_path / "other"  # type: ignore[misc]
+
+
+def test_router_skill_path_resolves_from_hermes_home_without_dereferencing_symlink(
+    tmp_path: Path,
+) -> None:
+    hermes_home = tmp_path / "hermes-home"
+    external_skill = tmp_path / "customization-repo" / "SKILL.md"
+    external_skill.parent.mkdir()
+    external_skill.write_text("---\nname: local-knowledge-router\n---\n", encoding="utf-8")
+    runtime_skill = hermes_home / "skills" / "note-taking" / "local-knowledge-router" / "SKILL.md"
+    runtime_skill.parent.mkdir(parents=True)
+    runtime_skill.symlink_to(external_skill)
+    write_config(
+        hermes_home,
+        """local_knowledge:
+  router_skill_path: skills/note-taking/local-knowledge-router/SKILL.md
+""",
+    )
+
+    resolved = resolve_config(hermes_home)
+
+    assert resolved.router_skill_path is not None
+    assert resolved.router_skill_path == runtime_skill
+    assert resolved.router_skill_path.resolve() == external_skill.resolve()
+    assert resolved.router_skill_path_source == "config"
 
 
 @pytest.mark.parametrize(

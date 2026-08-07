@@ -62,6 +62,8 @@ class Config:
     state_dir_source: str = "default"
     include_markdown_docs_source: str = "default"
     warnings: tuple[str, ...] = ()
+    router_skill_path: Path | None = None
+    router_skill_path_source: str = "default"
 
 
 def _present(value: Any) -> bool:
@@ -118,6 +120,15 @@ def _coerce_tuple(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
 def _resolve_path(value: Any, default: Path) -> Path:
     selected = default if not _present(value) else Path(str(value))
     return selected.expanduser().resolve()
+
+
+def _resolve_profile_path(value: Any, *, hermes_home: Path, default: Path) -> Path:
+    """Resolve a profile path without dereferencing its final symlink."""
+
+    selected = default if not _present(value) else Path(str(value)).expanduser()
+    if not selected.is_absolute():
+        selected = hermes_home / selected
+    return Path(os.path.abspath(selected))
 
 
 def _strip_yaml_comment(value: str) -> str:
@@ -365,6 +376,17 @@ def resolve_config(hermes_home: Path | str | None = None) -> Config:
         state_dir_source = "default"
     state_dir = _resolve_path(configured_state_dir, resolved_hermes_home / "local_knowledge")
 
+    configured_router_skill_path = _first_value(section, "router_skill_path")
+    router_skill_path_source = "config" if _present(configured_router_skill_path) else "default"
+    router_skill_path = (
+        _resolve_profile_path(
+            configured_router_skill_path,
+            hermes_home=resolved_hermes_home,
+            default=resolved_hermes_home / "skills" / "local-knowledge-router" / "SKILL.md",
+        )
+        if router_skill_path_source == "config"
+        else None
+    )
     defaults = IndexSettings()
     include_markdown_docs_value = _first_value(section, "include_markdown_docs")
     include_markdown_docs_source = (
@@ -406,6 +428,8 @@ def resolve_config(hermes_home: Path | str | None = None) -> Config:
         hermes_home=resolved_hermes_home,
         state_dir=state_dir,
         index_settings=index_settings,
+        router_skill_path=router_skill_path,
+        router_skill_path_source=router_skill_path_source,
         okf=_resolve_okf_settings(section),
         source_root_source=source_root_source,
         state_dir_source=state_dir_source,

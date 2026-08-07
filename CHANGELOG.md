@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.4] - 2026-08-07
+
+### Added
+
+- Added `local_knowledge.router_skill_path` for operators who intentionally deploy a customized proactive router skill instead of the bundled copy. Relative paths resolve from the active Hermes home.
+
+### Changed
+
+- The doctor validates an explicitly configured custom skill's enrolled runtime path and `local-knowledge-router` frontmatter identity without requiring byte equality with the bundled skill.
+- `install-router-skill` now treats a valid configured custom skill as authoritative and skips bundled installation even with `--force`.
+
+### Fixed
+
+- Release automation now renders the complete version-specific changelog notes into GitHub releases, detects and repairs missing or changed notes without rebuilding complete assets, and verifies the final body on every run.
+
+[0.4.4]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.3...v0.4.4
+
 ## [0.4.3] - 2026-08-07
 
 ### Added

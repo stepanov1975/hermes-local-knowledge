@@ -65,6 +65,94 @@ def _installed_router_skill_path(hermes_home: Path) -> Path:
     return lexical_home / ROUTER_SKILL_RELATIVE_PATH
 
 
+def _configured_router_skill_path(cfg: Config) -> Path:
+    return cfg.router_skill_path or _installed_router_skill_path(cfg.hermes_home)
+
+
+def _router_skill_enrollment_error(hermes_home: Path, target: Path) -> str | None:
+    lexical_skills = Path(os.path.abspath(hermes_home.expanduser())) / "skills"
+    lexical_target = Path(os.path.abspath(target.expanduser()))
+    try:
+        lexical_target.relative_to(lexical_skills)
+    except ValueError:
+        return "configured router skill path must be under HERMES_HOME/skills"
+    if lexical_target.name != "SKILL.md":
+        return "configured router skill path must name a SKILL.md file"
+    return None
+
+
+def _router_skill_frontmatter_name(path: Path) -> str | None:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    closing = next(
+        (index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+        None,
+    )
+    if closing is None:
+        return None
+    names: list[str | None] = []
+    for line in lines[1:closing]:
+        if line != line.lstrip():
+            continue
+        key, separator, value = line.partition(":")
+        if separator and key.strip() == "name":
+            names.append(_yaml_frontmatter_string(value))
+    return names[0] if len(names) == 1 else None
+
+
+def _yaml_frontmatter_string(raw: str) -> str | None:
+    """Parse the ordinary quoted/plain YAML scalar forms used for skill names."""
+
+    quote: str | None = None
+    escaped = False
+    comment_at: int | None = None
+    index = 0
+    while index < len(raw):
+        character = raw[index]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif quote == "'":
+            if character == "'":
+                if index + 1 < len(raw) and raw[index + 1] == "'":
+                    index += 1
+                else:
+                    quote = None
+        elif character in "'\"":
+            quote = character
+        elif character == "#" and (index == 0 or raw[index - 1].isspace()):
+            comment_at = index
+            break
+        index += 1
+    if quote is not None or escaped:
+        return None
+
+    value = raw[:comment_at].strip() if comment_at is not None else raw.strip()
+    if not value:
+        return None
+    if value.startswith('"'):
+        if not value.endswith('"'):
+            return None
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return decoded if isinstance(decoded, str) else None
+    if value.startswith("'"):
+        if not value.endswith("'"):
+            return None
+        return value[1:-1].replace("''", "'")
+    if value.endswith(("'", '"')):
+        return None
+    return value
+
+
 def _router_target_safety_error(hermes_home: Path, target: Path) -> str | None:
     if target.is_symlink():
         return "router skill target is a symbolic link; refusing to follow it"
@@ -469,14 +557,56 @@ def _emit_newer_index_error(exc: NewerIndexFormatError, *, json_output: bool) ->
         print(f"ERROR: {exc}", file=sys.stderr)
 
 
-def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[dict[str, Any], int]:
+def _install_router_skill_payload(cfg: Config, *, force: bool) -> tuple[dict[str, Any], int]:
     source = _bundled_router_skill_path()
-    target = _installed_router_skill_path(hermes_home)
+    target = _configured_router_skill_path(cfg)
     base: dict[str, Any] = {
         "source": str(source),
         "target": str(target),
     }
     try:
+        if cfg.router_skill_path is not None:
+            enrollment_error = _router_skill_enrollment_error(cfg.hermes_home, target)
+            if enrollment_error is not None:
+                return {
+                    **base,
+                    "success": False,
+                    "status": "custom_invalid",
+                    "force_required": False,
+                    "error": enrollment_error,
+                }, 1
+            if not target.is_file():
+                return {
+                    **base,
+                    "success": False,
+                    "status": "custom_missing",
+                    "force_required": False,
+                    "error": "configured custom local-knowledge-router skill is missing",
+                }, 1
+            skill_name = _router_skill_frontmatter_name(target)
+            if skill_name != "local-knowledge-router":
+                return {
+                    **base,
+                    "success": False,
+                    "status": "custom_invalid",
+                    "force_required": False,
+                    "error": (
+                        "configured custom router skill has frontmatter name "
+                        f"{skill_name!r}; expected 'local-knowledge-router'"
+                    ),
+                }, 1
+            return {
+                **base,
+                "success": True,
+                "status": "current",
+                "router_skill_mode": "custom",
+                "overwritten": False,
+                "message": (
+                    "configured custom local-knowledge-router skill is active; "
+                    "bundled installation skipped"
+                ),
+            }, 0
+
         if not source.is_file():
             return {
                 **base,
@@ -486,7 +616,7 @@ def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[di
             }, 1
         bundled_content = source.read_bytes()
 
-        safety_error = _router_target_safety_error(hermes_home, target)
+        safety_error = _router_target_safety_error(cfg.hermes_home, target)
         if safety_error is not None:
             return {
                 **base,
@@ -529,7 +659,7 @@ def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[di
         else:
             overwritten = False
 
-        safety_error = _router_target_safety_error(hermes_home, target)
+        safety_error = _router_target_safety_error(cfg.hermes_home, target)
         if safety_error is not None:
             return {
                 **base,
@@ -539,7 +669,7 @@ def _install_router_skill_payload(hermes_home: Path, *, force: bool) -> tuple[di
                 "error": safety_error,
             }, 1
         _atomic_write_bytes(target, bundled_content)
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         return {
             **base,
             "success": False,
@@ -670,36 +800,86 @@ def _doctor_payload(
     check("index_exists", db_path.exists(), str(db_path), fatal=False)
 
     bundled_router_skill = _bundled_router_skill_path()
-    installed_router_skill = _installed_router_skill_path(cfg.hermes_home)
+    installed_router_skill = _configured_router_skill_path(cfg)
+    router_skill_mode = "custom" if cfg.router_skill_path is not None else "bundled"
+    payload["router_skill_mode"] = router_skill_mode
+    payload["router_skill_path"] = str(installed_router_skill)
+    payload["router_skill_path_source"] = cfg.router_skill_path_source
     router_skill_installed = installed_router_skill.is_file()
     install_command = "hermes local-knowledge install-router-skill"
+    if router_skill_mode == "custom":
+        enrollment_error = _router_skill_enrollment_error(cfg.hermes_home, installed_router_skill)
+        check(
+            "router_skill_path_enrolled",
+            enrollment_error is None,
+            str(installed_router_skill) if enrollment_error is None else enrollment_error,
+            fatal=False,
+        )
     check(
         "router_skill_installed",
         router_skill_installed,
         str(installed_router_skill)
         if router_skill_installed
-        else f"missing {installed_router_skill}; run `{install_command}`",
-        fatal=False,
-    )
-    router_skill_matches = False
-    if router_skill_installed and bundled_router_skill.is_file():
-        try:
-            router_skill_matches = installed_router_skill.read_bytes() == bundled_router_skill.read_bytes()
-        except OSError:
-            router_skill_matches = False
-    check(
-        "router_skill_matches_plugin",
-        router_skill_matches,
-        "normal router skill matches the bundled plugin version"
-        if router_skill_matches
         else (
-            "normal router skill differs from the bundled plugin version; "
-            f"review it before running `{install_command} --force`"
-            if router_skill_installed
-            else "cannot compare until the normal router skill is installed"
+            f"missing configured custom router skill {installed_router_skill}"
+            if router_skill_mode == "custom"
+            else f"missing {installed_router_skill}; run `{install_command}`"
         ),
         fatal=False,
     )
+    if router_skill_mode == "custom":
+        router_skill_name: str | None = None
+        router_skill_identity_error: str | None = None
+        if router_skill_installed:
+            try:
+                router_skill_name = _router_skill_frontmatter_name(installed_router_skill)
+            except (OSError, UnicodeError) as exc:
+                router_skill_identity_error = f"failed to read configured custom router skill: {type(exc).__name__}: {exc}"
+        router_skill_identity = router_skill_name == "local-knowledge-router"
+        check(
+            "router_skill_identity",
+            router_skill_identity,
+            "configured custom router skill has frontmatter name 'local-knowledge-router'"
+            if router_skill_identity
+            else (
+                router_skill_identity_error
+                or (
+                    "configured custom router skill has frontmatter name "
+                    f"{router_skill_name!r}; expected frontmatter name 'local-knowledge-router'"
+                )
+            ),
+            fatal=False,
+        )
+        check(
+            "router_skill_matches_plugin",
+            router_skill_identity,
+            (
+                "explicit custom router skill is valid; bundled byte equality is intentionally not required"
+                if router_skill_identity
+                else "configured custom router skill is invalid; bundled byte equality is not applicable"
+            ),
+            fatal=False,
+        )
+    else:
+        router_skill_matches = False
+        if router_skill_installed and bundled_router_skill.is_file():
+            try:
+                router_skill_matches = installed_router_skill.read_bytes() == bundled_router_skill.read_bytes()
+            except OSError:
+                router_skill_matches = False
+        check(
+            "router_skill_matches_plugin",
+            router_skill_matches,
+            "normal router skill matches the bundled plugin version"
+            if router_skill_matches
+            else (
+                "normal router skill differs from the bundled plugin version; "
+                f"review it before running `{install_command} --force`"
+                if router_skill_installed
+                else "cannot compare until the normal router skill is installed"
+            ),
+            fatal=False,
+        )
     check(
         "okf_auto_generate",
         cfg.okf.auto_generate,
@@ -790,7 +970,7 @@ def main(
     args = parse_args(argv)
     if args.command == "install-router-skill":
         cfg = resolve_config(args.hermes_home)
-        payload, status = _install_router_skill_payload(cfg.hermes_home, force=bool(args.force))
+        payload, status = _install_router_skill_payload(cfg, force=bool(args.force))
         _emit_payload(payload, json_output=bool(args.json))
         return status
     if args.command == "okf":

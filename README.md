@@ -90,6 +90,15 @@ hermes local-knowledge install-router-skill --json
 
 `installed` and `current` are successful statuses. A different existing skill produces `conflict`; review it before choosing `--force`.
 
+To use an intentionally customized proactive skill instead, configure its deployed runtime path before running doctor or installer commands:
+
+```yaml
+local_knowledge:
+  router_skill_path: skills/note-taking/local-knowledge-router/SKILL.md
+```
+
+Relative paths resolve from `$HERMES_HOME`. The path must name an active `SKILL.md` under `$HERMES_HOME/skills`; that runtime path may be a symlink to a separately managed custom-skill repository. Doctor validates the skill's frontmatter name but does not require custom content to match the bundled copy. Invalid or missing configured custom skills appear as explicit doctor warnings while doctor retains its diagnostic-success exit status; the installer fails without modifying the configured target. `install-router-skill`, including `--force`, returns `current` with `router_skill_mode: custom` and does not overwrite a valid configured custom skill.
+
 From a source checkout before plugin CLI registration is available:
 
 ```bash
@@ -106,6 +115,8 @@ Put non-secret settings in `$HERMES_HOME/config.yaml`:
 local_knowledge:
   source_root: ~/repos/local-operations
   state_dir: ~/.hermes/local_knowledge
+  # Optional: use a deployed custom proactive skill instead of the bundled copy.
+  # router_skill_path: skills/note-taking/local-knowledge-router/SKILL.md
   custom_skill_dirs: [custom_skills]
   script_dirs: [scripts, hermes_home/scripts]
   memory_dirs: [memory]
@@ -128,6 +139,7 @@ Canonical settings, aliases, and defaults:
 | `source_root` | `root`; `LOCAL_KNOWLEDGE_ROOT` overrides config | `$HERMES_HOME` |
 | `state_dir` | `index_dir`; `LOCAL_KNOWLEDGE_STATE_DIR` overrides config | `$HERMES_HOME/local_knowledge` |
 | `hermes_home` | `HERMES_HOME`; explicit CLI `--hermes-home` selects a profile | Active Hermes home, otherwise `~/.hermes` |
+| `router_skill_path` | — | `$HERMES_HOME/skills/local-knowledge-router/SKILL.md`; an explicit relative path resolves from `$HERMES_HOME` and selects custom-skill validation |
 | `custom_skill_dirs` | — | `[custom_skills]` |
 | `script_dirs` | — | `[scripts, hermes_home/scripts]` |
 | `memory_dirs` | — | `[memory]` |

@@ -29,6 +29,17 @@ If it is already enabled, report that. If the user declines, leave `auto_generat
 
 ## 3. Install the proactive router skill
 
+Operators who already deploy an intentionally customized router skill should configure its exact runtime path instead of installing the bundled copy:
+
+```yaml
+local_knowledge:
+  router_skill_path: skills/note-taking/local-knowledge-router/SKILL.md
+```
+
+Relative paths resolve from `$HERMES_HOME`. The path must name an active `SKILL.md` under `$HERMES_HOME/skills`; it may be a symlink to a separately managed source. Doctor validates the custom skill identity without comparing bundled bytes, and installer commands never overwrite it, including with `--force`.
+
+Otherwise, install the bundled proactive skill:
+
 ```bash
 hermes local-knowledge install-router-skill --json
 ```
