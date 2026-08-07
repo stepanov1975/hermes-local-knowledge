@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.3] - 2026-08-07
+
+### Added
+
+- Added provenance-rich search telemetry that records the complete bounded result page, the unassisted baseline page, feedback-route outcome, root-scoped feedback high-water, index hash and format, plugin version, and resolved execution context needed for replay.
+- Added verified event-linked feedback and explicit correction resolutions. Feedback links now validate the source root, successful tool call, query, returned artifact, expected target, parent/child relationship, and unique accepted resolution in one transaction.
+- Added a private, read-only historical comparison harness that freezes telemetry and source/runtime/OKF inputs, builds each Git ref independently, and replays both raw index operations and managed production searches without mutating live usage data.
+- Added quality-tier metrics and provenance for explicit resolutions, verified events, and direct or legacy feedback, together with per-case replay evidence summaries.
+
+### Changed
+
+- Extended the usage schema additively while retaining migrated rows as fixed-capture diagnostic evidence instead of overstating them as exact historical observations.
+- Classified replay evidence as event-time reproduction, exact-input counterfactual, fixed-capture legacy, unavailable, mismatched, or errored. Exact claims now require reconstructable root-scoped feedback state, matching corpus and execution identity, and reproduction of recorded output and route provenance.
+- Historical acceptance now distinguishes rejection, supported improvement, and unchanged or insufficient evidence. Direct or legacy-only labels cannot by themselves prove an improvement.
+- Kept evaluation leakage-free by measuring unassisted ranking while evaluating feedback-assisted production behavior in a separate replay lane.
+
+### Fixed
+
+- Preserved quality-only queries and their outcomes through case materialization, per-ref execution, metric calculation, and private diagnostics.
+- Corrected explicit-resolution handling for omitted parent targets, conflicting declared targets, duplicate resolution edges, empty legacy queries, and root-mismatched or malformed feedback.
+- Made replay-bound validation root-scoped and propagated preparation-time availability so missing historical feedback cannot be classified as exact merely because another root owns the same numeric ID.
+- Aligned the correction-route acceptance oracle with production query matching, quote handling, scoring, artifact-type eligibility, and later query-wide or target-specific vetoes.
+
+[0.4.3]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.2...v0.4.3
+
 ## [0.4.2] - 2026-08-05
 
 ### Added
