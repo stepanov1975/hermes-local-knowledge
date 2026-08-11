@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .index import _query_terms, sqlite_readonly_uri
+from .telemetry import EXPLICIT_FEEDBACK_ORIGIN, IMPLICIT_FEEDBACK_ORIGIN
 
 POSITIVE_FEEDBACK_RATINGS = frozenset({"great", "useful"})
 NEGATIVE_FEEDBACK_RATINGS = frozenset(
@@ -24,6 +25,8 @@ FEEDBACK_SCAN_LIMIT = 1000
 RETRY_LIMIT = 10
 FEEDBACK_BUSY_TIMEOUT_SECONDS = 0.1
 FEEDBACK_BUSY_TIMEOUT_MS = 100
+MIN_IMPLICIT_CONFIRMATIONS = 2
+MAX_GENERIC_ARTIFACT_QUERIES = 5
 SearchIndexFn = Callable[..., list[dict[str, Any]]]
 ARTIFACT_TYPE_BY_ID_PREFIX = {
     "cron": "cron_job",
@@ -134,6 +137,8 @@ def _feedback_route_snapshot(
     root: Path,
     query: str,
     artifact_type: str | None,
+    min_confirmations: int = MIN_IMPLICIT_CONFIRMATIONS,
+    max_generic_queries: int = MAX_GENERIC_ARTIFACT_QUERIES,
 ) -> tuple[FeedbackRoute | None, int | None]:
     """Read one root-scoped feedback snapshot and select its strongest route.
 
@@ -142,6 +147,13 @@ def _feedback_route_snapshot(
     to the configured source root so test/probe telemetry cannot train live
     routing. The high-water includes every feedback row for this root, even rows
     irrelevant to today's matcher.
+
+    Implicit rows (``origin='implicit'``) are considered only as a fallback
+    channel below every explicit route and only after two gates: a
+    query/artifact pair needs at least ``min_confirmations`` implicit
+    confirmations, and an artifact confirmed for more than
+    ``max_generic_queries`` distinct queries is treated as generic (frequency
+    without specificity carries no routing signal).
     """
 
     current_terms = frozenset(_query_terms(query))
@@ -163,7 +175,8 @@ def _feedback_route_snapshot(
                 SELECT f.id,
                        f.rating,
                        COALESCE(NULLIF(TRIM(f.query), ''), e.query) AS effective_query,
-                       f.artifact_id
+                       f.artifact_id,
+                       f.origin
                 FROM feedback AS f
                 LEFT JOIN usage_events AS e ON e.id = f.event_id
                 WHERE f.root = ?
@@ -184,13 +197,36 @@ def _feedback_route_snapshot(
         return None, None
 
     latest: dict[tuple[str, str], FeedbackRoute | NegativeFeedback] = {}
+    latest_implicit: dict[tuple[str, str], FeedbackRoute] = {}
+    implicit_counts: dict[tuple[str, str], int] = {}
+    implicit_artifact_queries: dict[str, set[str]] = {}
+    implicit_candidates: list[FeedbackRoute] = []
     for row in rows:
         accepted_query = str(row["effective_query"] or "").strip()
         accepted_terms = frozenset(_query_terms(accepted_query))
         artifact_id = str(row["artifact_id"] or "").strip()
         query_key = _feedback_query_key(accepted_query, accepted_terms)
-        prefix, separator, _name = artifact_id.partition(":")
         if not accepted_terms:
+            continue
+        origin = str(row["origin"] or EXPLICIT_FEEDBACK_ORIGIN)
+        if origin == IMPLICIT_FEEDBACK_ORIGIN:
+            if str(row["rating"]) != "useful":
+                continue
+            key = (query_key, artifact_id)
+            implicit_counts[key] = implicit_counts.get(key, 0) + 1
+            implicit_artifact_queries.setdefault(artifact_id, set()).add(query_key)
+            prefix, separator, _name = artifact_id.partition(":")
+            if not separator or not prefix:
+                continue
+            implicit_candidates.append(
+                FeedbackRoute(
+                    query=accepted_query,
+                    artifact_id=artifact_id,
+                    artifact_type=ARTIFACT_TYPE_BY_ID_PREFIX.get(prefix, prefix),
+                    terms=accepted_terms,
+                    feedback_id=int(row["id"]),
+                )
+            )
             continue
         key = (query_key, artifact_id)
         if key in latest:
@@ -203,6 +239,7 @@ def _feedback_route_snapshot(
                 feedback_id=feedback_id,
             )
             continue
+        prefix, separator, _name = artifact_id.partition(":")
         if not separator or not prefix:
             continue
         latest[key] = FeedbackRoute(
@@ -213,31 +250,66 @@ def _feedback_route_snapshot(
             feedback_id=feedback_id,
         )
 
+    for candidate in implicit_candidates:
+        key = (candidate.query, candidate.artifact_id)
+        query_key = _feedback_query_key(candidate.query, candidate.terms)
+        counted_key = (query_key, candidate.artifact_id)
+        if implicit_counts.get(counted_key, 0) < min_confirmations:
+            continue
+        if (
+            len(implicit_artifact_queries.get(candidate.artifact_id, set()))
+            > max_generic_queries
+        ):
+            continue
+        if key in latest_implicit:
+            continue
+        latest_implicit[key] = candidate
+
     current_query_key = _feedback_query_key(query, current_terms)
     negative_feedback = [
         decision
         for decision in latest.values()
         if isinstance(decision, NegativeFeedback) and decision.query_key == current_query_key
     ]
-    scored: list[tuple[tuple[int, int, int, int], FeedbackRoute]] = []
+
+    def _vetoed(route: FeedbackRoute) -> bool:
+        return any(
+            rejection.feedback_id > route.feedback_id
+            and (not rejection.artifact_id or rejection.artifact_id == route.artifact_id)
+            for rejection in negative_feedback
+        )
+
+    scored_explicit: list[tuple[tuple[int, int, int, int], FeedbackRoute]] = []
     for route in latest.values():
         if not isinstance(route, FeedbackRoute):
             continue
         if artifact_type is not None and route.artifact_type != artifact_type:
             continue
-        if any(
-            rejection.feedback_id > route.feedback_id
-            and (not rejection.artifact_id or rejection.artifact_id == route.artifact_id)
-            for rejection in negative_feedback
-        ):
+        if _vetoed(route):
             continue
         score = _match_score(route, query, current_terms)
         if score is not None:
-            scored.append((score, route))
-    if not scored:
-        return None, feedback_max_id
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return scored[0][1], feedback_max_id
+            scored_explicit.append((score, route))
+    if scored_explicit:
+        scored_explicit.sort(key=lambda item: item[0], reverse=True)
+        return scored_explicit[0][1], feedback_max_id
+
+    scored_implicit: list[tuple[tuple[int, int, int, int], FeedbackRoute]] = []
+    for route in latest_implicit.values():
+        if artifact_type is not None and route.artifact_type != artifact_type:
+            continue
+        if _vetoed(route):
+            continue
+        score = _match_score(route, query, current_terms)
+        if score is not None:
+            # Implicit rows rank below every explicit route: exact 2→1, part 1→0.
+            scored_implicit.append(
+                ((score[0] - 1, score[1], score[2], score[3]), route)
+            )
+    if scored_implicit:
+        scored_implicit.sort(key=lambda item: item[0], reverse=True)
+        return scored_implicit[0][1], feedback_max_id
+    return None, feedback_max_id
 
 
 def best_feedback_route(
@@ -246,6 +318,8 @@ def best_feedback_route(
     root: Path,
     query: str,
     artifact_type: str | None,
+    min_confirmations: int = MIN_IMPLICIT_CONFIRMATIONS,
+    max_generic_queries: int = MAX_GENERIC_ARTIFACT_QUERIES,
 ) -> FeedbackRoute | None:
     """Return the strongest live route matching ``query``, or fail open."""
 
@@ -254,6 +328,8 @@ def best_feedback_route(
         root=root,
         query=query,
         artifact_type=artifact_type,
+        min_confirmations=min_confirmations,
+        max_generic_queries=max_generic_queries,
     )
     return route
 
@@ -350,6 +426,8 @@ def decide_feedback_route(
     db_path: Path,
     limit: int,
     search_index_fn: SearchIndexFn,
+    min_confirmations: int = MIN_IMPLICIT_CONFIRMATIONS,
+    max_generic_queries: int = MAX_GENERIC_ARTIFACT_QUERIES,
 ) -> RouteDecision:
     """Read and apply one route while retaining the route snapshot high-water."""
 
@@ -358,6 +436,8 @@ def decide_feedback_route(
         root=root,
         query=query,
         artifact_type=artifact_type,
+        min_confirmations=min_confirmations,
+        max_generic_queries=max_generic_queries,
     )
     return apply_feedback_route(
         rows,

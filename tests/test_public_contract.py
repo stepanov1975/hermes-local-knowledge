@@ -1920,6 +1920,7 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
         "cli.py",
         "config.py",
         "evaluation.py",
+        "implicit.py",
         "index.py",
         "indexer.py",
         "okf.py",

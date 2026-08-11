@@ -182,6 +182,8 @@ class LocalKnowledgeService:
                 db_path=target,
                 limit=limit,
                 search_index_fn=self._search_index_fn,
+                min_confirmations=self.config.implicit_feedback.min_confirmations,
+                max_generic_queries=self.config.implicit_feedback.max_generic_queries,
             )
         else:
             decision = apply_feedback_route(

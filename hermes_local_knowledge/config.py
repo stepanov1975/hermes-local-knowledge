@@ -10,7 +10,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-__all__ = ["Config", "IndexSettings", "OKFSettings", "resolve_config"]
+__all__ = [
+    "Config",
+    "IndexSettings",
+    "OKFSettings",
+    "ImplicitFeedbackSettings",
+    "resolve_config",
+]
 
 _CONFIG_SECTION = "local_knowledge"
 _ROOT_ENV = "LOCAL_KNOWLEDGE_ROOT"
@@ -50,6 +56,15 @@ class OKFSettings:
 
 
 @dataclass(frozen=True)
+class ImplicitFeedbackSettings:
+    """Settings for implicit usage feedback recorded from tool-call observation."""
+
+    enabled: bool = False
+    min_confirmations: int = 2
+    max_generic_queries: int = 5
+
+
+@dataclass(frozen=True)
 class Config:
     """Fully resolved local-knowledge configuration."""
 
@@ -58,6 +73,9 @@ class Config:
     state_dir: Path
     index_settings: IndexSettings
     okf: OKFSettings = field(default_factory=OKFSettings)
+    implicit_feedback: ImplicitFeedbackSettings = field(
+        default_factory=ImplicitFeedbackSettings
+    )
     source_root_source: str = "default"
     state_dir_source: str = "default"
     include_markdown_docs_source: str = "default"
@@ -324,6 +342,40 @@ def _resolve_okf_settings(section: Mapping[str, Any]) -> OKFSettings:
     )
 
 
+def _resolve_implicit_feedback_settings(
+    section: Mapping[str, Any],
+) -> ImplicitFeedbackSettings:
+    defaults = ImplicitFeedbackSettings()
+    nested = section.get("implicit_feedback", {})
+    implicit_section = nested if isinstance(nested, Mapping) else {}
+
+    def value(name: str, *, default: Any) -> Any:
+        return _first_value(
+            implicit_section,
+            name,
+            default=_first_value(section, f"implicit_feedback_{name}", default=default),
+        )
+
+    return ImplicitFeedbackSettings(
+        enabled=_coerce_bool(
+            value("enabled", default=defaults.enabled),
+            default=defaults.enabled,
+        ),
+        min_confirmations=_coerce_int(
+            value("min_confirmations", default=defaults.min_confirmations),
+            default=defaults.min_confirmations,
+            minimum=1,
+            maximum=100,
+        ),
+        max_generic_queries=_coerce_int(
+            value("max_generic_queries", default=defaults.max_generic_queries),
+            default=defaults.max_generic_queries,
+            minimum=1,
+            maximum=1000,
+        ),
+    )
+
+
 def _warnings(source_root_source: str, hermes_home: Path) -> tuple[str, ...]:
     if source_root_source != "default" or not (hermes_home / "hermes-agent").exists():
         return ()
@@ -431,6 +483,7 @@ def resolve_config(hermes_home: Path | str | None = None) -> Config:
         router_skill_path=router_skill_path,
         router_skill_path_source=router_skill_path_source,
         okf=_resolve_okf_settings(section),
+        implicit_feedback=_resolve_implicit_feedback_settings(section),
         source_root_source=source_root_source,
         state_dir_source=state_dir_source,
         include_markdown_docs_source=include_markdown_docs_source,

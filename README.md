@@ -130,6 +130,10 @@ local_knowledge:
     max_candidates_per_session: 2
     max_generation_seconds: 120
     min_use_count: 1
+  implicit_feedback:
+    enabled: false  # opt-in: record consumption of search results as useful
+    min_confirmations: 2
+    max_generic_queries: 5
 ```
 
 Canonical settings, aliases, and defaults:
@@ -152,8 +156,11 @@ Canonical settings, aliases, and defaults:
 | `okf.max_candidates_per_session` | flat `okf_max_candidates_per_session` | `2` |
 | `okf.max_generation_seconds` | flat `okf_max_generation_seconds`; `okf.max_worker_seconds` or flat `okf_max_worker_seconds` is a fallback when it is absent | `120` seconds |
 | `okf.min_use_count` | flat `okf_min_use_count` | `1` |
+| `implicit_feedback.enabled` | flat `implicit_feedback_enabled` | `false` |
+| `implicit_feedback.min_confirmations` | flat `implicit_feedback_min_confirmations` | `2` |
+| `implicit_feedback.max_generic_queries` | flat `implicit_feedback_max_generic_queries` | `5` |
 
-All nested `okf` keys also accept their flat `okf_*` form. YAML lists are preferred in `config.yaml`; comma-separated or bracket-list strings written by `hermes config set` are normalized.
+All nested `okf` keys also accept their flat `okf_*` form; all nested `implicit_feedback` keys accept their flat `implicit_feedback_*` form. YAML lists are preferred in `config.yaml`; comma-separated or bracket-list strings written by `hermes config set` are normalized.
 
 When `source_root` is omitted, runtime skills, cron jobs, and MCP configuration are still indexed from `$HERMES_HOME`, but arbitrary root-level Markdown is not included by default. Generated state belongs outside a source repository and must not be committed.
 
@@ -235,6 +242,8 @@ Managed searches may use one deterministic feedback prior when the index was bui
 
 `knowledge_usage_report` summarizes recent activity before changing ranking, triggers, source coverage, or graph edges.
 
+When `implicit_feedback.enabled` is true, a successful `knowledge_get` on an artifact that a recent same-session `knowledge_search` returned records an implicit `useful` confirmation (`origin='implicit'`) for that search's query and the consumed artifact. Implicit rows are gated: a query/artifact pair needs `min_confirmations` confirmations, an artifact confirmed for more than `max_generic_queries` distinct queries is treated as generic and ignored, explicit feedback always outranks implicit rows, and a newer explicit rejection still vetoes an older implicit confirmation. Implicit recording is best-effort and never raises.
+
 `evaluate` is read-only and intentionally measures the unassisted index ranking to avoid training/evaluation leakage. It replays positive local feedback against the current index and reports exact Hit@k/MRR plus parent-equivalent metrics. Parent equivalence is deliberately limited to a `skill_support_doc` and its owning skill; generic graph neighbors are not treated as successful equivalents.
 
 For historical comparisons from a source checkout:
@@ -282,6 +291,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and [`do
 - `telemetry.py` — local usage and feedback persistence/reporting.
 - `routing.py` — bounded live-root feedback matching, promotion, and one verified typed retry.
 - `evaluation.py` — read-only feedback-label replay and exact/parent-equivalent metrics.
+- `implicit.py` — implicit usage feedback derived from `post_tool_call` observations.
 - `service.py` — one resolved configuration's managed index and telemetry lifecycle.
 - `okf.py` — privacy-safe OKF queue, hooks, detached worker, validation, and fenced publication.
 - `plugin.py` — Hermes registration for five tools, two hooks, the bundled skill, and installed CLI adapter; `register` is its public export.

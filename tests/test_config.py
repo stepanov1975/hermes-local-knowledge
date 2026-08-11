@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 
 from hermes_local_knowledge import config as config_module
-from hermes_local_knowledge.config import Config, IndexSettings, OKFSettings, resolve_config
+from hermes_local_knowledge.config import (
+    Config,
+    ImplicitFeedbackSettings,
+    IndexSettings,
+    OKFSettings,
+    resolve_config,
+)
 
 
 def write_config(hermes_home: Path, body: str) -> None:
@@ -40,7 +46,13 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
 
     resolved = resolve_config(hermes_home)
 
-    assert config_module.__all__ == ["Config", "IndexSettings", "OKFSettings", "resolve_config"]
+    assert config_module.__all__ == [
+        "Config",
+        "IndexSettings",
+        "OKFSettings",
+        "ImplicitFeedbackSettings",
+        "resolve_config",
+    ]
     assert not hasattr(config_module, "RuntimeConfig")
     assert not hasattr(config_module, "OKFConfig")
     assert is_dataclass(Config)
@@ -50,6 +62,7 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
         "state_dir",
         "index_settings",
         "okf",
+        "implicit_feedback",
         "source_root_source",
         "state_dir_source",
         "include_markdown_docs_source",
@@ -69,6 +82,10 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
     assert resolved.warnings == ()
     assert resolved.router_skill_path is None
     assert resolved.router_skill_path_source == "default"
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings()
+    assert resolved.implicit_feedback.enabled is False
+    assert resolved.implicit_feedback.min_confirmations == 2
+    assert resolved.implicit_feedback.max_generic_queries == 5
     assert IndexSettings() == IndexSettings(
         custom_skill_dirs=("custom_skills",),
         script_dirs=("scripts", "hermes_home/scripts"),
@@ -480,3 +497,39 @@ def test_implicit_root_warning_is_conditional(
     configured_root = tmp_path / "configured-root"
     write_config(hermes_home, f"local_knowledge:\n  source_root: {configured_root}\n")
     assert resolve_config(hermes_home).warnings == ()
+
+
+def test_implicit_feedback_settings_override(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    write_config(
+        hermes_home,
+        "local_knowledge:\n"
+        "  implicit_feedback:\n"
+        "    enabled: true\n"
+        "    min_confirmations: 3\n"
+        "    max_generic_queries: 8\n",
+    )
+
+    resolved = resolve_config(hermes_home)
+
+    assert resolved.implicit_feedback.enabled is True
+    assert resolved.implicit_feedback.min_confirmations == 3
+    assert resolved.implicit_feedback.max_generic_queries == 8
+
+
+def test_implicit_feedback_settings_flat_aliases(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    write_config(
+        hermes_home,
+        "local_knowledge:\n"
+        "  implicit_feedback_enabled: true\n"
+        "  implicit_feedback_min_confirmations: 4\n",
+    )
+
+    resolved = resolve_config(hermes_home)
+
+    assert resolved.implicit_feedback.enabled is True
+    assert resolved.implicit_feedback.min_confirmations == 4
+    assert resolved.implicit_feedback.max_generic_queries == 5

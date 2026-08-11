@@ -21,6 +21,9 @@ FEEDBACK_RATINGS = {
     "other",
 }
 NEGATIVE_FEEDBACK_RATINGS = FEEDBACK_RATINGS - {"useful", "other"}
+EXPLICIT_FEEDBACK_ORIGIN = "explicit"
+IMPLICIT_FEEDBACK_ORIGIN = "implicit"
+FEEDBACK_ORIGINS = frozenset({EXPLICIT_FEEDBACK_ORIGIN, IMPLICIT_FEEDBACK_ORIGIN})
 LOOKUP_TOOLS = {"knowledge_search", "knowledge_get", "knowledge_neighbors"}
 GENERAL_TELEMETRY_TIMEOUT_SECONDS = 1.0
 
@@ -114,6 +117,7 @@ FEEDBACK_COLUMNS: dict[str, str] = {
     "expected_artifact_id": "TEXT",
     "resolves_feedback_id": "INTEGER",
     "linkage_status": "TEXT NOT NULL DEFAULT 'legacy'",
+    "origin": "TEXT NOT NULL DEFAULT 'explicit'",
 }
 
 
@@ -208,7 +212,8 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             root TEXT,
             expected_artifact_id TEXT,
             resolves_feedback_id INTEGER,
-            linkage_status TEXT NOT NULL DEFAULT 'legacy'
+            linkage_status TEXT NOT NULL DEFAULT 'legacy',
+            origin TEXT NOT NULL DEFAULT 'explicit'
         )
         """
     )
@@ -370,12 +375,15 @@ def _record_feedback(
     artifact_exists: Callable[[str], bool] | None = None,
     usage_started_at: float | None = None,
     usage_db_path: Path | None = None,
+    origin: str = EXPLICIT_FEEDBACK_ORIGIN,
 ) -> tuple[int, int]:
     root_text = str(root)
     canonical_query = _exact_text(query).strip()
     artifact_id = _exact_text(artifact_id).strip()
     expected_artifact_id = _exact_text(expected_artifact_id).strip()
     note = _exact_text(note)
+    if origin not in FEEDBACK_ORIGINS:
+        raise ValueError(f"origin must be one of: {', '.join(sorted(FEEDBACK_ORIGINS))}")
     conn: sqlite3.Connection | None = None
     try:
         conn = _usage_connect(root, usage_db_path, initialize=False)
@@ -446,6 +454,13 @@ def _record_feedback(
             raise ValueError(
                 "expected_artifact_id and resolves_feedback_id require replayable search feedback"
             )
+        if origin == IMPLICIT_FEEDBACK_ORIGIN:
+            if rating != "useful":
+                raise ValueError("implicit feedback requires rating='useful'")
+            if expected_artifact_id or resolves_feedback_id is not None:
+                raise ValueError("implicit feedback does not support explicit resolutions")
+            if event is None or str(event["tool"] or "") != "knowledge_search":
+                raise ValueError("implicit feedback requires a successful search event")
         if expected_artifact_id:
             if rating not in NEGATIVE_FEEDBACK_RATINGS:
                 raise ValueError("expected_artifact_id requires a negative search-quality rating")
@@ -518,8 +533,8 @@ def _record_feedback(
             INSERT INTO feedback (
                 ts, event_id, rating, query, artifact_id, note,
                 session_id, task_id, tool_call_id, root, expected_artifact_id,
-                resolves_feedback_id, linkage_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                resolves_feedback_id, linkage_status, origin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 timestamp,
@@ -535,6 +550,7 @@ def _record_feedback(
                 expected_artifact_id or None,
                 resolves_feedback_id,
                 linkage_status,
+                origin,
             ),
         )
         latency_ms = (
@@ -587,6 +603,38 @@ def _record_feedback(
     finally:
         if conn is not None:
             conn.close()
+
+def record_implicit_feedback(
+    root: Path,
+    *,
+    search_event_id: int,
+    query: str,
+    artifact_id: str,
+    context: dict[str, str],
+    usage_db_path: Path | None = None,
+) -> int | None:
+    """Record one implicit useful confirmation for a consumed search result.
+
+    The post_tool_call hook must stay silent under any failure: database
+    lock, missing event, or a result page that no longer contains the
+    artifact all simply produce no feedback.
+    """
+
+    try:
+        feedback_id, _usage_event_id = _record_feedback(
+            root,
+            rating="useful",
+            event_id=search_event_id,
+            query=query,
+            artifact_id=artifact_id,
+            note="implicit (auto-recorded from artifact consumption)",
+            context=context,
+            usage_db_path=usage_db_path,
+            origin=IMPLICIT_FEEDBACK_ORIGIN,
+        )
+        return feedback_id
+    except Exception:
+        return None
 
 def _rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
     return [dict(row) for row in conn.execute(sql, params).fetchall()]

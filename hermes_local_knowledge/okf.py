@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config, resolve_config
+from .implicit import on_post_tool_call as _on_post_tool_call_implicit_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -1645,28 +1646,27 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         return
     try:
         cfg = resolve_config()
-        if not cfg.okf.enabled:
-            return
-        tool_name = kwargs.get("tool_name")
-        if not isinstance(tool_name, str) or not tool_name:
-            return
-        args = kwargs.get("args")
-        if not isinstance(args, dict):
-            args = {}
-        success, error_type, error_message = _classify_hook_outcome(kwargs)
-        toolset, schema = _tool_metadata(tool_name)
-        upsert_tool_candidate(
-            cfg.state_dir,
-            tool_name=tool_name,
-            toolset=toolset,
-            schema=schema,
-            args=args,
-            success=success,
-            error_type=error_type,
-            error_message=error_message,
-        )
+        if cfg.okf.enabled:
+            tool_name = kwargs.get("tool_name")
+            if isinstance(tool_name, str) and tool_name:
+                args = kwargs.get("args")
+                if not isinstance(args, dict):
+                    args = {}
+                success, error_type, error_message = _classify_hook_outcome(kwargs)
+                toolset, schema = _tool_metadata(tool_name)
+                upsert_tool_candidate(
+                    cfg.state_dir,
+                    tool_name=tool_name,
+                    toolset=toolset,
+                    schema=schema,
+                    args=args,
+                    success=success,
+                    error_type=error_type,
+                    error_message=error_message,
+                )
     except Exception:
         logger.exception("Failed to record local-knowledge OKF tool candidate")
+    _on_post_tool_call_implicit_feedback(**kwargs)
 
 
 def _worker_command(cfg: Config) -> list[str]:
