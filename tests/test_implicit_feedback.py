@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from hermes_local_knowledge.config import Config, ImplicitFeedbackSettings, IndexSettings
 from hermes_local_knowledge.evaluation import load_positive_feedback_labels
-from hermes_local_knowledge.implicit import on_post_tool_call
+from hermes_local_knowledge.implicit import on_post_tool_call, on_pre_llm_call, on_session_end
 from hermes_local_knowledge import plugin
 from hermes_local_knowledge.routing import decide_feedback_route
 from hermes_local_knowledge.telemetry import _record_feedback, _record_usage, _usage_report
@@ -23,21 +26,39 @@ def _config(tmp_path: Path, *, enabled: bool = True) -> Config:
     )
 
 
-def _search(config: Config, *, session: str, task: str, query: str = "docker update progress") -> int:
+def _search(
+    config: Config,
+    *,
+    session: str,
+    task: str,
+    turn: str = "turn-1",
+    query: str = "docker update progress",
+    top_ids: list[str] | None = None,
+    baseline_top_ids: list[str] | None = None,
+) -> int:
+    top_ids = top_ids or ["runbook:target", "runbook:other"]
     event_id = _record_usage(
         config.source_root,
         tool="knowledge_search",
         success=True,
         query=query,
-        top_ids=["runbook:target", "runbook:other"],
-        context={"session_id": session, "task_id": task},
+        top_ids=top_ids,
+        baseline_top_ids=top_ids if baseline_top_ids is None else baseline_top_ids,
+        context={"session_id": session, "task_id": task, "turn_id": turn},
         usage_db_path=config.state_dir / "usage.sqlite",
     )
     assert event_id is not None
     return event_id
 
 
-def _consume(monkeypatch, config: Config, *, session: str, task: str) -> None:
+def _consume(
+    monkeypatch,
+    config: Config,
+    *,
+    session: str,
+    task: str,
+    turn: str = "turn-1",
+) -> None:
     monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
     on_post_tool_call(
         tool_name="knowledge_get",
@@ -45,6 +66,7 @@ def _consume(monkeypatch, config: Config, *, session: str, task: str) -> None:
         result=json.dumps({"success": True}),
         session_id=session,
         task_id=task,
+        turn_id=turn,
     )
 
 
@@ -78,6 +100,150 @@ def test_same_search_consumption_is_idempotent(tmp_path: Path, monkeypatch) -> N
         assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 1
 
 
+def test_lifecycle_turn_context_supports_bridge_hooks_missing_turn_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    event_id = _record_usage(
+        config.source_root,
+        tool="knowledge_search",
+        success=True,
+        query="docker update progress",
+        top_ids=["runbook:target"],
+        baseline_top_ids=["runbook:target"],
+        context={"session_id": "s1", "task_id": "t1"},
+        usage_db_path=config.state_dir / "usage.sqlite",
+    )
+    assert event_id is not None
+    monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
+    on_pre_llm_call(session_id="s1", task_id="t1", turn_id="turn-1")
+    try:
+        on_post_tool_call(
+            tool_name="knowledge_search",
+            args={"query": "docker update progress"},
+            result=json.dumps({"success": True, "usage_event_id": event_id}),
+            session_id="s1",
+            task_id="t1",
+        )
+        on_post_tool_call(
+            tool_name="knowledge_get",
+            args={"artifact_id": "runbook:target"},
+            result=json.dumps({"success": True}),
+            session_id="s1",
+            task_id="t1",
+        )
+    finally:
+        on_session_end()
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute(
+            "SELECT turn_id FROM usage_events WHERE id = ?", (event_id,)
+        ).fetchone() == ("turn-1",)
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 1
+
+
+def test_lifecycle_turn_context_requires_matching_session_and_task(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    event_id = _record_usage(
+        config.source_root,
+        tool="knowledge_search",
+        success=True,
+        query="docker update progress",
+        top_ids=["runbook:target"],
+        baseline_top_ids=["runbook:target"],
+        context={"session_id": "s1", "task_id": "other-task"},
+        usage_db_path=config.state_dir / "usage.sqlite",
+    )
+    assert event_id is not None
+    monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
+    on_pre_llm_call(session_id="s1", task_id="t1", turn_id="turn-1")
+    try:
+        on_post_tool_call(
+            tool_name="knowledge_search",
+            result=json.dumps({"success": True, "usage_event_id": event_id}),
+            session_id="s1",
+            task_id="other-task",
+        )
+    finally:
+        on_session_end()
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute(
+            "SELECT turn_id FROM usage_events WHERE id = ?", (event_id,)
+        ).fetchone() == (None,)
+
+
+def test_session_end_clears_lifecycle_turn_context(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    _search(config, session="s1", task="t1", turn="turn-1")
+    monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
+    on_pre_llm_call(session_id="s1", task_id="t1", turn_id="turn-1")
+    on_session_end()
+
+    on_post_tool_call(
+        tool_name="knowledge_get",
+        args={"artifact_id": "runbook:target"},
+        result=json.dumps({"success": True}),
+        session_id="s1",
+        task_id="t1",
+    )
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
+def test_different_turn_does_not_credit_recent_search(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    _search(config, session="s1", task="t1", turn="search-turn")
+
+    _consume(monkeypatch, config, session="s1", task="t1", turn="later-turn")
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
+def test_route_only_result_does_not_create_implicit_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    _search(
+        config,
+        session="s1",
+        task="t1",
+        top_ids=["runbook:target", "runbook:other"],
+        baseline_top_ids=["runbook:other"],
+    )
+
+    _consume(monkeypatch, config, session="s1", task="t1")
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
+def test_search_from_another_root_does_not_create_implicit_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    event_id = _record_usage(
+        tmp_path / "old-root",
+        tool="knowledge_search",
+        success=True,
+        query="docker update progress",
+        top_ids=["runbook:target"],
+        baseline_top_ids=["runbook:target"],
+        context={"session_id": "s1", "task_id": "t1", "turn_id": "turn-1"},
+        usage_db_path=config.state_dir / "usage.sqlite",
+    )
+    assert event_id is not None
+
+    _consume(monkeypatch, config, session="s1", task="t1")
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
 def test_semantically_failed_get_is_not_positive_evidence(tmp_path: Path, monkeypatch) -> None:
     config = _config(tmp_path)
     _search(config, session="s1", task="t1")
@@ -97,6 +263,7 @@ def test_semantically_failed_get_is_not_positive_evidence(tmp_path: Path, monkey
         ),
         session_id="s1",
         task_id="t1",
+        turn_id="turn-1",
     )
 
     with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
@@ -123,6 +290,67 @@ def test_requires_two_distinct_searches_before_routing(tmp_path: Path, monkeypat
     )
     assert report["feedback_count"] == 0
     assert report["implicit_feedback_count"] == 2
+
+
+def test_exact_implicit_route_tie_is_stable_across_hash_seeds(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    usage_db = config.state_dir / "usage.sqlite"
+    _search(config, session="s1", task="t1")
+    with sqlite3.connect(usage_db) as connection:
+        connection.executemany(
+            """
+            INSERT INTO implicit_feedback (
+                ts, search_event_id, query, artifact_id, session_id, task_id, root
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "2026-08-12T00:00:00+00:00",
+                    search_event_id,
+                    "docker update progress",
+                    artifact_id,
+                    "s1",
+                    "t1",
+                    str(config.source_root),
+                )
+                for artifact_id in ("runbook:a", "runbook:b")
+                for search_event_id in (
+                    100 + (0 if artifact_id == "runbook:a" else 10),
+                    101 + (0 if artifact_id == "runbook:a" else 10),
+                )
+            ],
+        )
+
+    script = """
+import sys
+from pathlib import Path
+from hermes_local_knowledge.routing import _implicit_feedback_route
+
+route = _implicit_feedback_route(
+    Path(sys.argv[1]),
+    root=Path(sys.argv[2]),
+    query="docker update progress",
+    artifact_type=None,
+    min_confirmations=2,
+    max_generic_queries=5,
+)
+print(route.artifact_id if route else "")
+"""
+    winners = set()
+    for seed in ("1", "2", "3", "4", "random"):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(usage_db), str(config.source_root)],
+            cwd=Path(__file__).resolve().parents[1],
+            env={**os.environ, "PYTHONHASHSEED": seed, "PYTHONDONTWRITEBYTECODE": "1"},
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        winners.add(result.stdout.strip())
+
+    assert winners == {"runbook:b"}
 
 
 def test_overly_generic_artifact_is_not_promoted(tmp_path: Path, monkeypatch) -> None:
@@ -197,7 +425,7 @@ def test_latest_eligible_search_can_precede_a_refinement(tmp_path: Path, monkeyp
         success=True,
         query="docker narrower refinement",
         top_ids=["runbook:other"],
-        context={"session_id": "s1", "task_id": "wanted"},
+        context={"session_id": "s1", "task_id": "wanted", "turn_id": "turn-1"},
         usage_db_path=config.state_dir / "usage.sqlite",
     )
 

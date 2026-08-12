@@ -568,13 +568,14 @@ def test_v042_schema_migrates_additively_and_rollback_writer_gets_legacy_default
         usage_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(usage_events)")}
         feedback_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(feedback)")}
         assert {
-            "baseline_top_ids_json", "route_feedback_id", "route_artifact_id", "route_outcome",
+            "turn_id", "baseline_top_ids_json", "route_feedback_id", "route_artifact_id", "route_outcome",
             "index_jsonl_sha256", "index_format_version", "feedback_max_id",
         } <= usage_columns
         assert {"expected_artifact_id", "resolves_feedback_id", "linkage_status"} <= feedback_columns
         assert conn.execute(
-            "SELECT feedback_max_id, baseline_top_ids_json, route_outcome FROM usage_events WHERE id=1"
-        ).fetchone() == (-1, "[]", "none")
+            "SELECT turn_id, feedback_max_id, baseline_top_ids_json, route_outcome "
+            "FROM usage_events WHERE id=1"
+        ).fetchone() == (None, -1, "[]", "none")
         assert conn.execute("SELECT linkage_status FROM feedback WHERE id=1").fetchone() == ("legacy",)
         indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(feedback)")}
         assert {"idx_feedback_resolution_unique", "idx_feedback_route_lookup"} <= indexes
@@ -584,9 +585,10 @@ def test_v042_schema_migrates_additively_and_rollback_writer_gets_legacy_default
             (str(root),),
         )
         rollback = conn.execute(
-            "SELECT feedback_max_id, baseline_top_ids_json, route_outcome FROM usage_events WHERE ts='rollback'"
+            "SELECT turn_id, feedback_max_id, baseline_top_ids_json, route_outcome "
+            "FROM usage_events WHERE ts='rollback'"
         ).fetchone()
-    assert rollback == (-1, "[]", "none")
+    assert rollback == (None, -1, "[]", "none")
 
 
 def test_usage_report_classifies_linkage_explicit_resolution_and_candidate_quality(

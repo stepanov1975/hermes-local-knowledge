@@ -66,6 +66,7 @@ USAGE_EVENT_COLUMNS: dict[str, str] = {
     "client": "TEXT NOT NULL DEFAULT 'native'",
     "session_id": "TEXT",
     "task_id": "TEXT",
+    "turn_id": "TEXT",
     "tool_call_id": "TEXT",
     "query": "TEXT",
     "artifact_id": "TEXT",
@@ -155,6 +156,7 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             client TEXT NOT NULL DEFAULT 'native',
             session_id TEXT,
             task_id TEXT,
+            turn_id TEXT,
             tool_call_id TEXT,
             query TEXT,
             artifact_id TEXT,
@@ -310,7 +312,7 @@ def _record_usage(
             cur = conn.execute(
                 """
                 INSERT INTO usage_events (
-                    ts, tool, client, session_id, task_id, tool_call_id, query,
+                    ts, tool, client, session_id, task_id, turn_id, tool_call_id, query,
                     artifact_id, artifact_type, limit_value, rebuild_requested,
                     rebuilt, success, error, result_count, top_ids_json,
                     top_types_json, baseline_top_ids_json, route_feedback_id,
@@ -321,7 +323,7 @@ def _record_usage(
                     index_artifact_counts_json, index_metadata_error,
                     build_duration_ms, root, db_path, index_jsonl_sha256,
                     index_format_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now(),
@@ -329,6 +331,7 @@ def _record_usage(
                     _clean_text(client, limit=40) or "native",
                     context.get("session_id") or None,
                     context.get("task_id") or None,
+                    context.get("turn_id") or None,
                     context.get("tool_call_id") or None,
                     _exact_text(query) or None,
                     _exact_text(artifact_id) or None,
@@ -374,6 +377,48 @@ def _record_usage(
     except Exception:
         # Telemetry must never break the lookup tools.
         return None
+
+
+def attach_usage_event_turn_id(
+    root: Path,
+    *,
+    event_id: int,
+    session_id: str,
+    task_id: str,
+    turn_id: str,
+    usage_db_path: Path,
+) -> bool:
+    """Attach host turn identity to a search event created by the tool handler."""
+
+    clean_session_id = _clean_text(session_id, limit=128)
+    clean_task_id = _clean_text(task_id, limit=128)
+    clean_turn_id = _clean_text(turn_id, limit=128)
+    if event_id <= 0 or not clean_session_id or not clean_task_id or not clean_turn_id:
+        return False
+    conn = _usage_connect(root, usage_db_path, initialize=False)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _init_usage_db(conn)
+        cursor = conn.execute(
+            """
+            UPDATE usage_events
+            SET turn_id = ?
+            WHERE id = ? AND tool = 'knowledge_search' AND success = 1
+              AND root = ? AND session_id = ? AND task_id = ?
+              AND (turn_id IS NULL OR turn_id = '')
+            """,
+            (
+                clean_turn_id,
+                event_id,
+                str(root),
+                clean_session_id,
+                clean_task_id,
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
 
 
 def record_implicit_feedback(

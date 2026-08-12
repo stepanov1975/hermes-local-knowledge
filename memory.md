@@ -7,7 +7,7 @@ Durable product, ranking, privacy, and state rationale for `hermes-local-knowled
 - The plugin routes a local question to a **whole artifact**: a skill, skill support document, script, memory document, runbook, generic document, cron job, MCP server, or generated tool OKF.
 - It answers “which artifact should be inspected first?” It does not replace reading that artifact and is not chunk RAG.
 - Runtime dependencies remain standard-library-only. Generated state is local-only.
-- Stable boundaries are the `hermes_local_knowledge.plugin` entry point and `register`, the five documented tools/two hooks, the documented CLI/config behavior, and the eight names in `indexer.__all__`.
+- Stable boundaries are the `hermes_local_knowledge.plugin` entry point and `register`, the five documented tools/four hooks, the documented CLI/config behavior, and the eight names in `indexer.__all__`.
 
 ## Ownership
 

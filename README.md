@@ -38,9 +38,9 @@ The plugin registers these native tools in the `local_knowledge` toolset:
 | `knowledge_feedback` | Record local lookup feedback such as `useful`, `missing`, `stale`, or `wrong_artifact`. |
 | `knowledge_usage_report` | Summarize local usage, failures, zero-result queries, and feedback. |
 
-The plugin also registers `post_tool_call` and `on_session_finalize` hooks for optional implicit search-result feedback and tool-OKF capture/generation.
+The plugin also registers `pre_llm_call`, `post_tool_call`, `on_session_end`, and `on_session_finalize` hooks for optional same-turn implicit search-result feedback and tool-OKF capture/generation. The turn lifecycle hooks keep correlation inside the plugin when Hermes dispatches local-knowledge tools through its deferred-tool bridge.
 
-Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed after distinct matching searches:
+Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed from the unassisted results of distinct matching searches in their respective Hermes turns:
 
 ```yaml
 local_knowledge:
@@ -299,7 +299,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and [`do
 - `evaluation.py` — read-only feedback-label replay and exact/parent-equivalent metrics.
 - `service.py` — one resolved configuration's managed index and telemetry lifecycle.
 - `okf.py` — privacy-safe OKF queue, hooks, detached worker, validation, and fenced publication.
-- `plugin.py` — Hermes registration for five tools, two hooks, the bundled skill, and installed CLI adapter; `register` is its public export.
+- `plugin.py` — Hermes registration for five tools, four hooks, the bundled skill, and installed CLI adapter; `register` is its public export.
 - `cli.py` — primary standalone command surface and the smaller Hermes CLI adapter.
 - `indexer.py` — thin compatibility facade exporting exactly `Artifact`, `Edge`, `IndexSettings`, `build_index`, `search_index`, `get_artifact`, `get_neighbors`, and `main`.
 - `__init__.py` — package version.

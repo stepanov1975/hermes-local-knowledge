@@ -12,6 +12,8 @@ from typing import Any
 from . import index
 from .config import resolve_config
 from .implicit import on_post_tool_call as _on_implicit_post_tool_call
+from .implicit import on_pre_llm_call as _on_implicit_pre_llm_call
+from .implicit import on_session_end as _on_implicit_session_end
 from .okf import _on_post_tool_call as _on_okf_post_tool_call
 from .okf import _on_session_finalize
 from .routing import ROUTING_TRACE_METADATA_KEY, SearchRoutingTrace
@@ -851,5 +853,7 @@ def register(ctx: Any) -> None:
     _register_cli(ctx)
     register_hook = getattr(ctx, "register_hook", None)
     if register_hook is not None:
+        register_hook("pre_llm_call", _on_implicit_pre_llm_call)
         register_hook("post_tool_call", _on_post_tool_call)
+        register_hook("on_session_end", _on_implicit_session_end)
         register_hook("on_session_finalize", _on_session_finalize)

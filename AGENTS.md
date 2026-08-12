@@ -13,7 +13,7 @@ These instructions apply to the whole repository.
 
 - Package version is synchronized in `plugin.yaml`, `pyproject.toml`, and `hermes_local_knowledge/__init__.py`.
 - The Python plugin entry point is `local_knowledge = hermes_local_knowledge.plugin`; `plugin.register` is the registration boundary.
-- Registration provides exactly five native tools (`knowledge_search`, `knowledge_get`, `knowledge_neighbors`, `knowledge_feedback`, `knowledge_usage_report`) and two hooks (`post_tool_call`, `on_session_finalize`).
+- Registration provides exactly five native tools (`knowledge_search`, `knowledge_get`, `knowledge_neighbors`, `knowledge_feedback`, `knowledge_usage_report`) and four hooks (`pre_llm_call`, `post_tool_call`, `on_session_end`, `on_session_finalize`).
 - `indexer.__all__` is exactly: `Artifact`, `Edge`, `IndexSettings`, `build_index`, `search_index`, `get_artifact`, `get_neighbors`, `main`.
 - `python -m hermes_local_knowledge.cli` is the primary standalone CLI. `python -m hermes_local_knowledge.indexer` is the preserved compatibility entry point. `hermes local-knowledge` is the smaller install/doctor surface; its worker command is host-internal.
 - Preserve documented configuration aliases and defaults. Do not preserve undocumented private call shapes merely because a test once patched them.
@@ -45,7 +45,7 @@ These instructions apply to the whole repository.
 - `$HERMES_HOME/skills/.archive` is excluded from active routing.
 - Feedback/evaluation data stays local. Keep public docs/tests free of raw telemetry and private content.
 - Feedback-assisted routing is current-index-root-only and bounded to the latest significant explicit query/artifact rating. Only `useful` is positive; a newer rejection for the route or matching current query vetoes an older overlapping positive. Promote an artifact only when the current index returns it, with at most one no-longer-than-current artifact-type retry. Explicit caller-owned indexes remain unassisted.
-- Optional implicit routing uses recent same-task search-result consumption, deduplicates one search/artifact pair, and requires confirmations from distinct search events. Mature evidence from too many query shapes is treated as generic. Explicit routes take precedence, and implicit evidence never becomes an evaluation label or unbounded historical replay input.
+- Optional implicit routing uses recent same-turn baseline search-result consumption, deduplicates one search/artifact pair, and requires confirmations from distinct search events. Route-assisted-only results are not evidence. Mature evidence from too many query shapes is treated as generic. Explicit routes take precedence, and implicit evidence never becomes an evaluation label or unbounded historical replay input.
 - Read-only evaluation measures the unassisted index ranking. Do not train on and score the same feedback replay.
 
 ## State and concurrency invariants

@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
-- Added opt-in implicit routing feedback when an artifact is consumed after a recent same-task search. Confirmations are deduplicated per search event, require distinct searches, and stop promoting artifacts mature across too many query shapes; explicit feedback remains authoritative and implicit evidence stays outside evaluation labels. Inspired by the proposal and implementation work in [PR #27](https://github.com/stepanov1975/hermes-local-knowledge/pull/27) by [@xXLODXx](https://github.com/xXLODXx).
+- Added opt-in implicit routing feedback when an artifact is consumed from a recent same-turn baseline search. Confirmations are deduplicated per search event, require distinct searches, and stop promoting artifacts mature across too many query shapes; route-assisted-only results do not create evidence, explicit feedback remains authoritative, and implicit evidence stays outside evaluation labels. Inspired by the proposal and implementation work in [PR #27](https://github.com/stepanov1975/hermes-local-knowledge/pull/27) by [@xXLODXx](https://github.com/xXLODXx).
 
 [0.4.6]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.5...v0.4.6
 

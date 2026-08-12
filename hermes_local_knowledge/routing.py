@@ -345,7 +345,11 @@ def _implicit_feedback_route(
         score = _match_score(route, query, current_terms)
         if score is not None:
             candidates.append((score, route))
-    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+    return (
+        max(candidates, key=lambda item: (item[0], item[1].artifact_id))[1]
+        if candidates
+        else None
+    )
 
 
 def best_feedback_route(
