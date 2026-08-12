@@ -170,13 +170,20 @@ def _feedback_route_snapshot(
                 (str(root),),
             ).fetchone()
             feedback_max_id = int(high_water_row[0])
+            # Legacy databases created before the `origin` column was added
+            # (telemetry._ensure_columns migrates it on the next write) still
+            # route: detect the column and fall back to explicit rows instead
+            # of letting the SELECT raise and dropping every feedback route.
+            legacy_schema = "origin" not in {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(feedback)")
+            }
+            origin_expression = "" if legacy_schema else ", f.origin"
             rows = connection.execute(
-                """
+                f"""
                 SELECT f.id,
                        f.rating,
                        COALESCE(NULLIF(TRIM(f.query), ''), e.query) AS effective_query,
-                       f.artifact_id,
-                       f.origin
+                       f.artifact_id{origin_expression}
                 FROM feedback AS f
                 LEFT JOIN usage_events AS e ON e.id = f.event_id
                 WHERE f.root = ?
@@ -208,7 +215,7 @@ def _feedback_route_snapshot(
         query_key = _feedback_query_key(accepted_query, accepted_terms)
         if not accepted_terms:
             continue
-        origin = str(row["origin"] or EXPLICIT_FEEDBACK_ORIGIN)
+        origin = str(row["origin"] or EXPLICIT_FEEDBACK_ORIGIN) if "origin" in row.keys() else EXPLICIT_FEEDBACK_ORIGIN
         if origin == IMPLICIT_FEEDBACK_ORIGIN:
             if str(row["rating"]) != "useful":
                 continue

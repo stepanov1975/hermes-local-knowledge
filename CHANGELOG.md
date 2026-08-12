@@ -9,6 +9,7 @@ All notable changes to this project are documented in this file.
 - Added opt-in implicit usage feedback: when the agent consumes a search result (`knowledge_get` on an artifact returned by a recent same-session `knowledge_search`), a `useful` confirmation is recorded automatically with `origin='implicit'`. Explicit `knowledge_feedback` remains authoritative and outranks implicit rows.
 - Implicit rows only train routing after two gates: a query/artifact pair needs `min_confirmations` (default 2) implicit confirmations, and an artifact confirmed for more than `max_generic_queries` (default 5) distinct queries is treated as generic and ignored. A newer explicit rejection still vetoes an older implicit confirmation.
 - Added `local_knowledge.implicit_feedback` settings (`enabled` defaults to `false`, `min_confirmations`, `max_generic_queries`). The `feedback` table gains an additive `origin` column (default `'explicit'`); existing databases migrate in place.
+- Fixed routing on legacy databases: `_feedback_route_snapshot` now detects a `feedback` table without the `origin` column (pre-migration schema) and treats all rows as explicit instead of dropping every feedback route on the first search after an upgrade.
 
 [0.4.6]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.5...v0.4.6
 

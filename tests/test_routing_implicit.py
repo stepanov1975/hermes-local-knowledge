@@ -273,3 +273,76 @@ def test_implicit_route_respects_artifact_type_filter(tmp_path: Path) -> None:
     )
     assert route is not None
     assert route.artifact_id == "runbook:target"
+
+
+def test_legacy_schema_without_origin_column_still_routes_explicit_feedback(
+    tmp_path: Path,
+) -> None:
+    """Regression: a database created before the ``origin`` column was added
+    must still route explicit feedback (Codex review P2, PR #27).
+
+    On upgraded profiles the schema migration runs on the next telemetry
+    write, so the first managed search after an upgrade hits the old schema.
+    Selecting ``f.origin`` there raised ``no such column``, which the broad
+    ``sqlite3.Error`` path swallowed and turned into "no route" — silently
+    dropping every existing explicit feedback route.
+    """
+
+    import sqlite3
+
+    root = tmp_path / "root"
+    usage_db_path = tmp_path / "state" / "usage.sqlite"
+    usage_db_path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(usage_db_path)
+    try:
+        # Minimal legacy schema: feedback table WITHOUT the origin column,
+        # plus the usage_events table the snapshot query left-joins to.
+        connection.execute(
+            """
+            CREATE TABLE feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL DEFAULT '',
+                root TEXT NOT NULL,
+                query TEXT NOT NULL DEFAULT '',
+                rating TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                event_id INTEGER,
+                note TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL DEFAULT '',
+                tool TEXT NOT NULL DEFAULT '',
+                client TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL DEFAULT '',
+                top_ids_json TEXT NOT NULL DEFAULT '[]',
+                success INTEGER NOT NULL DEFAULT 0,
+                root TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO feedback (root, query, rating, artifact_id)
+            VALUES (?, 'docker image version report', 'useful', 'runbook:legacy')
+            """,
+            (str(root),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    route = best_feedback_route(
+        usage_db_path,
+        root=root,
+        query="docker image version report",
+        artifact_type=None,
+    )
+
+    assert route is not None
+    assert route.artifact_id == "runbook:legacy"
