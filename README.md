@@ -38,7 +38,19 @@ The plugin registers these native tools in the `local_knowledge` toolset:
 | `knowledge_feedback` | Record local lookup feedback such as `useful`, `missing`, `stale`, or `wrong_artifact`. |
 | `knowledge_usage_report` | Summarize local usage, failures, zero-result queries, and feedback. |
 
-The plugin also registers `post_tool_call` and `on_session_finalize` hooks for optional tool-OKF capture and generation.
+The plugin also registers `post_tool_call` and `on_session_finalize` hooks for optional implicit search-result feedback and tool-OKF capture/generation.
+
+Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed after distinct matching searches:
+
+```yaml
+local_knowledge:
+  implicit_feedback:
+    enabled: true
+    min_confirmations: 2
+    max_generic_queries: 5
+```
+
+Only a recent search from the same Hermes task is eligible. Repeated gets from one search are deduplicated, and overly generic artifacts stop receiving implicit promotion. Explicit feedback remains authoritative, and implicit evidence is not used as evaluation ground truth.
 
 ## Install and model consent
 
@@ -152,6 +164,9 @@ Canonical settings, aliases, and defaults:
 | `okf.max_candidates_per_session` | flat `okf_max_candidates_per_session` | `2` |
 | `okf.max_generation_seconds` | flat `okf_max_generation_seconds`; `okf.max_worker_seconds` or flat `okf_max_worker_seconds` is a fallback when it is absent | `120` seconds |
 | `okf.min_use_count` | flat `okf_min_use_count` | `1` |
+| `implicit_feedback.enabled` | — | `false` |
+| `implicit_feedback.min_confirmations` | — | `2` |
+| `implicit_feedback.max_generic_queries` | — | `5` |
 
 All nested `okf` keys also accept their flat `okf_*` form. YAML lists are preferred in `config.yaml`; comma-separated or bracket-list strings written by `hermes config set` are normalized.
 

@@ -149,6 +149,13 @@ def create_provenance_usage_db(path: Path, live_root: Path, unrelated_root: Path
             );
             """
         )
+        conn.execute(
+            "CREATE TABLE implicit_feedback (id INTEGER PRIMARY KEY, root TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO implicit_feedback (id, root) VALUES (1, ?)",
+            (str(live_root),),
+        )
         conn.executemany(
             """
             INSERT INTO usage_events (
@@ -568,6 +575,7 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
     with sqlite3.connect(Path(baseline_states["bound-0"]) / "usage.sqlite") as conn:
         assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (3,)
         assert conn.execute("SELECT id FROM feedback ORDER BY id").fetchall() == [(4,)]
+        assert conn.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone() == (0,)
     with sqlite3.connect(Path(baseline_states["bound-2"]) / "usage.sqlite") as conn:
         assert conn.execute("SELECT id FROM usage_events ORDER BY id").fetchall() == [(1,), (2,), (3,)]
         assert conn.execute("SELECT id FROM feedback ORDER BY id").fetchall() == [(1,), (2,), (4,)]

@@ -649,6 +649,10 @@ def _prepare_production_states(
                         feedback_max_id=feedback_max_id,
                         root=layout.source_root,
                     )
+                # Historical events have an explicit-feedback high-water only.
+                # Do not leak later implicit routing signals into an exact replay.
+                if _table_columns(conn, "implicit_feedback"):
+                    conn.execute("DELETE FROM implicit_feedback")
                 conn.commit()
             finally:
                 conn.close()

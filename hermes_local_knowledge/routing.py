@@ -41,7 +41,7 @@ class FeedbackRoute:
     artifact_id: str
     artifact_type: str
     terms: frozenset[str]
-    feedback_id: int
+    feedback_id: int | None
 
 
 class RouteOutcome(str, Enum):
@@ -78,6 +78,8 @@ class NegativeFeedback:
     """One current explicit rejection used only to suppress an older route."""
 
     query_key: str
+    query: str
+    terms: frozenset[str]
     artifact_id: str
     feedback_id: int
 
@@ -90,6 +92,16 @@ def _connect_readonly(path: Path) -> sqlite3.Connection:
     )
     connection.execute(f"PRAGMA busy_timeout={FEEDBACK_BUSY_TIMEOUT_MS}")
     return connection
+
+
+def _has_table(connection: sqlite3.Connection, table: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
 
 
 def _normalized_query(query: str) -> str:
@@ -112,7 +124,7 @@ def _match_score(
     query_terms: frozenset[str],
 ) -> tuple[int, int, int, int] | None:
     if _normalized_query(route.query) == _normalized_query(query):
-        return (2, len(route.terms), len(route.terms), route.feedback_id)
+        return (2, len(route.terms), len(route.terms), route.feedback_id or 0)
     if '"' in route.query or '"' in query:
         return None
     if len(route.terms) < MIN_ROUTE_TERMS:
@@ -125,7 +137,7 @@ def _match_score(
     coverage = overlap / len(route.terms)
     if coverage < MIN_ROUTE_COVERAGE:
         return None
-    return (1, int(coverage * 1000), overlap, route.feedback_id)
+    return (1, int(coverage * 1000), overlap, route.feedback_id or 0)
 
 
 def _feedback_route_snapshot(
@@ -134,7 +146,7 @@ def _feedback_route_snapshot(
     root: Path,
     query: str,
     artifact_type: str | None,
-) -> tuple[FeedbackRoute | None, int | None]:
+) -> tuple[FeedbackRoute | None, int | None, tuple[NegativeFeedback, ...]]:
     """Read one root-scoped feedback snapshot and select its strongest route.
 
     Only the latest significant feedback for each normalized query/artifact pair
@@ -146,7 +158,7 @@ def _feedback_route_snapshot(
 
     current_terms = frozenset(_query_terms(query))
     if not usage_db_path.is_file():
-        return None, None
+        return None, None, ()
 
     try:
         connection = _connect_readonly(usage_db_path)
@@ -181,7 +193,7 @@ def _feedback_route_snapshot(
         finally:
             connection.close()
     except (OSError, sqlite3.Error):
-        return None, None
+        return None, None, ()
 
     latest: dict[tuple[str, str], FeedbackRoute | NegativeFeedback] = {}
     for row in rows:
@@ -199,6 +211,8 @@ def _feedback_route_snapshot(
         if str(row["rating"]) in NEGATIVE_FEEDBACK_RATINGS:
             latest[key] = NegativeFeedback(
                 query_key=query_key,
+                query=accepted_query,
+                terms=accepted_terms,
                 artifact_id=artifact_id,
                 feedback_id=feedback_id,
             )
@@ -217,7 +231,22 @@ def _feedback_route_snapshot(
     negative_feedback = [
         decision
         for decision in latest.values()
-        if isinstance(decision, NegativeFeedback) and decision.query_key == current_query_key
+        if isinstance(decision, NegativeFeedback)
+        and (
+            decision.query_key == current_query_key
+            or _match_score(
+                FeedbackRoute(
+                    query=decision.query,
+                    artifact_id=decision.artifact_id,
+                    artifact_type="",
+                    terms=decision.terms,
+                    feedback_id=decision.feedback_id,
+                ),
+                query,
+                current_terms,
+            )
+            is not None
+        )
     ]
     scored: list[tuple[tuple[int, int, int, int], FeedbackRoute]] = []
     for route in latest.values():
@@ -226,7 +255,7 @@ def _feedback_route_snapshot(
         if artifact_type is not None and route.artifact_type != artifact_type:
             continue
         if any(
-            rejection.feedback_id > route.feedback_id
+            rejection.feedback_id > (route.feedback_id or 0)
             and (not rejection.artifact_id or rejection.artifact_id == route.artifact_id)
             for rejection in negative_feedback
         ):
@@ -235,9 +264,88 @@ def _feedback_route_snapshot(
         if score is not None:
             scored.append((score, route))
     if not scored:
-        return None, feedback_max_id
+        return None, feedback_max_id, tuple(negative_feedback)
     scored.sort(key=lambda item: item[0], reverse=True)
-    return scored[0][1], feedback_max_id
+    return scored[0][1], feedback_max_id, tuple(negative_feedback)
+
+
+def _implicit_feedback_route(
+    usage_db_path: Path,
+    *,
+    root: Path,
+    query: str,
+    artifact_type: str | None,
+    min_confirmations: int,
+    max_generic_queries: int,
+) -> FeedbackRoute | None:
+    """Return a route confirmed by distinct searches without generic overreach."""
+
+    if not usage_db_path.is_file():
+        return None
+    try:
+        with _connect_readonly(usage_db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            if not _has_table(connection, "implicit_feedback"):
+                return None
+            rows = connection.execute(
+                """
+                SELECT id, query, artifact_id, search_event_id
+                FROM implicit_feedback
+                WHERE root = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (str(root), FEEDBACK_SCAN_LIMIT),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+
+    current_terms = frozenset(_query_terms(query))
+    confirmations: dict[tuple[str, str], set[int]] = {}
+    latest: dict[tuple[str, str], sqlite3.Row] = {}
+    for row in rows:
+        route_query = str(row["query"] or "").strip()
+        route_terms = frozenset(_query_terms(route_query))
+        candidate_id = str(row["artifact_id"] or "").strip()
+        if not route_terms or not candidate_id:
+            continue
+        key = (_feedback_query_key(route_query, route_terms), candidate_id)
+        confirmations.setdefault(key, set()).add(int(row["search_event_id"]))
+        latest.setdefault(key, row)
+
+    mature_keys = {
+        key for key, search_events in confirmations.items() if len(search_events) >= min_confirmations
+    }
+    mature_queries_by_artifact: dict[str, int] = {}
+    for _query_key, candidate_id in mature_keys:
+        mature_queries_by_artifact[candidate_id] = mature_queries_by_artifact.get(candidate_id, 0) + 1
+
+    candidates: list[tuple[tuple[int, int, int, int], FeedbackRoute]] = []
+    for key in mature_keys:
+        if mature_queries_by_artifact[key[1]] > max_generic_queries:
+            continue
+        row = latest[key]
+        route_query = str(row["query"])
+        candidate_id = str(row["artifact_id"])
+        prefix, separator, _name = candidate_id.partition(":")
+        if not separator or not prefix:
+            continue
+        inferred_type = ARTIFACT_TYPE_BY_ID_PREFIX.get(prefix, prefix)
+        if artifact_type is not None and artifact_type != inferred_type:
+            continue
+        route = FeedbackRoute(
+            query=route_query,
+            artifact_id=candidate_id,
+            artifact_type=inferred_type,
+            terms=frozenset(_query_terms(route_query)),
+            # Implicit IDs belong to another table and are not explicit
+            # feedback provenance.
+            feedback_id=None,
+        )
+        score = _match_score(route, query, current_terms)
+        if score is not None:
+            candidates.append((score, route))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
 def best_feedback_route(
@@ -249,7 +357,7 @@ def best_feedback_route(
 ) -> FeedbackRoute | None:
     """Return the strongest live route matching ``query``, or fail open."""
 
-    route, _feedback_max_id = _feedback_route_snapshot(
+    route, _feedback_max_id, _negative_feedback = _feedback_route_snapshot(
         usage_db_path,
         root=root,
         query=query,
@@ -350,19 +458,38 @@ def decide_feedback_route(
     db_path: Path,
     limit: int,
     search_index_fn: SearchIndexFn,
+    allow_implicit: bool = False,
+    implicit_min_confirmations: int = 2,
+    implicit_max_generic_queries: int = 5,
 ) -> RouteDecision:
     """Read and apply one route while retaining the route snapshot high-water."""
 
-    route, feedback_max_id = _feedback_route_snapshot(
+    route, feedback_max_id, negative_feedback = _feedback_route_snapshot(
         usage_db_path,
         root=root,
         query=query,
         artifact_type=artifact_type,
     )
+    implicit_route = False
+    if route is None and allow_implicit:
+        route = _implicit_feedback_route(
+            usage_db_path,
+            root=root,
+            query=query,
+            artifact_type=artifact_type,
+            min_confirmations=implicit_min_confirmations,
+            max_generic_queries=implicit_max_generic_queries,
+        )
+        if route is not None and any(
+            not rejection.artifact_id or rejection.artifact_id == route.artifact_id
+            for rejection in negative_feedback
+        ):
+            route = None
+        implicit_route = route is not None
     return apply_feedback_route(
         rows,
         route=route,
-        feedback_max_id=feedback_max_id,
+        feedback_max_id=None if implicit_route else feedback_max_id,
         db_path=db_path,
         limit=limit,
         search_index_fn=search_index_fn,

@@ -22,6 +22,7 @@ These instructions apply to the whole repository.
 ## Current owners
 
 - `config.py`: configuration models and resolution.
+- `implicit.py`: opt-in search-result consumption feedback.
 - `artifacts.py`: whole-artifact models, collection, privacy-safe metadata, graph edges.
 - `index.py`: format-4 persistence, cross-version/SQLite build locks, rebuild classification, deterministic retrieval.
 - `telemetry.py`: usage/feedback persistence and reports.
@@ -44,6 +45,7 @@ These instructions apply to the whole repository.
 - `$HERMES_HOME/skills/.archive` is excluded from active routing.
 - Feedback/evaluation data stays local. Keep public docs/tests free of raw telemetry and private content.
 - Feedback-assisted routing is current-index-root-only and bounded to the latest significant explicit query/artifact rating. Only `useful` is positive; a newer rejection for the route or matching current query vetoes an older overlapping positive. Promote an artifact only when the current index returns it, with at most one no-longer-than-current artifact-type retry. Explicit caller-owned indexes remain unassisted.
+- Optional implicit routing uses recent same-task search-result consumption, deduplicates one search/artifact pair, and requires confirmations from distinct search events. Mature evidence from too many query shapes is treated as generic. Explicit routes take precedence, and implicit evidence never becomes an evaluation label or unbounded historical replay input.
 - Read-only evaluation measures the unassisted index ranking. Do not train on and score the same feedback replay.
 
 ## State and concurrency invariants

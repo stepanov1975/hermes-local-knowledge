@@ -212,6 +212,21 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS implicit_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            search_event_id INTEGER NOT NULL,
+            query TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            root TEXT NOT NULL,
+            UNIQUE(search_event_id, artifact_id)
+        )
+        """
+    )
     _ensure_columns(conn, "usage_events", USAGE_EVENT_COLUMNS)
     _ensure_columns(conn, "feedback", FEEDBACK_COLUMNS)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events(ts)")
@@ -227,6 +242,10 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_feedback_route_lookup "
         "ON feedback(root, linkage_status, rating, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_implicit_feedback_route_lookup "
+        "ON implicit_feedback(root, id DESC)"
     )
 
 
@@ -355,6 +374,45 @@ def _record_usage(
     except Exception:
         # Telemetry must never break the lookup tools.
         return None
+
+
+def record_implicit_feedback(
+    root: Path,
+    *,
+    search_event_id: int,
+    query: str,
+    artifact_id: str,
+    session_id: str,
+    task_id: str,
+    usage_db_path: Path,
+) -> bool:
+    """Persist one idempotent consumed-result signal."""
+
+    conn = _usage_connect(root, usage_db_path, initialize=False)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _init_usage_db(conn)
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO implicit_feedback (
+                ts, search_event_id, query, artifact_id, session_id, task_id, root
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _utc_now(),
+                search_event_id,
+                _exact_text(query),
+                _exact_text(artifact_id),
+                _clean_text(session_id, limit=128),
+                _clean_text(task_id, limit=128),
+                str(root),
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
 
 def _record_feedback(
     root: Path,
@@ -858,6 +916,8 @@ def _usage_report(
             "live_total_events": 0,
             "feedback_count": 0,
             "live_feedback_count": 0,
+            "implicit_feedback_count": 0,
+            "live_implicit_feedback_count": 0,
             "root_breakdown": [],
             "feedback_root_breakdown": [],
             "top_tools": [],
@@ -923,6 +983,14 @@ def _usage_report(
         ).fetchone()[0]
         live_feedback_count = conn.execute(
             "SELECT COUNT(*) FROM feedback WHERE ts >= ? AND root = ?",
+            (since, root_text),
+        ).fetchone()[0]
+        implicit_feedback_count = conn.execute(
+            "SELECT COUNT(*) FROM implicit_feedback WHERE ts >= ?",
+            (since,),
+        ).fetchone()[0]
+        live_implicit_feedback_count = conn.execute(
+            "SELECT COUNT(*) FROM implicit_feedback WHERE ts >= ? AND root = ?",
             (since, root_text),
         ).fetchone()[0]
         avg_latency = conn.execute(
@@ -1431,6 +1499,8 @@ def _usage_report(
         "live_total_events": live_total_events,
         "feedback_count": feedback_count,
         "live_feedback_count": live_feedback_count,
+        "implicit_feedback_count": implicit_feedback_count,
+        "live_implicit_feedback_count": live_implicit_feedback_count,
         "avg_latency_ms": None if avg_latency is None else round(float(avg_latency), 1),
         "root_breakdown": root_breakdown,
         "feedback_root_breakdown": feedback_root_breakdown,
