@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections.abc import Callable
@@ -63,6 +64,7 @@ class RouteDecision:
     feedback_id: int | None
     artifact_id: str | None
     feedback_max_id: int | None
+    implicit_feedback_max_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +104,17 @@ def _has_table(connection: sqlite3.Connection, table: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _persisted_id(value: Any, *, allow_zero: bool = False) -> int | None:
+    minimum = 0 if allow_zero else 1
+    if type(value) is not int or value < minimum:
+        return None
+    return value
 
 
 def _normalized_query(query: str) -> str:
@@ -146,6 +159,7 @@ def _feedback_route_snapshot(
     root: Path,
     query: str,
     artifact_type: str | None,
+    connection: sqlite3.Connection | None = None,
 ) -> tuple[FeedbackRoute | None, int | None, tuple[NegativeFeedback, ...]]:
     """Read one root-scoped feedback snapshot and select its strongest route.
 
@@ -157,43 +171,54 @@ def _feedback_route_snapshot(
     """
 
     current_terms = frozenset(_query_terms(query))
-    if not usage_db_path.is_file():
-        return None, None, ()
-
-    try:
-        connection = _connect_readonly(usage_db_path)
-        connection.row_factory = sqlite3.Row
+    if connection is None:
+        if not usage_db_path.is_file():
+            return None, None, ()
         try:
-            connection.execute("BEGIN")
-            high_water_row = connection.execute(
-                "SELECT COALESCE(MAX(id), 0) FROM feedback WHERE root = ?",
-                (str(root),),
-            ).fetchone()
-            feedback_max_id = int(high_water_row[0])
-            rows = connection.execute(
-                """
-                SELECT f.id,
-                       f.rating,
-                       COALESCE(NULLIF(TRIM(f.query), ''), e.query) AS effective_query,
-                       f.artifact_id
-                FROM feedback AS f
-                LEFT JOIN usage_events AS e ON e.id = f.event_id
-                WHERE f.root = ?
-                  AND f.rating IN (?, ?, ?, ?, ?, ?, ?)
-                  AND COALESCE(NULLIF(TRIM(f.query), ''), e.query) IS NOT NULL
-                ORDER BY f.id DESC
-                LIMIT ?
-                """,
-                (
-                    str(root),
-                    *sorted(SIGNIFICANT_FEEDBACK_RATINGS),
-                    FEEDBACK_SCAN_LIMIT,
-                ),
-            ).fetchall() if current_terms else []
-        finally:
-            connection.close()
-    except (OSError, sqlite3.Error):
+            with _connect_readonly(usage_db_path) as owned_connection:
+                owned_connection.row_factory = sqlite3.Row
+                owned_connection.execute("BEGIN")
+                return _feedback_route_snapshot(
+                    usage_db_path,
+                    root=root,
+                    query=query,
+                    artifact_type=artifact_type,
+                    connection=owned_connection,
+                )
+        except (OSError, sqlite3.Error):
+            return None, None, ()
+
+    high_water_row = connection.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM feedback WHERE root = ?",
+        (str(root),),
+    ).fetchone()
+    feedback_max_id = _persisted_id(high_water_row[0], allow_zero=True)
+    if feedback_max_id is None:
         return None, None, ()
+    rows = (
+        connection.execute(
+            """
+            SELECT f.id,
+                   f.rating,
+                   COALESCE(NULLIF(TRIM(f.query), ''), e.query) AS effective_query,
+                   f.artifact_id
+            FROM feedback AS f
+            LEFT JOIN usage_events AS e ON e.id = f.event_id
+            WHERE f.root = ?
+              AND f.rating IN (?, ?, ?, ?, ?, ?, ?)
+              AND COALESCE(NULLIF(TRIM(f.query), ''), e.query) IS NOT NULL
+            ORDER BY f.id DESC
+            LIMIT ?
+            """,
+            (
+                str(root),
+                *sorted(SIGNIFICANT_FEEDBACK_RATINGS),
+                FEEDBACK_SCAN_LIMIT,
+            ),
+        ).fetchall()
+        if current_terms
+        else []
+    )
 
     latest: dict[tuple[str, str], FeedbackRoute | NegativeFeedback] = {}
     for row in rows:
@@ -207,7 +232,9 @@ def _feedback_route_snapshot(
         key = (query_key, artifact_id)
         if key in latest:
             continue
-        feedback_id = int(row["id"])
+        feedback_id = _persisted_id(row["id"])
+        if feedback_id is None:
+            continue
         if str(row["rating"]) in NEGATIVE_FEEDBACK_RATINGS:
             latest[key] = NegativeFeedback(
                 query_key=query_key,
@@ -269,7 +296,7 @@ def _feedback_route_snapshot(
     return scored[0][1], feedback_max_id, tuple(negative_feedback)
 
 
-def _implicit_feedback_route(
+def _implicit_feedback_route_snapshot(
     usage_db_path: Path,
     *,
     root: Path,
@@ -277,40 +304,131 @@ def _implicit_feedback_route(
     artifact_type: str | None,
     min_confirmations: int,
     max_generic_queries: int,
-) -> FeedbackRoute | None:
-    """Return a route confirmed by distinct searches without generic overreach."""
+    connection: sqlite3.Connection | None = None,
+) -> tuple[FeedbackRoute | None, int | None]:
+    """Return one validated implicit route and its root-scoped snapshot high-water."""
 
-    if not usage_db_path.is_file():
-        return None
-    try:
-        with _connect_readonly(usage_db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            if not _has_table(connection, "implicit_feedback"):
-                return None
-            rows = connection.execute(
-                """
-                SELECT id, query, artifact_id, search_event_id
-                FROM implicit_feedback
-                WHERE root = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (str(root), FEEDBACK_SCAN_LIMIT),
-            ).fetchall()
-    except (OSError, sqlite3.Error):
-        return None
+    if connection is None:
+        if not usage_db_path.is_file():
+            return None, None
+        try:
+            with _connect_readonly(usage_db_path) as owned_connection:
+                owned_connection.row_factory = sqlite3.Row
+                owned_connection.execute("BEGIN")
+                return _implicit_feedback_route_snapshot(
+                    usage_db_path,
+                    root=root,
+                    query=query,
+                    artifact_type=artifact_type,
+                    min_confirmations=min_confirmations,
+                    max_generic_queries=max_generic_queries,
+                    connection=owned_connection,
+                )
+        except (OSError, sqlite3.Error):
+            return None, None
+
+    if not _has_table(connection, "implicit_feedback"):
+        return None, None
+    implicit_columns = _table_columns(connection, "implicit_feedback")
+    if not {"id", "root"}.issubset(implicit_columns):
+        return None, None
+    high_water_row = connection.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM implicit_feedback WHERE root = ?",
+        (str(root),),
+    ).fetchone()
+    implicit_feedback_max_id = _persisted_id(high_water_row[0], allow_zero=True)
+    if implicit_feedback_max_id is None:
+        return None, None
+    if not {
+        "search_event_id",
+        "query",
+        "artifact_id",
+        "session_id",
+        "task_id",
+        "turn_id",
+    }.issubset(implicit_columns) or not _has_table(connection, "usage_events"):
+        return None, implicit_feedback_max_id
+    usage_columns = _table_columns(connection, "usage_events")
+    if not {
+        "id",
+        "tool",
+        "success",
+        "query",
+        "baseline_top_ids_json",
+        "session_id",
+        "task_id",
+        "turn_id",
+        "root",
+    }.issubset(usage_columns):
+        return None, implicit_feedback_max_id
+    rows = connection.execute(
+        """
+        SELECT i.id, i.query, i.artifact_id, i.search_event_id,
+               i.session_id AS implicit_session_id,
+               i.task_id AS implicit_task_id,
+               i.turn_id AS implicit_turn_id,
+               e.id AS event_id,
+               e.tool AS event_tool, e.success AS event_success,
+               e.query AS event_query,
+               e.baseline_top_ids_json AS event_baseline_top_ids_json,
+               e.session_id AS event_session_id,
+               e.task_id AS event_task_id,
+               e.turn_id AS event_turn_id,
+               e.root AS event_root
+        FROM implicit_feedback i
+        LEFT JOIN usage_events e ON e.id = i.search_event_id
+        WHERE i.root = ?
+        ORDER BY i.id DESC
+        LIMIT ?
+        """,
+        (str(root), FEEDBACK_SCAN_LIMIT),
+    ).fetchall()
 
     current_terms = frozenset(_query_terms(query))
     confirmations: dict[tuple[str, str], set[int]] = {}
     latest: dict[tuple[str, str], sqlite3.Row] = {}
     for row in rows:
+        try:
+            baseline_ids = json.loads(str(row["event_baseline_top_ids_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
         route_query = str(row["query"] or "").strip()
         route_terms = frozenset(_query_terms(route_query))
         candidate_id = str(row["artifact_id"] or "").strip()
-        if not route_terms or not candidate_id:
+        implicit_session_id = str(row["implicit_session_id"] or "")
+        implicit_task_id = str(row["implicit_task_id"] or "")
+        implicit_turn_id = str(row["implicit_turn_id"] or "")
+        if (
+            not route_terms
+            or not candidate_id
+            or str(row["event_tool"] or "") != "knowledge_search"
+            or type(row["event_success"]) is not int
+            or row["event_success"] != 1
+            or str(row["event_root"] or "") != str(root)
+            or route_query != str(row["event_query"] or "")
+            or not implicit_session_id
+            or implicit_session_id != str(row["event_session_id"] or "")
+            or not implicit_task_id
+            or implicit_task_id != str(row["event_task_id"] or "")
+            or not implicit_turn_id
+            or implicit_turn_id != str(row["event_turn_id"] or "")
+            or not isinstance(baseline_ids, list)
+            or any(type(value) is not str or not value for value in baseline_ids)
+            or candidate_id not in baseline_ids
+        ):
+            continue
+        implicit_feedback_id = _persisted_id(row["id"])
+        search_event_id = _persisted_id(row["search_event_id"])
+        event_id = _persisted_id(row["event_id"])
+        if (
+            implicit_feedback_id is None
+            or search_event_id is None
+            or event_id is None
+            or search_event_id != event_id
+        ):
             continue
         key = (_feedback_query_key(route_query, route_terms), candidate_id)
-        confirmations.setdefault(key, set()).add(int(row["search_event_id"]))
+        confirmations.setdefault(key, set()).add(search_event_id)
         latest.setdefault(key, row)
 
     mature_keys = {
@@ -333,7 +451,7 @@ def _implicit_feedback_route(
         inferred_type = ARTIFACT_TYPE_BY_ID_PREFIX.get(prefix, prefix)
         if artifact_type is not None and artifact_type != inferred_type:
             continue
-        route = FeedbackRoute(
+        candidate_route = FeedbackRoute(
             query=route_query,
             artifact_id=candidate_id,
             artifact_type=inferred_type,
@@ -342,14 +460,37 @@ def _implicit_feedback_route(
             # feedback provenance.
             feedback_id=None,
         )
-        score = _match_score(route, query, current_terms)
+        score = _match_score(candidate_route, query, current_terms)
         if score is not None:
-            candidates.append((score, route))
-    return (
+            candidates.append((score, candidate_route))
+    selected_route = (
         max(candidates, key=lambda item: (item[0], item[1].artifact_id))[1]
         if candidates
         else None
     )
+    return selected_route, implicit_feedback_max_id
+
+
+def _implicit_feedback_route(
+    usage_db_path: Path,
+    *,
+    root: Path,
+    query: str,
+    artifact_type: str | None,
+    min_confirmations: int,
+    max_generic_queries: int,
+) -> FeedbackRoute | None:
+    """Return a route confirmed by distinct searches without generic overreach."""
+
+    route, _implicit_feedback_max_id = _implicit_feedback_route_snapshot(
+        usage_db_path,
+        root=root,
+        query=query,
+        artifact_type=artifact_type,
+        min_confirmations=min_confirmations,
+        max_generic_queries=max_generic_queries,
+    )
+    return route
 
 
 def best_feedback_route(
@@ -378,6 +519,7 @@ def apply_feedback_route(
     db_path: Path,
     limit: int,
     search_index_fn: SearchIndexFn,
+    implicit_feedback_max_id: int | None = None,
 ) -> RouteDecision:
     """Promote one verified route and return complete typed provenance."""
 
@@ -388,6 +530,7 @@ def apply_feedback_route(
             feedback_id=None,
             artifact_id=None,
             feedback_max_id=feedback_max_id,
+            implicit_feedback_max_id=implicit_feedback_max_id,
         )
 
     for position, row in enumerate(rows):
@@ -400,6 +543,7 @@ def apply_feedback_route(
                 feedback_id=route.feedback_id,
                 artifact_id=route.artifact_id,
                 feedback_max_id=feedback_max_id,
+                implicit_feedback_max_id=implicit_feedback_max_id,
             )
         return RouteDecision(
             rows=[row, *rows[:position], *rows[position + 1 :]][:limit],
@@ -407,6 +551,7 @@ def apply_feedback_route(
             feedback_id=route.feedback_id,
             artifact_id=route.artifact_id,
             feedback_max_id=feedback_max_id,
+            implicit_feedback_max_id=implicit_feedback_max_id,
         )
 
     try:
@@ -423,6 +568,7 @@ def apply_feedback_route(
             feedback_id=route.feedback_id,
             artifact_id=route.artifact_id,
             feedback_max_id=feedback_max_id,
+            implicit_feedback_max_id=implicit_feedback_max_id,
         )
     verified = next(
         (
@@ -439,6 +585,7 @@ def apply_feedback_route(
             feedback_id=route.feedback_id,
             artifact_id=route.artifact_id,
             feedback_max_id=feedback_max_id,
+            implicit_feedback_max_id=implicit_feedback_max_id,
         )
     return RouteDecision(
         rows=[
@@ -449,6 +596,7 @@ def apply_feedback_route(
         feedback_id=route.feedback_id,
         artifact_id=route.artifact_id,
         feedback_max_id=feedback_max_id,
+        implicit_feedback_max_id=implicit_feedback_max_id,
     )
 
 
@@ -468,33 +616,59 @@ def decide_feedback_route(
 ) -> RouteDecision:
     """Read and apply one route while retaining the route snapshot high-water."""
 
-    route, feedback_max_id, negative_feedback = _feedback_route_snapshot(
-        usage_db_path,
-        root=root,
-        query=query,
-        artifact_type=artifact_type,
-    )
-    implicit_route = False
-    if route is None and allow_implicit:
-        route = _implicit_feedback_route(
-            usage_db_path,
-            root=root,
-            query=query,
-            artifact_type=artifact_type,
-            min_confirmations=implicit_min_confirmations,
-            max_generic_queries=implicit_max_generic_queries,
-        )
-        if route is not None and any(
-            not rejection.artifact_id or rejection.artifact_id == route.artifact_id
-            for rejection in negative_feedback
-        ):
+    route: FeedbackRoute | None = None
+    feedback_max_id: int | None = None
+    implicit_feedback_max_id: int | None = None
+    negative_feedback: tuple[NegativeFeedback, ...] = ()
+    if usage_db_path.is_file():
+        try:
+            with _connect_readonly(usage_db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("BEGIN")
+                route, feedback_max_id, negative_feedback = _feedback_route_snapshot(
+                    usage_db_path,
+                    root=root,
+                    query=query,
+                    artifact_type=artifact_type,
+                    connection=connection,
+                )
+                if _has_table(connection, "implicit_feedback") and {
+                    "id",
+                    "root",
+                }.issubset(_table_columns(connection, "implicit_feedback")):
+                    implicit_high_water_row = connection.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM implicit_feedback WHERE root = ?",
+                        (str(root),),
+                    ).fetchone()
+                    implicit_feedback_max_id = _persisted_id(
+                        implicit_high_water_row[0], allow_zero=True
+                    )
+                if route is None and allow_implicit:
+                    route, implicit_feedback_max_id = _implicit_feedback_route_snapshot(
+                        usage_db_path,
+                        root=root,
+                        query=query,
+                        artifact_type=artifact_type,
+                        min_confirmations=implicit_min_confirmations,
+                        max_generic_queries=implicit_max_generic_queries,
+                        connection=connection,
+                    )
+        except (OSError, sqlite3.Error):
             route = None
-        implicit_route = route is not None
+            feedback_max_id = None
+            implicit_feedback_max_id = None
+            negative_feedback = ()
+    if route is not None and route.feedback_id is None and any(
+        not rejection.artifact_id or rejection.artifact_id == route.artifact_id
+        for rejection in negative_feedback
+    ):
+        route = None
     return apply_feedback_route(
         rows,
         route=route,
-        feedback_max_id=None if implicit_route else feedback_max_id,
+        feedback_max_id=feedback_max_id,
         db_path=db_path,
         limit=limit,
         search_index_fn=search_index_fn,
+        implicit_feedback_max_id=implicit_feedback_max_id,
     )

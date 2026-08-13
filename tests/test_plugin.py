@@ -805,6 +805,36 @@ def test_lookup_error_telemetry_is_fail_open(
     }
 
 
+def test_successful_search_telemetry_is_fail_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Config(
+        source_root=tmp_path / "repo",
+        hermes_home=tmp_path / "hermes-home",
+        state_dir=tmp_path / "state",
+        index_settings=lci_index.IndexSettings(),
+    )
+
+    def failing_telemetry(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise sqlite3.OperationalError("telemetry unavailable")
+
+    service = LocalKnowledgeService(
+        config,
+        search_index_fn=lambda *_args, **_kwargs: [{"id": "skill:demo", "type": "skill"}],
+        index_metadata_fn=lambda _path: {"index_exists": True},
+        index_source_root_fn=lambda _path: str(config.source_root),
+        record_usage_fn=failing_telemetry,
+    )
+
+    monkeypatch.setattr(plugin, "_service", lambda: service)
+    payload = json.loads(plugin._handle_search({"query": "demo"}))
+
+    assert payload["success"] is True
+    assert payload["usage_event_id"] is None
+    assert payload["results"] == [{"id": "skill:demo", "type": "skill"}]
+
+
 def test_feedback_nonlock_failure_retains_best_effort_error_telemetry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

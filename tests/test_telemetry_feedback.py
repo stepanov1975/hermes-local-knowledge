@@ -823,6 +823,116 @@ def test_usage_metadata_persists_jsonl_hash_and_index_format(tmp_path: Path) -> 
     assert row == ("abc123", 4)
 
 
+def test_search_usage_persists_implicit_replay_boundary_and_settings(tmp_path: Path) -> None:
+    db_path = tmp_path / "usage.sqlite"
+    event_id = telemetry._record_usage(
+        tmp_path / "root",
+        tool="knowledge_search",
+        success=True,
+        feedback_max_id=7,
+        implicit_feedback_max_id=11,
+        implicit_feedback_enabled=True,
+        implicit_min_confirmations=3,
+        implicit_max_generic_queries=4,
+        usage_db_path=db_path,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT feedback_max_id,
+                   implicit_feedback_max_id,
+                   implicit_feedback_enabled,
+                   implicit_min_confirmations,
+                   implicit_max_generic_queries
+            FROM usage_events
+            WHERE id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+
+    assert row == (7, 11, 1, 3, 4)
+
+
+def test_usage_migration_adds_nullable_implicit_replay_columns(tmp_path: Path) -> None:
+    db_path = tmp_path / "usage.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                root TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO usage_events (ts, tool, success, root) VALUES ('before', 'knowledge_search', 1, 'legacy')"
+        )
+
+    telemetry._record_usage(
+        tmp_path / "root",
+        tool="knowledge_search",
+        success=True,
+        usage_db_path=db_path,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT implicit_feedback_max_id,
+                   implicit_feedback_enabled,
+                   implicit_min_confirmations,
+                   implicit_max_generic_queries
+            FROM usage_events
+            ORDER BY id
+            """
+        ).fetchall()
+
+    assert rows == [(None, None, None, None), (None, None, None, None)]
+
+
+def test_implicit_feedback_migration_adds_nullable_turn_id(tmp_path: Path) -> None:
+    db_path = tmp_path / "usage.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE implicit_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                search_event_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                root TEXT NOT NULL,
+                UNIQUE(search_event_id, artifact_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO implicit_feedback (
+                ts, search_event_id, query, artifact_id, session_id, task_id, root
+            ) VALUES ('before', 1, 'query', 'skill:a', 's', 't', 'legacy')
+            """
+        )
+
+    telemetry._record_usage(
+        tmp_path / "root",
+        tool="knowledge_search",
+        success=True,
+        usage_db_path=db_path,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT turn_id FROM implicit_feedback WHERE id=1").fetchone() == (
+            None,
+        )
+
+
 def test_general_telemetry_lock_budget_is_one_second_and_usage_remains_fail_open(tmp_path: Path) -> None:
     root = tmp_path / "root"
     db_path = tmp_path / "usage.sqlite"

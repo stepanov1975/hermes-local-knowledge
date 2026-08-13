@@ -86,6 +86,10 @@ USAGE_EVENT_COLUMNS: dict[str, str] = {
     "index_jsonl_sha256": "TEXT",
     "index_format_version": "INTEGER",
     "feedback_max_id": "INTEGER DEFAULT -1",
+    "implicit_feedback_max_id": "INTEGER",
+    "implicit_feedback_enabled": "INTEGER",
+    "implicit_min_confirmations": "INTEGER",
+    "implicit_max_generic_queries": "INTEGER",
     "latency_ms": "INTEGER",
     "plugin_version": "TEXT",
     "source_root_source": "TEXT",
@@ -115,6 +119,10 @@ FEEDBACK_COLUMNS: dict[str, str] = {
     "expected_artifact_id": "TEXT",
     "resolves_feedback_id": "INTEGER",
     "linkage_status": "TEXT NOT NULL DEFAULT 'legacy'",
+}
+
+IMPLICIT_FEEDBACK_COLUMNS: dict[str, str] = {
+    "turn_id": "TEXT",
 }
 
 
@@ -176,6 +184,10 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             index_jsonl_sha256 TEXT,
             index_format_version INTEGER,
             feedback_max_id INTEGER DEFAULT -1,
+            implicit_feedback_max_id INTEGER,
+            implicit_feedback_enabled INTEGER,
+            implicit_min_confirmations INTEGER,
+            implicit_max_generic_queries INTEGER,
             latency_ms INTEGER,
             plugin_version TEXT,
             source_root_source TEXT,
@@ -224,6 +236,7 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             artifact_id TEXT NOT NULL,
             session_id TEXT NOT NULL,
             task_id TEXT NOT NULL,
+            turn_id TEXT,
             root TEXT NOT NULL,
             UNIQUE(search_event_id, artifact_id)
         )
@@ -231,6 +244,7 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
     )
     _ensure_columns(conn, "usage_events", USAGE_EVENT_COLUMNS)
     _ensure_columns(conn, "feedback", FEEDBACK_COLUMNS)
+    _ensure_columns(conn, "implicit_feedback", IMPLICIT_FEEDBACK_COLUMNS)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_tool ON usage_events(tool)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_query ON usage_events(query)")
@@ -292,6 +306,10 @@ def _record_usage(
     route_artifact_id: str | None = None,
     route_outcome: str = "none",
     feedback_max_id: int | None = -1,
+    implicit_feedback_max_id: int | None = None,
+    implicit_feedback_enabled: bool | None = None,
+    implicit_min_confirmations: int | None = None,
+    implicit_max_generic_queries: int | None = None,
     latency_ms: int | None = None,
     db_path: Path | None = None,
     context: dict[str, str] | None = None,
@@ -316,14 +334,17 @@ def _record_usage(
                     artifact_id, artifact_type, limit_value, rebuild_requested,
                     rebuilt, success, error, result_count, top_ids_json,
                     top_types_json, baseline_top_ids_json, route_feedback_id,
-                    route_artifact_id, route_outcome, feedback_max_id, latency_ms,
+                    route_artifact_id, route_outcome, feedback_max_id,
+                    implicit_feedback_max_id, implicit_feedback_enabled,
+                    implicit_min_confirmations, implicit_max_generic_queries,
+                    latency_ms,
                     plugin_version, source_root_source, state_dir_source,
                     include_markdown_docs_source, index_exists, index_mtime,
                     index_age_seconds, index_artifact_count, index_edge_count,
                     index_artifact_counts_json, index_metadata_error,
                     build_duration_ms, root, db_path, index_jsonl_sha256,
                     index_format_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now(),
@@ -349,6 +370,14 @@ def _record_usage(
                     _exact_text(route_artifact_id) or None,
                     _clean_text(route_outcome, limit=40) or "none",
                     feedback_max_id,
+                    implicit_feedback_max_id,
+                    (
+                        None
+                        if implicit_feedback_enabled is None
+                        else (1 if implicit_feedback_enabled else 0)
+                    ),
+                    implicit_min_confirmations,
+                    implicit_max_generic_queries,
                     latency_ms,
                     _clean_text(index_metadata.get("plugin_version") or __version__, limit=80) or None,
                     _clean_text(index_metadata.get("source_root_source"), limit=80) or None,
@@ -429,6 +458,7 @@ def record_implicit_feedback(
     artifact_id: str,
     session_id: str,
     task_id: str,
+    turn_id: str,
     usage_db_path: Path,
 ) -> bool:
     """Persist one idempotent consumed-result signal."""
@@ -440,8 +470,8 @@ def record_implicit_feedback(
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO implicit_feedback (
-                ts, search_event_id, query, artifact_id, session_id, task_id, root
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ts, search_event_id, query, artifact_id, session_id, task_id, turn_id, root
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _utc_now(),
@@ -450,6 +480,7 @@ def record_implicit_feedback(
                 _exact_text(artifact_id),
                 _clean_text(session_id, limit=128),
                 _clean_text(task_id, limit=128),
+                _clean_text(turn_id, limit=128),
                 str(root),
             ),
         )

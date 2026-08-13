@@ -15,6 +15,7 @@ import pytest
 
 from hermes_local_knowledge import index as lci_index
 from hermes_local_knowledge import indexer as lci
+from hermes_local_knowledge.routing import decide_feedback_route
 
 
 def load_compare_helper() -> Any:
@@ -123,12 +124,19 @@ def create_provenance_usage_db(path: Path, live_root: Path, unrelated_root: Path
                 tool TEXT NOT NULL,
                 query TEXT,
                 success INTEGER NOT NULL,
+                session_id TEXT,
+                task_id TEXT,
+                turn_id TEXT,
                 root TEXT,
                 baseline_top_ids_json TEXT NOT NULL DEFAULT '[]',
                 top_ids_json TEXT NOT NULL DEFAULT '[]',
                 route_feedback_id INTEGER,
                 route_artifact_id TEXT,
-                feedback_max_id INTEGER
+                feedback_max_id INTEGER,
+                implicit_feedback_max_id INTEGER,
+                implicit_feedback_enabled INTEGER,
+                implicit_min_confirmations INTEGER,
+                implicit_max_generic_queries INTEGER
             );
             CREATE TABLE feedback (
                 id INTEGER PRIMARY KEY,
@@ -150,52 +158,95 @@ def create_provenance_usage_db(path: Path, live_root: Path, unrelated_root: Path
             """
         )
         conn.execute(
-            "CREATE TABLE implicit_feedback (id INTEGER PRIMARY KEY, root TEXT)"
+            """
+            CREATE TABLE implicit_feedback (
+                id INTEGER PRIMARY KEY,
+                search_event_id INTEGER,
+                query TEXT,
+                artifact_id TEXT,
+                session_id TEXT,
+                task_id TEXT,
+                turn_id TEXT,
+                root TEXT
+            )
+            """
         )
-        conn.execute(
-            "INSERT INTO implicit_feedback (id, root) VALUES (1, ?)",
-            (str(live_root),),
+        conn.executemany(
+            """
+            INSERT INTO implicit_feedback (
+                id, search_event_id, query, artifact_id, session_id, task_id, turn_id, root
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "alpha", "skill:old", "s1", "t1", "turn-1", str(live_root)),
+                (2, 2, "beta", "skill:old", "s2", "t2", "turn-2", str(live_root)),
+                (3, 2, "future", "skill:new", "s2", "t2", "turn-2", str(live_root)),
+                (4, 3, "other", "skill:other", "s3", "t3", "turn-3", str(unrelated_root)),
+            ],
         )
         conn.executemany(
             """
             INSERT INTO usage_events (
-                id, ts, tool, query, success, root, baseline_top_ids_json,
-                top_ids_json, route_feedback_id, route_artifact_id, feedback_max_id
-            ) VALUES (?, ?, 'knowledge_search', ?, 1, ?, ?, ?, ?, ?, ?)
+                id, ts, tool, query, success, session_id, task_id, turn_id, root, baseline_top_ids_json,
+                top_ids_json, route_feedback_id, route_artifact_id, feedback_max_id,
+                implicit_feedback_max_id, implicit_feedback_enabled,
+                implicit_min_confirmations, implicit_max_generic_queries
+            ) VALUES (?, ?, 'knowledge_search', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     1,
                     "2026-01-01T00:00:00Z",
                     "alpha",
+                    "s1",
+                    "t1",
+                    "turn-1",
                     str(live_root),
                     '["skill:old"]',
                     '["skill:old"]',
                     1,
                     "skill:old",
                     1,
+                    1,
+                    1,
+                    2,
+                    5,
                 ),
                 (
                     2,
                     "2026-01-01T00:01:00Z",
                     "beta",
+                    "s2",
+                    "t2",
+                    "turn-2",
                     str(live_root),
                     '["skill:old"]',
                     '["skill:new"]',
                     2,
                     "skill:new",
                     2,
+                    2,
+                    1,
+                    2,
+                    5,
                 ),
                 (
                     3,
                     "2026-01-01T00:02:00Z",
                     "other",
+                    "s3",
+                    "t3",
+                    "turn-3",
                     str(unrelated_root),
                     "[]",
                     "[]",
                     None,
                     None,
                     3,
+                    4,
+                    1,
+                    2,
+                    5,
                 ),
             ],
         )
@@ -534,10 +585,48 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
     build_tiny_index(baseline.state_dir)
     build_tiny_index(candidate.state_dir)
     cases = (
-        helper.ReplaySearchCase("unavailable", "alpha", 10, None, False, feedback_max_id=None),
-        helper.ReplaySearchCase("legacy", "alpha", 10, None, False, feedback_max_id=-1),
-        helper.ReplaySearchCase("bound-zero", "alpha", 10, None, False, feedback_max_id=0),
-        helper.ReplaySearchCase("bound-two", "beta", 10, None, False, feedback_max_id=2),
+        helper.ReplaySearchCase(
+            "unavailable",
+            "alpha",
+            10,
+            None,
+            False,
+            feedback_max_id=None,
+            implicit_feedback_max_id=None,
+        ),
+        helper.ReplaySearchCase(
+            "legacy",
+            "alpha",
+            10,
+            None,
+            False,
+            feedback_max_id=-1,
+            implicit_feedback_max_id=None,
+        ),
+        helper.ReplaySearchCase(
+            "bound-zero",
+            "alpha",
+            10,
+            None,
+            False,
+            feedback_max_id=0,
+            implicit_feedback_max_id=0,
+            implicit_feedback_enabled=True,
+            implicit_min_confirmations=2,
+            implicit_max_generic_queries=5,
+        ),
+        helper.ReplaySearchCase(
+            "bound-two",
+            "beta",
+            10,
+            None,
+            False,
+            feedback_max_id=2,
+            implicit_feedback_max_id=2,
+            implicit_feedback_enabled=True,
+            implicit_min_confirmations=2,
+            implicit_max_generic_queries=5,
+        ),
     )
 
     baseline_states, baseline_evidence = helper._prepare_production_states(
@@ -547,20 +636,34 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
         candidate, frozen.backup_path, live_root, cases
     )
 
-    assert set(baseline_states) == {"unavailable", "legacy", "bound-0", "bound-2"}
+    assert set(baseline_states) == {
+        "unavailable",
+        "explicit-legacy_implicit-unavailable",
+        "explicit-0_implicit-0_enabled-1_min-2_generic-5",
+        "explicit-2_implicit-2_enabled-1_min-2_generic-5",
+    }
     assert not (Path(baseline_states["unavailable"]) / "usage.sqlite").exists()
     assert baseline_evidence["unavailable"] == {
         "feedback_max_id": None,
         "feedback_bound": None,
         "feedback_bound_available": False,
+        "implicit_feedback_max_id": None,
+        "implicit_feedback_bound": None,
+        "implicit_feedback_bound_available": False,
         "usage_sha256": None,
         "canonical_usage_sha256": None,
         "table_counts": {},
         "link_counts": {},
     }
-    assert baseline_evidence["legacy"]["feedback_bound_available"] is False
-    assert baseline_evidence["bound-0"]["feedback_bound_available"] is True
-    assert baseline_evidence["bound-2"]["feedback_bound_available"] is True
+    legacy_key = "explicit-legacy_implicit-unavailable"
+    zero_key = "explicit-0_implicit-0_enabled-1_min-2_generic-5"
+    two_key = "explicit-2_implicit-2_enabled-1_min-2_generic-5"
+    assert baseline_evidence[legacy_key]["feedback_bound_available"] is False
+    assert baseline_evidence[legacy_key]["implicit_feedback_bound_available"] is False
+    assert baseline_evidence[zero_key]["feedback_bound_available"] is True
+    assert baseline_evidence[zero_key]["implicit_feedback_bound_available"] is True
+    assert baseline_evidence[two_key]["feedback_bound_available"] is True
+    assert baseline_evidence[two_key]["implicit_feedback_bound_available"] is True
     assert {
         key: value["canonical_usage_sha256"] for key, value in baseline_evidence.items()
     } == {
@@ -572,13 +675,31 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
         key: value["link_counts"] for key, value in candidate_evidence.items()
     }
 
-    with sqlite3.connect(Path(baseline_states["bound-0"]) / "usage.sqlite") as conn:
+    with sqlite3.connect(Path(baseline_states[legacy_key]) / "usage.sqlite") as conn:
+        assert conn.execute(
+            "SELECT id FROM implicit_feedback WHERE root = ? ORDER BY id",
+            (str(baseline.source_root),),
+        ).fetchall() == []
+        assert conn.execute(
+            "SELECT id FROM implicit_feedback WHERE root = ? ORDER BY id",
+            (str(unrelated_root),),
+        ).fetchall() == [(4,)]
+
+    with sqlite3.connect(Path(baseline_states[zero_key]) / "usage.sqlite") as conn:
         assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (3,)
         assert conn.execute("SELECT id FROM feedback ORDER BY id").fetchall() == [(4,)]
-        assert conn.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone() == (0,)
-    with sqlite3.connect(Path(baseline_states["bound-2"]) / "usage.sqlite") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM implicit_feedback WHERE root = ?",
+            (str(baseline.source_root),),
+        ).fetchone() == (0,)
+    with sqlite3.connect(Path(baseline_states[two_key]) / "usage.sqlite") as conn:
         assert conn.execute("SELECT id FROM usage_events ORDER BY id").fetchall() == [(1,), (2,), (3,)]
         assert conn.execute("SELECT id FROM feedback ORDER BY id").fetchall() == [(1,), (2,), (4,)]
+        assert conn.execute("SELECT id FROM implicit_feedback ORDER BY id").fetchall() == [
+            (1,),
+            (2,),
+            (4,),
+        ]
         assert conn.execute("SELECT root FROM usage_events WHERE id=1").fetchone() == (
             str(baseline.source_root),
         )
@@ -591,7 +712,7 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
         assert conn.execute("SELECT root FROM index_builds WHERE id=1").fetchone() == (
             str(baseline.source_root),
         )
-    with sqlite3.connect(Path(candidate_states["bound-2"]) / "usage.sqlite") as conn:
+    with sqlite3.connect(Path(candidate_states[two_key]) / "usage.sqlite") as conn:
         assert conn.execute("SELECT root FROM usage_events WHERE id=1").fetchone() == (
             str(candidate.source_root),
         )
@@ -599,7 +720,7 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
             str(unrelated_root),
         )
 
-    assert baseline_evidence["bound-2"]["link_counts"] == {
+    assert baseline_evidence[two_key]["link_counts"] == {
         "feedback_event_rows": 3,
         "feedback_event_links": 3,
         "feedback_resolution_rows": 1,
@@ -608,6 +729,490 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
         "usage_route_links": 2,
     }
     assert helper._sha256_file(frozen.backup_path) == frozen_hash
+
+
+@pytest.mark.parametrize(
+    ("corruption_sql", "corruption_params"),
+    [
+        ("UPDATE implicit_feedback SET search_event_id=999 WHERE id=2", ()),
+        ("UPDATE usage_events SET tool='knowledge_get' WHERE id=2", ()),
+        ("UPDATE usage_events SET success=0 WHERE id=2", ()),
+        ("UPDATE usage_events SET success='invalid' WHERE id=2", ()),
+        ("UPDATE usage_events SET root=? WHERE id=2", ("__OTHER_ROOT__",)),
+        ("UPDATE implicit_feedback SET query='wrong-query' WHERE id=2", ()),
+        ("UPDATE implicit_feedback SET session_id='wrong-session' WHERE id=2", ()),
+        ("UPDATE implicit_feedback SET task_id='wrong-task' WHERE id=2", ()),
+        ("UPDATE implicit_feedback SET turn_id='wrong-turn' WHERE id=2", ()),
+        ("UPDATE implicit_feedback SET turn_id='' WHERE id=2", ()),
+        (
+            "UPDATE usage_events SET baseline_top_ids_json='[\"skill:other\"]', "
+            "top_ids_json='[\"skill:old\"]' WHERE id=2",
+            (),
+        ),
+        ("UPDATE usage_events SET baseline_top_ids_json='not-json' WHERE id=2", ()),
+        (
+            "UPDATE usage_events SET baseline_top_ids_json='[\"skill:old\", 7]' WHERE id=2",
+            (),
+        ),
+        (
+            "UPDATE usage_events SET baseline_top_ids_json='[null, \"skill:old\"]' WHERE id=2",
+            (),
+        ),
+    ],
+    ids=[
+        "orphan-search-event",
+        "wrong-tool",
+        "failed-search",
+        "malformed-search-success",
+        "wrong-root",
+        "wrong-query",
+        "wrong-session",
+        "wrong-task",
+        "wrong-turn",
+        "empty-turn",
+        "route-assisted-only-artifact",
+        "malformed-baseline",
+        "mixed-type-baseline",
+        "null-baseline-entry",
+    ],
+)
+def test_implicit_replay_provenance_requires_exact_linked_baseline_evidence(
+    tmp_path: Path,
+    corruption_sql: str,
+    corruption_params: tuple[str, ...],
+) -> None:
+    helper = load_compare_helper()
+    root = tmp_path / "root"
+    other = tmp_path / "other"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, root, other)
+    params = tuple(str(other) if value == "__OTHER_ROOT__" else value for value in corruption_params)
+
+    with sqlite3.connect(usage_db) as conn:
+        conn.row_factory = sqlite3.Row
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=2,
+            root=root,
+        ) is True
+        conn.execute(corruption_sql, params)
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=2,
+            root=root,
+        ) is False
+
+
+@pytest.mark.parametrize(
+    ("implicit_id", "search_event_id", "usage_event_id"),
+    [
+        ("bad", 1, 1),
+        (0, 1, 1),
+        (-1, 1, 1),
+        (1.0, 1, 1),
+        (None, 1, 1),
+        (1, "bad", 1),
+        (1, 0, 1),
+        (1, -1, 1),
+        (1, 1.0, 1),
+        (1, None, 1),
+        (1, 1, "bad"),
+        (1, 1, 0),
+        (1, 1, -1),
+        (1, 1, 1.0),
+        (1, 1, None),
+    ],
+)
+def test_implicit_provenance_rejects_non_integer_ids_without_vacuous_success(
+    tmp_path: Path,
+    implicit_id: object,
+    search_event_id: object,
+    usage_event_id: object,
+) -> None:
+    helper = load_compare_helper()
+    usage_db = tmp_path / "usage.sqlite"
+    with sqlite3.connect(usage_db) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE usage_events (
+                id, tool, success, query, baseline_top_ids_json,
+                session_id, task_id, turn_id, root
+            );
+            CREATE TABLE implicit_feedback (
+                id, search_event_id, query, artifact_id,
+                session_id, task_id, turn_id, root
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO usage_events VALUES (?, 'knowledge_search', 1, 'q', "
+            "'[\"skill:a\"]', 's', 't', 'u', ?)",
+            (usage_event_id, str(tmp_path)),
+        )
+        conn.execute(
+            "INSERT INTO implicit_feedback VALUES (?, ?, 'q', 'skill:a', 's', 't', 'u', ?)",
+            (implicit_id, search_event_id, str(tmp_path)),
+        )
+
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=1,
+            root=tmp_path,
+        ) is False
+
+
+def test_implicit_provenance_accepts_exact_integer_ids_and_empty_zero_boundary(
+    tmp_path: Path,
+) -> None:
+    helper = load_compare_helper()
+    usage_db = tmp_path / "usage.sqlite"
+    with sqlite3.connect(usage_db) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE usage_events (
+                id, tool, success, query, baseline_top_ids_json,
+                session_id, task_id, turn_id, root
+            );
+            CREATE TABLE implicit_feedback (
+                id, search_event_id, query, artifact_id,
+                session_id, task_id, turn_id, root
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO usage_events VALUES (1, 'knowledge_search', 1, 'q', "
+            "'[\"skill:a\"]', 's', 't', 'u', ?)",
+            (str(tmp_path),),
+        )
+        conn.execute(
+            "INSERT INTO implicit_feedback VALUES (1, 1, 'q', 'skill:a', 's', 't', 'u', ?)",
+            (str(tmp_path),),
+        )
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=1,
+            root=tmp_path,
+        ) is True
+        conn.execute("DELETE FROM implicit_feedback")
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=0,
+            root=tmp_path,
+        ) is True
+
+
+def test_future_implicit_provenance_does_not_invalidate_earlier_boundary(
+    tmp_path: Path,
+) -> None:
+    helper = load_compare_helper()
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, tmp_path, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("UPDATE implicit_feedback SET search_event_id='bad' WHERE id=3")
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=2,
+            root=tmp_path,
+        ) is True
+
+
+@pytest.mark.parametrize(
+    "corruption_sql",
+    [
+        "UPDATE implicit_feedback SET turn_id='wrong-turn' WHERE id=2",
+        "UPDATE usage_events SET success='invalid' WHERE id=2",
+    ],
+)
+def test_malformed_implicit_provenance_is_neutralized_in_replay_copy(
+    tmp_path: Path,
+    corruption_sql: str,
+) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "live_root"
+    unrelated_root = live_root / "nested"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, unrelated_root)
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute(
+            "UPDATE implicit_feedback SET query='docker update progress', artifact_id='skill:old' "
+            "WHERE id IN (1, 2)"
+        )
+        conn.execute(
+            "UPDATE usage_events SET query='docker update progress', "
+            "baseline_top_ids_json='[\"skill:old\"]' WHERE id IN (1, 2)"
+        )
+        conn.execute(corruption_sql)
+
+    rows = [{"id": "skill:other"}, {"id": "skill:old"}]
+    source_decision = decide_feedback_route(
+        rows,
+        usage_db_path=usage_db,
+        root=live_root,
+        query="docker update progress",
+        artifact_type=None,
+        db_path=tmp_path / "unused.sqlite",
+        limit=2,
+        search_index_fn=lambda *_args, **_kwargs: [],
+        allow_implicit=True,
+        implicit_min_confirmations=2,
+        implicit_max_generic_queries=5,
+    )
+    assert source_decision.rows[0]["id"] == "skill:other"
+    assert source_decision.implicit_feedback_max_id == 3
+
+    layout = make_ref_layout(helper, tmp_path / "refs", "candidate")
+    build_tiny_index(layout.state_dir)
+    cases = (
+        helper.ReplaySearchCase(
+            "malformed",
+            "docker update progress",
+            10,
+            None,
+            False,
+            feedback_max_id=2,
+            implicit_feedback_max_id=2,
+            implicit_feedback_enabled=True,
+            implicit_min_confirmations=2,
+            implicit_max_generic_queries=5,
+        ),
+    )
+
+    states, evidence = helper._prepare_production_states(layout, usage_db, live_root, cases)
+    state_key = "explicit-2_implicit-2_enabled-1_min-2_generic-5"
+
+    assert evidence[state_key]["implicit_feedback_bound_available"] is False
+    replay_usage_db = Path(states[state_key]) / "usage.sqlite"
+    with sqlite3.connect(replay_usage_db) as conn:
+        assert conn.execute(
+            "SELECT id FROM implicit_feedback WHERE root = ? ORDER BY id",
+            (str(layout.source_root),),
+        ).fetchall() == []
+        assert conn.execute(
+            "SELECT id FROM implicit_feedback WHERE root = ? ORDER BY id",
+            (str(unrelated_root),),
+        ).fetchall() == [(4,)]
+    replay_decision = decide_feedback_route(
+        rows,
+        usage_db_path=replay_usage_db,
+        root=layout.source_root,
+        query="docker update progress",
+        artifact_type=None,
+        db_path=layout.state_dir / "index.sqlite",
+        limit=2,
+        search_index_fn=lambda *_args, **_kwargs: [],
+        allow_implicit=True,
+        implicit_min_confirmations=2,
+        implicit_max_generic_queries=5,
+    )
+    assert replay_decision.rows[0]["id"] == "skill:other"
+
+
+def test_implicit_neutralization_preserves_unscoped_legacy_rows(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    usage_db = tmp_path / "usage.sqlite"
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("CREATE TABLE implicit_feedback (id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO implicit_feedback (id) VALUES (1)")
+        helper._neutralize_implicit_feedback(conn, root=tmp_path / "root")
+        assert conn.execute("SELECT id FROM implicit_feedback").fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("implicit_feedback_max_id", -1),
+        ("implicit_feedback_max_id", "invalid"),
+        ("implicit_feedback_enabled", 2),
+        ("implicit_feedback_enabled", "invalid"),
+        ("implicit_min_confirmations", 0),
+        ("implicit_min_confirmations", 11),
+        ("implicit_min_confirmations", "invalid"),
+        ("implicit_max_generic_queries", 0),
+        ("implicit_max_generic_queries", 101),
+        ("implicit_max_generic_queries", "invalid"),
+    ],
+)
+def test_invalid_recorded_implicit_setting_remains_unknown(
+    tmp_path: Path,
+    column: str,
+    value: object,
+) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute(f"UPDATE usage_events SET {column}=? WHERE id=2", (value,))
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+    case = next(case for case in raw.replay_search if case.event_id == 2)
+
+    assert None in (
+        case.implicit_feedback_max_id,
+        case.implicit_feedback_enabled,
+        case.implicit_min_confirmations,
+        case.implicit_max_generic_queries,
+    )
+    assert helper._production_state_key(
+        case.feedback_max_id,
+        case.implicit_feedback_max_id,
+        case.implicit_feedback_enabled,
+        case.implicit_min_confirmations,
+        case.implicit_max_generic_queries,
+    ) == "bound-2"
+
+
+@pytest.mark.parametrize("value", ["invalid", -2])
+def test_invalid_recorded_explicit_bound_becomes_unavailable(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("UPDATE usage_events SET feedback_max_id=? WHERE id=2", (value,))
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+    case = next(case for case in raw.replay_search if case.event_id == 2)
+
+    assert case.feedback_max_id is None
+    assert helper._production_state_key(value, 2, True, 2, 5) == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("rebuild_requested", "invalid"),
+        ("rebuild_requested", 2),
+        ("limit_value", "invalid"),
+        ("limit_value", 0),
+        ("route_feedback_id", "invalid"),
+        ("route_feedback_id", 0),
+    ],
+)
+def test_malformed_recorded_scalar_inputs_are_inexact_without_raising(
+    tmp_path: Path,
+    column: str,
+    value: object,
+) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(usage_events)")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE usage_events ADD COLUMN {column} INTEGER")
+            if column == "rebuild_requested":
+                conn.execute("UPDATE usage_events SET rebuild_requested=0")
+        conn.execute(f"UPDATE usage_events SET {column}=? WHERE id=2", (value,))
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+    case = next(case for case in raw.replay_search if case.query == "beta")
+
+    assert case.recorded_inputs_valid is False
+
+
+def test_missing_search_event_id_is_best_effort_but_not_exact(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("ALTER TABLE usage_events RENAME TO usage_events_valid")
+        conn.execute("CREATE TABLE usage_events AS SELECT * FROM usage_events_valid")
+        conn.execute("UPDATE usage_events SET id=NULL WHERE id=2")
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+    case = next(case for case in raw.replay_search if case.query == "beta")
+
+    assert case.event_id is None
+    assert case.recorded_inputs_valid is False
+
+
+def test_malformed_feedback_ids_are_excluded_without_raising(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("ALTER TABLE feedback RENAME TO feedback_valid")
+        conn.execute(
+            "CREATE TABLE feedback AS SELECT * FROM feedback_valid WHERE 0"
+        )
+        conn.execute(
+            "INSERT INTO feedback SELECT * FROM feedback_valid WHERE id != 2"
+        )
+        conn.execute(
+            "INSERT INTO feedback SELECT 'bad-id', ts, event_id, rating, query, artifact_id, "
+            "root, expected_artifact_id, resolves_feedback_id, linkage_status "
+            "FROM feedback_valid WHERE id = 2"
+        )
+        conn.execute(
+            "UPDATE feedback SET resolves_feedback_id='bad-parent' WHERE id=3"
+        )
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+
+    assert all(row["feedback_id"] != "bad-id" for row in raw.label_provenance)
+    assert all(row["resolves_feedback_id"] != "bad-parent" for row in raw.label_provenance)
+    assert all(
+        row["feedback_id"] != 3 or row["quality_tier"] != "explicit_resolution"
+        for row in raw.label_provenance
+    )
+
+
+def test_malformed_search_success_is_ignored_without_raising(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_usage_db(usage_db, live_root)
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("UPDATE usage_events SET success='invalid' WHERE id=1")
+
+    raw = helper.read_usage_corpus(usage_db, live_root.resolve())
+
+    assert all(case.event_id != 1 for case in raw.replay_search)
+
+
+@pytest.mark.parametrize(
+    ("column", "validity_field"),
+    [
+        ("baseline_top_ids_json", "baseline_top_ids_valid"),
+        ("top_ids_json", "recorded_top_ids_valid"),
+    ],
+)
+@pytest.mark.parametrize("malformed_value", ["not-json", '["skill:old", 7]'])
+def test_malformed_recorded_result_lists_remain_invalid(
+    tmp_path: Path,
+    column: str,
+    validity_field: str,
+    malformed_value: str,
+) -> None:
+    helper = load_compare_helper()
+    live_root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, live_root, tmp_path / "other")
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute(f"UPDATE usage_events SET {column}=? WHERE id=2", (malformed_value,))
+
+    raw = helper.read_usage_corpus(usage_db, live_root)
+    case = next(case for case in raw.replay_search if case.event_id == 2)
+
+    assert getattr(case, validity_field) is False
+
+
+def test_disabled_implicit_replay_state_does_not_require_implicit_boundary() -> None:
+    helper = load_compare_helper()
+
+    assert helper._production_state_key(7, None, False, 99, 99) == (
+        "explicit-7_implicit-disabled"
+    )
 
 
 def test_canonical_usage_digest_does_not_hide_descendant_root_changes(tmp_path: Path) -> None:
@@ -738,7 +1343,7 @@ def test_production_corpus_match_uses_companion_jsonl_not_sqlite_bytes(tmp_path:
     assert first["corpus_match"] is True
     assert second["corpus_match"] is True
     assert second["corpus_match_basis"] == "index_jsonl_sha256"
-    assert second["event_inputs_exact"] is True
+    assert second["event_inputs_exact"] is False
     assert second["event_time_exact"] is False
     assert second["plugin_version_match"] is None
     assert second["index_format_match"] is None

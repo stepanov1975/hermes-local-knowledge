@@ -116,7 +116,11 @@ def _matching_search_event(
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         if now - timestamp.astimezone(timezone.utc) > MAX_SEARCH_AGE:
             break
-        if not isinstance(returned_ids, list) or artifact_id not in map(str, returned_ids):
+        if (
+            not isinstance(returned_ids, list)
+            or not all(isinstance(item, str) for item in returned_ids)
+            or artifact_id not in returned_ids
+        ):
             continue
         query = str(row["query"] or "").strip()
         return (int(row["id"]), query) if query else None
@@ -189,6 +193,7 @@ def on_post_tool_call(**kwargs: Any) -> None:
             artifact_id=artifact_id,
             session_id=session_id,
             task_id=task_id,
+            turn_id=turn_id,
             usage_db_path=usage_db_path,
         )
     except Exception:

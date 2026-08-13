@@ -128,10 +128,17 @@ class ReplaySearchCase:
     index_format_version: str | None = None
     baseline_top_ids: tuple[str, ...] = ()
     recorded_top_ids: tuple[str, ...] = ()
+    baseline_top_ids_valid: bool = True
+    recorded_top_ids_valid: bool = True
+    recorded_inputs_valid: bool = True
     route_feedback_id: int | None = None
     route_artifact_id: str | None = None
     route_outcome: str = "none"
     feedback_max_id: int | None = -1
+    implicit_feedback_max_id: int | None = None
+    implicit_feedback_enabled: bool | None = None
+    implicit_min_confirmations: int | None = None
+    implicit_max_generic_queries: int | None = None
 
 
 @dataclass(frozen=True)
@@ -470,12 +477,42 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _production_state_key(feedback_max_id: int | None) -> str:
-    if feedback_max_id is None:
+def _production_state_key(
+    feedback_max_id: Any,
+    implicit_feedback_max_id: Any = None,
+    implicit_feedback_enabled: Any = None,
+    implicit_min_confirmations: Any = None,
+    implicit_max_generic_queries: Any = None,
+) -> str:
+    explicit_bound = _persisted_feedback_bound(feedback_max_id)
+    if explicit_bound is None:
         return "unavailable"
-    if feedback_max_id < 0:
-        return "legacy"
-    return f"bound-{feedback_max_id}"
+    if explicit_bound == -1:
+        return "explicit-legacy_implicit-unavailable"
+    if implicit_feedback_enabled is False:
+        return f"explicit-{explicit_bound}_implicit-disabled"
+    implicit_bound = _bounded_persisted_int(
+        implicit_feedback_max_id, minimum=0, maximum=2**63 - 1
+    )
+    min_confirmations = _bounded_persisted_int(
+        implicit_min_confirmations, minimum=1, maximum=10
+    )
+    max_generic_queries = _bounded_persisted_int(
+        implicit_max_generic_queries, minimum=1, maximum=100
+    )
+    if (
+        implicit_bound is None
+        or type(implicit_feedback_enabled) is not bool
+        or min_confirmations is None
+        or max_generic_queries is None
+    ):
+        return f"bound-{explicit_bound}"
+    return (
+        f"explicit-{explicit_bound}_implicit-{implicit_bound}"
+        f"_enabled-{int(implicit_feedback_enabled)}"
+        f"_min-{min_confirmations}"
+        f"_generic-{max_generic_queries}"
+    )
 
 
 def _canonical_usage_digest(path: Path, *, root: Path) -> str:
@@ -573,10 +610,16 @@ def _delete_feedback_after_bound(
         return False
     root_text = str(root)
     if "root" in feedback_columns:
-        if feedback_max_id > 0 and conn.execute(
-            "SELECT 1 FROM feedback WHERE id = ? AND root = ?",
-            (feedback_max_id, root_text),
-        ).fetchone() is None:
+        root_ids = [
+            _persisted_id(row[0])
+            for row in conn.execute(
+                "SELECT id FROM feedback WHERE root = ?",
+                (root_text,),
+            ).fetchall()
+        ]
+        if any(value is None for value in root_ids):
+            return False
+        if feedback_max_id > 0 and feedback_max_id not in root_ids:
             return False
         conn.execute(
             "DELETE FROM feedback WHERE id > ? AND root = ?",
@@ -585,14 +628,29 @@ def _delete_feedback_after_bound(
         return True
     event_columns = _table_columns(conn, "usage_events")
     if "event_id" in feedback_columns and {"id", "root"}.issubset(event_columns):
-        if feedback_max_id > 0 and conn.execute(
+        linked_rows = conn.execute(
             """
-            SELECT 1 FROM feedback f
+            SELECT f.id AS feedback_id, f.event_id, e.id AS linked_event_id
+            FROM feedback f
             JOIN usage_events e ON e.id = f.event_id
-            WHERE f.id = ? AND e.root = ?
+            WHERE e.root = ?
             """,
-            (feedback_max_id, root_text),
-        ).fetchone() is None:
+            (root_text,),
+        ).fetchall()
+        linked_feedback_ids: list[int] = []
+        for row in linked_rows:
+            feedback_id = _persisted_id(row["feedback_id"])
+            event_id = _persisted_id(row["event_id"])
+            linked_event_id = _persisted_id(row["linked_event_id"])
+            if (
+                feedback_id is None
+                or event_id is None
+                or linked_event_id is None
+                or event_id != linked_event_id
+            ):
+                return False
+            linked_feedback_ids.append(feedback_id)
+        if feedback_max_id > 0 and feedback_max_id not in linked_feedback_ids:
             return False
         conn.execute(
             """
@@ -607,6 +665,130 @@ def _delete_feedback_after_bound(
     return False
 
 
+def _delete_implicit_feedback_after_bound(
+    conn: sqlite3.Connection, *, implicit_feedback_max_id: int, root: Path
+) -> bool:
+    columns = _table_columns(conn, "implicit_feedback")
+    if not {"id", "root"}.issubset(columns):
+        return False
+    root_text = str(root)
+    root_ids = [
+        _persisted_id(row[0])
+        for row in conn.execute(
+            "SELECT id FROM implicit_feedback WHERE root = ?",
+            (root_text,),
+        ).fetchall()
+    ]
+    if any(value is None for value in root_ids):
+        return False
+    if implicit_feedback_max_id > 0 and implicit_feedback_max_id not in root_ids:
+        return False
+    conn.execute(
+        "DELETE FROM implicit_feedback WHERE id > ? AND root = ?",
+        (implicit_feedback_max_id, root_text),
+    )
+    return True
+
+
+def _neutralize_implicit_feedback(conn: sqlite3.Connection, *, root: Path) -> None:
+    columns = _table_columns(conn, "implicit_feedback")
+    if "root" in columns:
+        conn.execute("DELETE FROM implicit_feedback WHERE root = ?", (str(root),))
+
+
+def _implicit_feedback_provenance_exact(
+    conn: sqlite3.Connection,
+    *,
+    implicit_feedback_max_id: int,
+    root: Path,
+) -> bool:
+    implicit_columns = _table_columns(conn, "implicit_feedback")
+    usage_columns = _table_columns(conn, "usage_events")
+    if not {
+        "id",
+        "search_event_id",
+        "query",
+        "artifact_id",
+        "session_id",
+        "task_id",
+        "turn_id",
+        "root",
+    }.issubset(implicit_columns) or not {
+        "id",
+        "tool",
+        "success",
+        "query",
+        "baseline_top_ids_json",
+        "session_id",
+        "task_id",
+        "turn_id",
+        "root",
+    }.issubset(usage_columns):
+        return False
+    rows = conn.execute(
+        """
+        SELECT i.id AS implicit_id, i.search_event_id,
+               i.query AS implicit_query, i.artifact_id,
+               i.session_id AS implicit_session_id, i.task_id AS implicit_task_id,
+               i.turn_id AS implicit_turn_id, e.id AS linked_event_id,
+               e.tool, e.success,
+               e.query AS event_query, e.baseline_top_ids_json,
+               e.session_id AS event_session_id, e.task_id AS event_task_id,
+               e.turn_id AS event_turn_id, e.root AS event_root
+        FROM implicit_feedback i
+        LEFT JOIN usage_events e ON e.id = i.search_event_id
+        WHERE i.root = ?
+        ORDER BY i.id DESC
+        LIMIT 1001
+        """,
+        (str(root),),
+    ).fetchall()
+    if len(rows) > 1000:
+        return False
+    bounded_rows: list[sqlite3.Row] = []
+    for row in rows:
+        implicit_id = _persisted_id(row["implicit_id"])
+        if implicit_id is None:
+            return False
+        if implicit_id > implicit_feedback_max_id:
+            continue
+        search_event_id = _persisted_id(row["search_event_id"])
+        linked_event_id = _persisted_id(row["linked_event_id"])
+        if (
+            search_event_id is None
+            or linked_event_id is None
+            or search_event_id != linked_event_id
+        ):
+            return False
+        bounded_rows.append(row)
+    if implicit_feedback_max_id > 0 and not any(
+        _persisted_id(row["implicit_id"]) == implicit_feedback_max_id for row in bounded_rows
+    ):
+        return False
+    for row in bounded_rows:
+        try:
+            baseline_ids = json.loads(str(row["baseline_top_ids_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        implicit_turn_id = str(row["implicit_turn_id"] or "")
+        if (
+            str(row["tool"] or "") != "knowledge_search"
+            or type(row["success"]) is not int
+            or row["success"] != 1
+            or str(row["event_root"] or "") != str(root)
+            or str(row["implicit_query"] or "") != str(row["event_query"] or "")
+            or str(row["implicit_session_id"] or "") != str(row["event_session_id"] or "")
+            or str(row["implicit_task_id"] or "") != str(row["event_task_id"] or "")
+            or not implicit_turn_id
+            or implicit_turn_id != str(row["event_turn_id"] or "")
+            or not isinstance(baseline_ids, list)
+            or any(type(value) is not str or not value for value in baseline_ids)
+            or str(row["artifact_id"] or "") not in baseline_ids
+        ):
+            return False
+    return True
+
+
 def _prepare_production_states(
     layout: RefLayout,
     usage_snapshot: Path,
@@ -616,23 +798,44 @@ def _prepare_production_states(
     states_root = ensure_private_directory(layout.state_dir.parent / "production-replay")
     state_paths: dict[str, str] = {}
     evidence: dict[str, dict[str, Any]] = {}
-    for feedback_max_id in sorted(
-        {case.feedback_max_id for case in cases},
-        key=lambda value: (value is None, -2 if value is None else value),
-    ):
-        state_key = _production_state_key(feedback_max_id)
+    state_inputs = {
+        _production_state_key(
+            case.feedback_max_id,
+            case.implicit_feedback_max_id,
+            case.implicit_feedback_enabled,
+            case.implicit_min_confirmations,
+            case.implicit_max_generic_queries,
+        ): (
+            case.feedback_max_id,
+            case.implicit_feedback_max_id,
+            case.implicit_feedback_enabled,
+            case.implicit_min_confirmations,
+            case.implicit_max_generic_queries,
+        )
+        for case in cases
+    }
+    for state_key, state_input in sorted(state_inputs.items()):
+        (
+            feedback_max_id,
+            implicit_feedback_max_id,
+            implicit_feedback_enabled,
+            implicit_min_confirmations,
+            implicit_max_generic_queries,
+        ) = state_input
         state_dir = ensure_private_directory(states_root / state_key)
         for name in ("index.sqlite", "index.jsonl"):
             shutil.copy2(layout.state_dir / name, state_dir / name)
             (state_dir / name).chmod(0o600)
         usage_db = state_dir / "usage.sqlite"
         feedback_bound_available = False
+        implicit_feedback_bound_available = False
         if feedback_max_id is not None:
             shutil.copy2(usage_snapshot, usage_db)
             usage_db.chmod(0o600)
             conn = sqlite3.connect(str(usage_db))
+            conn.row_factory = sqlite3.Row
             try:
-                for table in ("usage_events", "feedback", "index_builds"):
+                for table in ("usage_events", "feedback", "implicit_feedback", "index_builds"):
                     columns = _table_columns(conn, table)
                     if "root" in columns:
                         conn.execute(
@@ -649,10 +852,32 @@ def _prepare_production_states(
                         feedback_max_id=feedback_max_id,
                         root=layout.source_root,
                     )
-                # Historical events have an explicit-feedback high-water only.
-                # Do not leak later implicit routing signals into an exact replay.
-                if _table_columns(conn, "implicit_feedback"):
-                    conn.execute("DELETE FROM implicit_feedback")
+                if implicit_feedback_enabled is False:
+                    implicit_feedback_bound_available = True
+                elif (
+                    implicit_feedback_max_id is not None
+                    and implicit_min_confirmations is not None
+                    and implicit_max_generic_queries is not None
+                    and implicit_feedback_max_id >= 0
+                ):
+                    implicit_feedback_bound_available = _delete_implicit_feedback_after_bound(
+                        conn,
+                        implicit_feedback_max_id=implicit_feedback_max_id,
+                        root=layout.source_root,
+                    )
+                    implicit_feedback_bound_available = (
+                        implicit_feedback_bound_available
+                        and _implicit_feedback_provenance_exact(
+                            conn,
+                            implicit_feedback_max_id=implicit_feedback_max_id,
+                            root=layout.source_root,
+                        )
+                    )
+                    if not implicit_feedback_bound_available:
+                        _neutralize_implicit_feedback(conn, root=layout.source_root)
+                elif _table_columns(conn, "implicit_feedback"):
+                    # Legacy/partial rows cannot safely inherit later implicit evidence.
+                    _neutralize_implicit_feedback(conn, root=layout.source_root)
                 conn.commit()
             finally:
                 conn.close()
@@ -660,6 +885,12 @@ def _prepare_production_states(
                 "feedback_max_id": feedback_max_id,
                 "feedback_bound": feedback_max_id,
                 "feedback_bound_available": feedback_bound_available,
+                "implicit_feedback_max_id": implicit_feedback_max_id,
+                "implicit_feedback_bound": implicit_feedback_max_id,
+                "implicit_feedback_bound_available": implicit_feedback_bound_available,
+                "implicit_feedback_enabled": implicit_feedback_enabled,
+                "implicit_min_confirmations": implicit_min_confirmations,
+                "implicit_max_generic_queries": implicit_max_generic_queries,
                 "usage_sha256": _sha256_file(usage_db),
                 "canonical_usage_sha256": _canonical_usage_digest(
                     usage_db, root=layout.source_root
@@ -672,6 +903,9 @@ def _prepare_production_states(
                 "feedback_max_id": None,
                 "feedback_bound": None,
                 "feedback_bound_available": False,
+                "implicit_feedback_max_id": implicit_feedback_max_id,
+                "implicit_feedback_bound": implicit_feedback_max_id,
+                "implicit_feedback_bound_available": False,
                 "usage_sha256": None,
                 "canonical_usage_sha256": None,
                 "table_counts": {},
@@ -692,6 +926,34 @@ def _column(alias: str, columns: set[str], name: str, default: str = "NULL") -> 
 def _clean_label_text(value: Any) -> str:
     text = str(value or "").strip()
     return "" if text.lower() in IGNORED_LABEL_VALUES else text
+
+
+def _bounded_persisted_int(value: Any, *, minimum: int, maximum: int) -> int | None:
+    if type(value) is not int or not minimum <= value <= maximum:
+        return None
+    return value
+
+
+def _persisted_feedback_bound(value: Any) -> int | None:
+    if type(value) is not int or value < -1:
+        return None
+    return value
+
+
+def _persisted_id(value: Any) -> int | None:
+    if type(value) is not int or value < 1:
+        return None
+    return value
+
+
+def _persisted_bool(value: Any) -> bool | None:
+    if type(value) is not int or value not in (0, 1):
+        return None
+    return bool(value)
+
+
+def _persisted_limit(value: Any) -> int | None:
+    return _bounded_persisted_int(value, minimum=1, maximum=2**31 - 1)
 
 
 def _case_id(kind: str, values: Sequence[Any]) -> str:
@@ -723,6 +985,7 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                    {feedback_root} AS feedback_root,
                    COALESCE({feedback_root}, {event_root}) AS effective_root,
                    {_column('f', feedback_columns, 'event_id')} AS event_id,
+                   {_column('e', event_columns, 'id')} AS linked_event_id,
                    {_column('f', feedback_columns, 'linkage_status', "'legacy'")} AS linkage_status,
                    {_column('f', feedback_columns, 'resolves_feedback_id')} AS resolves_feedback_id,
                    {_column('e', event_columns, 'tool')} AS event_tool,
@@ -742,23 +1005,31 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
         }
         label_provenance: list[dict[str, Any]] = []
         route_vetoes: list[dict[str, Any]] = []
-        feedback_by_id = {int(row["feedback_id"]): row for row in feedback_rows}
+        valid_feedback_rows = [
+            row for row in feedback_rows if _persisted_id(row["feedback_id"]) is not None
+        ]
+        feedback_by_id = {
+            _persisted_id(row["feedback_id"]): row for row in valid_feedback_rows
+        }
         resolution_counts: dict[int, int] = {}
-        for row in feedback_rows:
-            parent_id = row["resolves_feedback_id"]
-            if parent_id is not None:
-                resolved_parent_id = int(parent_id)
+        for row in valid_feedback_rows:
+            resolved_parent_id = _persisted_id(row["resolves_feedback_id"])
+            if resolved_parent_id is not None:
                 resolution_counts[resolved_parent_id] = (
                     resolution_counts.get(resolved_parent_id, 0) + 1
                 )
 
         def valid_event_link(row: sqlite3.Row, expected_root: str) -> bool:
             top_ids, valid_top_ids = _decode_json_list(row["event_top_ids_json"])
+            feedback_event_id = _persisted_id(row["event_id"])
+            linked_event_id = _persisted_id(row["linked_event_id"])
             return (
                 str(row["linkage_status"] or "") == "verified_event"
-                and row["event_id"] is not None
+                and feedback_event_id is not None
+                and feedback_event_id == linked_event_id
                 and str(row["event_tool"] or "") == "knowledge_search"
-                and int(row["event_success"] or 0) == 1
+                and type(row["event_success"]) is int
+                and row["event_success"] == 1
                 and str(row["feedback_root"] or "") == expected_root
                 and str(row["event_root"] or "") == expected_root
                 and _clean_label_text(row["feedback_query"]) == _clean_label_text(row["event_query"])
@@ -766,7 +1037,10 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                 and _clean_label_text(row["artifact_id"]) in top_ids
             )
 
-        for row in feedback_rows:
+        for row in valid_feedback_rows:
+            feedback_id = _persisted_id(row["feedback_id"])
+            if feedback_id is None:
+                continue
             if str(row["effective_root"] or "") != root_text:
                 continue
             query = _clean_label_text(row["effective_query"])
@@ -778,7 +1052,7 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                 route_vetoes.append(
                     {
                         "query": query,
-                        "feedback_id": int(row["feedback_id"]),
+                        "feedback_id": feedback_id,
                         "artifact_id": artifact_id,
                     }
                 )
@@ -796,8 +1070,11 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                 trigger_query: str | None = None
                 resolves_feedback_id = row["resolves_feedback_id"]
                 linkage_status = str(row["linkage_status"] or "legacy")
-                if resolves_feedback_id is not None:
-                    parent = feedback_by_id.get(int(resolves_feedback_id))
+                resolved_parent_id = _persisted_id(resolves_feedback_id)
+                if resolves_feedback_id is not None and resolved_parent_id is None:
+                    tier = None
+                elif resolved_parent_id is not None:
+                    parent = feedback_by_id.get(resolved_parent_id)
                     trigger_query = (
                         _clean_label_text(parent["event_query"]) if parent is not None else ""
                     )
@@ -809,7 +1086,7 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                         and str(parent["effective_root"] or "") == root_text
                         and _clean_label_text(parent["rating"]).lower() in NEGATIVE_RATINGS
                         and _clean_label_text(parent["expected_artifact_id"]) in {"", artifact_id}
-                        and resolution_counts.get(int(resolves_feedback_id)) == 1
+                        and resolution_counts.get(resolved_parent_id) == 1
                         and parent_linkage == "verified_event"
                         and valid_event_link(parent, root_text)
                     )
@@ -828,12 +1105,10 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                         {
                             "query": tier_query,
                             "quality_tier": tier,
-                            "feedback_id": int(row["feedback_id"]),
+                            "feedback_id": feedback_id,
                             "artifact_id": artifact_id,
                             "linkage_status": linkage_status,
-                            "resolves_feedback_id": (
-                                None if resolves_feedback_id is None else int(resolves_feedback_id)
-                            ),
+                            "resolves_feedback_id": resolved_parent_id,
                             "trigger_query": trigger_query or None,
                             "verification_query": (
                                 _clean_label_text(row["event_query"])
@@ -867,7 +1142,11 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                    {event_value('route_feedback_id')} AS route_feedback_id,
                    {event_value('route_artifact_id')} AS route_artifact_id,
                    {event_value('route_outcome', "'none'")} AS route_outcome,
-                   {event_value('feedback_max_id', '-1')} AS feedback_max_id
+                   {event_value('feedback_max_id', '-1')} AS feedback_max_id,
+                   {event_value('implicit_feedback_max_id')} AS implicit_feedback_max_id,
+                   {event_value('implicit_feedback_enabled')} AS implicit_feedback_enabled,
+                   {event_value('implicit_min_confirmations')} AS implicit_min_confirmations,
+                   {event_value('implicit_max_generic_queries')} AS implicit_max_generic_queries
             FROM usage_events e
             ORDER BY event_id
             """
@@ -879,20 +1158,60 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
     get_cases: dict[str, ReplayGetCase] = {}
     neighbor_cases: dict[tuple[str, int | None], ReplayNeighborCase] = {}
     for row in event_rows:
-        if str(row["root"] or "") != root_text or int(row["success"] or 0) != 1:
+        if (
+            str(row["root"] or "") != root_text
+            or type(row["success"]) is not int
+            or row["success"] != 1
+        ):
             continue
         tool = str(row["tool"] or "")
-        rebuild = bool(int(row["rebuild_requested"] or 0))
+        rebuild = _persisted_bool(row["rebuild_requested"])
         raw_limit = row["limit_value"]
-        limit = None if raw_limit is None else int(raw_limit)
+        limit = None if raw_limit is None else _persisted_limit(raw_limit)
+        raw_event_id = row["event_id"]
+        event_id = None if raw_event_id is None else _persisted_id(raw_event_id)
+        raw_route_feedback_id = row["route_feedback_id"]
+        route_feedback_id = (
+            None if raw_route_feedback_id is None else _persisted_id(raw_route_feedback_id)
+        )
+        recorded_inputs_valid = (
+            rebuild is not None
+            and (raw_limit is None or limit is not None)
+            and event_id is not None
+            and (raw_route_feedback_id is None or route_feedback_id is not None)
+        )
+        rebuild_requested = False if rebuild is None else rebuild
         if tool == "knowledge_search":
             query = str(row["query"] or "")
             if not query:
                 continue
             artifact_type = str(row["artifact_type"] or "").strip() or None
-            baseline_top_ids = tuple(_decode_json_list(row["baseline_top_ids_json"])[0])
-            recorded_top_ids = tuple(_decode_json_list(row["top_ids_json"])[0])
-            feedback_max_id = None if row["feedback_max_id"] is None else int(row["feedback_max_id"])
+            raw_baseline_top_ids, baseline_top_ids_valid = _decode_json_list(
+                row["baseline_top_ids_json"]
+            )
+            raw_recorded_top_ids, recorded_top_ids_valid = _decode_json_list(row["top_ids_json"])
+            baseline_top_ids_valid = (
+                "baseline_top_ids_json" in event_columns and baseline_top_ids_valid
+            )
+            recorded_top_ids_valid = "top_ids_json" in event_columns and recorded_top_ids_valid
+            baseline_top_ids = tuple(raw_baseline_top_ids)
+            recorded_top_ids = tuple(raw_recorded_top_ids)
+            feedback_max_id = _persisted_feedback_bound(row["feedback_max_id"])
+            implicit_feedback_max_id = _bounded_persisted_int(
+                row["implicit_feedback_max_id"], minimum=0, maximum=2**63 - 1
+            )
+            raw_implicit_enabled = _bounded_persisted_int(
+                row["implicit_feedback_enabled"], minimum=0, maximum=1
+            )
+            implicit_feedback_enabled = (
+                None if raw_implicit_enabled is None else bool(raw_implicit_enabled)
+            )
+            implicit_min_confirmations = _bounded_persisted_int(
+                row["implicit_min_confirmations"], minimum=1, maximum=10
+            )
+            implicit_max_generic_queries = _bounded_persisted_int(
+                row["implicit_max_generic_queries"], minimum=1, maximum=100
+            )
             provenance = (
                 str(row["plugin_version"] or "") or None,
                 str(row["config_fingerprint"] or "") or None,
@@ -904,16 +1223,23 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                 str(row["route_artifact_id"] or "") or None,
                 str(row["route_outcome"] or "none"),
                 feedback_max_id,
+                implicit_feedback_max_id,
+                implicit_feedback_enabled,
+                implicit_min_confirmations,
+                implicit_max_generic_queries,
+                baseline_top_ids_valid,
+                recorded_top_ids_valid,
             )
-            event_id = None if row["event_id"] is None else int(row["event_id"])
-            event_identity: Any = event_id if event_id is not None else (provenance, rebuild)
+            event_identity: Any = (
+                event_id if event_id is not None else (provenance, rebuild_requested)
+            )
             search_key = (query, limit, artifact_type, event_identity)
             search_cases[search_key] = ReplaySearchCase(
                 _case_id("search", search_key),
                 query,
                 limit,
                 artifact_type,
-                rebuild,
+                rebuild_requested,
                 event_id=event_id,
                 plugin_version=provenance[0],
                 config_fingerprint=provenance[1],
@@ -921,29 +1247,41 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                 index_format_version=provenance[3],
                 baseline_top_ids=baseline_top_ids,
                 recorded_top_ids=recorded_top_ids,
-                route_feedback_id=(None if row["route_feedback_id"] is None else int(row["route_feedback_id"])),
+                baseline_top_ids_valid=baseline_top_ids_valid,
+                recorded_top_ids_valid=recorded_top_ids_valid,
+                recorded_inputs_valid=recorded_inputs_valid,
+                route_feedback_id=route_feedback_id,
                 route_artifact_id=provenance[7],
                 route_outcome=str(provenance[8]),
                 feedback_max_id=feedback_max_id,
+                implicit_feedback_max_id=implicit_feedback_max_id,
+                implicit_feedback_enabled=implicit_feedback_enabled,
+                implicit_min_confirmations=implicit_min_confirmations,
+                implicit_max_generic_queries=implicit_max_generic_queries,
             )
-        elif tool == "knowledge_get":
+        elif tool == "knowledge_get" and recorded_inputs_valid:
             artifact_id = str(row["artifact_id"] or "").strip()
             if artifact_id:
                 get_previous = get_cases.get(artifact_id)
-                rebuild = rebuild or (get_previous.rebuild_requested if get_previous is not None else False)
-                get_cases[artifact_id] = ReplayGetCase(
-                    _case_id("get", (artifact_id,)), artifact_id, rebuild
+                rebuild_requested = rebuild_requested or (
+                    get_previous.rebuild_requested if get_previous is not None else False
                 )
-        elif tool == "knowledge_neighbors":
+                get_cases[artifact_id] = ReplayGetCase(
+                    _case_id("get", (artifact_id,)), artifact_id, rebuild_requested
+                )
+        elif tool == "knowledge_neighbors" and recorded_inputs_valid:
             artifact_id = str(row["artifact_id"] or "").strip()
             if artifact_id:
                 neighbor_key = (artifact_id, limit)
                 neighbor_previous = neighbor_cases.get(neighbor_key)
-                rebuild = rebuild or (
+                rebuild_requested = rebuild_requested or (
                     neighbor_previous.rebuild_requested if neighbor_previous is not None else False
                 )
                 neighbor_cases[neighbor_key] = ReplayNeighborCase(
-                    _case_id("neighbors", neighbor_key), artifact_id, limit, rebuild
+                    _case_id("neighbors", neighbor_key),
+                    artifact_id,
+                    limit,
+                    rebuild_requested,
                 )
     return RawUsageCorpus(
         tuple(sorted(positives)),
@@ -2570,7 +2908,15 @@ def _evaluate_ref(
                 key: {
                     "feedback_bound_available": bool(
                         value.get("feedback_bound_available")
-                    )
+                    ),
+                    "implicit_feedback_bound_available": bool(
+                        value.get("implicit_feedback_bound_available")
+                    ),
+                    "implicit_feedback_enabled": value.get("implicit_feedback_enabled"),
+                    "implicit_min_confirmations": value.get("implicit_min_confirmations"),
+                    "implicit_max_generic_queries": value.get(
+                        "implicit_max_generic_queries"
+                    ),
                 }
                 for key, value in (production_evidence or {}).items()
             },
@@ -2868,17 +3214,23 @@ def _candidate_comparison(baseline: RefEvaluation, candidate: RefEvaluation, fro
         if row.get("quality_tier") != "explicit_resolution" or row.get("feedback_id") is None:
             continue
         accepted_query = str(row.get("query") or "")
+        feedback_id = _persisted_id(row.get("feedback_id"))
+        if feedback_id is None:
+            continue
         explicit_history.setdefault(accepted_query, []).append(
-            (int(row["feedback_id"]), str(row.get("artifact_id") or ""))
+            (feedback_id, str(row.get("artifact_id") or ""))
         )
     for history in explicit_history.values():
         history.sort()
     veto_history: dict[str, list[tuple[int, str]]] = {}
     for row in frozen.route_vetoes:
         veto_query = str(row.get("query") or "")
+        feedback_id = _persisted_id(row.get("feedback_id"))
+        if feedback_id is None:
+            continue
         query_key = _feedback_query_key(veto_query, frozenset(_query_terms(veto_query)))
         veto_history.setdefault(query_key, []).append(
-            (int(row["feedback_id"]), str(row.get("artifact_id") or ""))
+            (feedback_id, str(row.get("artifact_id") or ""))
         )
     for history in veto_history.values():
         history.sort()
@@ -2912,6 +3264,7 @@ def _candidate_comparison(baseline: RefEvaluation, candidate: RefEvaluation, fro
         ids = [str(value) for value in outcome.get("ids", [])]
         route_artifact_id = str(outcome.get("route_artifact_id") or "")
         route_feedback_id = outcome.get("route_feedback_id")
+        parsed_route_feedback_id = _persisted_id(route_feedback_id)
         current_route = (
             _current_explicit_route(
                 case,
@@ -2923,7 +3276,7 @@ def _candidate_comparison(baseline: RefEvaluation, candidate: RefEvaluation, fro
             else None
         )
         route_key = (
-            int(route_feedback_id) if route_feedback_id is not None else -1,
+            -1 if route_feedback_id is None else parsed_route_feedback_id,
             route_artifact_id,
         )
         if (

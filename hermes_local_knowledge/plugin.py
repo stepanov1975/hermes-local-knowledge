@@ -189,12 +189,15 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
             route_artifact_id = route_decision.artifact_id
             route_outcome = route_decision.outcome.value
             feedback_max_id = route_decision.feedback_max_id
+            implicit_feedback_max_id = route_decision.implicit_feedback_max_id
         else:
             baseline_ids = final_ids
             route_feedback_id = None
             route_artifact_id = None
             route_outcome = "none"
             feedback_max_id = None
+            implicit_feedback_max_id = None
+        implicit_settings = getattr(getattr(service, "config", None), "implicit_feedback", None)
         event_id = service.record_usage(
             tool="knowledge_search",
             success=True,
@@ -211,6 +214,16 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
             route_artifact_id=route_artifact_id,
             route_outcome=route_outcome,
             feedback_max_id=feedback_max_id,
+            implicit_feedback_max_id=implicit_feedback_max_id,
+            implicit_feedback_enabled=(
+                None if implicit_settings is None else implicit_settings.enabled
+            ),
+            implicit_min_confirmations=(
+                None if implicit_settings is None else implicit_settings.min_confirmations
+            ),
+            implicit_max_generic_queries=(
+                None if implicit_settings is None else implicit_settings.max_generic_queries
+            ),
             latency_ms=_latency_ms(started),
             db_path=db_path,
             context=context,
