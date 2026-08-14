@@ -126,6 +126,7 @@ class ReplaySearchCase:
     artifact_type: str | None
     rebuild_requested: bool
     event_id: int | None = None
+    observed_at: str | None = None
     plugin_version: str | None = None
     config_fingerprint: str | None = None
     index_jsonl_sha256: str | None = None
@@ -487,6 +488,7 @@ def _production_state_key(
     implicit_feedback_enabled: Any = None,
     implicit_min_confirmations: Any = None,
     implicit_max_generic_queries: Any = None,
+    implicit_observed_at: Any = None,
 ) -> str:
     explicit_bound = _persisted_feedback_bound(feedback_max_id)
     if explicit_bound is None:
@@ -511,12 +513,19 @@ def _production_state_key(
         or max_generic_queries is None
     ):
         return f"bound-{explicit_bound}"
-    return (
+    state_key = (
         f"explicit-{explicit_bound}_implicit-{implicit_bound}"
         f"_enabled-{int(implicit_feedback_enabled)}"
         f"_min-{min_confirmations}"
         f"_generic-{max_generic_queries}"
     )
+    if implicit_bound > 0:
+        observed_at = _parsed_utc_timestamp(implicit_observed_at)
+        if observed_at is None:
+            return f"bound-{explicit_bound}"
+        observed_key = sha256_text(observed_at.isoformat())[:16]
+        state_key += f"_observed-{observed_key}"
+    return state_key
 
 
 def _canonical_usage_digest(path: Path, *, root: Path) -> str:
@@ -700,11 +709,53 @@ def _neutralize_implicit_feedback(conn: sqlite3.Connection, *, root: Path) -> No
         conn.execute("DELETE FROM implicit_feedback WHERE root = ?", (str(root),))
 
 
+def _defer_implicit_feedback_after_observation(
+    conn: sqlite3.Connection,
+    *,
+    implicit_feedback_max_id: int,
+    root: Path,
+    observed_at: datetime,
+) -> bool:
+    implicit_columns = _table_columns(conn, "implicit_feedback")
+    usage_columns = _table_columns(conn, "usage_events")
+    if not {"id", "ts", "search_event_id", "root"}.issubset(implicit_columns) or not {
+        "id",
+        "ts",
+    }.issubset(usage_columns):
+        return False
+    rows = conn.execute(
+        """
+        SELECT i.id, i.ts AS implicit_ts, e.ts AS event_ts
+        FROM implicit_feedback i
+        LEFT JOIN usage_events e ON e.id = i.search_event_id
+        WHERE i.root = ? AND i.id <= ?
+        """,
+        (str(root), implicit_feedback_max_id),
+    ).fetchall()
+    deferred_ids: list[int] = []
+    for row in rows:
+        implicit_id = _persisted_id(row["id"])
+        implicit_timestamp = _parsed_utc_timestamp(row["implicit_ts"])
+        event_timestamp = _parsed_utc_timestamp(row["event_ts"])
+        if implicit_id is None or implicit_timestamp is None or event_timestamp is None:
+            return False
+        if implicit_timestamp > observed_at or event_timestamp > observed_at:
+            deferred_ids.append(implicit_id)
+    # Preserve the recorded high-water while keeping post-observation rows
+    # ineligible when the replay service evaluates them against the current clock.
+    conn.executemany(
+        "UPDATE implicit_feedback SET ts = '9999-12-31T23:59:59+00:00' WHERE id = ?",
+        ((implicit_id,) for implicit_id in deferred_ids),
+    )
+    return True
+
+
 def _implicit_feedback_provenance_exact(
     conn: sqlite3.Connection,
     *,
     implicit_feedback_max_id: int,
     root: Path,
+    observed_at: datetime | None = None,
 ) -> bool:
     implicit_columns = _table_columns(conn, "implicit_feedback")
     usage_columns = _table_columns(conn, "usage_events")
@@ -756,7 +807,7 @@ def _implicit_feedback_provenance_exact(
         (str(root), FEEDBACK_SCAN_LIMIT),
     ).fetchall()
     bounded_rows: list[sqlite3.Row] = []
-    observed_at = datetime.now(timezone.utc)
+    observed_at = observed_at or datetime.now(timezone.utc)
     for row in rows:
         implicit_id = _persisted_id(row["implicit_id"])
         if implicit_id is None:
@@ -785,12 +836,12 @@ def _implicit_feedback_provenance_exact(
         implicit_timestamp = _parsed_utc_timestamp(row["implicit_ts"])
         event_timestamp = _parsed_utc_timestamp(row["event_ts"])
         implicit_turn_id = str(row["implicit_turn_id"] or "")
+        if event_timestamp is None or implicit_timestamp is None:
+            return False
+        if event_timestamp > observed_at or implicit_timestamp > observed_at:
+            continue
         if (
-            event_timestamp is None
-            or implicit_timestamp is None
-            or event_timestamp > observed_at
-            or implicit_timestamp > observed_at
-            or implicit_timestamp < event_timestamp
+            implicit_timestamp < event_timestamp
             or implicit_timestamp - event_timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
             or str(row["tool"] or "") != "knowledge_search"
             or type(row["success"]) is not int
@@ -835,12 +886,14 @@ def _prepare_production_states(
             case.implicit_feedback_enabled,
             case.implicit_min_confirmations,
             case.implicit_max_generic_queries,
+            case.observed_at,
         ): (
             case.feedback_max_id,
             case.implicit_feedback_max_id,
             case.implicit_feedback_enabled,
             case.implicit_min_confirmations,
             case.implicit_max_generic_queries,
+            case.observed_at,
         )
         for case in cases
     }
@@ -851,6 +904,7 @@ def _prepare_production_states(
             implicit_feedback_enabled,
             implicit_min_confirmations,
             implicit_max_generic_queries,
+            implicit_observed_at,
         ) = state_input
         state_dir = ensure_private_directory(states_root / state_key)
         for name in ("index.sqlite", "index.jsonl"):
@@ -895,12 +949,29 @@ def _prepare_production_states(
                         implicit_feedback_max_id=implicit_feedback_max_id,
                         root=layout.source_root,
                     )
+                    observed_at = _parsed_utc_timestamp(implicit_observed_at)
+                    if (
+                        implicit_feedback_bound_available
+                        and implicit_feedback_max_id > 0
+                        and observed_at is None
+                    ):
+                        implicit_feedback_bound_available = False
+                    elif implicit_feedback_bound_available and observed_at is not None:
+                        implicit_feedback_bound_available = (
+                            _defer_implicit_feedback_after_observation(
+                                conn,
+                                implicit_feedback_max_id=implicit_feedback_max_id,
+                                root=layout.source_root,
+                                observed_at=observed_at,
+                            )
+                        )
                     implicit_feedback_bound_available = (
                         implicit_feedback_bound_available
                         and _implicit_feedback_provenance_exact(
                             conn,
                             implicit_feedback_max_id=implicit_feedback_max_id,
                             root=layout.source_root,
+                            observed_at=observed_at,
                         )
                     )
                     if not implicit_feedback_bound_available:
@@ -921,6 +992,7 @@ def _prepare_production_states(
                 "implicit_feedback_enabled": implicit_feedback_enabled,
                 "implicit_min_confirmations": implicit_min_confirmations,
                 "implicit_max_generic_queries": implicit_max_generic_queries,
+                "implicit_observed_at": implicit_observed_at,
                 "usage_sha256": _sha256_file(usage_db),
                 "canonical_usage_sha256": _canonical_usage_digest(
                     usage_db, root=layout.source_root
@@ -1155,6 +1227,7 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
         event_rows = conn.execute(
             f"""
             SELECT {event_value('id')} AS event_id,
+                   {event_value('ts')} AS event_ts,
                    {event_value('tool', "''")} AS tool,
                    {event_value('query')} AS query,
                    {event_value('artifact_id')} AS artifact_id,
@@ -1200,6 +1273,8 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
         limit = None if raw_limit is None else _persisted_limit(raw_limit)
         raw_event_id = row["event_id"]
         event_id = None if raw_event_id is None else _persisted_id(raw_event_id)
+        event_timestamp = _parsed_utc_timestamp(row["event_ts"])
+        observed_at = event_timestamp.isoformat() if event_timestamp is not None else None
         raw_route_feedback_id = row["route_feedback_id"]
         route_feedback_id = (
             None if raw_route_feedback_id is None else _persisted_id(raw_route_feedback_id)
@@ -1271,6 +1346,7 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                 artifact_type,
                 rebuild_requested,
                 event_id=event_id,
+                observed_at=observed_at,
                 plugin_version=provenance[0],
                 config_fingerprint=provenance[1],
                 index_jsonl_sha256=provenance[2],
@@ -3149,8 +3225,20 @@ def _current_explicit_route(
     if case.feedback_max_id is None:
         return None
     current_terms = frozenset(_query_terms(case.query))
-    current_query_key = _feedback_query_key(case.query, current_terms)
-    vetoes = (vetoes_by_query or {}).get(current_query_key, ())
+    vetoes: list[tuple[int, str]] = []
+    for veto_query_key, history in (vetoes_by_query or {}).items():
+        if veto_query_key.startswith("terms:"):
+            veto_query = veto_query_key.removeprefix("terms:")
+            veto_terms = frozenset(veto_query.split())
+        elif veto_query_key.startswith("quoted:"):
+            veto_query = veto_query_key.removeprefix("quoted:")
+            veto_terms = frozenset(_query_terms(veto_query))
+        else:
+            veto_query = veto_query_key
+            veto_terms = frozenset(_query_terms(veto_query))
+        veto_route = FeedbackRoute(veto_query, "", "", veto_terms, None)
+        if _match_score(veto_route, case.query, current_terms) is not None:
+            vetoes.extend(history)
     if case.feedback_max_id >= 0:
         vetoes = [row for row in vetoes if row[0] <= case.feedback_max_id]
 

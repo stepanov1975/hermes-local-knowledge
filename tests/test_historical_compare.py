@@ -573,6 +573,16 @@ def test_usage_snapshot_is_read_only_and_private_backup_has_same_counts(tmp_path
         conn.close()
 
 
+def test_production_state_key_includes_implicit_observation_time() -> None:
+    helper = load_compare_helper()
+
+    first = helper._production_state_key(2, 2, True, 2, 5, "2026-01-01T00:00:00Z")
+    second = helper._production_state_key(2, 2, True, 2, 5, "2026-01-01T00:01:00Z")
+
+    assert first != second
+    assert helper._production_state_key(2, 2, True, 2, 5) == "bound-2"
+
+
 def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_path: Path) -> None:
     helper = load_compare_helper()
     live_root = tmp_path / "live_root"
@@ -628,6 +638,7 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
             implicit_feedback_enabled=True,
             implicit_min_confirmations=2,
             implicit_max_generic_queries=5,
+            observed_at="2026-01-01T00:02:00+00:00",
         ),
     )
 
@@ -638,11 +649,14 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
         candidate, frozen.backup_path, live_root, cases
     )
 
+    two_key = helper._production_state_key(
+        2, 2, True, 2, 5, "2026-01-01T00:02:00+00:00"
+    )
     assert set(baseline_states) == {
         "unavailable",
         "explicit-legacy_implicit-unavailable",
         "explicit-0_implicit-0_enabled-1_min-2_generic-5",
-        "explicit-2_implicit-2_enabled-1_min-2_generic-5",
+        two_key,
     }
     assert not (Path(baseline_states["unavailable"]) / "usage.sqlite").exists()
     assert baseline_evidence["unavailable"] == {
@@ -659,7 +673,6 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
     }
     legacy_key = "explicit-legacy_implicit-unavailable"
     zero_key = "explicit-0_implicit-0_enabled-1_min-2_generic-5"
-    two_key = "explicit-2_implicit-2_enabled-1_min-2_generic-5"
     assert baseline_evidence[legacy_key]["feedback_bound_available"] is False
     assert baseline_evidence[legacy_key]["implicit_feedback_bound_available"] is False
     assert baseline_evidence[zero_key]["feedback_bound_available"] is True
@@ -842,11 +855,12 @@ def test_implicit_replay_provenance_requires_exact_linked_result_evidence(
         ) is False
 
 
-def test_implicit_replay_rejects_future_dated_confirmations(tmp_path: Path) -> None:
+def test_implicit_replay_defers_confirmations_after_observation(tmp_path: Path) -> None:
     helper = load_compare_helper()
     usage_db = tmp_path / "usage.sqlite"
     create_provenance_usage_db(usage_db, tmp_path, tmp_path / "other")
-    future_search = datetime.now(timezone.utc) + timedelta(hours=1)
+    observed_at = datetime.now(timezone.utc)
+    future_search = observed_at + timedelta(hours=1)
     future_consumption = future_search + timedelta(minutes=1)
     with sqlite3.connect(usage_db) as connection:
         connection.row_factory = sqlite3.Row
@@ -855,8 +869,20 @@ def test_implicit_replay_rejects_future_dated_confirmations(tmp_path: Path) -> N
             "UPDATE implicit_feedback SET ts = ? WHERE id <= 2",
             (future_consumption.isoformat(),),
         )
-        assert not helper._implicit_feedback_provenance_exact(
-            connection, implicit_feedback_max_id=2, root=tmp_path
+        assert helper._defer_implicit_feedback_after_observation(
+            connection,
+            implicit_feedback_max_id=2,
+            root=tmp_path,
+            observed_at=observed_at,
+        )
+        assert connection.execute(
+            "SELECT ts FROM implicit_feedback WHERE id = 2"
+        ).fetchone()[0] == "9999-12-31T23:59:59+00:00"
+        assert helper._implicit_feedback_provenance_exact(
+            connection,
+            implicit_feedback_max_id=2,
+            root=tmp_path,
+            observed_at=observed_at,
         )
 
 
@@ -1038,7 +1064,7 @@ def test_malformed_implicit_provenance_is_neutralized_in_replay_copy(
     )
 
     states, evidence = helper._prepare_production_states(layout, usage_db, live_root, cases)
-    state_key = "explicit-2_implicit-2_enabled-1_min-2_generic-5"
+    state_key = helper._production_state_key(2, 2, True, 2, 5)
 
     assert evidence[state_key]["implicit_feedback_bound_available"] is False
     replay_usage_db = Path(states[state_key]) / "usage.sqlite"
@@ -1879,6 +1905,22 @@ def test_current_explicit_route_applies_later_query_and_target_vetoes() -> None:
     ) == (10, "skill:first")
     assert helper._current_explicit_route(
         case, history, {"terms:repair": [(25, "")]}
+    ) is None
+
+
+def test_current_explicit_route_applies_overlapping_query_vetoes() -> None:
+    helper = load_compare_helper()
+    case = helper.ReplaySearchCase(
+        "case", "docker update progress status", 10, None, False, feedback_max_id=30
+    )
+    history = {"docker update progress status": [(10, "skill:target")]}
+    veto_key = helper._feedback_query_key(
+        "docker update progress",
+        frozenset(helper._query_terms("docker update progress")),
+    )
+
+    assert helper._current_explicit_route(
+        case, history, {veto_key: [(20, "skill:target")]}
     ) is None
 
 

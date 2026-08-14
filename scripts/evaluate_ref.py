@@ -364,6 +364,7 @@ def _production_state_key(
     implicit_feedback_enabled: Any = None,
     implicit_min_confirmations: Any = None,
     implicit_max_generic_queries: Any = None,
+    implicit_observed_at: Any = None,
 ) -> str:
     bound = _persisted_feedback_bound(raw_bound)
     if bound is None:
@@ -388,12 +389,18 @@ def _production_state_key(
         or max_generic_queries is None
     ):
         return f"bound-{bound}"
-    return (
+    state_key = (
         f"explicit-{bound}_implicit-{implicit_bound}"
         f"_enabled-{int(implicit_feedback_enabled)}"
         f"_min-{min_confirmations}"
         f"_generic-{max_generic_queries}"
     )
+    if implicit_bound > 0:
+        if not isinstance(implicit_observed_at, str) or not implicit_observed_at:
+            return f"bound-{bound}"
+        observed_key = hashlib.sha256(implicit_observed_at.encode()).hexdigest()[:16]
+        state_key += f"_observed-{observed_key}"
+    return state_key
 
 
 def _feedback_bound_kind(raw_bound: Any) -> str:
@@ -707,6 +714,7 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
                 row.get("implicit_feedback_enabled"),
                 row.get("implicit_min_confirmations"),
                 row.get("implicit_max_generic_queries"),
+                row.get("observed_at"),
             )
             if state_key not in production_services:
                 raise KeyError(f"missing production replay state: {state_key}")
