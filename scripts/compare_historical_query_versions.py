@@ -35,11 +35,11 @@ from hermes_local_knowledge.index import _query_terms  # noqa: E402
 from hermes_local_knowledge.routing import (  # noqa: E402
     ARTIFACT_TYPE_BY_ID_PREFIX,
     FEEDBACK_SCAN_LIMIT,
-    IMPLICIT_FEEDBACK_MAX_SEARCH_AGE,
     FeedbackRoute,
     _feedback_query_key,
     _match_score,
     _parsed_utc_timestamp,
+    _validated_implicit_feedback_evidence,
 )
 
 EVALUATOR = REPO_ROOT / "scripts" / "evaluate_ref.py"
@@ -791,13 +791,15 @@ def _implicit_feedback_provenance_exact(
     )
     rows = conn.execute(
         f"""
-        SELECT i.id AS implicit_id, i.ts AS implicit_ts, i.search_event_id,
+        SELECT i.id AS implicit_feedback_id, i.ts AS implicit_ts, i.search_event_id,
                i.query AS implicit_query, i.artifact_id,
                i.session_id AS implicit_session_id, i.task_id AS implicit_task_id,
                i.turn_id AS implicit_turn_id, e.id AS linked_event_id,
-               e.ts AS event_ts, e.tool, e.success,
+               e.ts AS event_ts, e.tool AS event_tool, e.success AS event_success,
                {recorded_enabled_expression} AS event_implicit_feedback_enabled,
-               e.query AS event_query, e.baseline_top_ids_json, e.top_ids_json,
+               e.query AS event_query,
+               e.baseline_top_ids_json AS event_baseline_top_ids_json,
+               e.top_ids_json AS event_top_ids_json,
                e.session_id AS event_session_id, e.task_id AS event_task_id,
                e.turn_id AS event_turn_id, e.root AS event_root
         FROM implicit_feedback i
@@ -811,69 +813,46 @@ def _implicit_feedback_provenance_exact(
     bounded_rows: list[sqlite3.Row] = []
     observed_at = observed_at or datetime.now(timezone.utc)
     for row in rows:
-        implicit_id = _persisted_id(row["implicit_id"])
+        implicit_id = _persisted_id(row["implicit_feedback_id"])
         if implicit_id is None:
             return False
         if implicit_id > implicit_feedback_max_id:
             continue
-        search_event_id = _persisted_id(row["search_event_id"])
-        linked_event_id = _persisted_id(row["linked_event_id"])
-        if (
-            search_event_id is None
-            or linked_event_id is None
-            or search_event_id != linked_event_id
-        ):
-            return False
         bounded_rows.append(row)
     if implicit_feedback_max_id > 0 and not any(
-        _persisted_id(row["implicit_id"]) == implicit_feedback_max_id for row in bounded_rows
+        _persisted_id(row["implicit_feedback_id"]) == implicit_feedback_max_id
+        for row in bounded_rows
     ):
         return False
     for row in bounded_rows:
-        try:
-            baseline_ids = json.loads(str(row["baseline_top_ids_json"] or ""))
-            final_ids = json.loads(str(row["top_ids_json"] or ""))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return False
         implicit_timestamp = _parsed_utc_timestamp(row["implicit_ts"])
         event_timestamp = _parsed_utc_timestamp(row["event_ts"])
-        implicit_session_id = str(row["implicit_session_id"] or "")
-        implicit_task_id = str(row["implicit_task_id"] or "")
-        implicit_turn_id = str(row["implicit_turn_id"] or "")
         if event_timestamp is None or implicit_timestamp is None:
             return False
         if event_timestamp > observed_at or implicit_timestamp > observed_at:
             continue
         if (
-            implicit_timestamp < event_timestamp
-            or implicit_timestamp - event_timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
-            or str(row["tool"] or "") != "knowledge_search"
-            or type(row["success"]) is not int
-            or row["success"] != 1
-            or (
-                recorded_enabled
-                and (
-                    type(row["event_implicit_feedback_enabled"]) is not int
-                    or row["event_implicit_feedback_enabled"] != 1
-                )
+            _validated_implicit_feedback_evidence(
+                row,
+                root=root,
+                observed_at=observed_at,
+                recorded_enabled=recorded_enabled,
+                query=str(row["implicit_query"] or ""),
+                artifact_id=str(row["artifact_id"] or ""),
             )
-            or str(row["event_root"] or "") != str(root)
-            or str(row["implicit_query"] or "") != str(row["event_query"] or "")
-            or not implicit_session_id
-            or implicit_session_id != str(row["event_session_id"] or "")
-            or not implicit_task_id
-            or implicit_task_id != str(row["event_task_id"] or "")
-            or not implicit_turn_id
-            or implicit_turn_id != str(row["event_turn_id"] or "")
-            or not isinstance(baseline_ids, list)
-            or any(type(value) is not str or not value for value in baseline_ids)
-            or str(row["artifact_id"] or "") not in baseline_ids
-            or not isinstance(final_ids, list)
-            or any(type(value) is not str or not value for value in final_ids)
-            or str(row["artifact_id"] or "") not in final_ids
+            is None
         ):
             return False
     return True
+
+
+def _share_readonly_file(source: Path, destination: Path) -> None:
+    destination.unlink(missing_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+        destination.chmod(0o600)
 
 
 def _prepare_production_states(
@@ -914,8 +893,7 @@ def _prepare_production_states(
         ) = state_input
         state_dir = ensure_private_directory(states_root / state_key)
         for name in ("index.sqlite", "index.jsonl"):
-            shutil.copy2(layout.state_dir / name, state_dir / name)
-            (state_dir / name).chmod(0o600)
+            _share_readonly_file(layout.state_dir / name, state_dir / name)
         usage_db = state_dir / "usage.sqlite"
         feedback_bound_available = False
         implicit_feedback_bound_available = False
@@ -2985,7 +2963,20 @@ def _case_file_payload(frozen: FrozenUsageCorpus, regression: Sequence[Mapping[s
         for tier in LABEL_QUALITY_TIERS
     }
     replay = {
-        "search": [asdict(case) for case in frozen.replay_search],
+        "search": [
+            {
+                **asdict(case),
+                "production_state_key": _production_state_key(
+                    case.feedback_max_id,
+                    case.implicit_feedback_max_id,
+                    case.implicit_feedback_enabled,
+                    case.implicit_min_confirmations,
+                    case.implicit_max_generic_queries,
+                    case.observed_at,
+                ),
+            }
+            for case in frozen.replay_search
+        ],
         "get": [asdict(case) for case in frozen.replay_get],
         "neighbors": [asdict(case) for case in frozen.replay_neighbors],
     }

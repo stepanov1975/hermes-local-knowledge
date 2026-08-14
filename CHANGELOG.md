@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.7] - 2026-08-14
+
+### Changed
+
+- Consolidated replay state-key ownership in frozen cases and shared persisted implicit-evidence validation between live routing and historical replay.
+- Reused immutable replay index files with hard links, with a private-copy fallback on filesystems without hard-link support.
+
+### Fixed
+
+- Kept unrelated and malformed post-tool hook calls inside the fail-open boundary without resolving implicit-feedback configuration.
+- Centralized root-scoped implicit-feedback high-water/schema handling so routing records one consistent replay boundary.
+
+[0.4.7]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.6...v0.4.7
+
 ## [0.4.6] - 2026-08-14
 
 ### Added

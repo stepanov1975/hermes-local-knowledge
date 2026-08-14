@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stdout
 from dataclasses import asdict, is_dataclass, replace
-from datetime import datetime, timezone
 import hashlib
 import importlib
 import importlib.util
@@ -345,16 +344,6 @@ def _persisted_feedback_bound(value: Any) -> int | None:
     return value
 
 
-def _parsed_utc_timestamp(value: Any) -> datetime | None:
-    try:
-        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        return timestamp.astimezone(timezone.utc)
-    except (ValueError, OverflowError):
-        return None
-
-
 def _bounded_persisted_int(value: Any, *, minimum: int, maximum: int) -> int | None:
     if type(value) is not int or not minimum <= value <= maximum:
         return None
@@ -367,52 +356,6 @@ def _persisted_limit(value: Any) -> int | None:
 
 def _persisted_id(value: Any) -> int | None:
     return _bounded_persisted_int(value, minimum=1, maximum=2**63 - 1)
-
-
-def _production_state_key(
-    raw_bound: Any,
-    implicit_feedback_max_id: Any = None,
-    implicit_feedback_enabled: Any = None,
-    implicit_min_confirmations: Any = None,
-    implicit_max_generic_queries: Any = None,
-    implicit_observed_at: Any = None,
-) -> str:
-    bound = _persisted_feedback_bound(raw_bound)
-    if bound is None:
-        return "unavailable"
-    if bound == -1:
-        return "explicit-legacy_implicit-unavailable"
-    if implicit_feedback_enabled is False:
-        return f"explicit-{bound}_implicit-disabled"
-    implicit_bound = _bounded_persisted_int(
-        implicit_feedback_max_id, minimum=0, maximum=2**63 - 1
-    )
-    min_confirmations = _bounded_persisted_int(
-        implicit_min_confirmations, minimum=1, maximum=10
-    )
-    max_generic_queries = _bounded_persisted_int(
-        implicit_max_generic_queries, minimum=1, maximum=100
-    )
-    if (
-        implicit_bound is None
-        or type(implicit_feedback_enabled) is not bool
-        or min_confirmations is None
-        or max_generic_queries is None
-    ):
-        return f"bound-{bound}"
-    state_key = (
-        f"explicit-{bound}_implicit-{implicit_bound}"
-        f"_enabled-{int(implicit_feedback_enabled)}"
-        f"_min-{min_confirmations}"
-        f"_generic-{max_generic_queries}"
-    )
-    if implicit_bound > 0:
-        observed_at = _parsed_utc_timestamp(implicit_observed_at)
-        if observed_at is None:
-            return f"bound-{bound}"
-        observed_key = hashlib.sha256(observed_at.isoformat().encode()).hexdigest()[:16]
-        state_key += f"_observed-{observed_key}"
-    return state_key
 
 
 def _feedback_bound_kind(raw_bound: Any) -> str:
@@ -720,14 +663,7 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
         )
         replay_results["search"][case_id] = _truncate_search_outcome(outcome, recorded_limit)
         if production_services:
-            state_key = _production_state_key(
-                row.get("feedback_max_id", -1),
-                row.get("implicit_feedback_max_id"),
-                row.get("implicit_feedback_enabled"),
-                row.get("implicit_min_confirmations"),
-                row.get("implicit_max_generic_queries"),
-                row.get("observed_at"),
-            )
+            state_key = str(row["production_state_key"])
             if state_key not in production_services:
                 raise KeyError(f"missing production replay state: {state_key}")
             production_results[case_id] = _production_search(

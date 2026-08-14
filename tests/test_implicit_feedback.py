@@ -13,7 +13,7 @@ import pytest
 from hermes_local_knowledge.config import Config, ImplicitFeedbackSettings, IndexSettings
 from hermes_local_knowledge.evaluation import load_positive_feedback_labels
 from hermes_local_knowledge.implicit import on_post_tool_call, on_pre_llm_call, on_session_end
-from hermes_local_knowledge import plugin
+from hermes_local_knowledge import plugin, routing
 from hermes_local_knowledge.routing import decide_feedback_route
 from hermes_local_knowledge.telemetry import (
     _clean_text,
@@ -31,6 +31,29 @@ def _config(tmp_path: Path, *, enabled: bool = True) -> Config:
         index_settings=IndexSettings(),
         implicit_feedback=ImplicitFeedbackSettings(enabled=enabled, min_confirmations=2),
     )
+
+
+def test_unrelated_post_tool_does_not_resolve_implicit_config(monkeypatch) -> None:
+    resolutions = 0
+
+    def unexpected_config_resolution() -> Config:
+        nonlocal resolutions
+        resolutions += 1
+        raise AssertionError("unrelated tools must not resolve implicit-feedback config")
+
+    monkeypatch.setattr(
+        "hermes_local_knowledge.implicit.resolve_config",
+        unexpected_config_resolution,
+    )
+
+    on_post_tool_call(tool_name="terminal", result=json.dumps({"success": True}))
+
+    assert resolutions == 0
+
+
+@pytest.mark.parametrize("tool_name", [[], {}], ids=["list", "mapping"])
+def test_unhashable_tool_name_remains_fail_open(tool_name: object) -> None:
+    on_post_tool_call(tool_name=tool_name)
 
 
 def _search(
@@ -367,6 +390,26 @@ def test_requires_two_distinct_searches_before_routing(tmp_path: Path, monkeypat
     )
     assert report["feedback_count"] == 0
     assert report["implicit_feedback_count"] == 2
+
+
+def test_implicit_route_reads_the_high_water_once(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    for session, task in (("s1", "t1"), ("s2", "t2")):
+        _search(config, session=session, task=task)
+        _consume(monkeypatch, config, session=session, task=task)
+
+    original = routing._implicit_feedback_high_water
+    calls = 0
+
+    def counting_high_water(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(routing, "_implicit_feedback_high_water", counting_high_water)
+
+    assert _decision(config).rows[0]["id"] == "runbook:target"
+    assert calls == 1
 
 
 def test_future_persisted_confirmations_do_not_route(tmp_path: Path, monkeypatch) -> None:

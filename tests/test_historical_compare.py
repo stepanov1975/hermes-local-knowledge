@@ -573,14 +573,84 @@ def test_usage_snapshot_is_read_only_and_private_backup_has_same_counts(tmp_path
         conn.close()
 
 
-def test_production_state_key_includes_implicit_observation_time() -> None:
+def test_production_state_key_is_owned_by_the_frozen_case_payload() -> None:
     helper = load_compare_helper()
 
-    first = helper._production_state_key(2, 2, True, 2, 5, "2026-01-01T00:00:00Z")
-    second = helper._production_state_key(2, 2, True, 2, 5, "2026-01-01T00:01:00Z")
+    equivalent = {
+        helper._production_state_key(2, 2, True, 2, 5, value)
+        for value in (
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00+00:00",
+            "2025-12-31T19:00:00-05:00",
+            "2026-01-01T00:00:00",
+        )
+    }
+    assert len(equivalent) == 1
+    state_key = next(iter(equivalent))
+    assert state_key.startswith(
+        "explicit-2_implicit-2_enabled-1_min-2_generic-5_observed-"
+    )
+    assert state_key != helper._production_state_key(
+        2, 2, True, 2, 5, "2026-01-01T00:01:00Z"
+    )
+    assert helper._production_state_key(2, 2, True, 2, 5, "malformed") == "bound-2"
+    assert helper._production_state_key(2, 2, True, 2, 5, None) == "bound-2"
+    assert helper._production_state_key("invalid", 2, True, 2, 5) == "unavailable"
 
-    assert first != second
-    assert helper._production_state_key(2, 2, True, 2, 5) == "bound-2"
+    replay_case = helper.ReplaySearchCase(
+        "case",
+        "alpha",
+        10,
+        None,
+        False,
+        feedback_max_id=2,
+        implicit_feedback_max_id=2,
+        implicit_feedback_enabled=True,
+        implicit_min_confirmations=2,
+        implicit_max_generic_queries=5,
+        observed_at="2026-01-01T00:00:00Z",
+    )
+    frozen = helper.FrozenUsageCorpus({}, (), (replay_case,), (), ())
+    payload = helper._case_file_payload(frozen, ())
+
+    assert payload["replay"]["search"][0]["production_state_key"] == state_key
+
+
+def test_share_readonly_file_uses_hard_links_when_supported(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    source = tmp_path / "source.sqlite"
+    destination = tmp_path / "state" / "index.sqlite"
+    destination.parent.mkdir()
+    source.write_bytes(b"immutable index")
+    probe = tmp_path / "probe.sqlite"
+    try:
+        os.link(source, probe)
+    except OSError:
+        pytest.skip("hard links are unavailable on this filesystem")
+    probe.unlink()
+    helper._share_readonly_file(source, destination)
+    assert os.path.samefile(source, destination)
+
+
+def test_share_readonly_file_falls_back_to_a_private_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    helper = load_compare_helper()
+    source = tmp_path / "source.sqlite"
+    destination = tmp_path / "state" / "index.sqlite"
+    destination.parent.mkdir()
+    source.write_bytes(b"immutable index")
+
+    def unsupported_hard_link(_source: Path, _destination: Path) -> None:
+        raise OSError("hard links unavailable")
+
+    monkeypatch.setattr(helper.os, "link", unsupported_hard_link)
+    helper._share_readonly_file(source, destination)
+
+    assert destination.read_bytes() == source.read_bytes()
+    assert not os.path.samefile(source, destination)
+    if os.name != "nt":
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o600
 
 
 def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_path: Path) -> None:
@@ -674,6 +744,17 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
     candidate_states, candidate_evidence = helper._prepare_production_states(
         candidate, frozen.backup_path, live_root, cases
     )
+
+    for layout, states in (
+        (baseline, baseline_states),
+        (candidate, candidate_states),
+    ):
+        for state_path in states.values():
+            state_dir = Path(state_path)
+            for name in ("index.sqlite", "index.jsonl"):
+                assert helper._sha256_file(state_dir / name) == helper._sha256_file(
+                    layout.state_dir / name
+                )
 
     two_key = helper._production_state_key(
         2, 2, True, 2, 5, "2026-01-01T00:02:00+00:00"
@@ -819,6 +900,31 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
             implicit_feedback_max_id=1001,
             root=root,
             observed_at=datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc),
+        ) is True
+
+
+def test_implicit_replay_preserves_raw_persisted_query_and_artifact_values(
+    tmp_path: Path,
+) -> None:
+    helper = load_compare_helper()
+    root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, root, tmp_path / "other")
+
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute(
+            "UPDATE implicit_feedback SET query=?, artifact_id=? WHERE id=2",
+            ("  beta  ", " skill:old "),
+        )
+        conn.execute(
+            "UPDATE usage_events SET query=?, baseline_top_ids_json=?, top_ids_json=? WHERE id=2",
+            ("  beta  ", '[" skill:old "]', '[" skill:old "]'),
+        )
+        conn.row_factory = sqlite3.Row
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=2,
+            root=root,
         ) is True
 
 

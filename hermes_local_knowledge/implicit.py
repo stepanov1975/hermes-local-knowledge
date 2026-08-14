@@ -153,12 +153,11 @@ def on_post_tool_call(**kwargs: Any) -> None:
     """Record one same-turn, recent, caller-visible baseline-result consumption; never break hooks."""
 
     try:
-        config = resolve_config()
         tool_name = kwargs.get("tool_name")
-        if not config.implicit_feedback.enabled or tool_name not in {
-            "knowledge_search",
-            "knowledge_get",
-        }:
+        if tool_name not in {"knowledge_search", "knowledge_get"}:
+            return
+        config = resolve_config()
+        if not config.implicit_feedback.enabled:
             return
         if not _hook_succeeded(kwargs):
             return
