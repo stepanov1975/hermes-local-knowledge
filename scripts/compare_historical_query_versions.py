@@ -37,6 +37,7 @@ from hermes_local_knowledge.routing import (  # noqa: E402
     FEEDBACK_SCAN_LIMIT,
     IMPLICIT_FEEDBACK_MAX_SEARCH_AGE,
     FeedbackRoute,
+    _feedback_query_key,
     _match_score,
     _parsed_utc_timestamp,
 )
@@ -937,7 +938,10 @@ def _prepare_production_states(
                         feedback_max_id=feedback_max_id,
                         root=layout.source_root,
                     )
-                if implicit_feedback_enabled is False:
+                if feedback_max_id == -1:
+                    # Legacy explicit bounds cannot identify an event-time snapshot.
+                    _neutralize_implicit_feedback(conn, root=layout.source_root)
+                elif implicit_feedback_enabled is False:
                     implicit_feedback_bound_available = True
                 elif (
                     implicit_feedback_enabled is True
@@ -3227,11 +3231,15 @@ def _current_explicit_route(
     if case.feedback_max_id is None:
         return None
     current_terms = frozenset(_query_terms(case.query))
+    current_query_key = _feedback_query_key(case.query, current_terms)
     vetoes: list[tuple[int, str]] = []
     for veto_query, history in (vetoes_by_query or {}).items():
         veto_terms = frozenset(_query_terms(veto_query))
         veto_route = FeedbackRoute(veto_query, "", "", veto_terms, None)
-        if _match_score(veto_route, case.query, current_terms) is not None:
+        if (
+            _feedback_query_key(veto_query, veto_terms) == current_query_key
+            or _match_score(veto_route, case.query, current_terms) is not None
+        ):
             vetoes.extend(history)
     if case.feedback_max_id >= 0:
         vetoes = [row for row in vetoes if row[0] <= case.feedback_max_id]

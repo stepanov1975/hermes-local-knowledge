@@ -616,6 +616,19 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
             implicit_feedback_max_id=None,
         ),
         helper.ReplaySearchCase(
+            "legacy-enabled",
+            "alpha",
+            10,
+            None,
+            False,
+            feedback_max_id=-1,
+            implicit_feedback_max_id=2,
+            implicit_feedback_enabled=True,
+            implicit_min_confirmations=2,
+            implicit_max_generic_queries=5,
+            observed_at="2026-01-01T00:02:00+00:00",
+        ),
+        helper.ReplaySearchCase(
             "bound-zero",
             "alpha",
             10,
@@ -689,6 +702,11 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
     zero_key = "explicit-0_implicit-0_enabled-1_min-2_generic-5"
     assert baseline_evidence[legacy_key]["feedback_bound_available"] is False
     assert baseline_evidence[legacy_key]["implicit_feedback_bound_available"] is False
+    with sqlite3.connect(Path(baseline_states[legacy_key]) / "usage.sqlite") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM implicit_feedback WHERE root = ?",
+            (str(baseline.source_root),),
+        ).fetchone() == (0,)
     assert baseline_evidence[zero_key]["feedback_bound_available"] is True
     assert baseline_evidence[zero_key]["implicit_feedback_bound_available"] is True
     assert baseline_evidence["bound-2"]["implicit_feedback_bound_available"] is False
@@ -1952,7 +1970,7 @@ def test_current_explicit_route_applies_overlapping_query_vetoes() -> None:
     assert helper._current_explicit_route(
         short_case,
         {"update docker": [(10, "skill:target")]},
-        {"update docker": [(20, "skill:target")]},
+        {"docker update": [(20, "skill:target")]},
     ) is None
 
 
