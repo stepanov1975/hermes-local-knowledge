@@ -837,6 +837,8 @@ def _implicit_feedback_provenance_exact(
             return False
         implicit_timestamp = _parsed_utc_timestamp(row["implicit_ts"])
         event_timestamp = _parsed_utc_timestamp(row["event_ts"])
+        implicit_session_id = str(row["implicit_session_id"] or "")
+        implicit_task_id = str(row["implicit_task_id"] or "")
         implicit_turn_id = str(row["implicit_turn_id"] or "")
         if event_timestamp is None or implicit_timestamp is None:
             return False
@@ -857,8 +859,10 @@ def _implicit_feedback_provenance_exact(
             )
             or str(row["event_root"] or "") != str(root)
             or str(row["implicit_query"] or "") != str(row["event_query"] or "")
-            or str(row["implicit_session_id"] or "") != str(row["event_session_id"] or "")
-            or str(row["implicit_task_id"] or "") != str(row["event_task_id"] or "")
+            or not implicit_session_id
+            or implicit_session_id != str(row["event_session_id"] or "")
+            or not implicit_task_id
+            or implicit_task_id != str(row["event_task_id"] or "")
             or not implicit_turn_id
             or implicit_turn_id != str(row["event_turn_id"] or "")
             or not isinstance(baseline_ids, list)

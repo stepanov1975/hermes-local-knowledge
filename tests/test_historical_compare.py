@@ -900,6 +900,28 @@ def test_implicit_replay_provenance_requires_exact_linked_result_evidence(
         ) is False
 
 
+@pytest.mark.parametrize("identity_column", ["session_id", "task_id"])
+def test_implicit_replay_provenance_rejects_empty_linked_identities(
+    tmp_path: Path, identity_column: str
+) -> None:
+    helper = load_compare_helper()
+    root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, root, tmp_path / "other")
+
+    with sqlite3.connect(usage_db) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            f"UPDATE implicit_feedback SET {identity_column}='' WHERE id=2"
+        )
+        conn.execute(f"UPDATE usage_events SET {identity_column}='' WHERE id=2")
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=2,
+            root=root,
+        ) is False
+
+
 def test_implicit_replay_defers_confirmations_after_observation(tmp_path: Path) -> None:
     helper = load_compare_helper()
     usage_db = tmp_path / "usage.sqlite"

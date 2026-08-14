@@ -142,7 +142,9 @@ def _matching_search_event(
         ):
             continue
         query = str(row["query"] or "").strip()
-        return (int(row["id"]), query) if query else None
+        if not query:
+            continue
+        return int(row["id"]), query
     return None
 
 

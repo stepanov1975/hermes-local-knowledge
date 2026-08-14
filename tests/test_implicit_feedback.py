@@ -624,6 +624,19 @@ def test_stale_newer_id_does_not_hide_recent_search(tmp_path: Path, monkeypatch)
         ).fetchone() == (recent_event,)
 
 
+def test_empty_query_newer_id_does_not_hide_recent_search(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    recent_event = _search(config, session="s1", task="wanted")
+    _search(config, session="s1", task="wanted", query=" ")
+
+    _consume(monkeypatch, config, session="s1", task="wanted")
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute(
+            "SELECT search_event_id FROM implicit_feedback"
+        ).fetchone() == (recent_event,)
+
+
 def test_latest_eligible_search_can_precede_a_refinement(tmp_path: Path, monkeypatch) -> None:
     config = _config(tmp_path)
     matching_event = _search(config, session="s1", task="wanted")
