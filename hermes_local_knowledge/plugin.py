@@ -11,12 +11,21 @@ from typing import Any
 
 from . import index
 from .config import resolve_config
-from .okf import _on_post_tool_call, _on_session_finalize
+from .implicit import on_post_tool_call as _on_implicit_post_tool_call
+from .implicit import on_pre_llm_call as _on_implicit_pre_llm_call
+from .implicit import on_session_end as _on_implicit_session_end
+from .okf import _on_post_tool_call as _on_okf_post_tool_call
+from .okf import _on_session_finalize
 from .routing import ROUTING_TRACE_METADATA_KEY, SearchRoutingTrace
 from .service import LocalKnowledgeService
 from .telemetry import FEEDBACK_RATINGS, FeedbackDatabaseLockedError, _usage_context
 
 __all__ = ["register"]
+
+
+def _on_post_tool_call(**kwargs: Any) -> None:
+    _on_okf_post_tool_call(**kwargs)
+    _on_implicit_post_tool_call(**kwargs)
 
 
 def _service() -> LocalKnowledgeService:
@@ -180,12 +189,15 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
             route_artifact_id = route_decision.artifact_id
             route_outcome = route_decision.outcome.value
             feedback_max_id = route_decision.feedback_max_id
+            implicit_feedback_max_id = route_decision.implicit_feedback_max_id
         else:
             baseline_ids = final_ids
             route_feedback_id = None
             route_artifact_id = None
             route_outcome = "none"
             feedback_max_id = None
+            implicit_feedback_max_id = None
+        implicit_settings = getattr(getattr(service, "config", None), "implicit_feedback", None)
         event_id = service.record_usage(
             tool="knowledge_search",
             success=True,
@@ -202,6 +214,16 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
             route_artifact_id=route_artifact_id,
             route_outcome=route_outcome,
             feedback_max_id=feedback_max_id,
+            implicit_feedback_max_id=implicit_feedback_max_id,
+            implicit_feedback_enabled=(
+                None if implicit_settings is None else implicit_settings.enabled
+            ),
+            implicit_min_confirmations=(
+                None if implicit_settings is None else implicit_settings.min_confirmations
+            ),
+            implicit_max_generic_queries=(
+                None if implicit_settings is None else implicit_settings.max_generic_queries
+            ),
             latency_ms=_latency_ms(started),
             db_path=db_path,
             context=context,
@@ -844,5 +866,7 @@ def register(ctx: Any) -> None:
     _register_cli(ctx)
     register_hook = getattr(ctx, "register_hook", None)
     if register_hook is not None:
+        register_hook("pre_llm_call", _on_implicit_pre_llm_call)
         register_hook("post_tool_call", _on_post_tool_call)
+        register_hook("on_session_end", _on_implicit_session_end)
         register_hook("on_session_finalize", _on_session_finalize)

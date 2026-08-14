@@ -38,7 +38,19 @@ The plugin registers these native tools in the `local_knowledge` toolset:
 | `knowledge_feedback` | Record local lookup feedback such as `useful`, `missing`, `stale`, or `wrong_artifact`. |
 | `knowledge_usage_report` | Summarize local usage, failures, zero-result queries, and feedback. |
 
-The plugin also registers `post_tool_call` and `on_session_finalize` hooks for optional tool-OKF capture and generation.
+The plugin also registers `pre_llm_call`, `post_tool_call`, `on_session_end`, and `on_session_finalize` hooks for optional same-turn implicit search-result feedback and tool-OKF capture/generation. The turn lifecycle hooks keep correlation inside the plugin when Hermes dispatches local-knowledge tools through its deferred-tool bridge.
+
+Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed after distinct matching searches, with each `knowledge_get` tied to that search's unassisted baseline in the same Hermes session, task, and turn:
+
+```yaml
+local_knowledge:
+  implicit_feedback:
+    enabled: true
+    min_confirmations: 2
+    max_generic_queries: 5
+```
+
+Only a recent search from the same Hermes session, task, and turn is eligible. Repeated gets from one search are deduplicated, and overly generic artifacts stop receiving implicit promotion. Explicit feedback remains authoritative, and implicit evidence is not used as evaluation ground truth.
 
 ## Install and model consent
 
@@ -152,6 +164,9 @@ Canonical settings, aliases, and defaults:
 | `okf.max_candidates_per_session` | flat `okf_max_candidates_per_session` | `2` |
 | `okf.max_generation_seconds` | flat `okf_max_generation_seconds`; `okf.max_worker_seconds` or flat `okf_max_worker_seconds` is a fallback when it is absent | `120` seconds |
 | `okf.min_use_count` | flat `okf_min_use_count` | `1` |
+| `implicit_feedback.enabled` | — | `false` |
+| `implicit_feedback.min_confirmations` | — | `2` |
+| `implicit_feedback.max_generic_queries` | — | `5` |
 
 All nested `okf` keys also accept their flat `okf_*` form. YAML lists are preferred in `config.yaml`; comma-separated or bracket-list strings written by `hermes config set` are normalized.
 
@@ -231,7 +246,9 @@ Version 0.4.0 reads the current v0.3.12 queue shape by normalizing a selected cl
 
 Lookup telemetry and feedback stay in `<state_dir>/usage.sqlite`. Tool handlers fail open for telemetry-only errors; explicit `knowledge_feedback` writes remain strict so callers know whether feedback was recorded. Do not put secrets or private document text in queries or feedback notes.
 
-Managed searches may use one deterministic feedback prior when the index was built for the configured source root. Only the latest significant explicit rating for a query/artifact pair is eligible, only `useful` is positive, and a newer rejection for that route or matching current query suppresses an older overlap route. A matching artifact already present in current results may move to rank one. If it is absent, the plugin performs at most one retry with an accepted query no longer than the current query and the mapped artifact type, and promotes only the exact artifact when that live retry rediscovers it. Searches against an explicit caller-owned `--db` remain unassisted.
+Managed searches may use one deterministic feedback prior when the index was built for the configured source root. Only the latest significant explicit rating for a query/artifact pair is eligible. Among ratings accepted by the current tool, only `useful` is positive; legacy persisted `great` rows remain positive compatibility input. A newer rejection for that route or matching current query suppresses an older overlap route. A matching artifact already present in current results may move to rank one. If it is absent, the plugin performs at most one retry with an accepted query no longer than the current query and the mapped artifact type, and promotes only the exact artifact when that live retry rediscovers it. Searches against an explicit caller-owned `--db` remain unassisted.
+
+When opt-in implicit feedback is enabled and no explicit route matches, mature same-turn evidence may supply the lower-priority route. It uses the same current-index promotion or one verified typed-retry path, and a matching explicit rejection can veto it.
 
 `knowledge_usage_report` summarizes recent activity before changing ranking, triggers, source coverage, or graph edges.
 
@@ -245,7 +262,7 @@ python scripts/compare_historical_query_versions.py \
   v0.4.2 WORKTREE
 ```
 
-The comparator opens live telemetry read-only, freezes one private source/runtime/OKF corpus, and builds each ref with that ref's own code. A nonnegative recorded feedback boundary plus a matching index-corpus hash proves that the recorded event inputs are available. The report calls a ref replay event-time exact only when that ref's plugin version and index format also match the recorded event and the replay reproduces its recorded baseline/final pages plus route provenance; a changed candidate otherwise remains a counterfactual replay over exact inputs, not historical output. Migrated legacy rows use one fixed captured feedback state, while missing boundaries or input/ref/output mismatches remain explicitly non-exact best-effort evidence. The machine report counts these evidence classes without exposing raw queries.
+The comparator opens live telemetry read-only, freezes one private source/runtime/OKF corpus, and builds each ref with that ref's own code. Nonnegative recorded explicit and enabled implicit feedback boundaries plus a matching index-corpus hash prove that the recorded event inputs are available. Implicit rows are accepted only when their exact successful search event has matching root, query, session, task, non-empty turn, and baseline-result membership. Searches recorded with implicit feedback disabled do not require unused implicit state. The report calls a ref replay event-time exact only when that ref's plugin version and index format also match the recorded event and the replay reproduces its recorded baseline/final pages plus route provenance; a changed candidate otherwise remains a counterfactual replay over exact inputs, not historical output. Migrated legacy rows without complete boundaries and same-turn provenance remain explicitly non-exact best-effort evidence. The machine report counts these evidence classes without exposing raw queries.
 
 Correction-route acceptance uses `explicit_resolution` Hit@1 as the primary outcome, then `verified_event` Hit@1/MRR, while requiring no increase in negative-artifact exposure, no unaccepted production ordering changes, and no replay errors. The comparison assessment distinguishes `rejected`, `accepted_improved`, and `accepted_unchanged_or_insufficient_evidence`. Direct/legacy aggregate metrics remain useful coverage and trend signals, but are not sufficient by themselves to prove a correction. Raw queries and artifact IDs appear only with `--details` inside the owner-only evaluation directory.
 
@@ -274,17 +291,24 @@ git diff --check
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and [`docs/github-security.md`](docs/github-security.md) for contribution, vulnerability-reporting, and repository-security guidance.
 
+## Acknowledgments
+
+This project benefits from people who contribute code, share ideas, or inspire features:
+
+- [@xXLODXx](https://github.com/xXLODXx) — contributed the initial opt-in implicit usage-feedback implementation and its confirmation and generic-artifact gates in [PR #27](https://github.com/stepanov1975/hermes-local-knowledge/pull/27), adapting ideas from [hermes-skill-router](https://github.com/xXLODXx/hermes-skill-router).
+
 ## Owner map
 
 - `config.py` — configuration models, aliases, defaults, and the single resolver.
+- `implicit.py` — opt-in same-turn search-result consumption attribution.
 - `artifacts.py` — whole-artifact models, source collection, privacy-safe metadata extraction, and graph edges.
 - `index.py` — format-4 SQLite/JSONL publication, cross-version and SQLite build locking, managed rebuild classification, and deterministic search/get/neighbors.
 - `telemetry.py` — local usage and feedback persistence/reporting.
-- `routing.py` — bounded live-root feedback matching, promotion, and one verified typed retry.
+- `routing.py` — bounded live-root explicit/implicit feedback matching, promotion, and one verified typed retry.
 - `evaluation.py` — read-only feedback-label replay and exact/parent-equivalent metrics.
 - `service.py` — one resolved configuration's managed index and telemetry lifecycle.
 - `okf.py` — privacy-safe OKF queue, hooks, detached worker, validation, and fenced publication.
-- `plugin.py` — Hermes registration for five tools, two hooks, the bundled skill, and installed CLI adapter; `register` is its public export.
+- `plugin.py` — Hermes registration for five tools, four hooks, the bundled skill, and installed CLI adapter; `register` is its public export.
 - `cli.py` — primary standalone command surface and the smaller Hermes CLI adapter.
 - `indexer.py` — thin compatibility facade exporting exactly `Artifact`, `Edge`, `IndexSettings`, `build_index`, `search_index`, `get_artifact`, `get_neighbors`, and `main`.
 - `__init__.py` — package version.

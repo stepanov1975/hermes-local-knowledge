@@ -60,6 +60,10 @@ local_knowledge:
   script_dirs: [scripts, hermes_home/scripts]
   include_markdown_docs: true
   exclude_dir_names: [build, dist]
+  implicit_feedback:
+    enabled: false  # optional; enable only for a private controlled installation
+    min_confirmations: 2
+    max_generic_queries: 5
   okf:
     enabled: true
     auto_generate: false  # set true only after the consent step
@@ -77,6 +81,8 @@ hermes config set local_knowledge.exclude_dir_names build,dist
 ```
 
 If `source_root` is omitted, it defaults to `$HERMES_HOME`; arbitrary root-level Markdown is then excluded by default to avoid a noisy broad scan.
+
+Implicit feedback is also opt-in. When enabled, a recent `knowledge_get` can become routing evidence only when the artifact appeared in an unassisted `knowledge_search` baseline from the same Hermes session, task, and turn. Repeated consumption from one search is deduplicated, confirmations require distinct search events, generic evidence is suppressed, and explicit feedback takes precedence. Leave it disabled outside a private controlled installation.
 
 ## 5. Run the doctor
 

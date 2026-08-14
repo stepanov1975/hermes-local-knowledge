@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 
 from hermes_local_knowledge import config as config_module
-from hermes_local_knowledge.config import Config, IndexSettings, OKFSettings, resolve_config
+from hermes_local_knowledge.config import (
+    Config,
+    ImplicitFeedbackSettings,
+    IndexSettings,
+    OKFSettings,
+    resolve_config,
+)
 
 
 def write_config(hermes_home: Path, body: str) -> None:
@@ -40,7 +46,13 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
 
     resolved = resolve_config(hermes_home)
 
-    assert config_module.__all__ == ["Config", "IndexSettings", "OKFSettings", "resolve_config"]
+    assert config_module.__all__ == [
+        "Config",
+        "ImplicitFeedbackSettings",
+        "IndexSettings",
+        "OKFSettings",
+        "resolve_config",
+    ]
     assert not hasattr(config_module, "RuntimeConfig")
     assert not hasattr(config_module, "OKFConfig")
     assert is_dataclass(Config)
@@ -50,6 +62,7 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
         "state_dir",
         "index_settings",
         "okf",
+        "implicit_feedback",
         "source_root_source",
         "state_dir_source",
         "include_markdown_docs_source",
@@ -86,6 +99,7 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
         min_use_count=1,
     )
     assert resolved.okf.max_worker_seconds == 120
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings()
     with pytest.raises(FrozenInstanceError):
         resolved.state_dir = tmp_path / "other"  # type: ignore[misc]
 
@@ -304,6 +318,25 @@ def test_okf_nested_flat_legacy_fallback_and_coercion(
 
     assert resolved.okf == expected
     assert resolved.okf.max_worker_seconds == expected.max_generation_seconds
+
+
+def test_implicit_feedback_settings_are_nested_and_bounded(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "hermes-home"
+    write_config(
+        hermes_home,
+        """local_knowledge:
+  implicit_feedback:
+    enabled: true
+    min_confirmations: 999
+    max_generic_queries: 999
+""",
+    )
+
+    assert resolve_config(hermes_home).implicit_feedback == ImplicitFeedbackSettings(
+        enabled=True,
+        min_confirmations=10,
+        max_generic_queries=100,
+    )
 
 
 def test_configured_hermes_home_and_explicit_override_resolution(

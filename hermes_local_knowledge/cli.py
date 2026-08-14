@@ -245,6 +245,10 @@ def _record_cli_usage(
     route_artifact_id: str | None = None,
     route_outcome: str = "none",
     feedback_max_id: int | None = -1,
+    implicit_feedback_max_id: int | None = None,
+    implicit_feedback_enabled: bool | None = None,
+    implicit_min_confirmations: int | None = None,
+    implicit_max_generic_queries: int | None = None,
     latency_ms: int | None = None,
     db_path: Path | None = None,
     index_meta: dict[str, Any] | None = None,
@@ -278,6 +282,10 @@ def _record_cli_usage(
         route_artifact_id=route_artifact_id,
         route_outcome=route_outcome,
         feedback_max_id=feedback_max_id,
+        implicit_feedback_max_id=implicit_feedback_max_id,
+        implicit_feedback_enabled=implicit_feedback_enabled,
+        implicit_min_confirmations=implicit_min_confirmations,
+        implicit_max_generic_queries=implicit_max_generic_queries,
         latency_ms=latency_ms,
         db_path=db_path,
         client="cli",
@@ -1078,12 +1086,15 @@ def main(
             route_artifact_id = route_decision.artifact_id
             route_outcome = route_decision.outcome.value
             feedback_max_id = route_decision.feedback_max_id
+            implicit_feedback_max_id = route_decision.implicit_feedback_max_id
         else:
             baseline_ids = final_ids
             route_feedback_id = None
             route_artifact_id = None
             route_outcome = "none"
             feedback_max_id = None
+            implicit_feedback_max_id = None
+        implicit_settings = getattr(getattr(service, "config", None), "implicit_feedback", None)
         _record_cli_usage(
             cfg,
             tool="knowledge_search",
@@ -1099,6 +1110,18 @@ def main(
             route_artifact_id=route_artifact_id,
             route_outcome=route_outcome,
             feedback_max_id=feedback_max_id,
+            implicit_feedback_max_id=implicit_feedback_max_id,
+            implicit_feedback_enabled=(
+                None
+                if implicit_settings is None
+                else (implicit_settings.enabled if managed else False)
+            ),
+            implicit_min_confirmations=(
+                None if implicit_settings is None else implicit_settings.min_confirmations
+            ),
+            implicit_max_generic_queries=(
+                None if implicit_settings is None else implicit_settings.max_generic_queries
+            ),
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             index_meta=meta,

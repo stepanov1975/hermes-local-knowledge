@@ -7,14 +7,16 @@ Durable product, ranking, privacy, and state rationale for `hermes-local-knowled
 - The plugin routes a local question to a **whole artifact**: a skill, skill support document, script, memory document, runbook, generic document, cron job, MCP server, or generated tool OKF.
 - It answers “which artifact should be inspected first?” It does not replace reading that artifact and is not chunk RAG.
 - Runtime dependencies remain standard-library-only. Generated state is local-only.
-- Stable boundaries are the `hermes_local_knowledge.plugin` entry point and `register`, the five documented tools/two hooks, the documented CLI/config behavior, and the eight names in `indexer.__all__`.
+- Stable boundaries are the `hermes_local_knowledge.plugin` entry point and `register`, the five documented tools/four hooks, the documented CLI/config behavior, and the eight names in `indexer.__all__`.
 
 ## Ownership
 
 - `config.py` resolves all configuration and aliases.
+- `implicit.py` owns same-turn search/get attribution for opt-in implicit evidence.
 - `artifacts.py` owns artifact/edge models, source collection, and safe routing metadata.
 - `index.py` owns format-4 publication and deterministic retrieval.
 - `telemetry.py` owns local usage/feedback data; `evaluation.py` owns read-only label replay.
+- `routing.py` owns bounded explicit and implicit route selection and promotion.
 - `service.py` composes one resolved configuration with managed index and telemetry lifecycles.
 - `okf.py` owns safe tool-use capture, the durable queue, detached generation, validation, and fenced publication.
 - `plugin.py` owns Hermes registration; `cli.py` owns command behavior; `indexer.py` is only the compatibility facade.
@@ -88,9 +90,11 @@ Automatic generation is optional and defaults off because it spends model tokens
 - Lookup usage, failures, zero-result queries, and explicit ratings stay in `usage.sqlite` and are summarized locally before changing ranking or source coverage.
 - Telemetry-only failures must not break lookup. Explicit feedback writes remain strict so callers know whether a rating was stored.
 - Evaluation is read-only and must not emit usage events or mutate feedback.
-- Explicit useful feedback may provide one bounded current-index-root routing prior, but it is not permanent truth. The newest significant query/artifact rating wins; a newer rejection for the route or matching current query vetoes an older overlap route. A retry must be no longer than the current query, must use the artifact's mapped type, and must rediscover the exact artifact before promotion. Explicit caller-owned indexes remain unassisted.
+- Explicit useful feedback may provide one bounded current-index-root routing prior, but it is not permanent truth. Legacy persisted `great` rows remain positive compatibility input even though the current tool rejects that rating. The newest significant query/artifact rating wins; a newer rejection for the route or matching current query vetoes an older overlap route. A retry must be no longer than the current query, must use the artifact's mapped type, and must rediscover the exact artifact before promotion. Explicit caller-owned indexes remain unassisted.
+- Opt-in implicit evidence comes only from a recent same-session/task/turn `knowledge_get` of an artifact returned by that search's unassisted baseline page. One search/artifact pair is deduplicated, confirmations must come from distinct search events, and evidence spread across too many query shapes is treated as generic. Implicit routing loses to matching explicit routes, uses the same current-index promotion or one verified typed-retry path, can be vetoed by matching explicit rejection, and is not an evaluation label.
 - Keep feedback lookup bounded and fail-open: scan only a recent capped window through the root/order index and use a short read timeout so optional routing cannot add multi-second lock delays.
 - Evaluation deliberately uses the unassisted index ranking so the same feedback rows are not both training data and evaluation labels. Ignore stale labels whose artifacts no longer exist.
+- Historical replay treats implicit state as exact input only when the recorded root-scoped high-water, effective settings, and same-turn baseline provenance are available. Searches recorded with implicit feedback disabled do not require unused implicit state; incomplete legacy rows remain explicitly non-exact evidence.
 - Report exact Hit@k/MRR and parent-equivalent metrics. Parent equivalence is limited to a `skill_support_doc` and its owning skill; peer skills, cron/script links, keyword overlap, and other graph edges are context rather than equivalence.
 - `*_at_10` metrics use an actual top-10 window regardless of a larger retrieval limit.
 - Curated regression cases protect exact/quoted behavior, identity recovery, operational intent, support-document diversity, type filters, privacy boundaries, and known historical routing wins.

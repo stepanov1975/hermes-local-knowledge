@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stdout
 from dataclasses import asdict, is_dataclass, replace
+from datetime import datetime, timezone
 import hashlib
 import importlib
 import importlib.util
@@ -338,11 +339,87 @@ def _truncate_search_outcome(outcome: dict[str, Any], limit: int | None) -> dict
     return output
 
 
-def _production_state_key(raw_bound: Any) -> str:
-    if raw_bound is None:
+def _persisted_feedback_bound(value: Any) -> int | None:
+    if type(value) is not int or value < -1:
+        return None
+    return value
+
+
+def _parsed_utc_timestamp(value: Any) -> datetime | None:
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _bounded_persisted_int(value: Any, *, minimum: int, maximum: int) -> int | None:
+    if type(value) is not int or not minimum <= value <= maximum:
+        return None
+    return value
+
+
+def _persisted_limit(value: Any) -> int | None:
+    return _bounded_persisted_int(value, minimum=1, maximum=2**31 - 1)
+
+
+def _persisted_id(value: Any) -> int | None:
+    return _bounded_persisted_int(value, minimum=1, maximum=2**63 - 1)
+
+
+def _production_state_key(
+    raw_bound: Any,
+    implicit_feedback_max_id: Any = None,
+    implicit_feedback_enabled: Any = None,
+    implicit_min_confirmations: Any = None,
+    implicit_max_generic_queries: Any = None,
+    implicit_observed_at: Any = None,
+) -> str:
+    bound = _persisted_feedback_bound(raw_bound)
+    if bound is None:
         return "unavailable"
-    bound = int(raw_bound)
-    return "legacy" if bound < 0 else f"bound-{bound}"
+    if bound == -1:
+        return "explicit-legacy_implicit-unavailable"
+    if implicit_feedback_enabled is False:
+        return f"explicit-{bound}_implicit-disabled"
+    implicit_bound = _bounded_persisted_int(
+        implicit_feedback_max_id, minimum=0, maximum=2**63 - 1
+    )
+    min_confirmations = _bounded_persisted_int(
+        implicit_min_confirmations, minimum=1, maximum=10
+    )
+    max_generic_queries = _bounded_persisted_int(
+        implicit_max_generic_queries, minimum=1, maximum=100
+    )
+    if (
+        implicit_bound is None
+        or type(implicit_feedback_enabled) is not bool
+        or min_confirmations is None
+        or max_generic_queries is None
+    ):
+        return f"bound-{bound}"
+    state_key = (
+        f"explicit-{bound}_implicit-{implicit_bound}"
+        f"_enabled-{int(implicit_feedback_enabled)}"
+        f"_min-{min_confirmations}"
+        f"_generic-{max_generic_queries}"
+    )
+    if implicit_bound > 0:
+        observed_at = _parsed_utc_timestamp(implicit_observed_at)
+        if observed_at is None:
+            return f"bound-{bound}"
+        observed_key = hashlib.sha256(observed_at.isoformat().encode()).hexdigest()[:16]
+        state_key += f"_observed-{observed_key}"
+    return state_key
+
+
+def _feedback_bound_kind(raw_bound: Any) -> str:
+    bound = _persisted_feedback_bound(raw_bound)
+    if bound is None:
+        return "unavailable"
+    return "legacy" if bound == -1 else f"bound-{bound}"
 
 
 def _routing_provenance(metadata: Mapping[str, Any], service_module: Any) -> dict[str, Any]:
@@ -358,6 +435,7 @@ def _routing_provenance(metadata: Mapping[str, Any], service_module: Any) -> dic
         "route_feedback_id": getattr(decision, "feedback_id", None),
         "route_artifact_id": getattr(decision, "artifact_id", None),
         "feedback_max_id": getattr(decision, "feedback_max_id", None),
+        "implicit_feedback_max_id": getattr(decision, "implicit_feedback_max_id", None),
     }
 
 
@@ -382,6 +460,8 @@ def _production_services(
     source_root = Path(str(production["source_root"])).resolve()
     hermes_home = Path(str(production["hermes_home"])).resolve()
     services: dict[str, Any] = {}
+    raw_evidence = production.get("evidence")
+    evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
     for state_key, raw_state_dir in raw_states.items():
         state_dir = Path(str(raw_state_dir)).resolve()
         os.environ["LOCAL_KNOWLEDGE_ROOT"] = str(source_root)
@@ -390,6 +470,31 @@ def _production_services(
         config = resolver(hermes_home)
         if is_dataclass(config):
             config = replace(cast(Any, config), source_root=source_root, state_dir=state_dir)
+            state_evidence = evidence.get(str(state_key), {})
+            implicit = getattr(config, "implicit_feedback", None)
+            if is_dataclass(implicit) and isinstance(state_evidence, dict):
+                enabled = state_evidence.get("implicit_feedback_enabled")
+                min_confirmations = state_evidence.get("implicit_min_confirmations")
+                max_generic_queries = state_evidence.get("implicit_max_generic_queries")
+                if enabled is False:
+                    config = replace(
+                        cast(Any, config),
+                        implicit_feedback=replace(cast(Any, implicit), enabled=False),
+                    )
+                elif (
+                    enabled is not None
+                    and min_confirmations is not None
+                    and max_generic_queries is not None
+                ):
+                    config = replace(
+                        cast(Any, config),
+                        implicit_feedback=replace(
+                            cast(Any, implicit),
+                            enabled=bool(enabled),
+                            min_confirmations=int(min_confirmations),
+                            max_generic_queries=int(max_generic_queries),
+                        ),
+                    )
         services[str(state_key)] = service_type(config)
     return services, service_module
 
@@ -400,8 +505,23 @@ def _production_search(
     row: Mapping[str, Any],
     *,
     feedback_bound_available: bool = False,
+    implicit_feedback_bound_available: bool = False,
 ) -> dict[str, Any]:
-    recorded_limit = None if row.get("limit") is None else int(row["limit"])
+    raw_recorded_limit = row.get("limit")
+    recorded_limit = (
+        None if raw_recorded_limit is None else _persisted_limit(raw_recorded_limit)
+    )
+    raw_route_feedback_id = row.get("route_feedback_id")
+    recorded_route_feedback_id = (
+        None if raw_route_feedback_id is None else _persisted_id(raw_route_feedback_id)
+    )
+    recorded_event_id = _persisted_id(row.get("event_id"))
+    recorded_inputs_valid = (
+        row.get("recorded_inputs_valid", True) is True
+        and (raw_recorded_limit is None or recorded_limit is not None)
+        and recorded_event_id is not None
+        and (raw_route_feedback_id is None or recorded_route_feedback_id is not None)
+    )
     companion_hash = _sha256_file(Path(str(service.config.state_dir)) / "index.jsonl")
 
     def call() -> dict[str, Any]:
@@ -426,13 +546,57 @@ def _production_search(
         replay_plugin_version = str(metadata.get("plugin_version") or "") or None
         recorded_format_version = str(row.get("index_format_version") or "") or None
         replay_format_version = str(metadata.get("format_version") or "") or None
-        feedback_max_id = row.get("feedback_max_id", -1)
+        feedback_max_id = _persisted_feedback_bound(row.get("feedback_max_id", -1))
+        implicit_feedback_max_id = _bounded_persisted_int(
+            row.get("implicit_feedback_max_id"), minimum=0, maximum=2**63 - 1
+        )
+        raw_implicit_enabled = row.get("implicit_feedback_enabled")
+        recorded_implicit_enabled = (
+            raw_implicit_enabled if type(raw_implicit_enabled) is bool else None
+        )
+        implicit_min_confirmations = _bounded_persisted_int(
+            row.get("implicit_min_confirmations"), minimum=1, maximum=10
+        )
+        implicit_max_generic_queries = _bounded_persisted_int(
+            row.get("implicit_max_generic_queries"), minimum=1, maximum=100
+        )
+        recorded_implicit_config = (
+            recorded_implicit_enabled,
+            implicit_min_confirmations,
+            implicit_max_generic_queries,
+        )
+        replay_implicit = getattr(service.config, "implicit_feedback", None)
+        implicit_config_match = (
+            replay_implicit is not None
+            and recorded_implicit_enabled is not None
+            and bool(recorded_implicit_enabled) == replay_implicit.enabled
+            and (
+                not replay_implicit.enabled
+                or recorded_implicit_config
+                == (
+                    replay_implicit.enabled,
+                    replay_implicit.min_confirmations,
+                    replay_implicit.max_generic_queries,
+                )
+            )
+        )
         corpus_match = None if recorded_hash is None else recorded_hash == companion_hash
+        implicit_state_relevant = bool(recorded_implicit_enabled)
+        implicit_state_exact = (
+            implicit_feedback_bound_available and implicit_feedback_max_id is not None
+            if implicit_state_relevant
+            else recorded_implicit_enabled is not None
+        )
         event_inputs_exact = (
-            feedback_bound_available
+            recorded_inputs_valid
+            and feedback_bound_available
+            and implicit_state_exact
             and feedback_max_id is not None
-            and int(feedback_max_id) >= 0
+            and feedback_max_id >= 0
+            and implicit_config_match
             and corpus_match is True
+            and row.get("baseline_top_ids_valid") is True
+            and row.get("recorded_top_ids_valid") is True
         )
         plugin_version_match = (
             None
@@ -461,9 +625,14 @@ def _production_search(
             else (
                 str(provenance.get("route_outcome") or "none")
                 == str(row.get("route_outcome") or "none")
-                and provenance.get("route_feedback_id") == row.get("route_feedback_id")
+                and provenance.get("route_feedback_id") == recorded_route_feedback_id
                 and provenance.get("route_artifact_id") == row.get("route_artifact_id")
                 and provenance.get("feedback_max_id") == feedback_max_id
+                and (
+                    not implicit_state_relevant
+                    or provenance.get("implicit_feedback_max_id")
+                    == implicit_feedback_max_id
+                )
             )
         )
         return {
@@ -480,6 +649,8 @@ def _production_search(
             "recorded_index_format_version": recorded_format_version,
             "index_format_match": index_format_match,
             "event_inputs_exact": event_inputs_exact,
+            "recorded_inputs_valid": recorded_inputs_valid,
+            "implicit_config_match": implicit_config_match,
             "recorded_output_match": recorded_output_match,
             "recorded_route_match": recorded_route_match,
             "event_time_exact": (
@@ -489,7 +660,7 @@ def _production_search(
                 and recorded_output_match is True
                 and recorded_route_match is True
             ),
-            "feedback_bound_kind": _production_state_key(feedback_max_id),
+            "feedback_bound_kind": _feedback_bound_kind(feedback_max_id),
         }
 
     started = time.perf_counter()
@@ -536,7 +707,10 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
     }
     for row in replay.get("search", []):
         case_id = str(row["case_id"])
-        recorded_limit = None if row.get("limit") is None else int(row["limit"])
+        raw_recorded_limit = row.get("limit")
+        recorded_limit = (
+            None if raw_recorded_limit is None else _persisted_limit(raw_recorded_limit)
+        )
         outcome = _search(
             module,
             full_db,
@@ -546,7 +720,14 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
         )
         replay_results["search"][case_id] = _truncate_search_outcome(outcome, recorded_limit)
         if production_services:
-            state_key = _production_state_key(row.get("feedback_max_id", -1))
+            state_key = _production_state_key(
+                row.get("feedback_max_id", -1),
+                row.get("implicit_feedback_max_id"),
+                row.get("implicit_feedback_enabled"),
+                row.get("implicit_min_confirmations"),
+                row.get("implicit_max_generic_queries"),
+                row.get("observed_at"),
+            )
             if state_key not in production_services:
                 raise KeyError(f"missing production replay state: {state_key}")
             production_results[case_id] = _production_search(
@@ -556,6 +737,12 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
                 feedback_bound_available=bool(
                     production_evidence.get(state_key, {}).get(
                         "feedback_bound_available",
+                        False,
+                    )
+                ),
+                implicit_feedback_bound_available=bool(
+                    production_evidence.get(state_key, {}).get(
+                        "implicit_feedback_bound_available",
                         False,
                     )
                 ),

@@ -10,6 +10,7 @@ import pytest
 from hermes_local_knowledge.routing import (
     FeedbackRoute,
     RouteOutcome,
+    _parsed_utc_timestamp,
     apply_feedback_route,
     best_feedback_route,
     decide_feedback_route,
@@ -35,6 +36,10 @@ def _feedback(
         context={},
         usage_db_path=usage_db_path,
     )
+
+
+def test_parsed_utc_timestamp_rejects_conversion_overflow() -> None:
+    assert _parsed_utc_timestamp("9999-12-31T23:59:59-23:59") is None
 
 
 def test_route_maps_nonmatching_id_prefix_and_requires_a_concise_retry(tmp_path: Path) -> None:

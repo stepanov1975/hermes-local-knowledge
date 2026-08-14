@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.6] - 2026-08-14
+
+### Added
+
+- Added opt-in implicit routing feedback when an artifact is consumed from a recent same-turn baseline search. Confirmations are deduplicated per search event, require distinct searches, and stop promoting artifacts mature across too many query shapes; route-assisted-only results do not create evidence, explicit feedback remains authoritative, and implicit evidence stays outside evaluation labels. The idea originated with [@xXLODXx](https://github.com/xXLODXx)'s proposal and initial implementation in [PR #27](https://github.com/stepanov1975/hermes-local-knowledge/pull/27), including its confirmation and generic-artifact gate design.
+- Added deterministic historical replay for implicit-routing state. Managed search telemetry records a root-scoped implicit high-water and effective settings; exact replay requires bounded same-turn baseline provenance to validate, while legacy or incomplete rows remain non-exact and disabled searches do not depend on unused implicit state.
+
+[0.4.6]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.5...v0.4.6
+
 ## [0.4.5] - 2026-08-07
 
 ### Changed

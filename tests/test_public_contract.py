@@ -294,6 +294,8 @@ USAGE_REPORT_KEYS = {
     "live_total_events",
     "feedback_count",
     "live_feedback_count",
+    "implicit_feedback_count",
+    "live_implicit_feedback_count",
     "avg_latency_ms",
     "root_breakdown",
     "feedback_root_breakdown",
@@ -719,7 +721,12 @@ def test_tool_registration_freezes_exact_five_contracts_and_host_integrations(
     expected_skill = REPO_ROOT / "skills" / "local-knowledge-router" / "SKILL.md"
     assert ctx.skills == [("local-knowledge-router", expected_skill)]
     assert expected_skill.is_file()
-    assert set(ctx.hooks) == {"post_tool_call", "on_session_finalize"}
+    assert set(ctx.hooks) == {
+        "pre_llm_call",
+        "post_tool_call",
+        "on_session_end",
+        "on_session_finalize",
+    }
     assert len(ctx.cli_commands) == 1
     cli_registration = ctx.cli_commands[0]
     assert set(cli_registration) == {"name", "help", "description", "setup_fn", "handler_fn"}
@@ -1823,7 +1830,12 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
         return values
 
     assert manifest_list("provides_tools") == EXPECTED_TOOL_ORDER
-    assert manifest_list("provides_hooks") == ["post_tool_call", "on_session_finalize"]
+    assert manifest_list("provides_hooks") == [
+        "pre_llm_call",
+        "post_tool_call",
+        "on_session_end",
+        "on_session_finalize",
+    ]
 
     root_skill = REPO_ROOT / "skills" / "local-knowledge-router" / "SKILL.md"
     package_skill = (
@@ -1922,6 +1934,7 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
         "evaluation.py",
         "index.py",
         "indexer.py",
+        "implicit.py",
         "okf.py",
         "plugin.py",
         "routing.py",
