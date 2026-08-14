@@ -476,6 +476,12 @@ def test_production_state_key_canonicalizes_implicit_observation_time() -> None:
         "explicit-2_implicit-2_enabled-1_min-2_generic-5_observed-"
     )
     assert evaluator._production_state_key(2, 2, True, 2, 5, "malformed") == "bound-2"
+    assert (
+        evaluator._production_state_key(
+            2, 2, True, 2, 5, "9999-12-31T23:59:59-23:59"
+        )
+        == "bound-2"
+    )
     assert evaluator._production_state_key(2, 2, True, 2, 5, None) == "bound-2"
 
 

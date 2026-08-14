@@ -658,6 +658,26 @@ def test_latest_eligible_search_can_precede_a_refinement(tmp_path: Path, monkeyp
         ).fetchone() == (matching_event,)
 
 
+def test_route_assisted_newer_search_blocks_older_attribution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    _search(config, session="s1", task="wanted")
+    _search(
+        config,
+        session="s1",
+        task="wanted",
+        query="docker narrower refinement",
+        top_ids=["runbook:target"],
+        baseline_top_ids=["runbook:other"],
+    )
+
+    _consume(monkeypatch, config, session="s1", task="wanted")
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone() == (0,)
+
+
 def test_explicit_route_takes_precedence_over_implicit(tmp_path: Path, monkeypatch) -> None:
     config = _config(tmp_path)
     for session, task in (("s1", "t1"), ("s2", "t2")):

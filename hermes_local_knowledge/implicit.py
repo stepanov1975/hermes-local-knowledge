@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import resolve_config
-from .routing import IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
+from .routing import IMPLICIT_FEEDBACK_MAX_SEARCH_AGE, _parsed_utc_timestamp
 from .telemetry import (
     _clean_text,
     attach_usage_event_turn_id,
@@ -119,15 +119,14 @@ def _matching_search_event(
     ).fetchall()
     now = datetime.now(timezone.utc)
     for row in rows:
+        timestamp = _parsed_utc_timestamp(row["ts"])
         try:
-            timestamp = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
             baseline_ids = json.loads(str(row["baseline_top_ids_json"] or "[]"))
             final_ids = json.loads(str(row["top_ids_json"] or "[]"))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        timestamp = timestamp.astimezone(timezone.utc)
+        if timestamp is None:
+            continue
         if timestamp > now:
             continue
         if now - timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE:
@@ -135,12 +134,14 @@ def _matching_search_event(
         if (
             not isinstance(baseline_ids, list)
             or not all(isinstance(item, str) for item in baseline_ids)
-            or artifact_id not in baseline_ids
             or not isinstance(final_ids, list)
             or not all(isinstance(item, str) for item in final_ids)
-            or artifact_id not in final_ids
         ):
             continue
+        if artifact_id not in final_ids:
+            continue
+        if artifact_id not in baseline_ids:
+            return None
         query = str(row["query"] or "").strip()
         if not query:
             continue

@@ -348,11 +348,11 @@ def _persisted_feedback_bound(value: Any) -> int | None:
 def _parsed_utc_timestamp(value: Any) -> datetime | None:
     try:
         timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    return timestamp.astimezone(timezone.utc)
 
 
 def _bounded_persisted_int(value: Any, *, minimum: int, maximum: int) -> int | None:

@@ -122,11 +122,11 @@ def _persisted_id(value: Any, *, allow_zero: bool = False) -> int | None:
 def _parsed_utc_timestamp(value: Any) -> datetime | None:
     try:
         timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    return timestamp.astimezone(timezone.utc)
 
 
 def _normalized_query(query: str) -> str:
