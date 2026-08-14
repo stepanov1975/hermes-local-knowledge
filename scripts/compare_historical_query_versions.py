@@ -720,6 +720,7 @@ def _implicit_feedback_provenance_exact(
         "success",
         "query",
         "baseline_top_ids_json",
+        "top_ids_json",
         "session_id",
         "task_id",
         "turn_id",
@@ -733,7 +734,7 @@ def _implicit_feedback_provenance_exact(
                i.session_id AS implicit_session_id, i.task_id AS implicit_task_id,
                i.turn_id AS implicit_turn_id, e.id AS linked_event_id,
                e.tool, e.success,
-               e.query AS event_query, e.baseline_top_ids_json,
+               e.query AS event_query, e.baseline_top_ids_json, e.top_ids_json,
                e.session_id AS event_session_id, e.task_id AS event_task_id,
                e.turn_id AS event_turn_id, e.root AS event_root
         FROM implicit_feedback i
@@ -767,6 +768,7 @@ def _implicit_feedback_provenance_exact(
     for row in bounded_rows:
         try:
             baseline_ids = json.loads(str(row["baseline_top_ids_json"] or ""))
+            final_ids = json.loads(str(row["top_ids_json"] or ""))
         except (TypeError, ValueError, json.JSONDecodeError):
             return False
         implicit_turn_id = str(row["implicit_turn_id"] or "")
@@ -783,6 +785,9 @@ def _implicit_feedback_provenance_exact(
             or not isinstance(baseline_ids, list)
             or any(type(value) is not str or not value for value in baseline_ids)
             or str(row["artifact_id"] or "") not in baseline_ids
+            or not isinstance(final_ids, list)
+            or any(type(value) is not str or not value for value in final_ids)
+            or str(row["artifact_id"] or "") not in final_ids
         ):
             return False
     return True

@@ -380,6 +380,7 @@ def test_requires_two_distinct_searches_before_routing(tmp_path: Path, monkeypat
             "UPDATE usage_events SET baseline_top_ids_json='[\"runbook:other\"]' WHERE id=2",
             (),
         ),
+        ("UPDATE usage_events SET top_ids_json='[\"runbook:other\"]' WHERE id=2", ()),
     ],
 )
 def test_live_implicit_routing_rejects_malformed_linked_provenance(

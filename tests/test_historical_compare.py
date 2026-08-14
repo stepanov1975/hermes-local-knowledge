@@ -221,7 +221,7 @@ def create_provenance_usage_db(path: Path, live_root: Path, unrelated_root: Path
                     "turn-2",
                     str(live_root),
                     '["skill:old"]',
-                    '["skill:new"]',
+                    '["skill:old", "skill:new"]',
                     2,
                     "skill:new",
                     2,
@@ -742,9 +742,10 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
         conn.execute("DELETE FROM usage_events")
         conn.executemany(
             "INSERT INTO usage_events "
-            "(id, ts, tool, query, success, session_id, task_id, turn_id, root, baseline_top_ids_json) "
+            "(id, ts, tool, query, success, session_id, task_id, turn_id, root, "
+            "baseline_top_ids_json, top_ids_json) "
             "VALUES (?, '2026-01-01T00:00:00Z', 'knowledge_search', 'query', 1, "
-            "'session', 'task', 'turn', ?, '[\"skill:a\"]')",
+            "'session', 'task', 'turn', ?, '[\"skill:a\"]', '[\"skill:a\"]')",
             ((row_id, str(root)) for row_id in row_ids),
         )
         conn.executemany(
@@ -779,6 +780,7 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
             "top_ids_json='[\"skill:old\"]' WHERE id=2",
             (),
         ),
+        ("UPDATE usage_events SET top_ids_json='[\"skill:other\"]' WHERE id=2", ()),
         ("UPDATE usage_events SET baseline_top_ids_json='not-json' WHERE id=2", ()),
         (
             "UPDATE usage_events SET baseline_top_ids_json='[\"skill:old\", 7]' WHERE id=2",
@@ -801,12 +803,13 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
         "wrong-turn",
         "empty-turn",
         "route-assisted-only-artifact",
+        "final-page-excluded-artifact",
         "malformed-baseline",
         "mixed-type-baseline",
         "null-baseline-entry",
     ],
 )
-def test_implicit_replay_provenance_requires_exact_linked_baseline_evidence(
+def test_implicit_replay_provenance_requires_exact_linked_result_evidence(
     tmp_path: Path,
     corruption_sql: str,
     corruption_params: tuple[str, ...],
@@ -866,7 +869,7 @@ def test_implicit_provenance_rejects_non_integer_ids_without_vacuous_success(
         conn.executescript(
             """
             CREATE TABLE usage_events (
-                id, tool, success, query, baseline_top_ids_json,
+                id, tool, success, query, baseline_top_ids_json, top_ids_json,
                 session_id, task_id, turn_id, root
             );
             CREATE TABLE implicit_feedback (
@@ -877,7 +880,7 @@ def test_implicit_provenance_rejects_non_integer_ids_without_vacuous_success(
         )
         conn.execute(
             "INSERT INTO usage_events VALUES (?, 'knowledge_search', 1, 'q', "
-            "'[\"skill:a\"]', 's', 't', 'u', ?)",
+            "'[\"skill:a\"]', '[\"skill:a\"]', 's', 't', 'u', ?)",
             (usage_event_id, str(tmp_path)),
         )
         conn.execute(
@@ -902,7 +905,7 @@ def test_implicit_provenance_accepts_exact_integer_ids_and_empty_zero_boundary(
         conn.executescript(
             """
             CREATE TABLE usage_events (
-                id, tool, success, query, baseline_top_ids_json,
+                id, tool, success, query, baseline_top_ids_json, top_ids_json,
                 session_id, task_id, turn_id, root
             );
             CREATE TABLE implicit_feedback (
@@ -913,7 +916,7 @@ def test_implicit_provenance_accepts_exact_integer_ids_and_empty_zero_boundary(
         )
         conn.execute(
             "INSERT INTO usage_events VALUES (1, 'knowledge_search', 1, 'q', "
-            "'[\"skill:a\"]', 's', 't', 'u', ?)",
+            "'[\"skill:a\"]', '[\"skill:a\"]', 's', 't', 'u', ?)",
             (str(tmp_path),),
         )
         conn.execute(

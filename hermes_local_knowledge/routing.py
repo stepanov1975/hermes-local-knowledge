@@ -355,6 +355,7 @@ def _implicit_feedback_route_snapshot(
         "success",
         "query",
         "baseline_top_ids_json",
+        "top_ids_json",
         "session_id",
         "task_id",
         "turn_id",
@@ -371,6 +372,7 @@ def _implicit_feedback_route_snapshot(
                e.tool AS event_tool, e.success AS event_success,
                e.query AS event_query,
                e.baseline_top_ids_json AS event_baseline_top_ids_json,
+               e.top_ids_json AS event_top_ids_json,
                e.session_id AS event_session_id,
                e.task_id AS event_task_id,
                e.turn_id AS event_turn_id,
@@ -390,6 +392,7 @@ def _implicit_feedback_route_snapshot(
     for row in rows:
         try:
             baseline_ids = json.loads(str(row["event_baseline_top_ids_json"] or ""))
+            final_ids = json.loads(str(row["event_top_ids_json"] or ""))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
         route_query = str(row["query"] or "").strip()
@@ -415,6 +418,9 @@ def _implicit_feedback_route_snapshot(
             or not isinstance(baseline_ids, list)
             or any(type(value) is not str or not value for value in baseline_ids)
             or candidate_id not in baseline_ids
+            or not isinstance(final_ids, list)
+            or any(type(value) is not str or not value for value in final_ids)
+            or candidate_id not in final_ids
         ):
             continue
         implicit_feedback_id = _persisted_id(row["id"])

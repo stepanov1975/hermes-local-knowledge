@@ -248,6 +248,11 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_tool ON usage_events(tool)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_query ON usage_events(query)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_events_implicit_lookup "
+        "ON usage_events(root, session_id, task_id, turn_id, id DESC) "
+        "WHERE tool = 'knowledge_search' AND success = 1"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_root_id ON feedback(root, id DESC)")

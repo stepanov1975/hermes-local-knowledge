@@ -136,7 +136,7 @@ def _matching_search_event(
 
 
 def on_post_tool_call(**kwargs: Any) -> None:
-    """Record one same-turn, recent baseline-result consumption; never break hooks."""
+    """Record one same-turn, recent, caller-visible baseline-result consumption; never break hooks."""
 
     try:
         config = resolve_config()

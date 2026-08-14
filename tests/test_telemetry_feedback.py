@@ -579,6 +579,15 @@ def test_v042_schema_migrates_additively_and_rollback_writer_gets_legacy_default
         assert conn.execute("SELECT linkage_status FROM feedback WHERE id=1").fetchone() == ("legacy",)
         indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(feedback)")}
         assert {"idx_feedback_resolution_unique", "idx_feedback_route_lookup"} <= indexes
+        usage_indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(usage_events)")}
+        assert "idx_usage_events_implicit_lookup" in usage_indexes
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM usage_events "
+            "WHERE session_id=? AND task_id=? AND turn_id=? AND root=? "
+            "AND tool='knowledge_search' AND success=1 ORDER BY id DESC LIMIT 20",
+            ("s", "t", "turn", "root"),
+        ).fetchall()
+        assert any("idx_usage_events_implicit_lookup" in str(row[3]) for row in plan)
         # Simulate a rolled-back v0.4.2 writer that knows none of the additive columns.
         conn.execute(
             "INSERT INTO usage_events (ts, tool, success, root) VALUES ('rollback', 'knowledge_search', 1, ?)",
