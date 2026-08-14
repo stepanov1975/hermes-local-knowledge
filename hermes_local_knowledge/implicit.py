@@ -55,6 +55,13 @@ def _resolved_turn_id(*, session_id: str, task_id: str, turn_id: Any) -> str:
 
 
 def _hook_succeeded(kwargs: Mapping[str, Any]) -> bool:
+    status = kwargs.get("status")
+    if (
+        isinstance(status, str)
+        and status.strip()
+        and status.strip().lower() not in {"ok", "success"}
+    ):
+        return False
     result = kwargs.get("result")
     if isinstance(result, str):
         try:
@@ -66,9 +73,6 @@ def _hook_succeeded(kwargs: Mapping[str, Any]) -> bool:
                 return False
             if payload.get("success") is True:
                 return True
-    status = kwargs.get("status")
-    if isinstance(status, str) and status.strip():
-        return status.strip().lower() in {"ok", "success"}
     return True
 
 

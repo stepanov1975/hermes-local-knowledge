@@ -60,12 +60,14 @@ def _consume(
     session: str,
     task: str,
     turn: str = "turn-1",
+    status: str | None = None,
 ) -> None:
     monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
     on_post_tool_call(
         tool_name="knowledge_get",
         args={"artifact_id": "runbook:target"},
         result=json.dumps({"success": True}),
+        status=status,
         session_id=session,
         task_id=task,
         turn_id=turn,
@@ -297,6 +299,15 @@ def test_semantically_failed_get_is_not_positive_evidence(tmp_path: Path, monkey
         task_id="t1",
         turn_id="turn-1",
     )
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
+def test_failed_status_overrides_success_payload(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    _search(config, session="s1", task="t1")
+    _consume(monkeypatch, config, session="s1", task="t1", status="error")
 
     with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
         assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
