@@ -123,7 +123,7 @@ def _matching_search_event(
         if timestamp > now:
             continue
         if now - timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE:
-            break
+            continue
         if (
             not isinstance(baseline_ids, list)
             or not all(isinstance(item, str) for item in baseline_ids)

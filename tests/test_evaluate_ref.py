@@ -235,6 +235,60 @@ def test_main_emits_one_json_object_for_lookup_payload_error(
     assert secret not in stdout
 
 
+def test_production_services_apply_recorded_disabled_state_without_thresholds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    evaluator = load_evaluator()
+
+    @dataclass(frozen=True)
+    class ImplicitConfig:
+        enabled: bool = True
+        min_confirmations: int = 2
+        max_generic_queries: int = 5
+
+    @dataclass(frozen=True)
+    class Config:
+        source_root: Path
+        state_dir: Path
+        implicit_feedback: ImplicitConfig = ImplicitConfig()
+
+    class FakeService:
+        def __init__(self, config: Config) -> None:
+            self.config = config
+
+    base_config = Config(source_root=tmp_path / "configured", state_dir=tmp_path / "configured-state")
+    service_module = SimpleNamespace(LocalKnowledgeService=FakeService)
+    monkeypatch.setattr(evaluator.importlib, "import_module", lambda _name: service_module)
+    monkeypatch.setattr(evaluator, "_module_path", lambda _module, _root: None)
+    monkeypatch.setattr(
+        evaluator,
+        "_config_resolver",
+        lambda _package, _root: lambda _home: base_config,
+    )
+    request = {
+        "production": {
+            "states": {"disabled": str(tmp_path / "state")},
+            "source_root": str(tmp_path / "source"),
+            "hermes_home": str(tmp_path / "home"),
+            "evidence": {
+                "disabled": {
+                    "implicit_feedback_enabled": False,
+                    "implicit_min_confirmations": None,
+                    "implicit_max_generic_queries": None,
+                }
+            },
+        }
+    }
+
+    services, _ = evaluator._production_services(
+        SimpleNamespace(__name__="package.indexer"), request, tmp_path
+    )
+
+    assert services["disabled"].config.implicit_feedback.enabled is False
+    assert services["disabled"].config.implicit_feedback.min_confirmations == 2
+    assert services["disabled"].config.implicit_feedback.max_generic_queries == 5
+
+
 def test_production_search_is_read_only_and_emits_route_provenance(tmp_path: Path) -> None:
     evaluator = load_evaluator()
     state_dir = tmp_path / "state"

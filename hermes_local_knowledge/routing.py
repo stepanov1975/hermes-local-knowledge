@@ -376,14 +376,19 @@ def _implicit_feedback_route_snapshot(
         "root",
     }.issubset(usage_columns):
         return None, implicit_feedback_max_id
+    recorded_enabled = "implicit_feedback_enabled" in usage_columns
+    recorded_enabled_expression = (
+        "e.implicit_feedback_enabled" if recorded_enabled else "NULL"
+    )
     rows = connection.execute(
-        """
+        f"""
         SELECT i.id, i.ts AS implicit_ts, i.query, i.artifact_id, i.search_event_id,
                i.session_id AS implicit_session_id,
                i.task_id AS implicit_task_id,
                i.turn_id AS implicit_turn_id,
                e.id AS event_id, e.ts AS event_ts,
                e.tool AS event_tool, e.success AS event_success,
+               {recorded_enabled_expression} AS event_implicit_feedback_enabled,
                e.query AS event_query,
                e.baseline_top_ids_json AS event_baseline_top_ids_json,
                e.top_ids_json AS event_top_ids_json,
@@ -430,6 +435,13 @@ def _implicit_feedback_route_snapshot(
             or str(row["event_tool"] or "") != "knowledge_search"
             or type(row["event_success"]) is not int
             or row["event_success"] != 1
+            or (
+                recorded_enabled
+                and (
+                    type(row["event_implicit_feedback_enabled"]) is not int
+                    or row["event_implicit_feedback_enabled"] != 1
+                )
+            )
             or str(row["event_root"] or "") != str(root)
             or route_query != str(row["event_query"] or "")
             or not implicit_session_id

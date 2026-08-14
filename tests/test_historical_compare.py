@@ -745,9 +745,9 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
         conn.executemany(
             "INSERT INTO usage_events "
             "(id, ts, tool, query, success, session_id, task_id, turn_id, root, "
-            "baseline_top_ids_json, top_ids_json) "
+            "baseline_top_ids_json, top_ids_json, implicit_feedback_enabled) "
             "VALUES (?, '2026-01-01T00:00:00Z', 'knowledge_search', 'query', 1, "
-            "'session', 'task', 'turn', ?, '[\"skill:a\"]', '[\"skill:a\"]')",
+            "'session', 'task', 'turn', ?, '[\"skill:a\"]', '[\"skill:a\"]', 1)",
             ((row_id, str(root)) for row_id in row_ids),
         )
         conn.executemany(
@@ -771,6 +771,7 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
         ("UPDATE usage_events SET tool='knowledge_get' WHERE id=2", ()),
         ("UPDATE usage_events SET success=0 WHERE id=2", ()),
         ("UPDATE usage_events SET success='invalid' WHERE id=2", ()),
+        ("UPDATE usage_events SET implicit_feedback_enabled=0 WHERE id=2", ()),
         ("UPDATE usage_events SET root=? WHERE id=2", ("__OTHER_ROOT__",)),
         ("UPDATE implicit_feedback SET query='wrong-query' WHERE id=2", ()),
         ("UPDATE implicit_feedback SET session_id='wrong-session' WHERE id=2", ()),
@@ -799,6 +800,7 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
         "wrong-tool",
         "failed-search",
         "malformed-search-success",
+        "feedback-disabled-search",
         "wrong-root",
         "wrong-query",
         "wrong-session",

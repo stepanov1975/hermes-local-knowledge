@@ -46,6 +46,9 @@ def _search(
         query=query,
         top_ids=top_ids,
         baseline_top_ids=top_ids if baseline_top_ids is None else baseline_top_ids,
+        implicit_feedback_enabled=config.implicit_feedback.enabled,
+        implicit_min_confirmations=config.implicit_feedback.min_confirmations,
+        implicit_max_generic_queries=config.implicit_feedback.max_generic_queries,
         context={"session_id": session, "task_id": task, "turn_id": turn},
         usage_db_path=config.state_dir / "usage.sqlite",
     )
@@ -381,6 +384,7 @@ def test_future_persisted_confirmations_do_not_route(tmp_path: Path, monkeypatch
         ("UPDATE implicit_feedback SET ts=datetime(ts, '+31 minutes') WHERE id=2", ()),
         ("UPDATE usage_events SET tool='knowledge_get' WHERE id=2", ()),
         ("UPDATE usage_events SET success='invalid' WHERE id=2", ()),
+        ("UPDATE usage_events SET implicit_feedback_enabled=0 WHERE id=2", ()),
         ("UPDATE usage_events SET root=? WHERE id=2", ("__OTHER_ROOT__",)),
         ("UPDATE usage_events SET query='wrong query' WHERE id=2", ()),
         ("UPDATE usage_events SET session_id='wrong-session' WHERE id=2", ()),
@@ -570,6 +574,22 @@ def test_future_search_is_not_eligible(tmp_path: Path, monkeypatch) -> None:
     _consume(monkeypatch, config, session="s1", task="wanted")
     with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
         assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
+def test_stale_newer_id_does_not_hide_recent_search(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    recent_event = _search(config, session="s1", task="wanted")
+    stale_event = _search(config, session="s1", task="wanted")
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        connection.execute("UPDATE usage_events SET ts = ? WHERE id = ?", (old, stale_event))
+
+    _consume(monkeypatch, config, session="s1", task="wanted")
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute(
+            "SELECT search_event_id FROM implicit_feedback"
+        ).fetchone() == (recent_event,)
 
 
 def test_latest_eligible_search_can_precede_a_refinement(tmp_path: Path, monkeypatch) -> None:

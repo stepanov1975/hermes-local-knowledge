@@ -457,7 +457,12 @@ def _production_services(
                 enabled = state_evidence.get("implicit_feedback_enabled")
                 min_confirmations = state_evidence.get("implicit_min_confirmations")
                 max_generic_queries = state_evidence.get("implicit_max_generic_queries")
-                if (
+                if enabled is False:
+                    config = replace(
+                        cast(Any, config),
+                        implicit_feedback=replace(cast(Any, implicit), enabled=False),
+                    )
+                elif (
                     enabled is not None
                     and min_confirmations is not None
                     and max_generic_queries is not None

@@ -732,13 +732,18 @@ def _implicit_feedback_provenance_exact(
         "root",
     }.issubset(usage_columns):
         return False
+    recorded_enabled = "implicit_feedback_enabled" in usage_columns
+    recorded_enabled_expression = (
+        "e.implicit_feedback_enabled" if recorded_enabled else "NULL"
+    )
     rows = conn.execute(
-        """
+        f"""
         SELECT i.id AS implicit_id, i.ts AS implicit_ts, i.search_event_id,
                i.query AS implicit_query, i.artifact_id,
                i.session_id AS implicit_session_id, i.task_id AS implicit_task_id,
                i.turn_id AS implicit_turn_id, e.id AS linked_event_id,
                e.ts AS event_ts, e.tool, e.success,
+               {recorded_enabled_expression} AS event_implicit_feedback_enabled,
                e.query AS event_query, e.baseline_top_ids_json, e.top_ids_json,
                e.session_id AS event_session_id, e.task_id AS event_task_id,
                e.turn_id AS event_turn_id, e.root AS event_root
@@ -790,6 +795,13 @@ def _implicit_feedback_provenance_exact(
             or str(row["tool"] or "") != "knowledge_search"
             or type(row["success"]) is not int
             or row["success"] != 1
+            or (
+                recorded_enabled
+                and (
+                    type(row["event_implicit_feedback_enabled"]) is not int
+                    or row["event_implicit_feedback_enabled"] != 1
+                )
+            )
             or str(row["event_root"] or "") != str(root)
             or str(row["implicit_query"] or "") != str(row["event_query"] or "")
             or str(row["implicit_session_id"] or "") != str(row["event_session_id"] or "")
