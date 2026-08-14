@@ -88,6 +88,13 @@ class NegativeFeedback:
     feedback_id: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ImplicitFeedbackEvidence:
+    search_event_id: int
+    query: str
+    artifact_id: str
+
+
 def _connect_readonly(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(
         sqlite_readonly_uri(path),
@@ -127,6 +134,73 @@ def _parsed_utc_timestamp(value: Any) -> datetime | None:
         return timestamp.astimezone(timezone.utc)
     except (ValueError, OverflowError):
         return None
+
+
+def _validated_implicit_feedback_evidence(
+    row: Any,
+    *,
+    root: Path,
+    observed_at: datetime,
+    recorded_enabled: bool,
+    query: str,
+    artifact_id: str,
+) -> _ImplicitFeedbackEvidence | None:
+    try:
+        baseline_ids = json.loads(str(row["event_baseline_top_ids_json"] or ""))
+        final_ids = json.loads(str(row["event_top_ids_json"] or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    implicit_timestamp = _parsed_utc_timestamp(row["implicit_ts"])
+    event_timestamp = _parsed_utc_timestamp(row["event_ts"])
+    implicit_session_id = str(row["implicit_session_id"] or "")
+    implicit_task_id = str(row["implicit_task_id"] or "")
+    implicit_turn_id = str(row["implicit_turn_id"] or "")
+    implicit_feedback_id = _persisted_id(row["implicit_feedback_id"])
+    search_event_id = _persisted_id(row["search_event_id"])
+    linked_event_id = _persisted_id(row["linked_event_id"])
+    if (
+        not artifact_id
+        or event_timestamp is None
+        or implicit_timestamp is None
+        or event_timestamp > observed_at
+        or implicit_timestamp > observed_at
+        or implicit_timestamp < event_timestamp
+        or implicit_timestamp - event_timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
+        or str(row["event_tool"] or "") != "knowledge_search"
+        or type(row["event_success"]) is not int
+        or row["event_success"] != 1
+        or (
+            recorded_enabled
+            and (
+                type(row["event_implicit_feedback_enabled"]) is not int
+                or row["event_implicit_feedback_enabled"] != 1
+            )
+        )
+        or str(row["event_root"] or "") != str(root)
+        or query != str(row["event_query"] or "")
+        or not implicit_session_id
+        or implicit_session_id != str(row["event_session_id"] or "")
+        or not implicit_task_id
+        or implicit_task_id != str(row["event_task_id"] or "")
+        or not implicit_turn_id
+        or implicit_turn_id != str(row["event_turn_id"] or "")
+        or not isinstance(baseline_ids, list)
+        or any(type(value) is not str or not value for value in baseline_ids)
+        or artifact_id not in baseline_ids
+        or not isinstance(final_ids, list)
+        or any(type(value) is not str or not value for value in final_ids)
+        or artifact_id not in final_ids
+        or implicit_feedback_id is None
+        or search_event_id is None
+        or linked_event_id is None
+        or search_event_id != linked_event_id
+    ):
+        return None
+    return _ImplicitFeedbackEvidence(
+        search_event_id=search_event_id,
+        query=query,
+        artifact_id=artifact_id,
+    )
 
 
 def _normalized_query(query: str) -> str:
@@ -308,6 +382,24 @@ def _feedback_route_snapshot(
     return scored[0][1], feedback_max_id, tuple(negative_feedback)
 
 
+def _implicit_feedback_high_water(
+    connection: sqlite3.Connection,
+    *,
+    root: Path,
+) -> tuple[int | None, set[str]]:
+    if not _has_table(connection, "implicit_feedback"):
+        return None, set()
+    implicit_columns = _table_columns(connection, "implicit_feedback")
+    if not {"id", "root"}.issubset(implicit_columns):
+        return None, implicit_columns
+    row = connection.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM implicit_feedback WHERE root = ?",
+        (str(root),),
+    ).fetchone()
+    value = row[0] if row is not None else None
+    return _persisted_id(value, allow_zero=True), implicit_columns
+
+
 def _implicit_feedback_route_snapshot(
     usage_db_path: Path,
     *,
@@ -339,16 +431,10 @@ def _implicit_feedback_route_snapshot(
         except (OSError, sqlite3.Error):
             return None, None
 
-    if not _has_table(connection, "implicit_feedback"):
-        return None, None
-    implicit_columns = _table_columns(connection, "implicit_feedback")
-    if not {"id", "root"}.issubset(implicit_columns):
-        return None, None
-    high_water_row = connection.execute(
-        "SELECT COALESCE(MAX(id), 0) FROM implicit_feedback WHERE root = ?",
-        (str(root),),
-    ).fetchone()
-    implicit_feedback_max_id = _persisted_id(high_water_row[0], allow_zero=True)
+    implicit_feedback_max_id, implicit_columns = _implicit_feedback_high_water(
+        connection,
+        root=root,
+    )
     if implicit_feedback_max_id is None:
         return None, None
     if not {
@@ -382,11 +468,12 @@ def _implicit_feedback_route_snapshot(
     )
     rows = connection.execute(
         f"""
-        SELECT i.id, i.ts AS implicit_ts, i.query, i.artifact_id, i.search_event_id,
+        SELECT i.id AS implicit_feedback_id, i.ts AS implicit_ts,
+               i.query AS implicit_query, i.artifact_id, i.search_event_id,
                i.session_id AS implicit_session_id,
                i.task_id AS implicit_task_id,
                i.turn_id AS implicit_turn_id,
-               e.id AS event_id, e.ts AS event_ts,
+               e.id AS linked_event_id, e.ts AS event_ts,
                e.tool AS event_tool, e.success AS event_success,
                {recorded_enabled_expression} AS event_implicit_feedback_enabled,
                e.query AS event_query,
@@ -408,69 +495,26 @@ def _implicit_feedback_route_snapshot(
     current_terms = frozenset(_query_terms(query))
     observed_at = datetime.now(timezone.utc)
     confirmations: dict[tuple[str, str], set[int]] = {}
-    latest: dict[tuple[str, str], sqlite3.Row] = {}
+    latest: dict[tuple[str, str], _ImplicitFeedbackEvidence] = {}
     for row in rows:
-        try:
-            baseline_ids = json.loads(str(row["event_baseline_top_ids_json"] or ""))
-            final_ids = json.loads(str(row["event_top_ids_json"] or ""))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        route_query = str(row["query"] or "").strip()
-        route_terms = frozenset(_query_terms(route_query))
+        route_query = str(row["implicit_query"] or "").strip()
         candidate_id = str(row["artifact_id"] or "").strip()
-        implicit_timestamp = _parsed_utc_timestamp(row["implicit_ts"])
-        event_timestamp = _parsed_utc_timestamp(row["event_ts"])
-        implicit_session_id = str(row["implicit_session_id"] or "")
-        implicit_task_id = str(row["implicit_task_id"] or "")
-        implicit_turn_id = str(row["implicit_turn_id"] or "")
-        if (
-            not route_terms
-            or not candidate_id
-            or event_timestamp is None
-            or implicit_timestamp is None
-            or event_timestamp > observed_at
-            or implicit_timestamp > observed_at
-            or implicit_timestamp < event_timestamp
-            or implicit_timestamp - event_timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
-            or str(row["event_tool"] or "") != "knowledge_search"
-            or type(row["event_success"]) is not int
-            or row["event_success"] != 1
-            or (
-                recorded_enabled
-                and (
-                    type(row["event_implicit_feedback_enabled"]) is not int
-                    or row["event_implicit_feedback_enabled"] != 1
-                )
-            )
-            or str(row["event_root"] or "") != str(root)
-            or route_query != str(row["event_query"] or "")
-            or not implicit_session_id
-            or implicit_session_id != str(row["event_session_id"] or "")
-            or not implicit_task_id
-            or implicit_task_id != str(row["event_task_id"] or "")
-            or not implicit_turn_id
-            or implicit_turn_id != str(row["event_turn_id"] or "")
-            or not isinstance(baseline_ids, list)
-            or any(type(value) is not str or not value for value in baseline_ids)
-            or candidate_id not in baseline_ids
-            or not isinstance(final_ids, list)
-            or any(type(value) is not str or not value for value in final_ids)
-            or candidate_id not in final_ids
-        ):
+        evidence = _validated_implicit_feedback_evidence(
+            row,
+            root=root,
+            observed_at=observed_at,
+            recorded_enabled=recorded_enabled,
+            query=route_query,
+            artifact_id=candidate_id,
+        )
+        if evidence is None:
             continue
-        implicit_feedback_id = _persisted_id(row["id"])
-        search_event_id = _persisted_id(row["search_event_id"])
-        event_id = _persisted_id(row["event_id"])
-        if (
-            implicit_feedback_id is None
-            or search_event_id is None
-            or event_id is None
-            or search_event_id != event_id
-        ):
+        route_terms = frozenset(_query_terms(evidence.query))
+        if not route_terms:
             continue
-        key = (_feedback_query_key(route_query, route_terms), candidate_id)
-        confirmations.setdefault(key, set()).add(search_event_id)
-        latest.setdefault(key, row)
+        key = (_feedback_query_key(evidence.query, route_terms), evidence.artifact_id)
+        confirmations.setdefault(key, set()).add(evidence.search_event_id)
+        latest.setdefault(key, evidence)
 
     mature_keys = {
         key for key, search_events in confirmations.items() if len(search_events) >= min_confirmations
@@ -483,9 +527,9 @@ def _implicit_feedback_route_snapshot(
     for key in mature_keys:
         if mature_queries_by_artifact[key[1]] > max_generic_queries:
             continue
-        row = latest[key]
-        route_query = str(row["query"])
-        candidate_id = str(row["artifact_id"])
+        evidence = latest[key]
+        route_query = evidence.query
+        candidate_id = evidence.artifact_id
         prefix, separator, _name = candidate_id.partition(":")
         if not separator or not prefix:
             continue
@@ -681,17 +725,6 @@ def decide_feedback_route(
                     artifact_type=artifact_type,
                     connection=connection,
                 )
-                if _has_table(connection, "implicit_feedback") and {
-                    "id",
-                    "root",
-                }.issubset(_table_columns(connection, "implicit_feedback")):
-                    implicit_high_water_row = connection.execute(
-                        "SELECT COALESCE(MAX(id), 0) FROM implicit_feedback WHERE root = ?",
-                        (str(root),),
-                    ).fetchone()
-                    implicit_feedback_max_id = _persisted_id(
-                        implicit_high_water_row[0], allow_zero=True
-                    )
                 if route is None and allow_implicit:
                     route, implicit_feedback_max_id = _implicit_feedback_route_snapshot(
                         usage_db_path,
@@ -701,6 +734,10 @@ def decide_feedback_route(
                         min_confirmations=implicit_min_confirmations,
                         max_generic_queries=implicit_max_generic_queries,
                         connection=connection,
+                    )
+                else:
+                    implicit_feedback_max_id, _implicit_columns = (
+                        _implicit_feedback_high_water(connection, root=root)
                     )
         except (OSError, sqlite3.Error):
             route = None

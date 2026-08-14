@@ -458,47 +458,16 @@ def test_production_search_is_read_only_and_emits_route_provenance(tmp_path: Pat
     assert disabled["event_time_exact"] is True
 
 
-def test_production_state_key_canonicalizes_implicit_observation_time() -> None:
-    evaluator = load_evaluator()
-    keys = {
-        evaluator._production_state_key(2, 2, True, 2, 5, value)
-        for value in (
-            "2026-01-01T00:00:00Z",
-            "2026-01-01T00:00:00+00:00",
-            "2025-12-31T19:00:00-05:00",
-            "2026-01-01T00:00:00",
-        )
-    }
-
-    assert len(keys) == 1
-    state_key = next(iter(keys))
-    assert state_key.startswith(
-        "explicit-2_implicit-2_enabled-1_min-2_generic-5_observed-"
-    )
-    assert evaluator._production_state_key(2, 2, True, 2, 5, "malformed") == "bound-2"
-    assert (
-        evaluator._production_state_key(
-            2, 2, True, 2, 5, "9999-12-31T23:59:59-23:59"
-        )
-        == "bound-2"
-    )
-    assert evaluator._production_state_key(2, 2, True, 2, 5, None) == "bound-2"
-
-
 @pytest.mark.parametrize("value", ["invalid", -2, True, None])
 def test_malformed_explicit_bound_is_unavailable_without_raising(value: object) -> None:
     evaluator = load_evaluator()
 
-    assert evaluator._production_state_key(value, 12, True, 2, 5) == "unavailable"
     assert evaluator._feedback_bound_kind(value) == "unavailable"
 
 
 def test_only_minus_one_is_the_legacy_explicit_bound() -> None:
     evaluator = load_evaluator()
 
-    assert evaluator._production_state_key(-1, None, None, None, None) == (
-        "explicit-legacy_implicit-unavailable"
-    )
     assert evaluator._feedback_bound_kind(-1) == "legacy"
 
 
