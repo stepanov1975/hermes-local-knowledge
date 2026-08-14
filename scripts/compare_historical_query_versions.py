@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -750,6 +751,7 @@ def _implicit_feedback_provenance_exact(
         (str(root), FEEDBACK_SCAN_LIMIT),
     ).fetchall()
     bounded_rows: list[sqlite3.Row] = []
+    observed_at = datetime.now(timezone.utc)
     for row in rows:
         implicit_id = _persisted_id(row["implicit_id"])
         if implicit_id is None:
@@ -781,6 +783,8 @@ def _implicit_feedback_provenance_exact(
         if (
             event_timestamp is None
             or implicit_timestamp is None
+            or event_timestamp > observed_at
+            or implicit_timestamp > observed_at
             or implicit_timestamp < event_timestamp
             or implicit_timestamp - event_timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
             or str(row["tool"] or "") != "knowledge_search"

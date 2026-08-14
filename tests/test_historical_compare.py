@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import stat
@@ -837,6 +838,24 @@ def test_implicit_replay_provenance_requires_exact_linked_result_evidence(
             implicit_feedback_max_id=2,
             root=root,
         ) is False
+
+
+def test_implicit_replay_rejects_future_dated_confirmations(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, tmp_path, tmp_path / "other")
+    future_search = datetime.now(timezone.utc) + timedelta(hours=1)
+    future_consumption = future_search + timedelta(minutes=1)
+    with sqlite3.connect(usage_db) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("UPDATE usage_events SET ts = ? WHERE id <= 2", (future_search.isoformat(),))
+        connection.execute(
+            "UPDATE implicit_feedback SET ts = ? WHERE id <= 2",
+            (future_consumption.isoformat(),),
+        )
+        assert not helper._implicit_feedback_provenance_exact(
+            connection, implicit_feedback_max_id=2, root=tmp_path
+        )
 
 
 @pytest.mark.parametrize(

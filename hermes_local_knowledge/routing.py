@@ -401,6 +401,7 @@ def _implicit_feedback_route_snapshot(
     ).fetchall()
 
     current_terms = frozenset(_query_terms(query))
+    observed_at = datetime.now(timezone.utc)
     confirmations: dict[tuple[str, str], set[int]] = {}
     latest: dict[tuple[str, str], sqlite3.Row] = {}
     for row in rows:
@@ -422,6 +423,8 @@ def _implicit_feedback_route_snapshot(
             or not candidate_id
             or event_timestamp is None
             or implicit_timestamp is None
+            or event_timestamp > observed_at
+            or implicit_timestamp > observed_at
             or implicit_timestamp < event_timestamp
             or implicit_timestamp - event_timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
             or str(row["event_tool"] or "") != "knowledge_search"

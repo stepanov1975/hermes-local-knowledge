@@ -355,6 +355,20 @@ def test_requires_two_distinct_searches_before_routing(tmp_path: Path, monkeypat
     assert report["implicit_feedback_count"] == 2
 
 
+def test_future_persisted_confirmations_do_not_route(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    for session, task in (("s1", "t1"), ("s2", "t2")):
+        _search(config, session=session, task=task)
+        _consume(monkeypatch, config, session=session, task=task)
+    future_search = datetime.now(timezone.utc) + timedelta(hours=1)
+    future_consumption = future_search + timedelta(minutes=1)
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        connection.execute("UPDATE usage_events SET ts = ?", (future_search.isoformat(),))
+        connection.execute("UPDATE implicit_feedback SET ts = ?", (future_consumption.isoformat(),))
+
+    assert _decision(config).rows[0]["id"] == "runbook:other"
+
+
 @pytest.mark.parametrize(
     ("corruption_sql", "params"),
     [
