@@ -392,7 +392,11 @@ def test_exact_implicit_route_tie_is_stable_across_hash_seeds(tmp_path: Path) ->
     config = _config(tmp_path)
     usage_db = config.state_dir / "usage.sqlite"
     implicit_rows = []
-    for artifact_id in ("runbook:a", "runbook:b"):
+    for artifact_id, route_query in (
+        ("runbook:a", "docker update progress"),
+        ("runbook:b", "docker update progress"),
+        ("runbook:b", "docker release progress"),
+    ):
         for occurrence in range(2):
             session = f"{artifact_id}-{occurrence}"
             task = f"task-{occurrence}"
@@ -402,6 +406,7 @@ def test_exact_implicit_route_tie_is_stable_across_hash_seeds(tmp_path: Path) ->
                 session=session,
                 task=task,
                 turn=turn,
+                query=route_query,
                 top_ids=[artifact_id],
                 baseline_top_ids=[artifact_id],
             )
@@ -409,7 +414,7 @@ def test_exact_implicit_route_tie_is_stable_across_hash_seeds(tmp_path: Path) ->
                 (
                     "2026-08-12T00:00:00+00:00",
                     search_event_id,
-                    "docker update progress",
+                    route_query,
                     artifact_id,
                     session,
                     task,
@@ -435,12 +440,12 @@ from hermes_local_knowledge.routing import _implicit_feedback_route
 route = _implicit_feedback_route(
     Path(sys.argv[1]),
     root=Path(sys.argv[2]),
-    query="docker update progress",
+    query="docker update release progress",
     artifact_type=None,
     min_confirmations=2,
     max_generic_queries=5,
 )
-print(route.artifact_id if route else "")
+print(f"{route.artifact_id}|{route.query}" if route else "")
 """
     winners = set()
     for seed in ("1", "2", "3", "4", "random"):
@@ -456,7 +461,7 @@ print(route.artifact_id if route else "")
         assert result.returncode == 0, result.stderr
         winners.add(result.stdout.strip())
 
-    assert winners == {"runbook:b"}
+    assert winners == {"runbook:b|docker update progress"}
 
 
 def test_overly_generic_artifact_is_not_promoted(tmp_path: Path, monkeypatch) -> None:

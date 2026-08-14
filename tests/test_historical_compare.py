@@ -731,6 +731,36 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
     assert helper._sha256_file(frozen.backup_path) == frozen_hash
 
 
+def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) -> None:
+    helper = load_compare_helper()
+    root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    create_provenance_usage_db(usage_db, root, tmp_path / "other")
+    row_ids = range(1, 1002)
+    with sqlite3.connect(usage_db) as conn:
+        conn.execute("DELETE FROM implicit_feedback")
+        conn.execute("DELETE FROM usage_events")
+        conn.executemany(
+            "INSERT INTO usage_events "
+            "(id, ts, tool, query, success, session_id, task_id, turn_id, root, baseline_top_ids_json) "
+            "VALUES (?, '2026-01-01T00:00:00Z', 'knowledge_search', 'query', 1, "
+            "'session', 'task', 'turn', ?, '[\"skill:a\"]')",
+            ((row_id, str(root)) for row_id in row_ids),
+        )
+        conn.executemany(
+            "INSERT INTO implicit_feedback "
+            "(id, search_event_id, query, artifact_id, session_id, task_id, turn_id, root) "
+            "VALUES (?, ?, 'query', 'skill:a', 'session', 'task', 'turn', ?)",
+            ((row_id, row_id, str(root)) for row_id in row_ids),
+        )
+        conn.row_factory = sqlite3.Row
+        assert helper._implicit_feedback_provenance_exact(
+            conn,
+            implicit_feedback_max_id=1001,
+            root=root,
+        ) is True
+
+
 @pytest.mark.parametrize(
     ("corruption_sql", "corruption_params"),
     [

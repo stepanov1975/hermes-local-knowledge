@@ -464,7 +464,15 @@ def _implicit_feedback_route_snapshot(
         if score is not None:
             candidates.append((score, candidate_route))
     selected_route = (
-        max(candidates, key=lambda item: (item[0], item[1].artifact_id))[1]
+        max(
+            candidates,
+            key=lambda item: (
+                item[0],
+                item[1].artifact_id,
+                _normalized_query(item[1].query),
+                item[1].query,
+            ),
+        )[1]
         if candidates
         else None
     )

@@ -33,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 from hermes_local_knowledge.index import _query_terms  # noqa: E402
 from hermes_local_knowledge.routing import (  # noqa: E402
     ARTIFACT_TYPE_BY_ID_PREFIX,
+    FEEDBACK_SCAN_LIMIT,
     FeedbackRoute,
     _feedback_query_key,
     _match_score,
@@ -739,12 +740,10 @@ def _implicit_feedback_provenance_exact(
         LEFT JOIN usage_events e ON e.id = i.search_event_id
         WHERE i.root = ?
         ORDER BY i.id DESC
-        LIMIT 1001
+        LIMIT ?
         """,
-        (str(root),),
+        (str(root), FEEDBACK_SCAN_LIMIT),
     ).fetchall()
-    if len(rows) > 1000:
-        return False
     bounded_rows: list[sqlite3.Row] = []
     for row in rows:
         implicit_id = _persisted_id(row["implicit_id"])
