@@ -628,6 +628,19 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
             implicit_max_generic_queries=5,
         ),
         helper.ReplaySearchCase(
+            "missing-opt-in",
+            "alpha",
+            10,
+            None,
+            False,
+            feedback_max_id=2,
+            implicit_feedback_max_id=2,
+            implicit_feedback_enabled=None,
+            implicit_min_confirmations=2,
+            implicit_max_generic_queries=5,
+            observed_at="2026-01-01T00:02:00+00:00",
+        ),
+        helper.ReplaySearchCase(
             "bound-two",
             "beta",
             10,
@@ -656,6 +669,7 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
         "unavailable",
         "explicit-legacy_implicit-unavailable",
         "explicit-0_implicit-0_enabled-1_min-2_generic-5",
+        "bound-2",
         two_key,
     }
     assert not (Path(baseline_states["unavailable"]) / "usage.sqlite").exists()
@@ -677,6 +691,12 @@ def test_prepared_production_states_are_immutable_bounded_and_root_exact(tmp_pat
     assert baseline_evidence[legacy_key]["implicit_feedback_bound_available"] is False
     assert baseline_evidence[zero_key]["feedback_bound_available"] is True
     assert baseline_evidence[zero_key]["implicit_feedback_bound_available"] is True
+    assert baseline_evidence["bound-2"]["implicit_feedback_bound_available"] is False
+    with sqlite3.connect(Path(baseline_states["bound-2"]) / "usage.sqlite") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM implicit_feedback WHERE root = ?",
+            (str(baseline.source_root),),
+        ).fetchone()[0] == 0
     assert baseline_evidence[two_key]["feedback_bound_available"] is True
     assert baseline_evidence[two_key]["implicit_feedback_bound_available"] is True
     assert {
@@ -1901,10 +1921,10 @@ def test_current_explicit_route_applies_later_query_and_target_vetoes() -> None:
     history = {"repair": [(10, "skill:first"), (20, "skill:current")]}
 
     assert helper._current_explicit_route(
-        case, history, {"terms:repair": [(25, "skill:current")]}
+        case, history, {"repair": [(25, "skill:current")]}
     ) == (10, "skill:first")
     assert helper._current_explicit_route(
-        case, history, {"terms:repair": [(25, "")]}
+        case, history, {"repair": [(25, "")]}
     ) is None
 
 
@@ -1914,13 +1934,18 @@ def test_current_explicit_route_applies_overlapping_query_vetoes() -> None:
         "case", "docker update progress status", 10, None, False, feedback_max_id=30
     )
     history = {"docker update progress status": [(10, "skill:target")]}
-    veto_key = helper._feedback_query_key(
-        "docker update progress",
-        frozenset(helper._query_terms("docker update progress")),
-    )
 
     assert helper._current_explicit_route(
-        case, history, {veto_key: [(20, "skill:target")]}
+        case, history, {"docker update progress": [(20, "skill:target")]}
+    ) is None
+
+    short_case = helper.ReplaySearchCase(
+        "short", "update docker", 10, None, False, feedback_max_id=30
+    )
+    assert helper._current_explicit_route(
+        short_case,
+        {"update docker": [(10, "skill:target")]},
+        {"update docker": [(20, "skill:target")]},
     ) is None
 
 

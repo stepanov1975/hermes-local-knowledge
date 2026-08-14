@@ -15,7 +15,12 @@ from hermes_local_knowledge.evaluation import load_positive_feedback_labels
 from hermes_local_knowledge.implicit import on_post_tool_call, on_pre_llm_call, on_session_end
 from hermes_local_knowledge import plugin
 from hermes_local_knowledge.routing import decide_feedback_route
-from hermes_local_knowledge.telemetry import _record_feedback, _record_usage, _usage_report
+from hermes_local_knowledge.telemetry import (
+    _clean_text,
+    _record_feedback,
+    _record_usage,
+    _usage_report,
+)
 
 
 def _config(tmp_path: Path, *, enabled: bool = True) -> Config:
@@ -139,6 +144,12 @@ def test_lifecycle_turn_context_supports_bridge_hooks_missing_turn_id(
     tmp_path: Path, monkeypatch
 ) -> None:
     config = _config(tmp_path)
+    session = "  session   " + "x" * 160
+    task = " task\t" + "y" * 160
+    turn = " turn\n" + "z" * 160
+    clean_session = _clean_text(session, limit=128)
+    clean_task = _clean_text(task, limit=128)
+    clean_turn = _clean_text(turn, limit=128)
     event_id = _record_usage(
         config.source_root,
         tool="knowledge_search",
@@ -146,26 +157,26 @@ def test_lifecycle_turn_context_supports_bridge_hooks_missing_turn_id(
         query="docker update progress",
         top_ids=["runbook:target"],
         baseline_top_ids=["runbook:target"],
-        context={"session_id": "s1", "task_id": "t1"},
+        context={"session_id": clean_session, "task_id": clean_task},
         usage_db_path=config.state_dir / "usage.sqlite",
     )
     assert event_id is not None
     monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
-    on_pre_llm_call(session_id="s1", task_id="t1", turn_id="turn-1")
+    on_pre_llm_call(session_id=session, task_id=task, turn_id=turn)
     try:
         on_post_tool_call(
             tool_name="knowledge_search",
             args={"query": "docker update progress"},
             result=json.dumps({"success": True, "usage_event_id": event_id}),
-            session_id="s1",
-            task_id="t1",
+            session_id=session,
+            task_id=task,
         )
         on_post_tool_call(
             tool_name="knowledge_get",
             args={"artifact_id": "runbook:target"},
             result=json.dumps({"success": True}),
-            session_id="s1",
-            task_id="t1",
+            session_id=session,
+            task_id=task,
         )
     finally:
         on_session_end()
@@ -173,10 +184,10 @@ def test_lifecycle_turn_context_supports_bridge_hooks_missing_turn_id(
     with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
         assert connection.execute(
             "SELECT turn_id FROM usage_events WHERE id = ?", (event_id,)
-        ).fetchone() == ("turn-1",)
+        ).fetchone() == (clean_turn,)
         assert connection.execute(
-            "SELECT search_event_id, turn_id FROM implicit_feedback"
-        ).fetchone() == (event_id, "turn-1")
+            "SELECT search_event_id, session_id, task_id, turn_id FROM implicit_feedback"
+        ).fetchone() == (event_id, clean_session, clean_task, clean_turn)
 
 
 def test_lifecycle_turn_context_requires_matching_session_and_task(
@@ -574,6 +585,27 @@ def test_future_search_is_not_eligible(tmp_path: Path, monkeypatch) -> None:
     _consume(monkeypatch, config, session="s1", task="wanted")
     with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
         assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
+def test_hook_identity_normalization_matches_telemetry_storage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    session = "  session   " + "x" * 160
+    task = " task\t" + "y" * 160
+    turn = " turn\n" + "z" * 160
+    _search(
+        config,
+        session=_clean_text(session, limit=128),
+        task=_clean_text(task, limit=128),
+        turn=_clean_text(turn, limit=128),
+        query="wanted",
+    )
+
+    _consume(monkeypatch, config, session=session, task=task, turn=turn)
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 1
 
 
 def test_stale_newer_id_does_not_hide_recent_search(tmp_path: Path, monkeypatch) -> None:

@@ -37,7 +37,6 @@ from hermes_local_knowledge.routing import (  # noqa: E402
     FEEDBACK_SCAN_LIMIT,
     IMPLICIT_FEEDBACK_MAX_SEARCH_AGE,
     FeedbackRoute,
-    _feedback_query_key,
     _match_score,
     _parsed_utc_timestamp,
 )
@@ -939,7 +938,8 @@ def _prepare_production_states(
                 if implicit_feedback_enabled is False:
                     implicit_feedback_bound_available = True
                 elif (
-                    implicit_feedback_max_id is not None
+                    implicit_feedback_enabled is True
+                    and implicit_feedback_max_id is not None
                     and implicit_min_confirmations is not None
                     and implicit_max_generic_queries is not None
                     and implicit_feedback_max_id >= 0
@@ -3226,16 +3226,8 @@ def _current_explicit_route(
         return None
     current_terms = frozenset(_query_terms(case.query))
     vetoes: list[tuple[int, str]] = []
-    for veto_query_key, history in (vetoes_by_query or {}).items():
-        if veto_query_key.startswith("terms:"):
-            veto_query = veto_query_key.removeprefix("terms:")
-            veto_terms = frozenset(veto_query.split())
-        elif veto_query_key.startswith("quoted:"):
-            veto_query = veto_query_key.removeprefix("quoted:")
-            veto_terms = frozenset(_query_terms(veto_query))
-        else:
-            veto_query = veto_query_key
-            veto_terms = frozenset(_query_terms(veto_query))
+    for veto_query, history in (vetoes_by_query or {}).items():
+        veto_terms = frozenset(_query_terms(veto_query))
         veto_route = FeedbackRoute(veto_query, "", "", veto_terms, None)
         if _match_score(veto_route, case.query, current_terms) is not None:
             vetoes.extend(history)
@@ -3346,8 +3338,7 @@ def _candidate_comparison(baseline: RefEvaluation, candidate: RefEvaluation, fro
         feedback_id = _persisted_id(row.get("feedback_id"))
         if feedback_id is None:
             continue
-        query_key = _feedback_query_key(veto_query, frozenset(_query_terms(veto_query)))
-        veto_history.setdefault(query_key, []).append(
+        veto_history.setdefault(veto_query, []).append(
             (feedback_id, str(row.get("artifact_id") or ""))
         )
     for history in veto_history.values():

@@ -16,7 +16,11 @@ from typing import Any
 
 from .config import resolve_config
 from .routing import IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
-from .telemetry import attach_usage_event_turn_id, record_implicit_feedback
+from .telemetry import (
+    _clean_text,
+    attach_usage_event_turn_id,
+    record_implicit_feedback,
+)
 
 logger = logging.getLogger(__name__)
 _TURN_CONTEXT: ContextVar[tuple[str, str, str] | None] = ContextVar(
@@ -25,12 +29,16 @@ _TURN_CONTEXT: ContextVar[tuple[str, str, str] | None] = ContextVar(
 )
 
 
+def _clean_identity(value: Any) -> str:
+    return _clean_text(value, limit=128)
+
+
 def on_pre_llm_call(**kwargs: Any) -> None:
     """Bind host turn identity for deferred tools whose bridge drops it."""
 
-    session_id = str(kwargs.get("session_id") or "").strip()
-    task_id = str(kwargs.get("task_id") or "").strip()
-    turn_id = str(kwargs.get("turn_id") or "").strip()
+    session_id = _clean_identity(kwargs.get("session_id"))
+    task_id = _clean_identity(kwargs.get("task_id"))
+    turn_id = _clean_identity(kwargs.get("turn_id"))
     _TURN_CONTEXT.set(
         (session_id, task_id, turn_id)
         if session_id and task_id and turn_id
@@ -45,7 +53,7 @@ def on_session_end(**_kwargs: Any) -> None:
 
 
 def _resolved_turn_id(*, session_id: str, task_id: str, turn_id: Any) -> str:
-    direct = str(turn_id or "").strip()
+    direct = _clean_identity(turn_id)
     if direct:
         return direct
     current = _TURN_CONTEXT.get()
@@ -151,8 +159,8 @@ def on_post_tool_call(**kwargs: Any) -> None:
             return
         if not _hook_succeeded(kwargs):
             return
-        session_id = str(kwargs.get("session_id") or "").strip()
-        task_id = str(kwargs.get("task_id") or "").strip()
+        session_id = _clean_identity(kwargs.get("session_id"))
+        task_id = _clean_identity(kwargs.get("task_id"))
         turn_id = _resolved_turn_id(
             session_id=session_id,
             task_id=task_id,
