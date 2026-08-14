@@ -291,6 +291,12 @@ git diff --check
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and [`docs/github-security.md`](docs/github-security.md) for contribution, vulnerability-reporting, and repository-security guidance.
 
+## Acknowledgments
+
+This project benefits from people who contribute code, share ideas, or inspire features:
+
+- [@xXLODXx](https://github.com/xXLODXx) — contributed the initial opt-in implicit usage-feedback implementation and its confirmation and generic-artifact gates in [PR #27](https://github.com/stepanov1975/hermes-local-knowledge/pull/27), adapting ideas from [hermes-skill-router](https://github.com/xXLODXx/hermes-skill-router).
+
 ## Owner map
 
 - `config.py` — configuration models, aliases, defaults, and the single resolver.
