@@ -6,7 +6,7 @@ This repository uses lightweight GitHub hygiene suitable for a public reusable H
 
 | File | Purpose |
 | --- | --- |
-| `.github/workflows/ci.yml` | Runs tests and Ruff on Python 3.11 and 3.12. |
+| `.github/workflows/ci.yml` | Runs version-policy checks and tests on Linux/Python 3.11 and 3.12, Ruff and mypy on Linux, Windows/Python 3.12 tests, then the release workflow for verified `main` pushes. |
 | `.github/workflows/security.yml` | Runs Gitleaks, actionlint, Semgrep, zizmor, ShellCheck, and gated pip-audit. |
 | `.github/dependabot.yml` | Weekly dependency/update checks for GitHub Actions and Python packaging metadata, with a 7-day cooldown. |
 | `.gitleaks.toml` | Secret scanner config with narrow placeholder allowlist. |
@@ -57,7 +57,7 @@ Recommended settings:
    - Keep workflow permissions read-only unless a workflow explicitly needs writes.
 3. **Settings → Branches / Rulesets**
    - Protect `main` or add a ruleset requiring pull requests and passing CI before merge.
-   - Recommended required checks after the first public run: `Python 3.11`, `Python 3.12`, `Gitleaks`, `actionlint`, `Python static/security checks`, `ShellCheck`, `Analyze (python)`, and `Analyze (actions)`.
+   - Recommended required checks after the first public run: `Python 3.11`, `Python 3.12`, `Windows Python 3.12`, `Gitleaks`, `actionlint`, `Python static/security checks`, `ShellCheck`, `Analyze (python)`, and `Analyze (actions)`.
 4. **Settings → General**
    - Delete head branches after merge.
    - Keep wiki and projects disabled unless project documentation actually moves there.

@@ -40,7 +40,7 @@ The plugin registers these native tools in the `local_knowledge` toolset:
 
 The plugin also registers `pre_llm_call`, `post_tool_call`, `on_session_end`, and `on_session_finalize` hooks for optional same-turn implicit search-result feedback and tool-OKF capture/generation. The turn lifecycle hooks keep correlation inside the plugin when Hermes dispatches local-knowledge tools through its deferred-tool bridge.
 
-Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed from the unassisted results of distinct matching searches in their respective Hermes turns:
+Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed after distinct matching searches, with each `knowledge_get` tied to that search's unassisted baseline in the same Hermes session, task, and turn:
 
 ```yaml
 local_knowledge:
@@ -50,7 +50,7 @@ local_knowledge:
     max_generic_queries: 5
 ```
 
-Only a recent search from the same Hermes task is eligible. Repeated gets from one search are deduplicated, and overly generic artifacts stop receiving implicit promotion. Explicit feedback remains authoritative, and implicit evidence is not used as evaluation ground truth.
+Only a recent search from the same Hermes session, task, and turn is eligible. Repeated gets from one search are deduplicated, and overly generic artifacts stop receiving implicit promotion. Explicit feedback remains authoritative, and implicit evidence is not used as evaluation ground truth.
 
 ## Install and model consent
 
@@ -246,7 +246,9 @@ Version 0.4.0 reads the current v0.3.12 queue shape by normalizing a selected cl
 
 Lookup telemetry and feedback stay in `<state_dir>/usage.sqlite`. Tool handlers fail open for telemetry-only errors; explicit `knowledge_feedback` writes remain strict so callers know whether feedback was recorded. Do not put secrets or private document text in queries or feedback notes.
 
-Managed searches may use one deterministic feedback prior when the index was built for the configured source root. Only the latest significant explicit rating for a query/artifact pair is eligible, only `useful` is positive, and a newer rejection for that route or matching current query suppresses an older overlap route. A matching artifact already present in current results may move to rank one. If it is absent, the plugin performs at most one retry with an accepted query no longer than the current query and the mapped artifact type, and promotes only the exact artifact when that live retry rediscovers it. Searches against an explicit caller-owned `--db` remain unassisted.
+Managed searches may use one deterministic feedback prior when the index was built for the configured source root. Only the latest significant explicit rating for a query/artifact pair is eligible. Among ratings accepted by the current tool, only `useful` is positive; legacy persisted `great` rows remain positive compatibility input. A newer rejection for that route or matching current query suppresses an older overlap route. A matching artifact already present in current results may move to rank one. If it is absent, the plugin performs at most one retry with an accepted query no longer than the current query and the mapped artifact type, and promotes only the exact artifact when that live retry rediscovers it. Searches against an explicit caller-owned `--db` remain unassisted.
+
+When opt-in implicit feedback is enabled and no explicit route matches, mature same-turn evidence may supply the lower-priority route. It uses the same current-index promotion or one verified typed-retry path, and a matching explicit rejection can veto it.
 
 `knowledge_usage_report` summarizes recent activity before changing ranking, triggers, source coverage, or graph edges.
 
@@ -292,10 +294,11 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and [`do
 ## Owner map
 
 - `config.py` — configuration models, aliases, defaults, and the single resolver.
+- `implicit.py` — opt-in same-turn search-result consumption attribution.
 - `artifacts.py` — whole-artifact models, source collection, privacy-safe metadata extraction, and graph edges.
 - `index.py` — format-4 SQLite/JSONL publication, cross-version and SQLite build locking, managed rebuild classification, and deterministic search/get/neighbors.
 - `telemetry.py` — local usage and feedback persistence/reporting.
-- `routing.py` — bounded live-root feedback matching, promotion, and one verified typed retry.
+- `routing.py` — bounded live-root explicit/implicit feedback matching, promotion, and one verified typed retry.
 - `evaluation.py` — read-only feedback-label replay and exact/parent-equivalent metrics.
 - `service.py` — one resolved configuration's managed index and telemetry lifecycle.
 - `okf.py` — privacy-safe OKF queue, hooks, detached worker, validation, and fenced publication.

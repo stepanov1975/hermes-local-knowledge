@@ -26,6 +26,7 @@ These instructions apply to the whole repository.
 - `artifacts.py`: whole-artifact models, collection, privacy-safe metadata, graph edges.
 - `index.py`: format-4 persistence, cross-version/SQLite build locks, rebuild classification, deterministic retrieval.
 - `telemetry.py`: usage/feedback persistence and reports.
+- `routing.py`: bounded explicit and implicit feedback-assisted routing.
 - `evaluation.py`: read-only feedback replay and metrics.
 - `service.py`: managed index and telemetry lifecycle for one resolved config.
 - `okf.py`: safe OKF queue, hooks, worker, validation, fenced publication.
@@ -44,7 +45,7 @@ These instructions apply to the whole repository.
 - Environment names may be routing signals. Environment values, MCP credential values, raw tool arguments/output, transcripts, OCR/private document text, and secret-like schema values must not enter indexed or generated artifacts.
 - `$HERMES_HOME/skills/.archive` is excluded from active routing.
 - Feedback/evaluation data stays local. Keep public docs/tests free of raw telemetry and private content.
-- Feedback-assisted routing is current-index-root-only and bounded to the latest significant explicit query/artifact rating. Only `useful` is positive; a newer rejection for the route or matching current query vetoes an older overlapping positive. Promote an artifact only when the current index returns it, with at most one no-longer-than-current artifact-type retry. Explicit caller-owned indexes remain unassisted.
+- Feedback-assisted routing is current-index-root-only and bounded to the latest significant explicit query/artifact rating. Among accepted current ratings, only `useful` is positive; legacy persisted `great` rows remain positive compatibility input. A newer rejection for the route or matching current query vetoes an older overlapping positive. Promote an artifact only when the current index returns it, with at most one no-longer-than-current artifact-type retry. Explicit caller-owned indexes remain unassisted.
 - Optional implicit routing uses recent same-turn baseline search-result consumption, deduplicates one search/artifact pair, and requires confirmations from distinct search events. Route-assisted-only results are not evidence. Mature evidence from too many query shapes is treated as generic. Explicit routes take precedence, and implicit evidence never becomes an evaluation label or unbounded historical replay input.
 - Read-only evaluation measures the unassisted index ranking. Do not train on and score the same feedback replay.
 

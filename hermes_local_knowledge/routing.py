@@ -1,4 +1,4 @@
-"""Deterministic routing hints learned from explicit local feedback."""
+"""Deterministic routing hints learned from explicit and implicit local feedback."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ ROUTING_TRACE_METADATA_KEY = "_routing_trace"
 
 @dataclass(frozen=True, slots=True)
 class FeedbackRoute:
-    """One current, explicitly accepted query-to-artifact route."""
+    """One current explicit or implicit query-to-artifact route."""
 
     query: str
     artifact_id: str

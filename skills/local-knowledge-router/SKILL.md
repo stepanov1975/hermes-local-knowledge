@@ -64,7 +64,7 @@ The plugin indexes whole artifacts. It identifies the first artifact to inspect;
 
    `knowledge_get` and `knowledge_neighbors` also accept `rebuild=true`. An operator may optionally schedule the plugin's explicit CLI build command to enforce a freshness interval, but no schedule is required.
 
-5. If mixed results look weak, retry once with a shorter core-intent query and the likely `artifact_type`. Current plugin revisions can perform one such retry automatically when a matching explicit `useful` route exists and its accepted query is no longer than the current query; the remembered artifact still has to be rediscovered in the live index. A newer matching rejection vetoes an older overlap route.
+5. If mixed results look weak, retry once with a shorter core-intent query and the likely `artifact_type`. Current plugin revisions can perform one such retry automatically when a matching explicit `useful` route exists and its accepted query is no longer than the current query; the remembered artifact still has to be rediscovered in the live index. A newer matching rejection vetoes an older overlap route. When opt-in implicit feedback is enabled, mature same-turn evidence may supply a lower-priority route under the same safeguards: current-index promotion or one verified typed retry. Matching explicit routes take precedence.
 
 6. Record clear lookup outcomes:
 
