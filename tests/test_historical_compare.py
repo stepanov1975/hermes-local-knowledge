@@ -789,11 +789,18 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
             "VALUES (?, '2026-01-01T00:00:01Z', ?, 'query', 'skill:a', 'session', 'task', 'turn', ?)",
             ((row_id, row_id, str(root)) for row_id in row_ids),
         )
+        conn.execute("UPDATE implicit_feedback SET ts='malformed' WHERE id=1")
         conn.row_factory = sqlite3.Row
         assert helper._implicit_feedback_provenance_exact(
             conn,
             implicit_feedback_max_id=1001,
             root=root,
+        ) is True
+        assert helper._defer_implicit_feedback_after_observation(
+            conn,
+            implicit_feedback_max_id=1001,
+            root=root,
+            observed_at=datetime(2026, 1, 1, 0, 2, tzinfo=timezone.utc),
         ) is True
 
 

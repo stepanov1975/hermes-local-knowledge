@@ -728,8 +728,10 @@ def _defer_implicit_feedback_after_observation(
         FROM implicit_feedback i
         LEFT JOIN usage_events e ON e.id = i.search_event_id
         WHERE i.root = ? AND i.id <= ?
+        ORDER BY i.id DESC
+        LIMIT ?
         """,
-        (str(root), implicit_feedback_max_id),
+        (str(root), implicit_feedback_max_id, FEEDBACK_SCAN_LIMIT),
     ).fetchall()
     deferred_ids: list[int] = []
     for row in rows:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stdout
 from dataclasses import asdict, is_dataclass, replace
+from datetime import datetime, timezone
 import hashlib
 import importlib
 import importlib.util
@@ -344,6 +345,16 @@ def _persisted_feedback_bound(value: Any) -> int | None:
     return value
 
 
+def _parsed_utc_timestamp(value: Any) -> datetime | None:
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
 def _bounded_persisted_int(value: Any, *, minimum: int, maximum: int) -> int | None:
     if type(value) is not int or not minimum <= value <= maximum:
         return None
@@ -396,9 +407,10 @@ def _production_state_key(
         f"_generic-{max_generic_queries}"
     )
     if implicit_bound > 0:
-        if not isinstance(implicit_observed_at, str) or not implicit_observed_at:
+        observed_at = _parsed_utc_timestamp(implicit_observed_at)
+        if observed_at is None:
             return f"bound-{bound}"
-        observed_key = hashlib.sha256(implicit_observed_at.encode()).hexdigest()[:16]
+        observed_key = hashlib.sha256(observed_at.isoformat().encode()).hexdigest()[:16]
         state_key += f"_observed-{observed_key}"
     return state_key
 
