@@ -256,6 +256,24 @@ def test_route_only_result_does_not_create_implicit_evidence(
         assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
 
 
+def test_truncated_baseline_result_does_not_create_implicit_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    _search(
+        config,
+        session="s1",
+        task="t1",
+        top_ids=["runbook:other"],
+        baseline_top_ids=["runbook:target"],
+    )
+
+    _consume(monkeypatch, config, session="s1", task="t1")
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
 def test_search_from_another_root_does_not_create_implicit_evidence(
     tmp_path: Path, monkeypatch
 ) -> None:

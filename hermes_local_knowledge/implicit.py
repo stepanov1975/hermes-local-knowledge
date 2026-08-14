@@ -100,7 +100,7 @@ def _matching_search_event(
 ) -> tuple[int, str] | None:
     rows = connection.execute(
         """
-        SELECT id, ts, query, baseline_top_ids_json
+        SELECT id, ts, query, baseline_top_ids_json, top_ids_json
         FROM usage_events
         WHERE session_id = ? AND task_id = ? AND turn_id = ? AND root = ?
           AND tool = 'knowledge_search' AND success = 1
@@ -113,7 +113,8 @@ def _matching_search_event(
     for row in rows:
         try:
             timestamp = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
-            returned_ids = json.loads(str(row["baseline_top_ids_json"] or "[]"))
+            baseline_ids = json.loads(str(row["baseline_top_ids_json"] or "[]"))
+            final_ids = json.loads(str(row["top_ids_json"] or "[]"))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
         if timestamp.tzinfo is None:
@@ -121,9 +122,12 @@ def _matching_search_event(
         if now - timestamp.astimezone(timezone.utc) > MAX_SEARCH_AGE:
             break
         if (
-            not isinstance(returned_ids, list)
-            or not all(isinstance(item, str) for item in returned_ids)
-            or artifact_id not in returned_ids
+            not isinstance(baseline_ids, list)
+            or not all(isinstance(item, str) for item in baseline_ids)
+            or artifact_id not in baseline_ids
+            or not isinstance(final_ids, list)
+            or not all(isinstance(item, str) for item in final_ids)
+            or artifact_id not in final_ids
         ):
             continue
         query = str(row["query"] or "").strip()
