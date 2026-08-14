@@ -34,9 +34,11 @@ from hermes_local_knowledge.index import _query_terms  # noqa: E402
 from hermes_local_knowledge.routing import (  # noqa: E402
     ARTIFACT_TYPE_BY_ID_PREFIX,
     FEEDBACK_SCAN_LIMIT,
+    IMPLICIT_FEEDBACK_MAX_SEARCH_AGE,
     FeedbackRoute,
     _feedback_query_key,
     _match_score,
+    _parsed_utc_timestamp,
 )
 
 EVALUATOR = REPO_ROOT / "scripts" / "evaluate_ref.py"
@@ -707,6 +709,7 @@ def _implicit_feedback_provenance_exact(
     usage_columns = _table_columns(conn, "usage_events")
     if not {
         "id",
+        "ts",
         "search_event_id",
         "query",
         "artifact_id",
@@ -716,6 +719,7 @@ def _implicit_feedback_provenance_exact(
         "root",
     }.issubset(implicit_columns) or not {
         "id",
+        "ts",
         "tool",
         "success",
         "query",
@@ -729,11 +733,11 @@ def _implicit_feedback_provenance_exact(
         return False
     rows = conn.execute(
         """
-        SELECT i.id AS implicit_id, i.search_event_id,
+        SELECT i.id AS implicit_id, i.ts AS implicit_ts, i.search_event_id,
                i.query AS implicit_query, i.artifact_id,
                i.session_id AS implicit_session_id, i.task_id AS implicit_task_id,
                i.turn_id AS implicit_turn_id, e.id AS linked_event_id,
-               e.tool, e.success,
+               e.ts AS event_ts, e.tool, e.success,
                e.query AS event_query, e.baseline_top_ids_json, e.top_ids_json,
                e.session_id AS event_session_id, e.task_id AS event_task_id,
                e.turn_id AS event_turn_id, e.root AS event_root
@@ -771,9 +775,15 @@ def _implicit_feedback_provenance_exact(
             final_ids = json.loads(str(row["top_ids_json"] or ""))
         except (TypeError, ValueError, json.JSONDecodeError):
             return False
+        implicit_timestamp = _parsed_utc_timestamp(row["implicit_ts"])
+        event_timestamp = _parsed_utc_timestamp(row["event_ts"])
         implicit_turn_id = str(row["implicit_turn_id"] or "")
         if (
-            str(row["tool"] or "") != "knowledge_search"
+            event_timestamp is None
+            or implicit_timestamp is None
+            or implicit_timestamp < event_timestamp
+            or implicit_timestamp - event_timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
+            or str(row["tool"] or "") != "knowledge_search"
             or type(row["success"]) is not int
             or row["success"] != 1
             or str(row["event_root"] or "") != str(root)

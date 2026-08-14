@@ -364,6 +364,7 @@ def test_requires_two_distinct_searches_before_routing(tmp_path: Path, monkeypat
         ("UPDATE implicit_feedback SET task_id='wrong-task' WHERE id=2", ()),
         ("UPDATE implicit_feedback SET turn_id='wrong-turn' WHERE id=2", ()),
         ("UPDATE implicit_feedback SET turn_id='' WHERE id=2", ()),
+        ("UPDATE implicit_feedback SET ts=datetime(ts, '+31 minutes') WHERE id=2", ()),
         ("UPDATE usage_events SET tool='knowledge_get' WHERE id=2", ()),
         ("UPDATE usage_events SET success='invalid' WHERE id=2", ()),
         ("UPDATE usage_events SET root=? WHERE id=2", ("__OTHER_ROOT__",)),
@@ -431,7 +432,7 @@ def test_exact_implicit_route_tie_is_stable_across_hash_seeds(tmp_path: Path) ->
             )
             implicit_rows.append(
                 (
-                    "2026-08-12T00:00:00+00:00",
+                    datetime.now(timezone.utc).isoformat(),
                     search_event_id,
                     route_query,
                     artifact_id,
@@ -541,6 +542,17 @@ def test_only_latest_same_task_recent_search_is_eligible(tmp_path: Path, monkeyp
     old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
         connection.execute("UPDATE usage_events SET ts = ? WHERE id = ?", (old, event_id))
+    _consume(monkeypatch, config, session="s1", task="wanted")
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0
+
+
+def test_future_search_is_not_eligible(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    event_id = _search(config, session="s1", task="wanted")
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        connection.execute("UPDATE usage_events SET ts = ? WHERE id = ?", (future, event_id))
     _consume(monkeypatch, config, session="s1", task="wanted")
     with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
         assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone()[0] == 0

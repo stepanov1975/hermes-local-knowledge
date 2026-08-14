@@ -7,6 +7,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ MIN_ROUTE_TERMS = 3
 MIN_OVERLAP_TERMS = 3
 MIN_ROUTE_COVERAGE = 0.75
 FEEDBACK_SCAN_LIMIT = 1000
+IMPLICIT_FEEDBACK_MAX_SEARCH_AGE = timedelta(minutes=30)
 RETRY_LIMIT = 10
 FEEDBACK_BUSY_TIMEOUT_SECONDS = 0.1
 FEEDBACK_BUSY_TIMEOUT_MS = 100
@@ -115,6 +117,16 @@ def _persisted_id(value: Any, *, allow_zero: bool = False) -> int | None:
     if type(value) is not int or value < minimum:
         return None
     return value
+
+
+def _parsed_utc_timestamp(value: Any) -> datetime | None:
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
 
 
 def _normalized_query(query: str) -> str:
@@ -341,6 +353,7 @@ def _implicit_feedback_route_snapshot(
         return None, None
     if not {
         "search_event_id",
+        "ts",
         "query",
         "artifact_id",
         "session_id",
@@ -351,6 +364,7 @@ def _implicit_feedback_route_snapshot(
     usage_columns = _table_columns(connection, "usage_events")
     if not {
         "id",
+        "ts",
         "tool",
         "success",
         "query",
@@ -364,11 +378,11 @@ def _implicit_feedback_route_snapshot(
         return None, implicit_feedback_max_id
     rows = connection.execute(
         """
-        SELECT i.id, i.query, i.artifact_id, i.search_event_id,
+        SELECT i.id, i.ts AS implicit_ts, i.query, i.artifact_id, i.search_event_id,
                i.session_id AS implicit_session_id,
                i.task_id AS implicit_task_id,
                i.turn_id AS implicit_turn_id,
-               e.id AS event_id,
+               e.id AS event_id, e.ts AS event_ts,
                e.tool AS event_tool, e.success AS event_success,
                e.query AS event_query,
                e.baseline_top_ids_json AS event_baseline_top_ids_json,
@@ -398,12 +412,18 @@ def _implicit_feedback_route_snapshot(
         route_query = str(row["query"] or "").strip()
         route_terms = frozenset(_query_terms(route_query))
         candidate_id = str(row["artifact_id"] or "").strip()
+        implicit_timestamp = _parsed_utc_timestamp(row["implicit_ts"])
+        event_timestamp = _parsed_utc_timestamp(row["event_ts"])
         implicit_session_id = str(row["implicit_session_id"] or "")
         implicit_task_id = str(row["implicit_task_id"] or "")
         implicit_turn_id = str(row["implicit_turn_id"] or "")
         if (
             not route_terms
             or not candidate_id
+            or event_timestamp is None
+            or implicit_timestamp is None
+            or implicit_timestamp < event_timestamp
+            or implicit_timestamp - event_timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
             or str(row["event_tool"] or "") != "knowledge_search"
             or type(row["event_success"]) is not int
             or row["event_success"] != 1

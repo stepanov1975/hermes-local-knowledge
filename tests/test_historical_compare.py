@@ -161,6 +161,7 @@ def create_provenance_usage_db(path: Path, live_root: Path, unrelated_root: Path
             """
             CREATE TABLE implicit_feedback (
                 id INTEGER PRIMARY KEY,
+                ts TEXT NOT NULL,
                 search_event_id INTEGER,
                 query TEXT,
                 artifact_id TEXT,
@@ -174,14 +175,14 @@ def create_provenance_usage_db(path: Path, live_root: Path, unrelated_root: Path
         conn.executemany(
             """
             INSERT INTO implicit_feedback (
-                id, search_event_id, query, artifact_id, session_id, task_id, turn_id, root
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                id, ts, search_event_id, query, artifact_id, session_id, task_id, turn_id, root
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                (1, 1, "alpha", "skill:old", "s1", "t1", "turn-1", str(live_root)),
-                (2, 2, "beta", "skill:old", "s2", "t2", "turn-2", str(live_root)),
-                (3, 2, "future", "skill:new", "s2", "t2", "turn-2", str(live_root)),
-                (4, 3, "other", "skill:other", "s3", "t3", "turn-3", str(unrelated_root)),
+                (1, "2026-01-01T00:00:01Z", 1, "alpha", "skill:old", "s1", "t1", "turn-1", str(live_root)),
+                (2, "2026-01-01T00:01:01Z", 2, "beta", "skill:old", "s2", "t2", "turn-2", str(live_root)),
+                (3, "2026-01-01T00:01:02Z", 2, "future", "skill:new", "s2", "t2", "turn-2", str(live_root)),
+                (4, "2026-01-01T00:02:01Z", 3, "other", "skill:other", "s3", "t3", "turn-3", str(unrelated_root)),
             ],
         )
         conn.executemany(
@@ -750,8 +751,8 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
         )
         conn.executemany(
             "INSERT INTO implicit_feedback "
-            "(id, search_event_id, query, artifact_id, session_id, task_id, turn_id, root) "
-            "VALUES (?, ?, 'query', 'skill:a', 'session', 'task', 'turn', ?)",
+            "(id, ts, search_event_id, query, artifact_id, session_id, task_id, turn_id, root) "
+            "VALUES (?, '2026-01-01T00:00:01Z', ?, 'query', 'skill:a', 'session', 'task', 'turn', ?)",
             ((row_id, row_id, str(root)) for row_id in row_ids),
         )
         conn.row_factory = sqlite3.Row
@@ -775,6 +776,7 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
         ("UPDATE implicit_feedback SET task_id='wrong-task' WHERE id=2", ()),
         ("UPDATE implicit_feedback SET turn_id='wrong-turn' WHERE id=2", ()),
         ("UPDATE implicit_feedback SET turn_id='' WHERE id=2", ()),
+        ("UPDATE implicit_feedback SET ts='2026-01-01T00:31:01Z' WHERE id=2", ()),
         (
             "UPDATE usage_events SET baseline_top_ids_json='[\"skill:other\"]', "
             "top_ids_json='[\"skill:old\"]' WHERE id=2",
@@ -802,6 +804,7 @@ def test_implicit_provenance_accepts_more_than_routing_window(tmp_path: Path) ->
         "wrong-task",
         "wrong-turn",
         "empty-turn",
+        "stale-consumption",
         "route-assisted-only-artifact",
         "final-page-excluded-artifact",
         "malformed-baseline",
@@ -869,22 +872,22 @@ def test_implicit_provenance_rejects_non_integer_ids_without_vacuous_success(
         conn.executescript(
             """
             CREATE TABLE usage_events (
-                id, tool, success, query, baseline_top_ids_json, top_ids_json,
+                id, ts, tool, success, query, baseline_top_ids_json, top_ids_json,
                 session_id, task_id, turn_id, root
             );
             CREATE TABLE implicit_feedback (
-                id, search_event_id, query, artifact_id,
+                id, ts, search_event_id, query, artifact_id,
                 session_id, task_id, turn_id, root
             );
             """
         )
         conn.execute(
-            "INSERT INTO usage_events VALUES (?, 'knowledge_search', 1, 'q', "
+            "INSERT INTO usage_events VALUES (?, '2026-01-01T00:00:00Z', 'knowledge_search', 1, 'q', "
             "'[\"skill:a\"]', '[\"skill:a\"]', 's', 't', 'u', ?)",
             (usage_event_id, str(tmp_path)),
         )
         conn.execute(
-            "INSERT INTO implicit_feedback VALUES (?, ?, 'q', 'skill:a', 's', 't', 'u', ?)",
+            "INSERT INTO implicit_feedback VALUES (?, '2026-01-01T00:00:01Z', ?, 'q', 'skill:a', 's', 't', 'u', ?)",
             (implicit_id, search_event_id, str(tmp_path)),
         )
 
@@ -905,22 +908,22 @@ def test_implicit_provenance_accepts_exact_integer_ids_and_empty_zero_boundary(
         conn.executescript(
             """
             CREATE TABLE usage_events (
-                id, tool, success, query, baseline_top_ids_json, top_ids_json,
+                id, ts, tool, success, query, baseline_top_ids_json, top_ids_json,
                 session_id, task_id, turn_id, root
             );
             CREATE TABLE implicit_feedback (
-                id, search_event_id, query, artifact_id,
+                id, ts, search_event_id, query, artifact_id,
                 session_id, task_id, turn_id, root
             );
             """
         )
         conn.execute(
-            "INSERT INTO usage_events VALUES (1, 'knowledge_search', 1, 'q', "
+            "INSERT INTO usage_events VALUES (1, '2026-01-01T00:00:00Z', 'knowledge_search', 1, 'q', "
             "'[\"skill:a\"]', '[\"skill:a\"]', 's', 't', 'u', ?)",
             (str(tmp_path),),
         )
         conn.execute(
-            "INSERT INTO implicit_feedback VALUES (1, 1, 'q', 'skill:a', 's', 't', 'u', ?)",
+            "INSERT INTO implicit_feedback VALUES (1, '2026-01-01T00:00:01Z', 1, 'q', 'skill:a', 's', 't', 'u', ?)",
             (str(tmp_path),),
         )
         assert helper._implicit_feedback_provenance_exact(

@@ -11,14 +11,14 @@ import logging
 import sqlite3
 from collections.abc import Mapping
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import resolve_config
+from .routing import IMPLICIT_FEEDBACK_MAX_SEARCH_AGE
 from .telemetry import attach_usage_event_turn_id, record_implicit_feedback
 
 logger = logging.getLogger(__name__)
-MAX_SEARCH_AGE = timedelta(minutes=30)
 _TURN_CONTEXT: ContextVar[tuple[str, str, str] | None] = ContextVar(
     "local_knowledge_implicit_turn",
     default=None,
@@ -119,7 +119,10 @@ def _matching_search_event(
             continue
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
-        if now - timestamp.astimezone(timezone.utc) > MAX_SEARCH_AGE:
+        timestamp = timestamp.astimezone(timezone.utc)
+        if timestamp > now:
+            continue
+        if now - timestamp > IMPLICIT_FEEDBACK_MAX_SEARCH_AGE:
             break
         if (
             not isinstance(baseline_ids, list)
