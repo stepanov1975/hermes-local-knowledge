@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,18 @@ KNOWLEDGE_SEARCH_HINT = (
 )
 
 
+def _render_search_hint(_session_info: Mapping[str, Any]) -> str:
+    """Render the static hint only when local knowledge is configured."""
+
+    return KNOWLEDGE_SEARCH_HINT if check_knowledge_available() else ""
+
+
+def _bind_implicit_pre_llm_context(**kwargs: Any) -> None:
+    """Bind implicit-feedback state without injecting static prompt text."""
+
+    _on_implicit_pre_llm_call(**kwargs)
+
+
 def _history_contains_search_hint(conversation_history: Any) -> bool:
     """Return whether the current API history already carries the hint."""
 
@@ -43,9 +56,9 @@ def _history_contains_search_hint(conversation_history: Any) -> bool:
 
 
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
-    """Bind implicit-feedback context and advertise available local search."""
+    """Bind implicit state and inject the hint on older Hermes hosts."""
 
-    _on_implicit_pre_llm_call(**kwargs)
+    _bind_implicit_pre_llm_context(**kwargs)
     if not check_knowledge_available():
         return None
     if _history_contains_search_hint(kwargs.get("conversation_history")):
@@ -894,9 +907,19 @@ def register(ctx: Any) -> None:
         )
     _register_bundled_skills(ctx)
     _register_cli(ctx)
+    pre_llm_callback = _on_pre_llm_call
+    register_system_prompt_section = getattr(ctx, "register_system_prompt_section", None)
+    if callable(register_system_prompt_section):
+        register_system_prompt_section(
+            "local-knowledge.discovery",
+            _render_search_hint,
+            position="after_memory",
+            max_chars=200,
+        )
+        pre_llm_callback = _bind_implicit_pre_llm_context
     register_hook = getattr(ctx, "register_hook", None)
     if register_hook is not None:
-        register_hook("pre_llm_call", _on_pre_llm_call)
+        register_hook("pre_llm_call", pre_llm_callback)
         register_hook("post_tool_call", _on_post_tool_call)
         register_hook("on_session_end", _on_implicit_session_end)
         register_hook("on_session_finalize", _on_session_finalize)

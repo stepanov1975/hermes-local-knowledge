@@ -40,7 +40,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
-    assert hermes_local_knowledge.__version__ == "0.4.8"
+    assert hermes_local_knowledge.__version__ == "0.4.9"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
@@ -160,6 +160,85 @@ def test_register_exposes_native_tools_and_bundled_skill():
         ("post_tool_call", plugin._on_post_tool_call),
         ("on_session_end", plugin._on_implicit_session_end),
         ("on_session_finalize", plugin._on_session_finalize),
+    ]
+
+
+def test_register_prefers_system_prompt_section_when_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    section_calls = []
+    hook_calls = []
+    implicit_kwargs: dict[str, object] = {}
+
+    def bind_implicit_context(**kwargs):  # type: ignore[no-untyped-def]
+        implicit_kwargs.update(kwargs)
+
+    monkeypatch.setattr(plugin, "_on_implicit_pre_llm_call", bind_implicit_context)
+    monkeypatch.setattr(plugin, "check_knowledge_available", lambda: True)
+
+    class Ctx:
+        llm = None
+
+        def register_tool(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return None
+
+        def register_skill(self, _name, _skill_md):  # type: ignore[no-untyped-def]
+            return None
+
+        def register_cli_command(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return None
+
+        def register_hook(self, name, callback):  # type: ignore[no-untyped-def]
+            hook_calls.append((name, callback))
+
+        def register_system_prompt_section(
+            self,
+            section_id,
+            content,
+            **kwargs,
+        ):  # type: ignore[no-untyped-def]
+            section_calls.append((section_id, content, kwargs))
+
+    plugin.register(Ctx())
+
+    assert section_calls == [
+        (
+            "local-knowledge.discovery",
+            plugin._render_search_hint,
+            {"position": "after_memory", "max_chars": 200},
+        )
+    ]
+    assert section_calls[0][1]({"session_id": "session-1"}) == plugin.KNOWLEDGE_SEARCH_HINT
+    assert hook_calls[0] == ("pre_llm_call", plugin._bind_implicit_pre_llm_context)
+    assert hook_calls[0][1](turn_id="turn-1") is None
+    assert implicit_kwargs["turn_id"] == "turn-1"
+
+    monkeypatch.setattr(plugin, "check_knowledge_available", lambda: False)
+    assert section_calls[0][1]({"session_id": "session-2"}) == ""
+
+
+def test_supported_hermes_renders_search_hint_as_system_prompt_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hermes_plugins = importlib.import_module("hermes_cli.plugins")
+    plugin_context = hermes_plugins.PluginContext
+    if not hasattr(plugin_context, "register_system_prompt_section"):
+        pytest.skip("installed Hermes predates system-prompt sections")
+
+    manager = hermes_plugins.PluginManager()
+    manifest = hermes_plugins.PluginManifest(
+        name="local_knowledge",
+        key="local_knowledge",
+        source="test",
+    )
+    ctx = plugin_context(manifest, manager)
+    monkeypatch.setattr(plugin, "check_knowledge_available", lambda: True)
+
+    plugin.register(ctx)
+    rendered = manager.render_system_prompt_sections({"session_id": "session-1"})
+
+    assert [(section.id, section.content) for section in rendered] == [
+        ("local-knowledge.discovery", plugin.KNOWLEDGE_SEARCH_HINT)
     ]
 
 

@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.9] - 2026-08-17
+
+### Changed
+
+- Registered the static `knowledge_search` discovery hint as a bounded, cache-safe system-prompt section on supported Hermes hosts, while retaining the deduplicated `pre_llm_call` injection as a backward-compatible fallback.
+- Kept the `pre_llm_call` hook dedicated to implicit-feedback context binding when system-prompt sections are available, so the static hint survives compression and remains present for multimodal turns without repeated user-message injection.
+
+[0.4.9]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.8...v0.4.9
+
 ## [0.4.8] - 2026-08-17
 
 ### Added
