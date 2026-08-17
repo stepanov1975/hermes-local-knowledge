@@ -22,6 +22,36 @@ from .telemetry import FEEDBACK_RATINGS, FeedbackDatabaseLockedError, _usage_con
 
 __all__ = ["register"]
 
+KNOWLEDGE_SEARCH_HINT = (
+    "To search for local tools and information, use the `knowledge_search` tool."
+)
+
+
+def _history_contains_search_hint(conversation_history: Any) -> bool:
+    """Return whether the current API history already carries the hint."""
+
+    if not isinstance(conversation_history, list):
+        return False
+    for message in conversation_history:
+        if not isinstance(message, dict):
+            continue
+        for key in ("api_content", "content"):
+            content = message.get(key)
+            if isinstance(content, str) and KNOWLEDGE_SEARCH_HINT in content:
+                return True
+    return False
+
+
+def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
+    """Bind implicit-feedback context and advertise available local search."""
+
+    _on_implicit_pre_llm_call(**kwargs)
+    if not check_knowledge_available():
+        return None
+    if _history_contains_search_hint(kwargs.get("conversation_history")):
+        return None
+    return {"context": KNOWLEDGE_SEARCH_HINT}
+
 
 def _on_post_tool_call(**kwargs: Any) -> None:
     _on_okf_post_tool_call(**kwargs)
@@ -39,7 +69,7 @@ def check_knowledge_available() -> bool:
 
     try:
         config = resolve_config()
-        return config.source_root.exists() and config.hermes_home.exists()
+        return config.source_root.is_dir() and config.hermes_home.is_dir()
     except Exception:
         return False
 
@@ -866,7 +896,7 @@ def register(ctx: Any) -> None:
     _register_cli(ctx)
     register_hook = getattr(ctx, "register_hook", None)
     if register_hook is not None:
-        register_hook("pre_llm_call", _on_implicit_pre_llm_call)
+        register_hook("pre_llm_call", _on_pre_llm_call)
         register_hook("post_tool_call", _on_post_tool_call)
         register_hook("on_session_end", _on_implicit_session_end)
         register_hook("on_session_finalize", _on_session_finalize)

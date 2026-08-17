@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import json
 import sqlite3
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import hermes_local_knowledge
 import pytest
@@ -38,7 +40,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
-    assert hermes_local_knowledge.__version__ == "0.4.7"
+    assert hermes_local_knowledge.__version__ == "0.4.8"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
@@ -107,6 +109,7 @@ def test_register_exposes_native_tools_and_bundled_skill():
     tool_calls = []
     skill_calls = []
     cli_calls = []
+    hook_calls = []
     host_llm = object()
 
     class Ctx:
@@ -120,6 +123,9 @@ def test_register_exposes_native_tools_and_bundled_skill():
 
         def register_cli_command(self, **kwargs):  # type: ignore[no-untyped-def]
             cli_calls.append(kwargs)
+
+        def register_hook(self, name, callback):  # type: ignore[no-untyped-def]
+            hook_calls.append((name, callback))
 
     plugin.register(Ctx())
 
@@ -149,6 +155,119 @@ def test_register_exposes_native_tools_and_bundled_skill():
     assert callable(cli_calls[0]["setup_fn"])
     assert callable(cli_calls[0]["handler_fn"])
     assert cli_calls[0]["handler_fn"].keywords["llm"] is host_llm
+    assert hook_calls == [
+        ("pre_llm_call", plugin._on_pre_llm_call),
+        ("post_tool_call", plugin._on_post_tool_call),
+        ("on_session_end", plugin._on_implicit_session_end),
+        ("on_session_finalize", plugin._on_session_finalize),
+    ]
+
+
+def test_knowledge_availability_requires_source_and_home_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    hermes_home = tmp_path / "home"
+    source_root.write_text("not a directory", encoding="utf-8")
+    hermes_home.mkdir()
+    monkeypatch.setattr(
+        plugin,
+        "resolve_config",
+        lambda: SimpleNamespace(source_root=source_root, hermes_home=hermes_home),
+    )
+    assert plugin.check_knowledge_available() is False
+
+    source_root.unlink()
+    source_root.mkdir()
+    assert plugin.check_knowledge_available() is True
+
+    hermes_home.rmdir()
+    hermes_home.write_text("not a directory", encoding="utf-8")
+    assert plugin.check_knowledge_available() is False
+
+
+def test_pre_llm_hook_injects_search_hint_into_real_api_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback_kwargs: dict[str, object] = {}
+
+    def bind_implicit_context(**kwargs):  # type: ignore[no-untyped-def]
+        callback_kwargs.update(kwargs)
+
+    monkeypatch.setattr(plugin, "_on_implicit_pre_llm_call", bind_implicit_context)
+    monkeypatch.setattr(plugin, "check_knowledge_available", lambda: True)
+
+    result = plugin._on_pre_llm_call(
+        session_id="session-1",
+        task_id="task-1",
+        turn_id="turn-1",
+        user_message="Where is the backup runbook?",
+    )
+
+    assert result == {"context": plugin.KNOWLEDGE_SEARCH_HINT}
+    assert result is not None
+    assert callback_kwargs["turn_id"] == "turn-1"
+
+    compose_user_api_content = importlib.import_module(
+        "agent.turn_context"
+    ).compose_user_api_content
+
+    api_content = compose_user_api_content(
+        "Where is the backup runbook?",
+        "Remembered deployment context.",
+        result["context"],
+    )
+    assert api_content is not None
+    assert api_content.startswith("Where is the backup runbook?\n\n")
+    assert "Remembered deployment context." in api_content
+    assert api_content.endswith(plugin.KNOWLEDGE_SEARCH_HINT)
+    assert api_content.count(plugin.KNOWLEDGE_SEARCH_HINT) == 1
+
+
+def test_pre_llm_hook_omits_hint_when_local_knowledge_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback_kwargs: dict[str, object] = {}
+
+    def bind_implicit_context(**kwargs):  # type: ignore[no-untyped-def]
+        callback_kwargs.update(kwargs)
+
+    monkeypatch.setattr(plugin, "_on_implicit_pre_llm_call", bind_implicit_context)
+    monkeypatch.setattr(plugin, "check_knowledge_available", lambda: False)
+
+    assert plugin._on_pre_llm_call(turn_id="turn-2") is None
+    assert callback_kwargs["turn_id"] == "turn-2"
+
+
+def test_pre_llm_hook_does_not_duplicate_hint_already_in_api_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback_kwargs: dict[str, object] = {}
+
+    def bind_implicit_context(**kwargs):  # type: ignore[no-untyped-def]
+        callback_kwargs.update(kwargs)
+
+    monkeypatch.setattr(plugin, "_on_implicit_pre_llm_call", bind_implicit_context)
+    monkeypatch.setattr(plugin, "check_knowledge_available", lambda: True)
+
+    history = [
+        {
+            "role": "user",
+            "content": "Where is the backup runbook?",
+            "api_content": (
+                "Where is the backup runbook?\n\n" + plugin.KNOWLEDGE_SEARCH_HINT
+            ),
+        }
+    ]
+    assert (
+        plugin._on_pre_llm_call(
+            turn_id="turn-3",
+            conversation_history=history,
+        )
+        is None
+    )
+    assert callback_kwargs["turn_id"] == "turn-3"
 
 
 def test_feedback_handler_forwards_verified_fields_and_uses_atomic_usage_event(

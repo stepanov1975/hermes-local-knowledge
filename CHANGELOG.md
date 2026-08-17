@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.8] - 2026-08-17
+
+### Added
+
+- Added a concise, availability-gated `pre_llm_call` hint that tells the model to use `knowledge_search` for local tools and information while preserving the existing implicit-feedback turn binding and avoiding duplicate hints in conversation history.
+
+### Fixed
+
+- Tightened the shared tool and hint availability check so configured source and Hermes-home paths must be directories rather than merely existing paths.
+
+[0.4.8]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.7...v0.4.8
+
 ## [0.4.7] - 2026-08-14
 
 ### Changed
