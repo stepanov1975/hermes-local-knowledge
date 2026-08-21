@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import sys
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 from pathlib import Path
@@ -401,6 +402,29 @@ def test_active_home_uses_host_loader_when_available(
     assert host_calls == ["load_config"]
     assert resolved.hermes_home == hermes_home.resolve()
     assert resolved.source_root == host_root.resolve()
+
+
+def test_active_home_prefers_host_profile_scope_over_process_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hermes_constants = importlib.import_module("hermes_constants")
+
+    default_home = tmp_path / "default"
+    profile_home = tmp_path / "profiles" / "work"
+    default_home.mkdir()
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    token = hermes_constants.set_hermes_home_override(profile_home)
+    try:
+        resolved = resolve_config()
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+
+    assert resolved.hermes_home == profile_home.resolve()
+    assert resolved.source_root == profile_home.resolve()
+    assert resolved.state_dir == (profile_home / "local_knowledge").resolve()
 
 
 def test_explicit_hermes_home_reads_that_config_without_host_loader(

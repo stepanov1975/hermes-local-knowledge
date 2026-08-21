@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.11] - 2026-08-21
+
+### Fixed
+
+- Preferred Hermes' context-local active profile over the process-wide `HERMES_HOME` fallback, keeping profile configuration, indexes, usage telemetry, and learned feedback isolated when multiple profile managers coexist in one process.
+
+[0.4.11]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.10...v0.4.11
+
 ## [0.4.10] - 2026-08-21
 
 ### Added

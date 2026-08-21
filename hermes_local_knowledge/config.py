@@ -286,14 +286,14 @@ def _load_section(hermes_home: Path, *, explicit_home: bool) -> dict[str, Any]:
 def _base_hermes_home(override: Path | str | None) -> Path:
     if _present(override):
         return Path(str(override)).expanduser().resolve()
-    env_home = os.environ.get(_HERMES_HOME_ENV)
-    if _present(env_home):
-        return Path(str(env_home)).expanduser().resolve()
     try:
         from hermes_constants import get_hermes_home  # type: ignore[import-not-found,import-untyped]
 
         return Path(get_hermes_home()).expanduser().resolve()
     except Exception:
+        env_home = os.environ.get(_HERMES_HOME_ENV)
+        if _present(env_home):
+            return Path(str(env_home)).expanduser().resolve()
         return (Path.home() / ".hermes").resolve()
 
 

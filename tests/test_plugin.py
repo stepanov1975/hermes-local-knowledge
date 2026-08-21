@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import sqlite3
 import tomllib
@@ -40,7 +41,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
-    assert hermes_local_knowledge.__version__ == "0.4.10"
+    assert hermes_local_knowledge.__version__ == "0.4.11"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
@@ -240,6 +241,84 @@ def test_supported_hermes_renders_search_hint_as_system_prompt_section(
     assert [(section.id, section.content) for section in rendered] == [
         ("local-knowledge.discovery", plugin.KNOWLEDGE_SEARCH_HINT)
     ]
+
+
+def test_supported_hermes_keeps_two_profile_tool_state_isolated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hermes_plugins = importlib.import_module("hermes_cli.plugins")
+    hermes_constants = importlib.import_module("hermes_constants")
+    registry = importlib.import_module("tools.registry").registry
+    if "scope_key" not in inspect.signature(hermes_plugins.PluginManager).parameters:
+        pytest.skip("installed Hermes predates in-process profile-scoped plugin managers")
+
+    default_home = tmp_path / "default"
+    default_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_ROOT", raising=False)
+    monkeypatch.delenv("LOCAL_KNOWLEDGE_STATE_DIR", raising=False)
+
+    profiles: dict[str, tuple[Path, Path, str]] = {}
+    managers = []
+    for name, token in (("alpha", "quasaralpha"), ("beta", "nebulabeta")):
+        profile_home = tmp_path / "profiles" / name
+        source_root = tmp_path / "sources" / name
+        write(source_root / "docs" / "capability.md", f"# {token}\n")
+        write(
+            profile_home / "config.yaml",
+            f"""local_knowledge:
+  source_root: {source_root}
+""",
+        )
+        manager = hermes_plugins.PluginManager(scope_key=str(profile_home.resolve()))
+        manifest = hermes_plugins.PluginManifest(
+            name="local_knowledge",
+            key="local_knowledge",
+            source="test",
+        )
+        scope_token = hermes_constants.set_hermes_home_override(profile_home)
+        try:
+            plugin.register(hermes_plugins.PluginContext(manifest, manager))
+        finally:
+            hermes_constants.reset_hermes_home_override(scope_token)
+        managers.append(manager)
+        profiles[name] = (profile_home, source_root, token)
+
+    try:
+        for name, (profile_home, source_root, own_query) in profiles.items():
+            other_query = profiles["beta" if name == "alpha" else "alpha"][2]
+            scope_token = hermes_constants.set_hermes_home_override(profile_home)
+            try:
+                resolved = resolve_config()
+                assert resolved.hermes_home == profile_home.resolve()
+                assert resolved.source_root == source_root.resolve()
+                own = json.loads(
+                    registry.dispatch(
+                        "knowledge_search",
+                        {"query": own_query, "rebuild": True},
+                        scope=str(profile_home.resolve()),
+                    )
+                )
+                other = json.loads(
+                    registry.dispatch(
+                        "knowledge_search",
+                        {"query": other_query},
+                        scope=str(profile_home.resolve()),
+                    )
+                )
+            finally:
+                hermes_constants.reset_hermes_home_override(scope_token)
+
+            assert own["success"] is True
+            assert own["results"]
+            assert other["success"] is True
+            assert other["results"] == []
+            assert (profile_home / "local_knowledge" / "index.sqlite").is_file()
+            assert (profile_home / "local_knowledge" / "usage.sqlite").is_file()
+    finally:
+        for manager in managers:
+            manager.unload()
 
 
 def test_knowledge_availability_requires_source_and_home_directories(
