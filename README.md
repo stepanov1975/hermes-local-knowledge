@@ -170,6 +170,8 @@ Canonical settings, aliases, and defaults:
 
 All nested `okf` keys also accept their flat `okf_*` form. YAML lists are preferred in `config.yaml`; comma-separated or bracket-list strings written by `hermes config set` are normalized.
 
+Each invocation follows Hermes' context-local active profile, including hosts that keep multiple profile managers in one process. By default, each profile therefore uses its own config, runtime artifacts, index, telemetry, and learned feedback under `$HERMES_HOME/local_knowledge`. A shared `source_root` is safe when profiles should search the same curated tree, but keep `state_dir` profile-specific unless combined telemetry and feedback are explicitly intended. Process-level `LOCAL_KNOWLEDGE_ROOT` and `LOCAL_KNOWLEDGE_STATE_DIR` overrides still apply to every profile in that process.
+
 When `source_root` is omitted, runtime skills, cron jobs, and MCP configuration are still indexed from `$HERMES_HOME`, but arbitrary root-level Markdown is not included by default. Generated state belongs outside a source repository and must not be committed.
 
 ## CLI
