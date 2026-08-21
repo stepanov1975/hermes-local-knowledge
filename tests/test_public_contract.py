@@ -296,6 +296,9 @@ USAGE_REPORT_KEYS = {
     "live_feedback_count",
     "implicit_feedback_count",
     "live_implicit_feedback_count",
+    "implicit_feedback_by_consumer",
+    "current_native_search_quality",
+    "event_cohorts",
     "avg_latency_ms",
     "root_breakdown",
     "feedback_root_breakdown",
@@ -363,6 +366,7 @@ USAGE_EVENT_SCHEMA = [
     ("session_id", "TEXT", 0, None, 0),
     ("task_id", "TEXT", 0, None, 0),
     ("tool_call_id", "TEXT", 0, None, 0),
+    ("api_request_id", "TEXT", 0, None, 0),
     ("query", "TEXT", 0, None, 0),
     ("artifact_id", "TEXT", 0, None, 0),
     ("artifact_type", "TEXT", 0, None, 0),
@@ -745,6 +749,7 @@ def test_registered_handlers_return_stable_json_success_envelopes(workspace: Wor
         "knowledge_search",
         {"query": "quartz inventory operations", "limit": 5, "rebuild": True},
         session_id="public-contract-session",
+        api_request_id="public-contract-request",
     )
     assert set(search) == {
         "success",
@@ -762,6 +767,11 @@ def test_registered_handlers_return_stable_json_success_envelopes(workspace: Wor
     assert search["artifact_type"] is None
     assert search["limit"] == 5
     assert isinstance(search["usage_event_id"], int)
+    with sqlite3.connect(workspace.state_dir / "usage.sqlite") as connection:
+        assert connection.execute(
+            "SELECT api_request_id FROM usage_events WHERE id = ?",
+            (search["usage_event_id"],),
+        ).fetchone() == ("public-contract-request",)
     assert search["root"] == str(workspace.root.resolve())
     assert search["state_dir"] == str(workspace.state_dir.resolve())
     assert search["source_root_source"] == "env"

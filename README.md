@@ -38,9 +38,9 @@ The plugin registers these native tools in the `local_knowledge` toolset:
 | `knowledge_feedback` | Record local lookup feedback such as `useful`, `missing`, `stale`, or `wrong_artifact`. |
 | `knowledge_usage_report` | Summarize local usage, failures, zero-result queries, and feedback. |
 
-The plugin also registers `pre_llm_call`, `post_tool_call`, `on_session_end`, and `on_session_finalize` hooks. When the configured source is available, Hermes hosts with cache-safe plugin prompt sections add one concise system-prompt hint for each new session: use `knowledge_search` for local tools and information. Older hosts use a deduplicated `pre_llm_call` hint as a compatibility fallback. In either case, `pre_llm_call` continues to bind optional same-turn implicit search-result feedback; the remaining lifecycle hooks support that feedback and tool-OKF capture/generation while keeping correlation inside the plugin when Hermes dispatches local-knowledge tools through its deferred-tool bridge.
+The plugin also registers `pre_llm_call`, `post_tool_call`, `on_session_end`, and `on_session_finalize` hooks. When the configured source is available, Hermes hosts with cache-safe plugin prompt sections add one concise system-prompt hint for each new session: use `knowledge_search` for local tools and information. Older hosts use a deduplicated `pre_llm_call` hint as a compatibility fallback. In either case, `pre_llm_call` continues to bind optional same-turn implicit search-result feedback; the remaining lifecycle hooks support exact successful consumption through `knowledge_get`, `skill_view`, or `read_file` plus tool-OKF capture/generation while keeping correlation inside the plugin when Hermes dispatches local-knowledge tools through its deferred-tool bridge.
 
-Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed after distinct matching searches, with each `knowledge_get` tied to that search's unassisted baseline in the same Hermes session, task, and turn:
+Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed after distinct matching searches, with each supported consumer tied to that search's unassisted baseline in the same Hermes session, task, and turn:
 
 ```yaml
 local_knowledge:
@@ -50,7 +50,7 @@ local_knowledge:
     max_generic_queries: 5
 ```
 
-Only a recent search from the same Hermes session, task, and turn is eligible. Repeated gets from one search are deduplicated, and overly generic artifacts stop receiving implicit promotion. Explicit feedback remains authoritative, and implicit evidence is not used as evaluation ground truth.
+Only a recent search from the same Hermes session, task, and turn is eligible. `skill_view` and `read_file` must run in a later model request, after the search result is available, and count only when their successful result resolves by canonical source path to exactly one baseline artifact in the same current index snapshot. Repeated consumption from one search is deduplicated, and overly generic artifacts stop receiving implicit promotion. Explicit feedback remains authoritative, and implicit evidence is not used as evaluation ground truth.
 
 ## Install and model consent
 
@@ -248,9 +248,9 @@ Lookup telemetry and feedback stay in `<state_dir>/usage.sqlite`. Tool handlers 
 
 Managed searches may use one deterministic feedback prior when the index was built for the configured source root. Only the latest significant explicit rating for a query/artifact pair is eligible. Among ratings accepted by the current tool, only `useful` is positive; legacy persisted `great` rows remain positive compatibility input. A newer rejection for that route or matching current query suppresses an older overlap route. A matching artifact already present in current results may move to rank one. If it is absent, the plugin performs at most one retry with an accepted query no longer than the current query and the mapped artifact type, and promotes only the exact artifact when that live retry rediscovers it. Searches against an explicit caller-owned `--db` remain unassisted.
 
-When opt-in implicit feedback is enabled and no explicit route matches, mature same-turn evidence may supply the lower-priority route. It uses the same current-index promotion or one verified typed-retry path, and a matching explicit rejection can veto it.
+When opt-in implicit feedback is enabled and no explicit route matches, mature same-turn evidence may supply the lower-priority route. Consumption through `skill_view` and `read_file` is accepted only from a later model request when a successful call resolves to exactly one caller-visible baseline artifact in the same current index snapshot; same-request parallel calls and route-assisted-only results remain ineligible. It uses the same current-index promotion or one verified typed-retry path, and a matching explicit rejection can veto it.
 
-`knowledge_usage_report` summarizes recent activity before changing ranking, triggers, source coverage, or graph edges.
+`knowledge_usage_report` summarizes recent activity before changing ranking, triggers, source coverage, or graph edges. Its `current_native_search_quality` headline isolates live native searches from the current plugin version while excluding known probe queries. `event_cohorts` reports current searches, probes, hourly doctor runs, other CLI/native activity, and historical-version searches separately; `implicit_feedback_by_consumer` distinguishes learned `knowledge_get`, `skill_view`, and `read_file` signals from migrated legacy rows. The original aggregate fields remain available for operations.
 
 `evaluate` is read-only and intentionally measures the unassisted index ranking to avoid training/evaluation leakage. It replays positive local feedback against the current index and reports exact Hit@k/MRR plus parent-equivalent metrics. Parent equivalence is deliberately limited to a `skill_support_doc` and its owning skill; generic graph neighbors are not treated as successful equivalents.
 

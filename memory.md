@@ -12,7 +12,7 @@ Durable product, ranking, privacy, and state rationale for `hermes-local-knowled
 ## Ownership
 
 - `config.py` resolves all configuration and aliases.
-- `implicit.py` owns same-turn search/get attribution for opt-in implicit evidence.
+- `implicit.py` owns strict same-turn search-result consumption attribution for opt-in implicit evidence.
 - `artifacts.py` owns artifact/edge models, source collection, and safe routing metadata.
 - `index.py` owns format-4 publication and deterministic retrieval.
 - `telemetry.py` owns local usage/feedback data; `evaluation.py` owns read-only label replay.
@@ -87,11 +87,11 @@ Automatic generation is optional and defaults off because it spends model tokens
 
 ## Feedback and evaluator rationale
 
-- Lookup usage, failures, zero-result queries, and explicit ratings stay in `usage.sqlite` and are summarized locally before changing ranking or source coverage.
+- Lookup usage, failures, zero-result queries, and explicit ratings stay in `usage.sqlite` and are summarized locally before changing ranking or source coverage. User-search quality defaults to the live current-version native-search cohort; probes, CLI maintenance, other native activity, and historical versions remain visible as separate operational cohorts.
 - Telemetry-only failures must not break lookup. Explicit feedback writes remain strict so callers know whether a rating was stored.
 - Evaluation is read-only and must not emit usage events or mutate feedback.
 - Explicit useful feedback may provide one bounded current-index-root routing prior, but it is not permanent truth. Legacy persisted `great` rows remain positive compatibility input even though the current tool rejects that rating. The newest significant query/artifact rating wins; a newer rejection for the route or matching current query vetoes an older overlap route. A retry must be no longer than the current query, must use the artifact's mapped type, and must rediscover the exact artifact before promotion. Explicit caller-owned indexes remain unassisted.
-- Opt-in implicit evidence comes only from a recent same-session/task/turn `knowledge_get` of an artifact returned by that search's unassisted baseline page. One search/artifact pair is deduplicated, confirmations must come from distinct search events, and evidence spread across too many query shapes is treated as generic. Implicit routing loses to matching explicit routes, uses the same current-index promotion or one verified typed-retry path, can be vetoed by matching explicit rejection, and is not an evaluation label.
+- Opt-in implicit evidence comes only from a recent same-session/task/turn consumption of an artifact returned by that search's unassisted baseline page. `knowledge_get` uses the explicit artifact ID; `skill_view` and `read_file` require a successful later model request whose canonical source path resolves to exactly one baseline artifact in the same current index snapshot. Same-request parallel calls and route-assisted-only results are ineligible. One search/artifact pair is deduplicated, confirmations must come from distinct search events, and evidence spread across too many query shapes is treated as generic. Implicit routing loses to matching explicit routes, uses the same current-index promotion or one verified typed-retry path, can be vetoed by matching explicit rejection, and is not evaluation ground truth.
 - Keep feedback lookup bounded and fail-open: scan only a recent capped window through the root/order index and use a short read timeout so optional routing cannot add multi-second lock delays.
 - Evaluation deliberately uses the unassisted index ranking so the same feedback rows are not both training data and evaluation labels. Ignore stale labels whose artifacts no longer exist.
 - Historical replay treats implicit state as exact input only when the recorded root-scoped high-water, effective settings, and same-turn baseline provenance are available. Searches recorded with implicit feedback disabled do not require unused implicit state; incomplete legacy rows remain explicitly non-exact evidence.

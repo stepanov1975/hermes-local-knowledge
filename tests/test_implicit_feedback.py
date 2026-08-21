@@ -14,6 +14,7 @@ from hermes_local_knowledge.config import Config, ImplicitFeedbackSettings, Inde
 from hermes_local_knowledge.evaluation import load_positive_feedback_labels
 from hermes_local_knowledge.implicit import on_post_tool_call, on_pre_llm_call, on_session_end
 from hermes_local_knowledge import plugin, routing
+from hermes_local_knowledge.index import build_index, index_metadata
 from hermes_local_knowledge.routing import decide_feedback_route
 from hermes_local_knowledge.telemetry import (
     _clean_text,
@@ -65,6 +66,8 @@ def _search(
     query: str = "docker update progress",
     top_ids: list[str] | None = None,
     baseline_top_ids: list[str] | None = None,
+    metadata: dict[str, object] | None = None,
+    api_request_id: str = "search-request",
 ) -> int:
     top_ids = top_ids or ["runbook:target", "runbook:other"]
     event_id = _record_usage(
@@ -77,11 +80,43 @@ def _search(
         implicit_feedback_enabled=config.implicit_feedback.enabled,
         implicit_min_confirmations=config.implicit_feedback.min_confirmations,
         implicit_max_generic_queries=config.implicit_feedback.max_generic_queries,
-        context={"session_id": session, "task_id": task, "turn_id": turn},
+        index_metadata=metadata,
+        context={
+            "session_id": session,
+            "task_id": task,
+            "turn_id": turn,
+            "api_request_id": api_request_id,
+        },
         usage_db_path=config.state_dir / "usage.sqlite",
     )
     assert event_id is not None
     return event_id
+
+
+def _consumer_index(config: Config) -> tuple[str, Path, str, Path, dict[str, object]]:
+    skill_path = config.source_root / "custom_skills" / "test-router" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        "---\nname: test-router\ndescription: Route test operations.\n---\n\n# Test Router\n",
+        encoding="utf-8",
+    )
+    runbook_path = config.source_root / "docs" / "test-update.md"
+    runbook_path.parent.mkdir(parents=True)
+    runbook_path.write_text("# Test update runbook\n", encoding="utf-8")
+    artifacts_and_edges = build_index(
+        config.source_root,
+        config.state_dir,
+        config.hermes_home,
+        config.index_settings,
+    )
+    assert artifacts_and_edges is not None
+    artifacts, _edges = artifacts_and_edges
+    skill_id = next(artifact.id for artifact in artifacts if artifact.title == "test-router")
+    runbook_id = next(
+        artifact.id for artifact in artifacts if artifact.path == "docs/test-update.md"
+    )
+    metadata = index_metadata(config.state_dir / "index.sqlite")
+    return skill_id, skill_path, runbook_id, runbook_path, metadata
 
 
 def _consume(
@@ -122,6 +157,174 @@ def _decision(config: Config, *, allow_implicit: bool = True):
 
 def tmp_path_placeholder() -> Path:
     return Path("/unused/index.sqlite")
+
+
+@pytest.mark.parametrize("consumer", ["skill_view", "read_file"])
+def test_exact_file_backed_consumer_records_implicit_feedback(
+    tmp_path: Path,
+    monkeypatch,
+    consumer: str,
+) -> None:
+    config = _config(tmp_path)
+    skill_id, skill_path, runbook_id, runbook_path, metadata = _consumer_index(config)
+    artifact_id = skill_id if consumer == "skill_view" else runbook_id
+    event_id = _search(
+        config,
+        session="s1",
+        task="t1",
+        top_ids=[artifact_id],
+        metadata=metadata,
+    )
+    monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
+    if consumer == "skill_view":
+        on_post_tool_call(
+            tool_name="skill_view",
+            args={"name": "test-router"},
+            result=json.dumps({"success": True, "_source_path": str(skill_path)}),
+            session_id="s1",
+            task_id="t1",
+            turn_id="turn-1",
+            api_request_id="consumer-request",
+        )
+    else:
+        on_post_tool_call(
+            tool_name="read_file",
+            args={"path": str(runbook_path)},
+            result=json.dumps({"content": "# Test update runbook", "total_lines": 1}),
+            session_id="s1",
+            task_id="t1",
+            turn_id="turn-1",
+            api_request_id="consumer-request",
+        )
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute(
+            "SELECT search_event_id, artifact_id, consumer_tool FROM implicit_feedback"
+        ).fetchall() == [(event_id, artifact_id, consumer)]
+
+
+@pytest.mark.parametrize("api_request_id", ["search-request", ""])
+def test_file_backed_consumer_requires_a_later_model_request(
+    tmp_path: Path,
+    monkeypatch,
+    api_request_id: str,
+) -> None:
+    config = _config(tmp_path)
+    skill_id, skill_path, _runbook_id, _runbook_path, metadata = _consumer_index(config)
+    _search(
+        config,
+        session="s1",
+        task="t1",
+        top_ids=[skill_id],
+        metadata=metadata,
+    )
+    monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
+
+    on_post_tool_call(
+        tool_name="skill_view",
+        args={"name": "test-router"},
+        result=json.dumps({"success": True, "_source_path": str(skill_path)}),
+        session_id="s1",
+        task_id="t1",
+        turn_id="turn-1",
+        api_request_id=api_request_id,
+    )
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("consumer", ["skill_view", "read_file"])
+def test_file_backed_consumer_rejects_nonmatching_path_or_index_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+    consumer: str,
+) -> None:
+    config = _config(tmp_path)
+    skill_id, skill_path, runbook_id, runbook_path, metadata = _consumer_index(config)
+    artifact_id = skill_id if consumer == "skill_view" else runbook_id
+    event_id = _search(
+        config,
+        session="s1",
+        task="t1",
+        top_ids=[artifact_id],
+        metadata=metadata,
+    )
+    monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
+
+    if consumer == "skill_view":
+        call = {
+            "tool_name": "skill_view",
+            "args": {"name": "test-router"},
+            "result": json.dumps(
+                {"success": True, "_source_path": str(skill_path.with_name("OTHER.md"))}
+            ),
+        }
+    else:
+        call = {
+            "tool_name": "read_file",
+            "args": {"path": str(runbook_path.with_name("other.md"))},
+            "result": json.dumps({"content": "other", "total_lines": 1}),
+        }
+    on_post_tool_call(
+        **call,
+        session_id="s1",
+        task_id="t1",
+        turn_id="turn-1",
+        api_request_id="consumer-request",
+    )
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone() == (0,)
+        connection.execute(
+            "UPDATE usage_events SET index_jsonl_sha256 = ? WHERE id = ?",
+            ("0" * 64, event_id),
+        )
+        connection.commit()
+
+    if consumer == "skill_view":
+        call["result"] = json.dumps({"success": True, "_source_path": str(skill_path)})
+    else:
+        call["args"] = {"path": str(runbook_path)}
+    on_post_tool_call(
+        **call,
+        session_id="s1",
+        task_id="t1",
+        turn_id="turn-1",
+        api_request_id="consumer-request",
+    )
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone() == (0,)
+
+
+def test_file_backed_consumer_rejects_route_assisted_only_result(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    skill_id, skill_path, runbook_id, _runbook_path, metadata = _consumer_index(config)
+    _search(
+        config,
+        session="s1",
+        task="t1",
+        top_ids=[skill_id],
+        baseline_top_ids=[runbook_id],
+        metadata=metadata,
+    )
+    monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
+
+    on_post_tool_call(
+        tool_name="skill_view",
+        args={"name": "test-router"},
+        result=json.dumps({"success": True, "_source_path": str(skill_path)}),
+        session_id="s1",
+        task_id="t1",
+        turn_id="turn-1",
+        api_request_id="consumer-request",
+    )
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone() == (0,)
 
 
 def test_same_search_consumption_is_idempotent(tmp_path: Path, monkeypatch) -> None:

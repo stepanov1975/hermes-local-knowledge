@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_local_knowledge import __version__
 from hermes_local_knowledge import telemetry
 
 
@@ -976,3 +977,102 @@ def test_feedback_lock_budget_is_strict_and_does_not_write_a_second_usage_event(
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM feedback").fetchone() == (0,)
         assert conn.execute("SELECT COUNT(*) FROM usage_events WHERE tool='knowledge_feedback'").fetchone() == (0,)
+
+
+def test_usage_report_separates_current_native_search_quality_from_operations(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+
+    current_ids = [
+        telemetry._record_usage(
+            root,
+            tool="knowledge_search",
+            success=True,
+            query="healthy query",
+            result_count=2,
+            latency_ms=10,
+            usage_db_path=usage_db,
+        ),
+        telemetry._record_usage(
+            root,
+            tool="knowledge_search",
+            success=True,
+            query="missing query",
+            result_count=0,
+            latency_ms=20,
+            usage_db_path=usage_db,
+        ),
+        telemetry._record_usage(
+            root,
+            tool="knowledge_search",
+            success=False,
+            query="broken query",
+            error="search failed",
+            latency_ms=30,
+            usage_db_path=usage_db,
+        ),
+    ]
+    doctor_id = telemetry._record_usage(
+        root,
+        tool="cli_doctor",
+        client="cli",
+        success=True,
+        latency_ms=1000,
+        usage_db_path=usage_db,
+    )
+    old_search_id = telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=False,
+        query="old failure",
+        error="historical failure",
+        latency_ms=500,
+        usage_db_path=usage_db,
+    )
+    current_other_id = telemetry._record_usage(
+        root,
+        tool="knowledge_get",
+        success=True,
+        latency_ms=5,
+        usage_db_path=usage_db,
+    )
+    assert all(
+        event_id is not None
+        for event_id in [*current_ids, doctor_id, old_search_id, current_other_id]
+    )
+
+    with sqlite3.connect(usage_db) as connection:
+        connection.execute(
+            "UPDATE usage_events SET plugin_version = '0.1.0' WHERE id = ?",
+            (old_search_id,),
+        )
+        connection.commit()
+
+    report = telemetry._usage_report(root, days=30, limit=10, usage_db_path=usage_db)
+
+    quality = report["current_native_search_quality"]
+    assert quality["cohort"] == "current_live_native_search"
+    assert quality["plugin_version"] == __version__
+    assert quality["count"] == 3
+    assert quality["successes"] == 2
+    assert quality["errors"] == 1
+    assert quality["zero_results"] == 1
+    assert quality["route_changes"] == 0
+    assert quality["avg_latency_ms"] == 20.0
+    assert {row["query"] for row in quality["top_queries"]} == {
+        "healthy query",
+        "missing query",
+        "broken query",
+    }
+    assert [row["query"] for row in quality["zero_result_queries"]] == [
+        "missing query"
+    ]
+    assert quality["errors_by_message"][0]["error"] == "search failed"
+
+    cohorts = {row["cohort"]: row for row in report["event_cohorts"]}
+    assert cohorts["current_native_search"]["count"] == 3
+    assert cohorts["cli_doctor_maintenance"]["count"] == 1
+    assert cohorts["current_other_native"]["count"] == 1
+    assert cohorts["historical_native_search"]["count"] == 1
