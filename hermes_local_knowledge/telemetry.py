@@ -68,6 +68,7 @@ USAGE_EVENT_COLUMNS: dict[str, str] = {
     "task_id": "TEXT",
     "turn_id": "TEXT",
     "tool_call_id": "TEXT",
+    "api_request_id": "TEXT",
     "query": "TEXT",
     "artifact_id": "TEXT",
     "artifact_type": "TEXT",
@@ -123,6 +124,7 @@ FEEDBACK_COLUMNS: dict[str, str] = {
 
 IMPLICIT_FEEDBACK_COLUMNS: dict[str, str] = {
     "turn_id": "TEXT",
+    "consumer_tool": "TEXT",
 }
 
 
@@ -152,6 +154,7 @@ def _usage_context(kwargs: dict[str, Any]) -> dict[str, str]:
         "session_id": _clean_text(kwargs.get("session_id"), limit=128),
         "task_id": _clean_text(kwargs.get("task_id"), limit=128),
         "tool_call_id": _clean_text(kwargs.get("tool_call_id"), limit=128),
+        "api_request_id": _clean_text(kwargs.get("api_request_id"), limit=128),
     }
 
 def _init_usage_db(conn: sqlite3.Connection) -> None:
@@ -166,6 +169,7 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             task_id TEXT,
             turn_id TEXT,
             tool_call_id TEXT,
+            api_request_id TEXT,
             query TEXT,
             artifact_id TEXT,
             artifact_type TEXT,
@@ -237,6 +241,7 @@ def _init_usage_db(conn: sqlite3.Connection) -> None:
             session_id TEXT NOT NULL,
             task_id TEXT NOT NULL,
             turn_id TEXT,
+            consumer_tool TEXT,
             root TEXT NOT NULL,
             UNIQUE(search_event_id, artifact_id)
         )
@@ -335,8 +340,8 @@ def _record_usage(
             cur = conn.execute(
                 """
                 INSERT INTO usage_events (
-                    ts, tool, client, session_id, task_id, turn_id, tool_call_id, query,
-                    artifact_id, artifact_type, limit_value, rebuild_requested,
+                    ts, tool, client, session_id, task_id, turn_id, tool_call_id,
+                    api_request_id, query, artifact_id, artifact_type, limit_value, rebuild_requested,
                     rebuilt, success, error, result_count, top_ids_json,
                     top_types_json, baseline_top_ids_json, route_feedback_id,
                     route_artifact_id, route_outcome, feedback_max_id,
@@ -349,7 +354,7 @@ def _record_usage(
                     index_artifact_counts_json, index_metadata_error,
                     build_duration_ms, root, db_path, index_jsonl_sha256,
                     index_format_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now(),
@@ -359,6 +364,7 @@ def _record_usage(
                     context.get("task_id") or None,
                     context.get("turn_id") or None,
                     context.get("tool_call_id") or None,
+                    context.get("api_request_id") or None,
                     _exact_text(query) or None,
                     _exact_text(artifact_id) or None,
                     _clean_text(artifact_type, limit=80) or None,
@@ -420,13 +426,15 @@ def attach_usage_event_turn_id(
     session_id: str,
     task_id: str,
     turn_id: str,
+    api_request_id: str,
     usage_db_path: Path,
 ) -> bool:
-    """Attach host turn identity to a search event created by the tool handler."""
+    """Attach host turn and request identity to a search event created by the tool handler."""
 
     clean_session_id = _clean_text(session_id, limit=128)
     clean_task_id = _clean_text(task_id, limit=128)
     clean_turn_id = _clean_text(turn_id, limit=128)
+    clean_api_request_id = _clean_text(api_request_id, limit=128)
     if event_id <= 0 or not clean_session_id or not clean_task_id or not clean_turn_id:
         return False
     conn = _usage_connect(root, usage_db_path, initialize=False)
@@ -436,13 +444,14 @@ def attach_usage_event_turn_id(
         cursor = conn.execute(
             """
             UPDATE usage_events
-            SET turn_id = ?
+            SET turn_id = ?, api_request_id = COALESCE(NULLIF(api_request_id, ''), ?)
             WHERE id = ? AND tool = 'knowledge_search' AND success = 1
               AND root = ? AND session_id = ? AND task_id = ?
               AND (turn_id IS NULL OR turn_id = '')
             """,
             (
                 clean_turn_id,
+                clean_api_request_id,
                 event_id,
                 str(root),
                 clean_session_id,
@@ -465,6 +474,7 @@ def record_implicit_feedback(
     task_id: str,
     turn_id: str,
     usage_db_path: Path,
+    consumer_tool: str = "knowledge_get",
 ) -> bool:
     """Persist one idempotent consumed-result signal."""
 
@@ -475,8 +485,9 @@ def record_implicit_feedback(
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO implicit_feedback (
-                ts, search_event_id, query, artifact_id, session_id, task_id, turn_id, root
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ts, search_event_id, query, artifact_id, session_id, task_id,
+                turn_id, consumer_tool, root
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _utc_now(),
@@ -486,6 +497,7 @@ def record_implicit_feedback(
                 _clean_text(session_id, limit=128),
                 _clean_text(task_id, limit=128),
                 _clean_text(turn_id, limit=128),
+                _clean_text(consumer_tool, limit=80) or "knowledge_get",
                 str(root),
             ),
         )
@@ -999,6 +1011,23 @@ def _usage_report(
             "live_feedback_count": 0,
             "implicit_feedback_count": 0,
             "live_implicit_feedback_count": 0,
+            "implicit_feedback_by_consumer": [],
+            "current_native_search_quality": {
+                "cohort": "current_live_native_search",
+                "plugin_version": __version__,
+                "root": root_text,
+                "count": 0,
+                "successes": 0,
+                "errors": 0,
+                "zero_results": 0,
+                "route_changes": 0,
+                "avg_latency_ms": None,
+                "last_seen": None,
+                "top_queries": [],
+                "zero_result_queries": [],
+                "errors_by_message": [],
+            },
+            "event_cohorts": [],
             "root_breakdown": [],
             "feedback_root_breakdown": [],
             "top_tools": [],
@@ -1074,10 +1103,140 @@ def _usage_report(
             "SELECT COUNT(*) FROM implicit_feedback WHERE ts >= ? AND root = ?",
             (since, root_text),
         ).fetchone()[0]
+        implicit_feedback_by_consumer = _rows(
+            conn,
+            """
+            SELECT COALESCE(NULLIF(consumer_tool, ''), 'legacy_unknown') AS consumer_tool,
+                   COUNT(*) AS count, MAX(ts) AS last_seen
+            FROM implicit_feedback
+            WHERE ts >= ? AND root = ?
+            GROUP BY consumer_tool
+            ORDER BY count DESC, consumer_tool
+            """,
+            (since, root_text),
+        )
         avg_latency = conn.execute(
             "SELECT AVG(latency_ms) FROM usage_events WHERE ts >= ? AND latency_ms IS NOT NULL",
             (since,),
         ).fetchone()[0]
+        probe_queries = tuple(sorted(PROBE_QUERIES))
+        probe_placeholders = ",".join("?" for _ in probe_queries)
+        current_search_where = f"""
+            ts >= ? AND root = ? AND client = 'native'
+            AND tool = 'knowledge_search' AND plugin_version = ?
+            AND LOWER(TRIM(COALESCE(query, ''))) NOT IN ({probe_placeholders})
+        """
+        current_search_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count,
+                   COALESCE(SUM(success), 0) AS successes,
+                   COUNT(*) - COALESCE(SUM(success), 0) AS errors,
+                   COALESCE(SUM(CASE WHEN success = 1 AND COALESCE(result_count, 0) = 0 THEN 1 ELSE 0 END), 0)
+                       AS zero_results,
+                   COALESCE(SUM(CASE WHEN COALESCE(route_outcome, 'none') <> 'none' THEN 1 ELSE 0 END), 0)
+                       AS route_changes,
+                   ROUND(AVG(latency_ms), 1) AS avg_latency_ms,
+                   MAX(ts) AS last_seen
+            FROM usage_events
+            WHERE {current_search_where}
+            """,
+            (since, root_text, __version__, *probe_queries),
+        ).fetchone()
+        current_search_top_queries = _rows(
+            conn,
+            f"""
+            SELECT query, COUNT(*) AS count, ROUND(AVG(result_count), 1) AS avg_results,
+                   MAX(ts) AS last_seen
+            FROM usage_events
+            WHERE {current_search_where} AND query IS NOT NULL
+            GROUP BY query
+            ORDER BY count DESC, last_seen DESC
+            LIMIT ?
+            """,
+            (since, root_text, __version__, *probe_queries, limit),
+        )
+        current_search_zero_results = _rows(
+            conn,
+            f"""
+            SELECT query, COUNT(*) AS count, MAX(ts) AS last_seen
+            FROM usage_events
+            WHERE {current_search_where} AND success = 1
+              AND COALESCE(result_count, 0) = 0 AND query IS NOT NULL
+            GROUP BY query
+            ORDER BY count DESC, last_seen DESC
+            LIMIT ?
+            """,
+            (since, root_text, __version__, *probe_queries, limit),
+        )
+        current_search_errors = _rows(
+            conn,
+            f"""
+            SELECT error, COUNT(*) AS count, MAX(ts) AS last_seen
+            FROM usage_events
+            WHERE {current_search_where} AND success = 0 AND error IS NOT NULL
+            GROUP BY error
+            ORDER BY count DESC, last_seen DESC
+            LIMIT ?
+            """,
+            (since, root_text, __version__, *probe_queries, limit),
+        )
+        current_native_search_quality = {
+            "cohort": "current_live_native_search",
+            "plugin_version": __version__,
+            "root": root_text,
+            "count": int(current_search_row["count"]),
+            "successes": int(current_search_row["successes"]),
+            "errors": int(current_search_row["errors"]),
+            "zero_results": int(current_search_row["zero_results"]),
+            "route_changes": int(current_search_row["route_changes"]),
+            "avg_latency_ms": current_search_row["avg_latency_ms"],
+            "last_seen": current_search_row["last_seen"],
+            "top_queries": current_search_top_queries,
+            "zero_result_queries": current_search_zero_results,
+            "errors_by_message": current_search_errors,
+        }
+        event_cohorts = _rows(
+            conn,
+            f"""
+            SELECT cohort, COUNT(*) AS count, SUM(success) AS successes,
+                   COUNT(*) - SUM(success) AS errors,
+                   ROUND(AVG(latency_ms), 1) AS avg_latency_ms,
+                   MAX(ts) AS last_seen
+            FROM (
+                SELECT success, latency_ms, ts,
+                       CASE
+                           WHEN plugin_version = ? AND client = 'native'
+                                AND tool = 'knowledge_search'
+                                AND LOWER(TRIM(COALESCE(query, ''))) IN ({probe_placeholders})
+                               THEN 'current_native_probe'
+                           WHEN plugin_version = ? AND client = 'native' AND tool = 'knowledge_search'
+                               THEN 'current_native_search'
+                           WHEN client = 'cli' AND tool = 'cli_doctor'
+                               THEN 'cli_doctor_maintenance'
+                           WHEN client = 'cli'
+                               THEN 'cli_other'
+                           WHEN plugin_version <> ? AND client = 'native' AND tool = 'knowledge_search'
+                               THEN 'historical_native_search'
+                           WHEN plugin_version = ? AND client = 'native'
+                               THEN 'current_other_native'
+                           ELSE 'historical_or_other'
+                       END AS cohort
+                FROM usage_events
+                WHERE ts >= ? AND root = ?
+            )
+            GROUP BY cohort
+            ORDER BY count DESC, cohort
+            """,
+            (
+                __version__,
+                *probe_queries,
+                __version__,
+                __version__,
+                __version__,
+                since,
+                root_text,
+            ),
+        )
         root_breakdown = _rows(
             conn,
             f"""
@@ -1582,6 +1741,9 @@ def _usage_report(
         "live_feedback_count": live_feedback_count,
         "implicit_feedback_count": implicit_feedback_count,
         "live_implicit_feedback_count": live_implicit_feedback_count,
+        "implicit_feedback_by_consumer": implicit_feedback_by_consumer,
+        "current_native_search_quality": current_native_search_quality,
+        "event_cohorts": event_cohorts,
         "avg_latency_ms": None if avg_latency is None else round(float(avg_latency), 1),
         "root_breakdown": root_breakdown,
         "feedback_root_breakdown": feedback_root_breakdown,

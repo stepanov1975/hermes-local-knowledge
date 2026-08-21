@@ -40,7 +40,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
-    assert hermes_local_knowledge.__version__ == "0.4.9"
+    assert hermes_local_knowledge.__version__ == "0.4.10"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
@@ -557,6 +557,7 @@ def test_plugin_handler_wrapper_uses_one_service_factory(monkeypatch, tmp_path: 
         "session_id": "session-1",
         "task_id": "",
         "tool_call_id": "",
+        "api_request_id": "",
     }
 
 
@@ -941,6 +942,7 @@ def test_handle_search_uses_one_service_and_records_usage_context(
         "session_id": "session-123",
         "task_id": "",
         "tool_call_id": "",
+        "api_request_id": "",
     }
     assert usage_kwargs["query"] == "demo"
     assert usage_kwargs["artifact_type"] == "script"
@@ -1083,6 +1085,7 @@ def test_feedback_nonlock_failure_retains_best_effort_error_telemetry(
         "session_id": "session-91",
         "task_id": "",
         "tool_call_id": "",
+        "api_request_id": "",
     }
     assert usage["usage_db_path"] == service.usage_db_path
 

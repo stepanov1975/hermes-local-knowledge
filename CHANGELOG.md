@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.10] - 2026-08-21
+
+### Added
+
+- Added a current-version live native-search quality cohort and explicit operational/history cohorts to `knowledge_usage_report`, keeping aggregate operational totals while separating probes, hourly doctor runs, other CLI/native activity, and historical searches; implicit feedback is also broken down by consuming tool.
+- Added strict same-turn implicit-consumption adapters for successful later-request `skill_view` and `read_file` calls whose canonical source path resolves to exactly one caller-visible baseline artifact in the same current index snapshot; same-request parallel calls remain ineligible.
+
+[0.4.10]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.9...v0.4.10
+
 ## [0.4.9] - 2026-08-17
 
 ### Changed
