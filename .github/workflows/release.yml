@@ -12,16 +12,14 @@ jobs:
 
     steps:
       - name: Check out verified commit
-        # actions/checkout v7.0.1
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
-        # actions/setup-python v7.0.0
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
 
@@ -31,14 +29,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.sha }}
           RELEASE_JSON_FILE: ${{ runner.temp }}/release.json
+          RELEASE_LOOKUP_ERROR_FILE: ${{ runner.temp }}/release-lookup-error.txt
           RELEASE_NOTES_FILE: ${{ runner.temp }}/release-notes.md
           RELEASE_NOTES_SCRIPT: ${{ runner.temp }}/render-release-notes.py
+          RELEASE_REQUIREMENTS_FILE: ${{ runner.temp }}/requirements-release.txt
           TAG_CHANGELOG_FILE: ${{ runner.temp }}/tag-CHANGELOG.md
         run: |
           set -euo pipefail
           output() {
             printf '%s\n' "$@" >> "$GITHUB_OUTPUT"
           }
+          cp requirements-release.txt "$RELEASE_REQUIREMENTS_FILE"
           version=$(python - <<'PY'
           import pathlib
           import re
@@ -87,9 +88,18 @@ jobs:
             --changelog "$notes_changelog" \
             --output "$RELEASE_NOTES_FILE"
 
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,isPrerelease,assets,body > "$RELEASE_JSON_FILE" 2>/dev/null; then
-            output "release_exists=true"
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+            >/dev/null 2>"$RELEASE_LOOKUP_ERROR_FILE"; then
+            gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+              --json isImmutable,isDraft,isPrerelease,assets,body > "$RELEASE_JSON_FILE"
+            release_is_draft=$(jq -r '.isDraft' "$RELEASE_JSON_FILE")
+            release_is_immutable=$(jq -r '.isImmutable' "$RELEASE_JSON_FILE")
+            release_is_prerelease=$(jq -r '.isPrerelease' "$RELEASE_JSON_FILE")
+            output \
+              "release_exists=true" \
+              "release_is_draft=${release_is_draft}" \
+              "release_is_immutable=${release_is_immutable}" \
+              "release_is_prerelease=${release_is_prerelease}"
             release_state=$(python "$RELEASE_NOTES_SCRIPT" \
               --version "$version" \
               --changelog "$notes_changelog" \
@@ -101,6 +111,20 @@ jobs:
             build_needed=$(jq -r '.build_needed' <<<"$release_state")
             needed=$(jq -r '.needed' <<<"$release_state")
 
+            if [[ "$release_is_draft" == true ]]; then
+              if [[ "$expected_sha" != "$HEAD_SHA" ]]; then
+                echo "Draft release ${tag} targets ${expected_sha}, not verified commit ${HEAD_SHA}." >&2
+                exit 1
+              fi
+              # Draft assets are still mutable. Rebuild and replace them from
+              # the verified commit before publication, regardless of names/sizes.
+              build_needed=true
+              needed=true
+            fi
+            if [[ "$release_is_immutable" == true && "$build_needed" == true ]]; then
+              echo "Immutable release ${tag} is missing an expected asset and cannot be repaired." >&2
+              exit 1
+            fi
             if [[ "$needed" == false ]]; then
               echo "Release ${tag} is already complete and matches CHANGELOG.md."
               output "needed=false" "build_needed=false"
@@ -111,25 +135,40 @@ jobs:
             exit 0
           fi
 
-          output "release_exists=false" "needed=true" "build_needed=true"
+          release_lookup_error=$(<"$RELEASE_LOOKUP_ERROR_FILE")
+          if [[ "$release_lookup_error" != *"(HTTP 404)"* ]]; then
+            printf '%s\n' "$release_lookup_error" >&2
+            exit 1
+          fi
+
+          output \
+            "release_exists=false" \
+            "release_is_draft=false" \
+            "release_is_immutable=false" \
+            "release_is_prerelease=false" \
+            "needed=true" \
+            "build_needed=true"
           if [[ "$tag_exists" == true && "$expected_sha" != "$HEAD_SHA" ]]; then
             echo "Tag ${tag} points to ${expected_sha}, not verified commit ${HEAD_SHA}." >&2
             exit 1
           fi
 
-      - name: Check out tagged source for release build or repair
+      - name: Check out verified source for release build or repair
         if: >-
           steps.release.outputs.build_needed == 'true' &&
           steps.release.outputs.tag_exists == 'true'
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: git checkout --detach "$RELEASE_TAG"
+          EXPECTED_SHA: ${{ steps.release.outputs.expected_sha }}
+        run: git checkout --detach "$EXPECTED_SHA"
 
       - name: Build and verify release artifacts
         if: steps.release.outputs.build_needed == 'true'
+        env:
+          PIP_CONSTRAINT: ${{ runner.temp }}/requirements-release.txt
+          RELEASE_REQUIREMENTS_FILE: ${{ runner.temp }}/requirements-release.txt
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip build twine
+          python -m pip install --requirement "$RELEASE_REQUIREMENTS_FILE"
           python -m build --outdir dist
           python -m twine check dist/*
 
@@ -162,11 +201,17 @@ jobs:
           steps.release.outputs.build_needed == 'true' &&
           steps.release.outputs.release_exists == 'true'
         env:
+          EXPECTED_SDIST: ${{ steps.release.outputs.sdist }}
+          EXPECTED_WHEEL: ${{ steps.release.outputs.wheel }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$RELEASE_TAG" \
+            "dist/$EXPECTED_WHEEL" \
+            "dist/$EXPECTED_SDIST" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
 
       - name: Repair GitHub release metadata and notes
         if: >-
@@ -179,10 +224,18 @@ jobs:
         run: |
           set -euo pipefail
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --draft=false \
-            --prerelease=false \
             --title "$RELEASE_TAG" \
             --notes-file "$RELEASE_NOTES_FILE"
+
+      - name: Repair prerelease status
+        if: >-
+          steps.release.outputs.needed == 'true' &&
+          steps.release.outputs.release_exists == 'true' &&
+          steps.release.outputs.release_is_prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false
 
       - name: Create GitHub release from existing tag
         if: >-
@@ -195,13 +248,12 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          if ! gh release create "$RELEASE_TAG" dist/* \
+          gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
+            --draft \
             --verify-tag \
             --title "$RELEASE_TAG" \
-            --notes-file "$RELEASE_NOTES_FILE"; then
-            echo "Release creation failed; final verification will reject partial publication." >&2
-          fi
+            --notes-file "$RELEASE_NOTES_FILE"
 
       - name: Create tag and GitHub release
         if: >-
@@ -215,13 +267,84 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          if ! gh release create "$RELEASE_TAG" dist/* \
+          gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
+            --draft \
             --target "$HEAD_SHA" \
             --title "$RELEASE_TAG" \
-            --notes-file "$RELEASE_NOTES_FILE"; then
-            echo "Release creation failed; final verification will reject partial publication." >&2
+            --notes-file "$RELEASE_NOTES_FILE"
+
+      - name: Upload new draft release artifacts
+        if: >-
+          steps.release.outputs.needed == 'true' &&
+          steps.release.outputs.release_exists == 'false'
+        env:
+          EXPECTED_SDIST: ${{ steps.release.outputs.sdist }}
+          EXPECTED_WHEEL: ${{ steps.release.outputs.wheel }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            "dist/$EXPECTED_WHEEL" \
+            "dist/$EXPECTED_SDIST" \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify draft tag target
+        if: >-
+          steps.release.outputs.needed == 'true' &&
+          (steps.release.outputs.release_exists == 'false' ||
+          steps.release.outputs.release_is_draft == 'true')
+        env:
+          EXPECTED_SHA: ${{ steps.release.outputs.expected_sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          actual_sha=$(git rev-parse "${RELEASE_TAG}^{commit}")
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "Draft release tag ${RELEASE_TAG} points to ${actual_sha}, not ${EXPECTED_SHA}." >&2
+            exit 1
           fi
+
+      - name: Verify draft release content
+        if: >-
+          steps.release.outputs.needed == 'true' &&
+          (steps.release.outputs.release_exists == 'false' ||
+          steps.release.outputs.release_is_draft == 'true')
+        env:
+          EXPECTED_SDIST: ${{ steps.release.outputs.sdist }}
+          EXPECTED_WHEEL: ${{ steps.release.outputs.wheel }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_JSON_FILE: ${{ runner.temp }}/release-draft.json
+          RELEASE_NOTES_FILE: ${{ runner.temp }}/release-notes.md
+          RELEASE_NOTES_SCRIPT: ${{ runner.temp }}/render-release-notes.py
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          TAG_CHANGELOG_FILE: ${{ runner.temp }}/tag-CHANGELOG.md
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,assets,body > "$RELEASE_JSON_FILE"
+          jq -e '.isDraft == true and .isPrerelease == false' "$RELEASE_JSON_FILE" >/dev/null
+          release_state=$(python "$RELEASE_NOTES_SCRIPT" \
+            --version "${RELEASE_TAG#v}" \
+            --changelog "$TAG_CHANGELOG_FILE" \
+            --output "$RELEASE_NOTES_FILE" \
+            --release-json "$RELEASE_JSON_FILE" \
+            --expected-wheel "$EXPECTED_WHEEL" \
+            --expected-sdist "$EXPECTED_SDIST" \
+            --inspect-release)
+          jq -e '.assets_complete and .notes_match' <<<"$release_state" >/dev/null
+
+      - name: Publish verified draft release
+        if: >-
+          steps.release.outputs.needed == 'true' &&
+          (steps.release.outputs.release_exists == 'false' ||
+          steps.release.outputs.release_is_draft == 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false
 
       - name: Verify published release
         env:

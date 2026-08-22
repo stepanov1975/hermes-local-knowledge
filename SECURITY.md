@@ -8,10 +8,9 @@ This repository is a small Hermes Agent plugin. The `main` branch is the only su
 
 Do not open a public issue for suspected credential leaks or security-sensitive behavior.
 
-Preferred reporting path after the repository is public:
+Preferred reporting path:
 
-1. Use GitHub's **Security → Report a vulnerability** flow if it is available for this repository.
-2. If private vulnerability reporting is unavailable, open a minimal public issue asking for a private security contact, but do **not** include secret values, exploit details, private local paths, or sensitive logs in the issue.
+Use GitHub's private **[Report a vulnerability](https://github.com/stepanov1975/hermes-local-knowledge/security/advisories/new)** flow. Do not include vulnerability details in a public issue.
 
 Please include, privately:
 

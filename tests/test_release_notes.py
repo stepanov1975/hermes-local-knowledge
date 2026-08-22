@@ -301,6 +301,36 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert "steps.release.outputs.build_needed == 'true'" in workflow
     assert "--inspect-release" in workflow
     assert "--verify-complete" in workflow
+    assert 'python -m pip install --requirement "$RELEASE_REQUIREMENTS_FILE"' in workflow
+    assert "python -m pip install --upgrade pip build twine" not in workflow
+    assert 'repos/${GITHUB_REPOSITORY}/releases/tags/${tag}' in workflow
+    assert "--json isImmutable,isDraft,isPrerelease,assets,body" in workflow
+    assert 'if [[ "$release_is_draft" == true ]]' in workflow
+    assert 'if [[ "$expected_sha" != "$HEAD_SHA" ]]' in workflow
+    assert "Draft assets are still mutable" in workflow
+    draft_repair = workflow.split('if [[ "$release_is_draft" == true ]]', maxsplit=1)[1].split(
+        'if [[ "$release_is_immutable" == true', maxsplit=1
+    )[0]
+    assert "build_needed=true" in draft_repair
+    assert "needed=true" in draft_repair
+    assert 'run: git checkout --detach "$EXPECTED_SHA"' in workflow
+    assert workflow.count("            --draft \\\n") == 2
+    assert 'gh release create "$RELEASE_TAG" dist/*' not in workflow
+    assert '"dist/$EXPECTED_WHEEL"' in workflow
+    assert '"dist/$EXPECTED_SDIST"' in workflow
+    assert "Repair prerelease status" in workflow
+    prerelease_repair = workflow.split("- name: Repair prerelease status", maxsplit=1)[1].split(
+        "- name: Create GitHub release from existing tag", maxsplit=1
+    )[0]
+    assert "release_is_prerelease == 'true'" in prerelease_repair
+    assert "release_is_draft == 'false'" not in prerelease_repair
+    assert "Verify draft tag target" in workflow
+    assert 'actual_sha=$(git rev-parse "${RELEASE_TAG}^{commit}")' in workflow
+    assert "Verify draft release content" in workflow
+    assert ".isDraft == true and .isPrerelease == false" in workflow
+    assert ".assets_complete and .notes_match" in workflow
+    assert "Publish verified draft release" in workflow
+    assert "final verification will reject partial publication" not in workflow
     assert "gh api --method DELETE" not in workflow
 
 
