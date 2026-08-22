@@ -1076,3 +1076,269 @@ def test_usage_report_separates_current_native_search_quality_from_operations(
     assert cohorts["cli_doctor_maintenance"]["count"] == 1
     assert cohorts["current_other_native"]["count"] == 1
     assert cohorts["historical_native_search"]["count"] == 1
+
+
+def test_usage_report_implicit_consumed_rank_lower_bound_uses_current_baselines_only(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    other_root = tmp_path / "other-root"
+    usage_db = tmp_path / "usage.sqlite"
+
+    def search_event(
+        event_root: Path,
+        query: str,
+        baseline: list[str],
+        *,
+        final: list[str] | None = None,
+    ) -> int:
+        final_ids = baseline if final is None else final
+        event_id = telemetry._record_usage(
+            event_root,
+            tool="knowledge_search",
+            success=True,
+            query=query,
+            result_count=len(final_ids),
+            top_ids=final_ids,
+            baseline_top_ids=baseline,
+            implicit_feedback_enabled=True,
+            context={
+                "session_id": "session",
+                "task_id": "task",
+                "turn_id": "turn",
+            },
+            usage_db_path=usage_db,
+        )
+        assert event_id is not None
+        return event_id
+
+    def consume(event_root: Path, event_id: int, query: str, artifact_id: str) -> None:
+        assert telemetry.record_implicit_feedback(
+            event_root,
+            search_event_id=event_id,
+            query=query,
+            artifact_id=artifact_id,
+            session_id="session",
+            task_id="task",
+            turn_id="turn",
+            usage_db_path=usage_db,
+        )
+
+    first = search_event(root, "orchid runbook", ["a", "b", "c", "d"])
+    for artifact_id in ("a", "c", "d"):
+        consume(root, first, "orchid runbook", artifact_id)
+    second = search_event(root, "orchid docs", ["x", "y"])
+    consume(root, second, "orchid docs", "y")
+    missing_baseline = search_event(root, "orchid memory", [], final=["missing"])
+    consume(root, missing_baseline, "orchid memory", "missing")
+    malformed_baseline = search_event(root, "orchid malformed", ["malformed"])
+    consume(root, malformed_baseline, "orchid malformed", "malformed")
+    failed = search_event(root, "failed query", ["failed"])
+    consume(root, failed, "failed query", "failed")
+
+    historical = search_event(root, "historical query", ["historical"])
+    consume(root, historical, "historical query", "historical")
+    probe = search_event(root, "demo", ["probe"])
+    consume(root, probe, "demo", "probe")
+    cross_root = search_event(other_root, "other root query", ["other"])
+    consume(other_root, cross_root, "other root query", "other")
+    with sqlite3.connect(usage_db) as connection:
+        connection.execute(
+            "UPDATE usage_events SET plugin_version = '0.1.0' WHERE id = ?",
+            (historical,),
+        )
+        connection.execute(
+            "UPDATE usage_events SET baseline_top_ids_json = ? WHERE id = ?",
+            ('{"unexpected": "malformed"}', malformed_baseline),
+        )
+        connection.execute(
+            "UPDATE usage_events SET success = 0 WHERE id = ?",
+            (failed,),
+        )
+        connection.commit()
+
+    report = telemetry._usage_report(root, days=30, limit=10, usage_db_path=usage_db)
+    diagnostic = report["current_native_search_quality"][
+        "implicit_consumed_rank_lower_bound"
+    ]
+
+    assert diagnostic == {
+        "consumed_artifact_count": 4,
+        "consumed_search_count": 2,
+        "ranked_consumption_count": 4,
+        "unranked_consumption_count": 0,
+        "consumed_at_rank_1": 1,
+        "consumed_in_top_3": 3,
+        "consumed_outside_top_3": 1,
+        "searches_with_consumed_rank_1": 1,
+        "searches_with_consumed_top_3": 2,
+        "median_consumed_rank": 2.5,
+        "rank_distribution": [
+            {"rank": 1, "count": 1},
+            {"rank": 2, "count": 1},
+            {"rank": 3, "count": 1},
+            {"rank": 4, "count": 1},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "orphaned_event",
+        "query_mismatch",
+        "session_mismatch",
+        "task_mismatch",
+        "empty_turn",
+        "turn_mismatch",
+        "root_mismatch",
+        "disabled_event",
+        "implicit_before_search",
+        "consumption_too_late",
+        "search_before_window",
+        "future_consumption",
+        "artifact_absent_from_baseline",
+        "artifact_absent_from_final",
+        "malformed_baseline",
+        "malformed_final",
+    ],
+)
+def test_usage_report_consumed_rank_excludes_malformed_implicit_linkage(
+    tmp_path: Path,
+    malformation: str,
+) -> None:
+    root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+    event_id = telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="current linked query",
+        result_count=2,
+        top_ids=["first", "consumed"],
+        baseline_top_ids=["first", "consumed"],
+        implicit_feedback_enabled=True,
+        context={
+            "session_id": "session",
+            "task_id": "task",
+            "turn_id": "turn",
+        },
+        usage_db_path=usage_db,
+    )
+    assert event_id is not None
+    assert telemetry.record_implicit_feedback(
+        root,
+        search_event_id=event_id,
+        query="current linked query",
+        artifact_id="consumed",
+        session_id="session",
+        task_id="task",
+        turn_id="turn",
+        usage_db_path=usage_db,
+    )
+
+    with sqlite3.connect(usage_db) as connection:
+        if malformation == "orphaned_event":
+            connection.execute(
+                "UPDATE implicit_feedback SET search_event_id = ?",
+                (event_id + 1000,),
+            )
+        elif malformation == "query_mismatch":
+            connection.execute("UPDATE implicit_feedback SET query = 'different query'")
+        elif malformation == "session_mismatch":
+            connection.execute("UPDATE implicit_feedback SET session_id = 'different-session'")
+        elif malformation == "task_mismatch":
+            connection.execute("UPDATE implicit_feedback SET task_id = 'different-task'")
+        elif malformation == "empty_turn":
+            connection.execute("UPDATE implicit_feedback SET turn_id = ''")
+        elif malformation == "turn_mismatch":
+            connection.execute("UPDATE usage_events SET turn_id = 'different-turn' WHERE id = ?", (event_id,))
+        elif malformation == "root_mismatch":
+            connection.execute("UPDATE usage_events SET root = 'different-root' WHERE id = ?", (event_id,))
+        elif malformation == "disabled_event":
+            connection.execute(
+                "UPDATE usage_events SET implicit_feedback_enabled = 0 WHERE id = ?",
+                (event_id,),
+            )
+        elif malformation == "implicit_before_search":
+            connection.execute(
+                """
+                UPDATE implicit_feedback
+                SET ts = (SELECT datetime(ts, '-1 second') FROM usage_events WHERE id = ?)
+                """,
+                (event_id,),
+            )
+        elif malformation == "consumption_too_late":
+            connection.execute(
+                "UPDATE usage_events SET ts = datetime('now', '-40 minutes') WHERE id = ?",
+                (event_id,),
+            )
+            connection.execute(
+                "UPDATE implicit_feedback SET ts = datetime('now', '-5 minutes')"
+            )
+        elif malformation == "search_before_window":
+            connection.execute(
+                """
+                UPDATE usage_events
+                SET ts = datetime('now', '-30 days', '-5 minutes')
+                WHERE id = ?
+                """,
+                (event_id,),
+            )
+            connection.execute(
+                """
+                UPDATE implicit_feedback
+                SET ts = datetime('now', '-30 days', '+5 minutes')
+                """
+            )
+        elif malformation == "future_consumption":
+            connection.execute(
+                "UPDATE implicit_feedback SET ts = datetime('now', '+1 day')"
+            )
+        elif malformation == "artifact_absent_from_baseline":
+            connection.execute(
+                "UPDATE implicit_feedback SET artifact_id = 'not-returned'"
+            )
+        elif malformation == "artifact_absent_from_final":
+            connection.execute(
+                "UPDATE usage_events SET top_ids_json = '[\"first\"]' WHERE id = ?",
+                (event_id,),
+            )
+        elif malformation == "malformed_baseline":
+            connection.execute(
+                "UPDATE usage_events SET baseline_top_ids_json = '{\"not\": \"a-list\"}' WHERE id = ?",
+                (event_id,),
+            )
+        elif malformation == "malformed_final":
+            connection.execute(
+                "UPDATE usage_events SET top_ids_json = '[\"consumed\", 7]' WHERE id = ?",
+                (event_id,),
+            )
+        else:
+            raise AssertionError(f"unhandled malformation: {malformation}")
+
+    report = telemetry._usage_report(root, days=30, limit=10, usage_db_path=usage_db)
+
+    assert report["current_native_search_quality"][
+        "implicit_consumed_rank_lower_bound"
+    ] == telemetry._empty_implicit_consumed_rank_lower_bound()
+
+
+@pytest.mark.parametrize("existing_empty_file", [False, True])
+def test_usage_report_empty_or_missing_db_has_zero_consumed_rank_shape(
+    tmp_path: Path,
+    existing_empty_file: bool,
+) -> None:
+    usage_db = tmp_path / "usage.sqlite"
+    if existing_empty_file:
+        usage_db.touch()
+    report = telemetry._usage_report(
+        tmp_path / "root",
+        days=30,
+        limit=10,
+        usage_db_path=usage_db,
+    )
+
+    assert report["current_native_search_quality"][
+        "implicit_consumed_rank_lower_bound"
+    ] == telemetry._empty_implicit_consumed_rank_lower_bound()

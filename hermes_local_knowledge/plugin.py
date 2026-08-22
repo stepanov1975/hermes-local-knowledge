@@ -24,7 +24,8 @@ from .telemetry import FEEDBACK_RATINGS, FeedbackDatabaseLockedError, _usage_con
 __all__ = ["register"]
 
 KNOWLEDGE_SEARCH_HINT = (
-    "To search for local tools and information, use the `knowledge_search` tool."
+    "For local Hermes/homelab skills, scripts, runbooks, cron jobs, MCP wrappers, or service "
+    "docs, use `knowledge_search` before broad file search; verify live state directly."
 )
 
 

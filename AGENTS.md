@@ -40,6 +40,7 @@ These instructions apply to the whole repository.
 - Route to whole artifacts; do not introduce chunk RAG without an explicit design change.
 - FTS is the primary broad-recall path. Deterministic identity/metadata retrieval is complementary, not a replacement.
 - Operational type promotion is narrow and query-gated. Quoted searches, explicit `artifact_type` filters, skill-parent lifting, and global per-parent support-doc diversity must retain their documented behavior.
+- Query-terminal artifact-type promotion uses one SQLite read snapshot and one immutable legacy baseline. Eligibility is limit-independent across the complete index, requires a complete configured entity label in the exact target's ID/title/path plus a distinct topic term, never transfers identity across support siblings, and may only apply one stable target/owner move while preserving every unrelated result's relative order.
 - Parent-equivalent evaluation only relates a `skill_support_doc` to its owning skill; graph neighbors are not evaluation equivalence.
 - Script search text uses routing-safe metadata, never arbitrary body literals.
 - Environment names may be routing signals. Environment values, MCP credential values, raw tool arguments/output, transcripts, OCR/private document text, and secret-like schema values must not enter indexed or generated artifacts.
