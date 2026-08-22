@@ -1567,7 +1567,9 @@ def search_index(
     lift_parents = not exact_query and not type_filter
     requested = set() if exact_query else _requested_operational_types(intent_terms)
     active_intent_terms = _operational_intent_terms(intent_terms)
-    explicit_type_intent = any(term in EXPLICIT_ARTIFACT_TYPE_INTENT for term in active_intent_terms)
+    explicit_type_intent = not type_filter and any(
+        term in EXPLICIT_ARTIFACT_TYPE_INTENT for term in active_intent_terms
+    )
     ranking_requested = set() if explicit_type_intent else requested
     specific_terms = _specific_terms_for_ranking(
         terms,

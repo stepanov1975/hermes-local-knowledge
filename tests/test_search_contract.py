@@ -593,6 +593,14 @@ def test_explicit_doc_promotion_selects_eligible_support_sibling_before_diversit
     ]
     assert "skill-support:orchid:generic" not in {row["id"] for row in results}
 
+    filtered = index_owner.search_index(
+        db_path,
+        "orchid deployment docs",
+        limit=4,
+        artifact_type="skill_support_doc",
+    )
+    assert filtered[0]["id"] == "skill-support:orchid:generic"
+
 
 def test_explicit_intent_without_promotion_uses_baseline_diversity() -> None:
     owner = index_owner._Candidate(
