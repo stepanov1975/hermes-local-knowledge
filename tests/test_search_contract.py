@@ -286,8 +286,20 @@ def test_new_type_intent_requires_one_terminal_artifact_noun() -> None:
         index_owner._query_terms("paperless cron script runbook")
     ) == {"cron_job", "script"}
     assert index_owner._requested_operational_types(
+        index_owner._raw_query_terms("orchid runbook and skill")
+    ) == set()
+    assert index_owner._requested_operational_types(
         index_owner._raw_query_terms("orchid deployment runbook next")
     ) == set()
+    automation_terms = index_owner._query_terms("automation workflow runbook")
+    automation_intent = index_owner._operational_intent_terms(
+        index_owner._raw_query_terms("automation workflow runbook")
+    )
+    assert index_owner._specific_terms_for_ranking(
+        automation_terms,
+        automation_intent,
+        explicit_type_intent=True,
+    ) == []
     assert index_owner._requested_operational_types(
         index_owner._raw_query_terms(
             "for the orchid runbook show the deployment runbook"

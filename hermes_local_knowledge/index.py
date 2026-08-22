@@ -1058,6 +1058,20 @@ def _high_signal_terms(terms: Sequence[str]) -> list[str]:
     return specific or list(terms)
 
 
+def _specific_terms_for_ranking(
+    terms: Sequence[str],
+    active_intent_terms: set[str],
+    *,
+    explicit_type_intent: bool,
+) -> list[str]:
+    source = (
+        [term for term in terms if term not in ROUTING_HINT_TERMS]
+        if explicit_type_intent
+        else _high_signal_terms(terms)
+    )
+    return [term for term in source if term not in active_intent_terms]
+
+
 def _token_hits(tokens: set[str], terms: Sequence[str]) -> int:
     return sum(any(token == term or token.startswith(term) for token in tokens) for term in terms)
 
@@ -1541,9 +1555,11 @@ def search_index(
     active_intent_terms = _operational_intent_terms(intent_terms)
     explicit_type_intent = any(term in EXPLICIT_ARTIFACT_TYPE_INTENT for term in active_intent_terms)
     ranking_requested = set() if explicit_type_intent else requested
-    specific_terms = [
-        term for term in _high_signal_terms(terms) if term not in active_intent_terms
-    ]
+    specific_terms = _specific_terms_for_ranking(
+        terms,
+        active_intent_terms,
+        explicit_type_intent=explicit_type_intent,
+    )
     candidate_limit = max(output_limit * 20, 100)
 
     connection = connect_readonly(db_path)
