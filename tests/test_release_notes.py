@@ -301,6 +301,22 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert "steps.release.outputs.build_needed == 'true'" in workflow
     assert "--inspect-release" in workflow
     assert "--verify-complete" in workflow
+    assert 'python -m pip install --requirement "$RELEASE_REQUIREMENTS_FILE"' in workflow
+    assert "python -m pip install --upgrade pip build twine" not in workflow
+    assert 'repos/${GITHUB_REPOSITORY}/releases/tags/${tag}' in workflow
+    assert "--json isImmutable,isDraft,isPrerelease,assets,body" in workflow
+    assert workflow.count("            --draft \\\n") == 2
+    assert 'gh release create "$RELEASE_TAG" dist/*' not in workflow
+    assert '"dist/$EXPECTED_WHEEL"' in workflow
+    assert '"dist/$EXPECTED_SDIST"' in workflow
+    assert "Repair published prerelease status" in workflow
+    assert "Verify draft tag target" in workflow
+    assert 'actual_sha=$(git rev-parse "${RELEASE_TAG}^{commit}")' in workflow
+    assert "Verify draft release content" in workflow
+    assert ".isDraft == true and .isPrerelease == false" in workflow
+    assert ".assets_complete and .notes_match" in workflow
+    assert "Publish verified draft release" in workflow
+    assert "final verification will reject partial publication" not in workflow
     assert "gh api --method DELETE" not in workflow
 
 
