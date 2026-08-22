@@ -1435,7 +1435,14 @@ def _explicit_identity_terms(
         for term in specific_terms:
             if term in entity_terms:
                 families_by_term[term].add(family)
-    return {term for term, families in families_by_term.items() if len(families) == 1}
+    unique_families = {
+        term: next(iter(families))
+        for term, families in families_by_term.items()
+        if len(families) == 1
+    }
+    if len(set(unique_families.values())) != 1:
+        return set()
+    return set(unique_families)
 
 
 def _promote_explicit_type_candidate(
@@ -1492,12 +1499,19 @@ def _finalize_candidates(
     specific_terms: Sequence[str],
     explicit_type_intent: bool,
     output_limit: int,
+    *,
+    baseline_candidates: Sequence[_Candidate] | None = None,
 ) -> list[dict[str, Any]]:
     if explicit_type_intent:
+        promotion_pool = list(candidates)
         promoted = _promote_explicit_type_candidate(
-            list(candidates), requested_types, specific_terms
+            promotion_pool, requested_types, specific_terms
         )
-        selected = _select_candidates(promoted)
+        selected = _select_candidates(
+            baseline_candidates
+            if promoted is promotion_pool and baseline_candidates is not None
+            else promoted
+        )
     else:
         selected = _select_candidates(candidates)
     if not explicit_type_intent and requested_types:
@@ -1577,6 +1591,7 @@ def search_index(
             lift_parents=lift_parents,
             enforce_support_diversity=not explicit_type_intent,
         )
+        strict_baseline = _select_candidates(strict) if explicit_type_intent else strict
         strict_ids = {str(candidate.row.get("id") or "") for candidate in strict}
         if quoted_only:
             return _finalize_candidates(
@@ -1588,6 +1603,7 @@ def search_index(
             )
 
         identity: list[_Candidate] = []
+        identity_baseline: list[_Candidate] = []
         if not requested or explicit_type_intent:
             identity_candidates = _decode_candidates(
                 _query_identity_rows(connection, terms, candidate_limit, type_filter),
@@ -1608,8 +1624,16 @@ def search_index(
                 lift_parents=lift_parents,
                 enforce_support_diversity=not explicit_type_intent,
             )
+            identity_baseline = (
+                _select_candidates(identity) if explicit_type_intent else identity
+            )
         identity_ids = {str(candidate.row.get("id") or "") for candidate in identity}
         prioritized = [*strict, *identity] if exact_query else [*identity, *strict]
+        prioritized_baseline = (
+            [*strict_baseline, *identity_baseline]
+            if exact_query
+            else [*identity_baseline, *strict_baseline]
+        )
         if len(strict) >= output_limit and not requested:
             return _finalize_candidates(
                 prioritized,
@@ -1638,12 +1662,16 @@ def search_index(
             lift_parents=lift_parents,
             enforce_support_diversity=not explicit_type_intent,
         )
+        fallback_baseline = (
+            _select_candidates(fallback) if explicit_type_intent else fallback
+        )
         return _finalize_candidates(
             [*prioritized, *fallback],
             requested,
             specific_terms,
             explicit_type_intent,
             output_limit,
+            baseline_candidates=[*prioritized_baseline, *fallback_baseline],
         )
     finally:
         connection.close()

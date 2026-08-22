@@ -439,6 +439,33 @@ def test_explicit_type_intent_promotes_one_full_match_without_crowding() -> None
         {"runbook"},
         ["docker", "update"],
     ) == [owner, *docker_runbooks]
+    orchid_mixed = index_owner._Candidate(
+        {
+            "id": "runbook:orchid-mixed",
+            "type": "runbook",
+            "title": "Orchid deployment",
+            "summary": "Lotus deployment interoperability.",
+            "entities": ["Orchid"],
+        },
+        source_tier=1,
+        strict=True,
+    )
+    lotus_mixed = index_owner._Candidate(
+        {
+            "id": "runbook:lotus-mixed",
+            "type": "runbook",
+            "title": "Lotus deployment",
+            "summary": "Orchid deployment interoperability.",
+            "entities": ["Lotus"],
+        },
+        source_tier=1,
+        strict=True,
+    )
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, orchid_mixed, lotus_mixed],
+        {"runbook"},
+        ["orchid", "lotus", "deployment"],
+    ) == [owner, orchid_mixed, lotus_mixed]
 
 
 def test_artifact_noun_intent_preserves_generic_quoted_filtered_reference_and_parent_behavior(
@@ -565,3 +592,45 @@ def test_explicit_doc_promotion_selects_eligible_support_sibling_before_diversit
         "skill-support:orchid:reference",
     ]
     assert "skill-support:orchid:generic" not in {row["id"] for row in results}
+
+
+def test_explicit_intent_without_promotion_uses_baseline_diversity() -> None:
+    owner = index_owner._Candidate(
+        {"id": "skill:orchid", "type": "skill", "title": "Orchid"},
+        source_tier=1,
+        strict=True,
+    )
+    baseline_support = index_owner._Candidate(
+        {
+            "id": "skill-support:orchid:baseline",
+            "type": "skill_support_doc",
+            "title": "Alpha baseline",
+            "related": ["skill:orchid"],
+        },
+        source_tier=1,
+        strict=True,
+    )
+    alternate_support = index_owner._Candidate(
+        {
+            "id": "skill-support:orchid:alternate",
+            "type": "skill_support_doc",
+            "title": "Alpha alternate",
+            "related": ["skill:orchid"],
+        },
+        source_tier=0,
+        strict=False,
+    )
+
+    rows = index_owner._finalize_candidates(
+        [owner, alternate_support, baseline_support],
+        {"skill"},
+        ["orchid", "alpha"],
+        True,
+        5,
+        baseline_candidates=[owner, baseline_support],
+    )
+
+    assert [row["id"] for row in rows] == [
+        "skill:orchid",
+        "skill-support:orchid:baseline",
+    ]
