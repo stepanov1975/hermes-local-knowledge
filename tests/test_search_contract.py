@@ -285,6 +285,14 @@ def test_new_type_intent_requires_one_terminal_artifact_noun() -> None:
     assert index_owner._requested_operational_types(
         index_owner._query_terms("paperless cron script runbook")
     ) == {"cron_job", "script"}
+    assert index_owner._requested_operational_types(
+        index_owner._raw_query_terms("orchid deployment runbook next")
+    ) == set()
+    assert index_owner._requested_operational_types(
+        index_owner._raw_query_terms(
+            "for the orchid runbook show the deployment runbook"
+        )
+    ) == {"runbook"}
 
 
 @pytest.mark.parametrize(
@@ -356,6 +364,11 @@ def test_explicit_type_intent_promotes_one_full_match_without_crowding() -> None
         [owner, best_runbook],
         {"runbook"},
         ["update", "app", "upgrade", "docker"],
+    ) == [owner, best_runbook]
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, best_runbook],
+        {"runbook"},
+        ["backup", "operation"],
     ) == [owner, best_runbook]
 
 

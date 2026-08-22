@@ -165,6 +165,9 @@ EXPLICIT_TYPE_GENERIC_TERMS = {
     "image",
     "install",
     "migration",
+    "maintenance",
+    "operation",
+    "process",
     "production",
     "procedure",
     "proxy",
@@ -173,6 +176,7 @@ EXPLICIT_TYPE_GENERIC_TERMS = {
     "reverse",
     "self",
     "service",
+    "task",
     "update",
     "upgrade",
     "version",
@@ -1005,8 +1009,15 @@ def _normalize_query_term(term: str) -> str:
     return term
 
 
+def _raw_query_terms(query: str) -> list[str]:
+    return [
+        _normalize_query_term(term)
+        for term in re.findall(r"[A-Za-z0-9]{2,}", query.lower())
+    ]
+
+
 def _query_terms(query: str, *, drop_stopwords: bool = True) -> list[str]:
-    terms = [_normalize_query_term(term) for term in re.findall(r"[A-Za-z0-9]{2,}", query.lower())]
+    terms = _raw_query_terms(query)
     if drop_stopwords:
         terms = [term for term in terms if term not in QUERY_STOPWORDS]
     return _unique(terms)
@@ -1101,9 +1112,10 @@ def _requested_operational_types(terms: Sequence[str]) -> set[str]:
     requested: set[str] = set()
     for term in terms:
         requested.update(LEGACY_ARTIFACT_TYPE_INTENT.get(term, ()))
-    explicit_terms = [term for term in terms if term in EXPLICIT_ARTIFACT_TYPE_INTENT]
-    if not requested and len(explicit_terms) == 1 and terms and terms[-1] == explicit_terms[0]:
-        requested.update(EXPLICIT_ARTIFACT_TYPE_INTENT[explicit_terms[0]])
+    explicit_terms = {term for term in terms if term in EXPLICIT_ARTIFACT_TYPE_INTENT}
+    terminal_term = terms[-1] if terms else ""
+    if not requested and explicit_terms == {terminal_term}:
+        requested.update(EXPLICIT_ARTIFACT_TYPE_INTENT[terminal_term])
     return requested
 
 
@@ -1111,9 +1123,10 @@ def _operational_intent_terms(terms: Sequence[str]) -> set[str]:
     """Return only type terms that actually activated deterministic promotion."""
 
     active = {term for term in terms if term in LEGACY_ARTIFACT_TYPE_INTENT}
-    explicit_terms = [term for term in terms if term in EXPLICIT_ARTIFACT_TYPE_INTENT]
-    if not active and len(explicit_terms) == 1 and terms and terms[-1] == explicit_terms[0]:
-        active.add(explicit_terms[0])
+    explicit_terms = {term for term in terms if term in EXPLICIT_ARTIFACT_TYPE_INTENT}
+    terminal_term = terms[-1] if terms else ""
+    if not active and explicit_terms == {terminal_term}:
+        active.add(terminal_term)
     return active
 
 
@@ -1501,6 +1514,7 @@ def search_index(
     if output_limit == 0:
         return []
     terms = _query_terms(query)
+    intent_terms = _raw_query_terms(query)
     strict_match = _fts_query(query)
     if not strict_match:
         return []
@@ -1509,8 +1523,8 @@ def search_index(
     exact_query = _has_quoted_phrase(query)
     quoted_only = _is_quoted_only_query(query)
     lift_parents = not exact_query and not type_filter
-    requested = set() if exact_query else _requested_operational_types(terms)
-    active_intent_terms = _operational_intent_terms(terms)
+    requested = set() if exact_query else _requested_operational_types(intent_terms)
+    active_intent_terms = _operational_intent_terms(intent_terms)
     explicit_type_intent = any(term in EXPLICIT_ARTIFACT_TYPE_INTENT for term in active_intent_terms)
     ranking_requested = set() if explicit_type_intent else requested
     specific_terms = [
