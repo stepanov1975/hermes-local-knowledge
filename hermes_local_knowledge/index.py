@@ -1102,6 +1102,13 @@ def _requested_operational_types(terms: Sequence[str]) -> set[str]:
     return requested
 
 
+def _legacy_requested_operational_types(terms: Sequence[str]) -> set[str]:
+    requested: set[str] = set()
+    for term in terms:
+        requested.update(LEGACY_ARTIFACT_TYPE_INTENT.get(term, ()))
+    return requested
+
+
 def _operational_intent_terms(terms: Sequence[str]) -> set[str]:
     """Return only type terms that actually activated deterministic promotion."""
 
@@ -1500,18 +1507,16 @@ def _finalize_candidates(
     explicit_type_intent: bool,
     output_limit: int,
     *,
-    baseline_candidates: Sequence[_Candidate] | None = None,
+    baseline_output: Sequence[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if explicit_type_intent:
         promotion_pool = list(candidates)
         promoted = _promote_explicit_type_candidate(
             promotion_pool, requested_types, specific_terms
         )
-        selected = _select_candidates(
-            baseline_candidates
-            if promoted is promotion_pool and baseline_candidates is not None
-            else promoted
-        )
+        if promoted is promotion_pool and baseline_output is not None:
+            return list(baseline_output[:output_limit])
+        selected = _select_candidates(promoted)
     else:
         selected = _select_candidates(candidates)
     if not explicit_type_intent and requested_types:
@@ -1551,6 +1556,7 @@ def search_index(
     *,
     limit: int = 10,
     artifact_type: str | None = None,
+    _disable_explicit_intent: bool = False,
 ) -> list[dict[str, Any]]:
     output_limit = max(0, int(limit))
     if output_limit == 0:
@@ -1565,10 +1571,37 @@ def search_index(
     exact_query = _has_quoted_phrase(query)
     quoted_only = _is_quoted_only_query(query)
     lift_parents = not exact_query and not type_filter
-    requested = set() if exact_query else _requested_operational_types(intent_terms)
-    active_intent_terms = _operational_intent_terms(intent_terms)
-    explicit_type_intent = not type_filter and any(
+    requested = (
+        set()
+        if exact_query
+        else (
+            _legacy_requested_operational_types(intent_terms)
+            if _disable_explicit_intent
+            else _requested_operational_types(intent_terms)
+        )
+    )
+    active_intent_terms = (
+        {
+            term
+            for term in intent_terms
+            if term in LEGACY_ARTIFACT_TYPE_INTENT
+        }
+        if _disable_explicit_intent
+        else _operational_intent_terms(intent_terms)
+    )
+    explicit_type_intent = not type_filter and not _disable_explicit_intent and any(
         term in EXPLICIT_ARTIFACT_TYPE_INTENT for term in active_intent_terms
+    )
+    baseline_output = (
+        search_index(
+            db_path,
+            query,
+            limit=output_limit,
+            artifact_type=artifact_type,
+            _disable_explicit_intent=True,
+        )
+        if explicit_type_intent
+        else None
     )
     ranking_requested = set() if explicit_type_intent else requested
     specific_terms = _specific_terms_for_ranking(
@@ -1593,7 +1626,6 @@ def search_index(
             lift_parents=lift_parents,
             enforce_support_diversity=not explicit_type_intent,
         )
-        strict_baseline = _select_candidates(strict) if explicit_type_intent else strict
         strict_ids = {str(candidate.row.get("id") or "") for candidate in strict}
         if quoted_only:
             return _finalize_candidates(
@@ -1605,7 +1637,6 @@ def search_index(
             )
 
         identity: list[_Candidate] = []
-        identity_baseline: list[_Candidate] = []
         if not requested or explicit_type_intent:
             identity_candidates = _decode_candidates(
                 _query_identity_rows(connection, terms, candidate_limit, type_filter),
@@ -1626,16 +1657,8 @@ def search_index(
                 lift_parents=lift_parents,
                 enforce_support_diversity=not explicit_type_intent,
             )
-            identity_baseline = (
-                _select_candidates(identity) if explicit_type_intent else identity
-            )
         identity_ids = {str(candidate.row.get("id") or "") for candidate in identity}
         prioritized = [*strict, *identity] if exact_query else [*identity, *strict]
-        prioritized_baseline = (
-            [*strict_baseline, *identity_baseline]
-            if exact_query
-            else [*identity_baseline, *strict_baseline]
-        )
         if len(strict) >= output_limit and not requested:
             return _finalize_candidates(
                 prioritized,
@@ -1664,16 +1687,13 @@ def search_index(
             lift_parents=lift_parents,
             enforce_support_diversity=not explicit_type_intent,
         )
-        fallback_baseline = (
-            _select_candidates(fallback) if explicit_type_intent else fallback
-        )
         return _finalize_candidates(
             [*prioritized, *fallback],
             requested,
             specific_terms,
             explicit_type_intent,
             output_limit,
-            baseline_candidates=[*prioritized_baseline, *fallback_baseline],
+            baseline_output=baseline_output,
         )
     finally:
         connection.close()

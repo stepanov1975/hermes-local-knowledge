@@ -540,13 +540,33 @@ def test_artifact_noun_intent_preserves_generic_quoted_filtered_reference_and_pa
         )
     } == {"skill_support_doc"}
     docs = index_owner.search_index(db_path, "orchid docs", limit=5)
-    assert docs[0]["id"] == "skill:orchid"
+    baseline_docs = index_owner.search_index(
+        db_path,
+        "orchid docs",
+        limit=5,
+        _disable_explicit_intent=True,
+    )
+    assert [row["id"] for row in docs] == [row["id"] for row in baseline_docs]
     assert len([row for row in docs if row["type"] == "skill_support_doc"]) == 1
     specific_docs = index_owner.search_index(db_path, "orchid service docs", limit=5)
-    assert specific_docs[0]["id"] == "skill:orchid"
-    assert specific_docs[1]["type"] == "skill_support_doc"
+    baseline_specific_docs = index_owner.search_index(
+        db_path,
+        "orchid service docs",
+        limit=5,
+        _disable_explicit_intent=True,
+    )
+    assert [row["id"] for row in specific_docs] == [
+        row["id"] for row in baseline_specific_docs
+    ]
     assert len([row for row in specific_docs if row["type"] == "skill_support_doc"]) == 1
-    assert index_owner.search_index(db_path, "orchid script", limit=5)[0]["id"] == "skill:orchid"
+    script = index_owner.search_index(db_path, "orchid script", limit=5)
+    baseline_script = index_owner.search_index(
+        db_path,
+        "orchid script",
+        limit=5,
+        _disable_explicit_intent=True,
+    )
+    assert [row["id"] for row in script] == [row["id"] for row in baseline_script]
 
 
 def test_explicit_doc_promotion_selects_eligible_support_sibling_before_diversity(
@@ -635,10 +655,55 @@ def test_explicit_intent_without_promotion_uses_baseline_diversity() -> None:
         ["orchid", "alpha"],
         True,
         5,
-        baseline_candidates=[owner, baseline_support],
+        baseline_output=[owner.row, baseline_support.row],
     )
 
     assert [row["id"] for row in rows] == [
         "skill:orchid",
         "skill-support:orchid:baseline",
     ]
+
+
+def test_explicit_intent_without_eligible_target_reuses_full_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = [
+        Artifact(
+            id="skill:orchid",
+            type="skill",
+            title="Orchid skill",
+            path="skills/orchid",
+            summary="Orchid alpha behavior.",
+            search_text="orchid alpha skill",
+        ),
+        Artifact(
+            id="skill-support:orchid:a",
+            type="skill_support_doc",
+            title="Orchid alpha A",
+            path="skills/orchid/references/a.md",
+            summary="Orchid alpha skill details.",
+            related=["skill:orchid"],
+            search_text="orchid alpha skill",
+        ),
+        Artifact(
+            id="skill-support:orchid:b",
+            type="skill_support_doc",
+            title="Orchid alpha B",
+            path="skills/orchid/references/b.md",
+            summary="Orchid alpha skill details.",
+            related=["skill:orchid"],
+            search_text="orchid alpha skill",
+        ),
+    ]
+    db_path = build_fixture_index(tmp_path, monkeypatch, artifacts)
+
+    baseline = index_owner.search_index(
+        db_path,
+        "orchid alpha skill",
+        limit=5,
+        _disable_explicit_intent=True,
+    )
+    explicit = index_owner.search_index(db_path, "orchid alpha skill", limit=5)
+
+    assert [row["id"] for row in explicit] == [row["id"] for row in baseline]
