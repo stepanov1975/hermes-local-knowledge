@@ -217,11 +217,10 @@ jobs:
             --title "$RELEASE_TAG" \
             --notes-file "$RELEASE_NOTES_FILE"
 
-      - name: Repair published prerelease status
+      - name: Repair prerelease status
         if: >-
           steps.release.outputs.needed == 'true' &&
           steps.release.outputs.release_exists == 'true' &&
-          steps.release.outputs.release_is_draft == 'false' &&
           steps.release.outputs.release_is_prerelease == 'true'
         env:
           GH_TOKEN: ${{ github.token }}

@@ -309,7 +309,12 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert 'gh release create "$RELEASE_TAG" dist/*' not in workflow
     assert '"dist/$EXPECTED_WHEEL"' in workflow
     assert '"dist/$EXPECTED_SDIST"' in workflow
-    assert "Repair published prerelease status" in workflow
+    assert "Repair prerelease status" in workflow
+    prerelease_repair = workflow.split("- name: Repair prerelease status", maxsplit=1)[1].split(
+        "- name: Create GitHub release from existing tag", maxsplit=1
+    )[0]
+    assert "release_is_prerelease == 'true'" in prerelease_repair
+    assert "release_is_draft == 'false'" not in prerelease_repair
     assert "Verify draft tag target" in workflow
     assert 'actual_sha=$(git rev-parse "${RELEASE_TAG}^{commit}")' in workflow
     assert "Verify draft release content" in workflow
