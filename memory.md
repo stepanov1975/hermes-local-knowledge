@@ -44,6 +44,7 @@ An LLM/neural ranker is not justified without a larger labeled corpus and offlin
 
 - Strong identity evidence requires an exact compact identity or all non-routing identity terms in ID/title/basename/path. Partial filename overlap must not beat fuller conceptual evidence.
 - Operational promotion applies only when the query asks for script, cron/job, MCP, or wrapper artifacts and the candidate satisfies the relevant domain terms. It is not global type promotion.
+- Query-terminal runbook, skill, document/reference, and memory intent is a separate conservative transformation over one immutable legacy baseline from one SQLite read snapshot. A target qualifies only with a complete configured entity label in its own ID/title/path and a distinct topic term; body-only and sibling-derived identity never qualify. Resolve family ambiguity across the complete index independently of output limit, then stably move only the exact target and its owner while preserving unrelated order.
 - Script-only queries protect strict skill/support-document hits. Cron/MCP candidates must not leapfrog same-domain prose on weak overlap.
 - Pure quoted queries stay strict. Quoted phrases preserve phrase order and do not trigger parent lifting or operational promotion.
 - An explicit `artifact_type` filter returns only that type.

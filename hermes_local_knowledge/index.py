@@ -132,10 +132,25 @@ STOPWORDS = {
     "with",
 } | _runtime_stopwords()
 QUERY_STOPWORDS = {"find", "flow", "markdown", "need", "next", "show", "want", "what", "where", "which"}
+EXPLICIT_ARTIFACT_TYPE_ALIASES: dict[str, frozenset[str]] = {
+    "runbook": frozenset({"runbook"}),
+    "skill": frozenset({"skill"}),
+    "doc": frozenset({"doc", "skill_support_doc"}),
+    "docs": frozenset({"doc", "skill_support_doc"}),
+    "document": frozenset({"doc", "skill_support_doc"}),
+    "documentation": frozenset({"doc", "skill_support_doc"}),
+    "reference": frozenset({"doc", "skill_support_doc"}),
+    "memory": frozenset({"memory_doc"}),
+}
 ROUTING_HINT_TERMS = STOPWORDS | {"automation", "cron", "job", "runbook", "workflow"}
 OPERATIONAL_INTENT_TERMS = {"script", "cron", "job", "jobs", "mcp", "wrapper"}
 PROSE_ARTIFACT_TYPES = {"doc", "runbook", "memory_doc"}
 STRICT_REFERENCE_TYPES = {"skill", "skill_support_doc"}
+_TERMINAL_ARTIFACT_TYPE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])"
+    r"(?P<noun>runbooks?|skills?|docs?|documents?|documentation|references?|memories|memory)"
+    r"(?![A-Za-z0-9_])[^A-Za-z0-9]*$"
+)
 
 
 class NewerIndexFormatError(RuntimeError):
@@ -961,8 +976,15 @@ def _normalize_query_term(term: str) -> str:
     return term
 
 
+def _raw_query_terms(query: str) -> list[str]:
+    return [
+        _normalize_query_term(term)
+        for term in re.findall(r"[A-Za-z0-9]{2,}", query.lower())
+    ]
+
+
 def _query_terms(query: str, *, drop_stopwords: bool = True) -> list[str]:
-    terms = [_normalize_query_term(term) for term in re.findall(r"[A-Za-z0-9]{2,}", query.lower())]
+    terms = _raw_query_terms(query)
     if drop_stopwords:
         terms = [term for term in terms if term not in QUERY_STOPWORDS]
     return _unique(terms)
@@ -1063,6 +1085,46 @@ def _requested_operational_types(terms: Sequence[str]) -> set[str]:
     if term_set & {"mcp", "wrapper"}:
         requested.update({"mcp_server", "script"})
     return requested
+
+
+@dataclass(frozen=True)
+class _ExplicitTypeRequest:
+    artifact_types: frozenset[str]
+    intent_term: str
+    query_tokens: tuple[str, ...]
+    specific_terms: tuple[str, ...]
+
+
+def _explicit_type_request(
+    query: str,
+    *,
+    exact_query: bool,
+    type_filter: str,
+) -> _ExplicitTypeRequest | None:
+    if exact_query or type_filter:
+        return None
+    terminal = _TERMINAL_ARTIFACT_TYPE_RE.search(query)
+    if terminal is None:
+        return None
+    intent_term = _normalize_query_term(terminal.group("noun").lower())
+    raw_terms = _raw_query_terms(query)
+    if any(term in OPERATIONAL_INTENT_TERMS for term in raw_terms):
+        return None
+    explicit_terms = {
+        term for term in raw_terms if term in EXPLICIT_ARTIFACT_TYPE_ALIASES
+    }
+    if explicit_terms != {intent_term}:
+        return None
+    query_tokens = tuple(raw_terms)
+    specific_terms = tuple(
+        term for term in _query_terms(query) if term != intent_term
+    )
+    return _ExplicitTypeRequest(
+        artifact_types=EXPLICIT_ARTIFACT_TYPE_ALIASES[intent_term],
+        intent_term=intent_term,
+        query_tokens=query_tokens,
+        specific_terms=specific_terms,
+    )
 
 
 def _row_specific_hits(row: dict[str, Any], specific_terms: Sequence[str]) -> int:
@@ -1274,6 +1336,17 @@ def _query_metadata_rows(
     ).fetchall()
 
 
+def _query_artifacts_by_type(
+    connection: sqlite3.Connection,
+    artifact_types: Sequence[str],
+) -> list[sqlite3.Row]:
+    placeholders = ", ".join("?" for _ in artifact_types)
+    return connection.execute(
+        f"SELECT a.*, 0.0 AS rank FROM artifacts a WHERE a.type IN ({placeholders}) ORDER BY a.id",
+        list(artifact_types),
+    ).fetchall()
+
+
 def _support_parent(row: dict[str, Any]) -> str | None:
     if row.get("type") != "skill_support_doc":
         return None
@@ -1294,7 +1367,11 @@ def _fetch_parents(
     return {str(row["id"]): decode_artifact_row(row) for row in rows}
 
 
-def _select_candidates(candidates: Sequence[_Candidate]) -> list[_Candidate]:
+def _select_candidates(
+    candidates: Sequence[_Candidate],
+    *,
+    enforce_support_diversity: bool = True,
+) -> list[_Candidate]:
     selected: list[_Candidate] = []
     emitted: set[str] = set()
     support_counts: dict[str, int] = {}
@@ -1303,7 +1380,7 @@ def _select_candidates(candidates: Sequence[_Candidate]) -> list[_Candidate]:
         if artifact_id in emitted:
             continue
         parent = _support_parent(candidate.row)
-        if parent:
+        if parent and enforce_support_diversity:
             count = support_counts.get(parent, 0)
             if count >= 1:
                 continue
@@ -1321,13 +1398,17 @@ def _rank_group(
     specific_terms: Sequence[str],
     *,
     lift_parents: bool,
+    enforce_support_diversity: bool = True,
 ) -> list[_Candidate]:
     ordered = sorted(
         candidates,
         key=lambda candidate: _rank_key(candidate, terms, requested_types, specific_terms),
     )
     if not lift_parents:
-        return _select_candidates(ordered)
+        return _select_candidates(
+            ordered,
+            enforce_support_diversity=enforce_support_diversity,
+        )
     existing = {str(candidate.row.get("id") or ""): candidate for candidate in ordered}
     missing_parent_ids = list(
         dict.fromkeys(
@@ -1353,15 +1434,74 @@ def _rank_group(
             if parent_candidate is not None:
                 expanded.append(parent_candidate)
         expanded.append(candidate)
-    return _select_candidates(expanded)
+    return _select_candidates(
+        expanded,
+        enforce_support_diversity=enforce_support_diversity,
+    )
 
 
-def _finalize_candidates(
+def _contains_token_sequence(tokens: Sequence[str], sequence: Sequence[str]) -> bool:
+    width = len(sequence)
+    return bool(width) and any(
+        list(tokens[index : index + width]) == list(sequence)
+        for index in range(len(tokens) - width + 1)
+    )
+
+
+def _eligible_explicit_target(row: dict[str, Any], request: _ExplicitTypeRequest) -> bool:
+    if _row_specific_hits(row, request.specific_terms) != len(request.specific_terms):
+        return False
+    identity_fields = (
+        str(row.get("id") or ""),
+        str(row.get("title") or ""),
+        str(row.get("path") or ""),
+    )
+    identity_tokens = [
+        _raw_query_terms(field)
+        for field in identity_fields
+    ]
+    query_entity_tokens: list[tuple[str, ...]] = []
+    identity_entity_tokens: list[tuple[str, ...]] = []
+    for label in row.get("entities") or []:
+        label_tokens = tuple(_raw_query_terms(str(label)))
+        if not label_tokens or not _contains_token_sequence(request.query_tokens, label_tokens):
+            continue
+        query_entity_tokens.append(label_tokens)
+        if any(_contains_token_sequence(tokens, label_tokens) for tokens in identity_tokens):
+            identity_entity_tokens.append(label_tokens)
+    if not identity_entity_tokens:
+        return False
+    entity_terms = {
+        term
+        for label_tokens in query_entity_tokens
+        for term in label_tokens
+    }
+    return any(
+        term not in entity_terms and term not in ROUTING_HINT_TERMS
+        for term in request.specific_terms
+    )
+
+
+def _eligible_explicit_families(
+    rows: Sequence[dict[str, Any]],
+    request: _ExplicitTypeRequest,
+) -> tuple[set[str], set[str]]:
+    eligible_ids: set[str] = set()
+    families: set[str] = set()
+    for row in rows:
+        if not _eligible_explicit_target(row, request):
+            continue
+        artifact_id = str(row.get("id") or "")
+        eligible_ids.add(artifact_id)
+        families.add(_support_parent(row) or artifact_id)
+    return eligible_ids, families
+
+
+def _ordered_candidates(
     candidates: Sequence[_Candidate],
     requested_types: set[str],
     specific_terms: Sequence[str],
-    output_limit: int,
-) -> list[dict[str, Any]]:
+) -> list[_Candidate]:
     selected = _select_candidates(candidates)
     if requested_types:
         selected.sort(
@@ -1371,6 +1511,57 @@ def _finalize_candidates(
                 specific_terms,
             )
         )
+    return selected
+
+
+def _promote_explicit_target(
+    candidates: Sequence[_Candidate],
+    baseline: Sequence[_Candidate],
+    eligible_ids: set[str],
+) -> list[_Candidate]:
+    target = next(
+        (
+            candidate
+            for candidate in candidates
+            if str(candidate.row.get("id") or "") in eligible_ids
+        ),
+        None,
+    )
+    if target is None:
+        return list(baseline)
+    target_id = str(target.row.get("id") or "")
+    parent_id = _support_parent(target.row)
+    if parent_id is None:
+        return [
+            target,
+            *(candidate for candidate in baseline if str(candidate.row.get("id") or "") != target_id),
+        ]
+    owner = next(
+        (
+            candidate
+            for candidate in candidates
+            if str(candidate.row.get("id") or "") == parent_id
+        ),
+        None,
+    )
+    if owner is None:
+        return list(baseline)
+    remaining = [
+        candidate
+        for candidate in baseline
+        if str(candidate.row.get("id") or "") != parent_id
+        and _support_parent(candidate.row) != parent_id
+    ]
+    return [owner, target, *remaining]
+
+
+def _finalize_candidates(
+    candidates: Sequence[_Candidate],
+    requested_types: set[str],
+    specific_terms: Sequence[str],
+    output_limit: int,
+) -> list[dict[str, Any]]:
+    selected = _ordered_candidates(candidates, requested_types, specific_terms)
     return [candidate.row for candidate in selected[:output_limit]]
 
 
@@ -1394,6 +1585,92 @@ def _decode_candidates(
     return output
 
 
+def _collect_search_candidates(
+    connection: sqlite3.Connection,
+    *,
+    strict_match: str,
+    fallback_match: str,
+    type_filter: str,
+    candidate_limit: int,
+    exact_query: bool,
+    quoted_only: bool,
+    lift_parents: bool,
+    terms: Sequence[str],
+    requested: set[str],
+    specific_terms: Sequence[str],
+    output_limit: int,
+    preserve_support_candidates: bool,
+    force_fallback: bool,
+) -> list[_Candidate]:
+    strict = _rank_group(
+        connection,
+        _decode_candidates(
+            _query_fts_rows(connection, strict_match, candidate_limit, type_filter),
+            source_tier=0 if exact_query else 1,
+            strict=True,
+        ),
+        terms,
+        requested,
+        specific_terms,
+        lift_parents=lift_parents,
+        enforce_support_diversity=not preserve_support_candidates,
+    )
+    if quoted_only:
+        return strict
+
+    strict_ids = {str(candidate.row.get("id") or "") for candidate in strict}
+    identity: list[_Candidate] = []
+    if not requested:
+        identity_candidates = _decode_candidates(
+            _query_identity_rows(connection, terms, candidate_limit, type_filter),
+            source_tier=1 if exact_query else 0,
+            strict=False,
+            excluded_ids=strict_ids,
+        )
+        identity = _rank_group(
+            connection,
+            [
+                candidate
+                for candidate in identity_candidates
+                if _identity_match_tier(candidate.row, terms) < 3
+            ],
+            terms,
+            requested,
+            specific_terms,
+            lift_parents=lift_parents,
+            enforce_support_diversity=not preserve_support_candidates,
+        )
+    identity_ids = {str(candidate.row.get("id") or "") for candidate in identity}
+    prioritized = [*strict, *identity] if exact_query else [*identity, *strict]
+    if not force_fallback and len(strict) >= output_limit and not requested:
+        return prioritized
+
+    fallback_rows: list[sqlite3.Row] = []
+    if fallback_match != strict_match:
+        fallback_rows.extend(
+            _query_fts_rows(connection, fallback_match, candidate_limit, type_filter)
+        )
+    if not identity:
+        fallback_rows.extend(
+            _query_metadata_rows(connection, terms, candidate_limit, type_filter)
+        )
+    fallback = _rank_group(
+        connection,
+        _decode_candidates(
+            fallback_rows,
+            source_tier=2,
+            strict=False,
+            excluded_ids=strict_ids | identity_ids,
+        ),
+        terms,
+        requested,
+        specific_terms,
+        lift_parents=lift_parents,
+        enforce_support_diversity=not preserve_support_candidates,
+    )
+    return [*prioritized, *fallback]
+
+
 def search_index(
     db_path: Path,
     query: str,
@@ -1415,79 +1692,85 @@ def search_index(
     lift_parents = not exact_query and not type_filter
     requested = set() if exact_query else _requested_operational_types(terms)
     specific_terms = [term for term in _high_signal_terms(terms) if term not in OPERATIONAL_INTENT_TERMS]
-    candidate_limit = max(output_limit * 20, 100)
+    explicit_request = _explicit_type_request(
+        query,
+        exact_query=exact_query,
+        type_filter=type_filter,
+    )
 
+    baseline_candidate_limit = max(output_limit * 20, 100)
     connection = connect_readonly(db_path)
     try:
-        strict = _rank_group(
+        connection.execute("BEGIN")
+        baseline_candidates = _collect_search_candidates(
             connection,
-            _decode_candidates(
-                _query_fts_rows(connection, strict_match, candidate_limit, type_filter),
-                source_tier=0 if exact_query else 1,
-                strict=True,
-            ),
-            terms,
-            requested,
-            specific_terms,
+            strict_match=strict_match,
+            fallback_match=fallback_match,
+            type_filter=type_filter,
+            candidate_limit=baseline_candidate_limit,
+            exact_query=exact_query,
+            quoted_only=quoted_only,
             lift_parents=lift_parents,
+            terms=terms,
+            requested=requested,
+            specific_terms=specific_terms,
+            output_limit=output_limit,
+            preserve_support_candidates=False,
+            force_fallback=False,
         )
-        strict_ids = {str(candidate.row.get("id") or "") for candidate in strict}
-        if quoted_only:
-            return _finalize_candidates(strict, requested, specific_terms, output_limit)
-
-        identity: list[_Candidate] = []
-        if not requested:
-            identity_candidates = _decode_candidates(
-                _query_identity_rows(connection, terms, candidate_limit, type_filter),
-                source_tier=1 if exact_query else 0,
-                strict=False,
-                excluded_ids=strict_ids,
-            )
-            identity = _rank_group(
-                connection,
-                [
-                    candidate
-                    for candidate in identity_candidates
-                    if _identity_match_tier(candidate.row, terms) < 3
-                ],
-                terms,
-                requested,
-                specific_terms,
-                lift_parents=lift_parents,
-            )
-        identity_ids = {str(candidate.row.get("id") or "") for candidate in identity}
-        prioritized = [*strict, *identity] if exact_query else [*identity, *strict]
-        if len(strict) >= output_limit and not requested:
+        if explicit_request is None:
             return _finalize_candidates(
-                prioritized,
+                baseline_candidates,
                 requested,
                 specific_terms,
                 output_limit,
             )
 
-        fallback_rows: list[sqlite3.Row] = []
-        if fallback_match != strict_match:
-            fallback_rows.extend(_query_fts_rows(connection, fallback_match, candidate_limit, type_filter))
-        if not identity:
-            fallback_rows.extend(_query_metadata_rows(connection, terms, candidate_limit, type_filter))
-        fallback = _rank_group(
+        baseline = _ordered_candidates(
+            baseline_candidates,
+            requested,
+            specific_terms,
+        )
+        explicit_rows = [
+            decode_artifact_row(row)
+            for row in _query_artifacts_by_type(
+                connection,
+                sorted(explicit_request.artifact_types),
+            )
+        ]
+        eligible_ids, families = _eligible_explicit_families(
+            explicit_rows,
+            explicit_request,
+        )
+        if len(families) != 1:
+            return [candidate.row for candidate in baseline[:output_limit]]
+
+        artifact_count = int(
+            connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+        )
+        promotion_candidates = _collect_search_candidates(
             connection,
-            _decode_candidates(
-                fallback_rows,
-                source_tier=2,
-                strict=False,
-                excluded_ids=strict_ids | identity_ids,
-            ),
-            terms,
-            requested,
-            specific_terms,
+            strict_match=strict_match,
+            fallback_match=fallback_match,
+            type_filter=type_filter,
+            candidate_limit=max(artifact_count, 1),
+            exact_query=exact_query,
+            quoted_only=quoted_only,
             lift_parents=lift_parents,
+            terms=terms,
+            requested=requested,
+            specific_terms=specific_terms,
+            output_limit=output_limit,
+            preserve_support_candidates=True,
+            force_fallback=True,
         )
-        return _finalize_candidates(
-            [*prioritized, *fallback],
-            requested,
-            specific_terms,
-            output_limit,
+        promoted = _promote_explicit_target(
+            promotion_candidates,
+            baseline,
+            eligible_ids,
         )
+        return [candidate.row for candidate in promoted[:output_limit]]
     finally:
+        if connection.in_transaction:
+            connection.rollback()
         connection.close()

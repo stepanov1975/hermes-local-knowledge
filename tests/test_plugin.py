@@ -41,7 +41,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
-    assert hermes_local_knowledge.__version__ == "0.4.11"
+    assert hermes_local_knowledge.__version__ == "0.4.12"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
@@ -210,6 +210,11 @@ def test_register_prefers_system_prompt_section_when_supported(
         )
     ]
     assert section_calls[0][1]({"session_id": "session-1"}) == plugin.KNOWLEDGE_SEARCH_HINT
+    assert plugin.KNOWLEDGE_SEARCH_HINT == (
+        "For local Hermes/homelab skills, scripts, runbooks, cron jobs, MCP wrappers, or service "
+        "docs, use `knowledge_search` before broad file search; verify live state directly."
+    )
+    assert len(plugin.KNOWLEDGE_SEARCH_HINT) <= 200
     assert hook_calls[0] == ("pre_llm_call", plugin._bind_implicit_pre_llm_context)
     assert hook_calls[0][1](turn_id="turn-1") is None
     assert implicit_kwargs["turn_id"] == "turn-1"

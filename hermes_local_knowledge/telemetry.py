@@ -26,6 +26,8 @@ GENERAL_TELEMETRY_TIMEOUT_SECONDS = 1.0
 
 RECENT_LIVE_ERROR_DAYS = 3
 PROBE_QUERIES = {"demo", "sentinel unlikely", "xxxx"}
+IMPLICIT_CONSUMED_RANK_SCAN_LIMIT = 1000
+IMPLICIT_CONSUMPTION_MAX_SEARCH_AGE_MINUTES = 30
 
 
 class FeedbackDatabaseLockedError(RuntimeError):
@@ -984,6 +986,187 @@ def _split_resolved_zero_results(
     return unresolved, resolved
 
 
+def _empty_implicit_consumed_rank_lower_bound() -> dict[str, Any]:
+    """Return the zero shape for the lower-bound consumed-rank diagnostic."""
+
+    return {
+        "consumed_artifact_count": 0,
+        "consumed_search_count": 0,
+        "ranked_consumption_count": 0,
+        "unranked_consumption_count": 0,
+        "consumed_at_rank_1": 0,
+        "consumed_in_top_3": 0,
+        "consumed_outside_top_3": 0,
+        "searches_with_consumed_rank_1": 0,
+        "searches_with_consumed_top_3": 0,
+        "median_consumed_rank": None,
+        "rank_distribution": [],
+    }
+
+
+def _implicit_consumed_rank_lower_bound(
+    conn: sqlite3.Connection,
+    *,
+    since: str,
+    root: str,
+    probe_queries: tuple[str, ...],
+) -> dict[str, Any]:
+    """Aggregate recent, routing-valid baseline consumption; never infer labels."""
+
+    probe_placeholders = ",".join("?" for _ in probe_queries)
+    baseline_json = """
+        CASE
+            WHEN json_valid(COALESCE(e.baseline_top_ids_json, '')) = 1
+                THEN e.baseline_top_ids_json
+            ELSE '[]'
+        END
+    """
+    final_json = """
+        CASE
+            WHEN json_valid(COALESCE(e.top_ids_json, '')) = 1
+                THEN e.top_ids_json
+            ELSE '[]'
+        END
+    """
+    consumed_cte = f"""
+        WITH candidate_feedback AS (
+            SELECT id, ts, search_event_id, query, artifact_id,
+                   session_id, task_id, turn_id, root
+            FROM implicit_feedback
+            WHERE root = ?
+            ORDER BY id DESC
+            LIMIT ?
+        ),
+        consumed AS (
+            SELECT i.search_event_id,
+                   (
+                       SELECT MIN(CAST(result.key AS INTEGER)) + 1
+                       FROM json_each({baseline_json}) AS result
+                       WHERE result.type = 'text'
+                         AND CAST(result.value AS TEXT) = i.artifact_id
+                   ) AS consumed_rank
+            FROM candidate_feedback AS i
+            JOIN usage_events AS e ON e.id = i.search_event_id
+            WHERE julianday(i.ts) >= julianday(?)
+              AND julianday(i.ts) <= julianday(?)
+              AND julianday(e.ts) IS NOT NULL
+              AND julianday(e.ts) >= julianday(?)
+              AND julianday(e.ts) <= julianday(?)
+              AND julianday(i.ts) >= julianday(e.ts)
+              AND julianday(i.ts) <= julianday(
+                  e.ts, '+{IMPLICIT_CONSUMPTION_MAX_SEARCH_AGE_MINUTES} minutes'
+              )
+              AND e.root = ? AND e.root = i.root
+              AND e.client = 'native' AND e.tool = 'knowledge_search'
+              AND e.plugin_version = ? AND e.success = 1
+              AND e.implicit_feedback_enabled = 1
+              AND i.query <> '' AND i.query = TRIM(i.query) AND e.query = i.query
+              AND i.artifact_id <> ''
+              AND i.session_id <> '' AND e.session_id = i.session_id
+              AND i.task_id <> '' AND e.task_id = i.task_id
+              AND i.turn_id <> '' AND e.turn_id = i.turn_id
+              AND json_type({baseline_json}) = 'array'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM json_each({baseline_json}) AS result
+                  WHERE result.type <> 'text' OR CAST(result.value AS TEXT) = ''
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM json_each({baseline_json}) AS result
+                  WHERE result.type = 'text'
+                    AND CAST(result.value AS TEXT) = i.artifact_id
+              )
+              AND json_type({final_json}) = 'array'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM json_each({final_json}) AS result
+                  WHERE result.type <> 'text' OR CAST(result.value AS TEXT) = ''
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM json_each({final_json}) AS result
+                  WHERE result.type = 'text'
+                    AND CAST(result.value AS TEXT) = i.artifact_id
+              )
+              AND LOWER(TRIM(COALESCE(e.query, ''))) NOT IN ({probe_placeholders})
+        )
+    """
+    observed_at = _utc_now()
+    params = (
+        root,
+        IMPLICIT_CONSUMED_RANK_SCAN_LIMIT,
+        since,
+        observed_at,
+        since,
+        observed_at,
+        root,
+        __version__,
+        *probe_queries,
+    )
+    try:
+        aggregate = conn.execute(
+            consumed_cte
+            + """
+            SELECT COUNT(*) AS consumed_artifact_count,
+                   COUNT(DISTINCT search_event_id) AS consumed_search_count,
+                   COALESCE(SUM(consumed_rank IS NOT NULL), 0) AS ranked_consumption_count,
+                   COALESCE(SUM(consumed_rank IS NULL), 0) AS unranked_consumption_count,
+                   COALESCE(SUM(consumed_rank = 1), 0) AS consumed_at_rank_1,
+                   COALESCE(SUM(consumed_rank <= 3), 0) AS consumed_in_top_3,
+                   COALESCE(SUM(consumed_rank > 3), 0) AS consumed_outside_top_3,
+                   COUNT(DISTINCT CASE WHEN consumed_rank = 1 THEN search_event_id END)
+                       AS searches_with_consumed_rank_1,
+                   COUNT(DISTINCT CASE WHEN consumed_rank <= 3 THEN search_event_id END)
+                       AS searches_with_consumed_top_3,
+                   (
+                       SELECT AVG(consumed_rank)
+                       FROM (
+                           SELECT consumed_rank,
+                                  ROW_NUMBER() OVER (ORDER BY consumed_rank) AS rank_number,
+                                  COUNT(*) OVER () AS rank_count
+                           FROM consumed
+                           WHERE consumed_rank IS NOT NULL
+                       ) AS ordered_ranks
+                       WHERE rank_number IN ((rank_count + 1) / 2, (rank_count + 2) / 2)
+                   ) AS median_consumed_rank
+            FROM consumed
+            """,
+            params,
+        ).fetchone()
+        rank_distribution = _rows(
+            conn,
+            consumed_cte
+            + """
+            SELECT consumed_rank AS rank, COUNT(*) AS count
+            FROM consumed
+            WHERE consumed_rank IS NOT NULL
+            GROUP BY consumed_rank
+            ORDER BY consumed_rank
+            LIMIT 100
+            """,
+            params,
+        )
+    except sqlite3.Error:
+        # This optional report diagnostic must not make the broader local report fail.
+        return _empty_implicit_consumed_rank_lower_bound()
+    if aggregate is None:
+        return _empty_implicit_consumed_rank_lower_bound()
+    return {
+        "consumed_artifact_count": int(aggregate["consumed_artifact_count"] or 0),
+        "consumed_search_count": int(aggregate["consumed_search_count"] or 0),
+        "ranked_consumption_count": int(aggregate["ranked_consumption_count"] or 0),
+        "unranked_consumption_count": int(aggregate["unranked_consumption_count"] or 0),
+        "consumed_at_rank_1": int(aggregate["consumed_at_rank_1"] or 0),
+        "consumed_in_top_3": int(aggregate["consumed_in_top_3"] or 0),
+        "consumed_outside_top_3": int(aggregate["consumed_outside_top_3"] or 0),
+        "searches_with_consumed_rank_1": int(aggregate["searches_with_consumed_rank_1"] or 0),
+        "searches_with_consumed_top_3": int(aggregate["searches_with_consumed_top_3"] or 0),
+        "median_consumed_rank": aggregate["median_consumed_rank"],
+        "rank_distribution": rank_distribution,
+    }
+
+
 def _usage_report(
     root: Path,
     *,
@@ -1026,6 +1209,7 @@ def _usage_report(
                 "top_queries": [],
                 "zero_result_queries": [],
                 "errors_by_message": [],
+                "implicit_consumed_rank_lower_bound": _empty_implicit_consumed_rank_lower_bound(),
             },
             "event_cohorts": [],
             "root_breakdown": [],
@@ -1180,6 +1364,12 @@ def _usage_report(
             """,
             (since, root_text, __version__, *probe_queries, limit),
         )
+        implicit_consumed_rank_lower_bound = _implicit_consumed_rank_lower_bound(
+            conn,
+            since=since,
+            root=root_text,
+            probe_queries=probe_queries,
+        )
         current_native_search_quality = {
             "cohort": "current_live_native_search",
             "plugin_version": __version__,
@@ -1194,6 +1384,7 @@ def _usage_report(
             "top_queries": current_search_top_queries,
             "zero_result_queries": current_search_zero_results,
             "errors_by_message": current_search_errors,
+            "implicit_consumed_rank_lower_bound": implicit_consumed_rank_lower_bound,
         }
         event_cohorts = _rows(
             conn,
