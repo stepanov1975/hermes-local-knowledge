@@ -466,6 +466,33 @@ def test_explicit_type_intent_promotes_one_full_match_without_crowding() -> None
         {"runbook"},
         ["orchid", "lotus", "deployment"],
     ) == [owner, orchid_mixed, lotus_mixed]
+    redirection = index_owner._Candidate(
+        {
+            "id": "runbook:redirection",
+            "type": "runbook",
+            "title": "Redirection backup",
+            "summary": "Redis backup compatibility.",
+            "entities": ["Redirection"],
+        },
+        source_tier=1,
+        strict=True,
+    )
+    redis = index_owner._Candidate(
+        {
+            "id": "runbook:redis",
+            "type": "runbook",
+            "title": "Redis backup",
+            "summary": "Redis backup procedure.",
+            "entities": ["Redis"],
+        },
+        source_tier=1,
+        strict=True,
+    )
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, redirection, redis],
+        {"runbook"},
+        ["redi", "backup"],
+    ) == [redis, owner, redirection]
 
 
 def test_artifact_noun_intent_preserves_generic_quoted_filtered_reference_and_parent_behavior(

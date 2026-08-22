@@ -1429,7 +1429,7 @@ def _explicit_identity_terms(
     candidates: Sequence[_Candidate],
     requested_types: set[str],
     specific_terms: Sequence[str],
-) -> set[str]:
+) -> tuple[set[str], str | None]:
     families_by_term: dict[str, set[str]] = {term: set() for term in specific_terms}
     for candidate in candidates:
         row = candidate.row
@@ -1448,8 +1448,8 @@ def _explicit_identity_terms(
         if len(families) == 1
     }
     if len(set(unique_families.values())) != 1:
-        return set()
-    return set(unique_families)
+        return set(), None
+    return set(unique_families), next(iter(unique_families.values()))
 
 
 def _promote_explicit_type_candidate(
@@ -1461,18 +1461,23 @@ def _promote_explicit_type_candidate(
 
     if len(specific_terms) < 2:
         return selected
-    identity_terms = _explicit_identity_terms(
+    identity_terms, identity_family = _explicit_identity_terms(
         selected,
         requested_types,
         specific_terms,
     )
-    if not identity_terms:
+    if not identity_terms or identity_family is None:
         return selected
     target = next(
         (
             candidate
             for candidate in selected
             if str(candidate.row.get("type") or "") in requested_types
+            and (
+                _support_parent(candidate.row)
+                or str(candidate.row.get("id") or "")
+            )
+            == identity_family
             and _row_specific_hits(candidate.row, specific_terms) == len(specific_terms)
             and _row_entity_hits(candidate.row, sorted(identity_terms)) > 0
             and _row_entity_hits(candidate.row, specific_terms) < len(specific_terms)
