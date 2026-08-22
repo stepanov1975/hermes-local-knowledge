@@ -522,6 +522,10 @@ def test_search_uses_one_readonly_connection_and_transaction(
     assert [statement for statement in statements if statement.upper().startswith("BEGIN")] == ["BEGIN"]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows cannot replace an open SQLite database file",
+)
 def test_atomic_replacement_returns_one_coherent_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
