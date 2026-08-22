@@ -150,37 +150,6 @@ EXPLICIT_ARTIFACT_TYPE_INTENT: dict[str, set[str]] = {
     "reference": {"doc", "skill_support_doc"},
     "memory": {"memory_doc"},
 }
-EXPLICIT_TYPE_GENERIC_TERMS = {
-    "app",
-    "application",
-    "backup",
-    "compose",
-    "configuration",
-    "convention",
-    "deployment",
-    "docker",
-    "endpoint",
-    "guide",
-    "host",
-    "image",
-    "install",
-    "migration",
-    "maintenance",
-    "operation",
-    "process",
-    "production",
-    "procedure",
-    "proxy",
-    "resource",
-    "restore",
-    "reverse",
-    "self",
-    "service",
-    "task",
-    "update",
-    "upgrade",
-    "version",
-}
 ROUTING_HINT_TERMS = STOPWORDS | {"automation", "cron", "job", "runbook", "workflow"}
 PROSE_ARTIFACT_TYPES = {"doc", "runbook", "memory_doc"}
 STRICT_REFERENCE_TYPES = {"skill", "skill_support_doc"}
@@ -1158,15 +1127,8 @@ def _row_specific_hits(row: dict[str, Any], specific_terms: Sequence[str]) -> in
     return _token_hits(set(_query_terms(source, drop_stopwords=False)), specific_terms)
 
 
-def _row_identity_hits(row: dict[str, Any], specific_terms: Sequence[str]) -> int:
-    source = " ".join(
-        [
-            str(row.get("id") or ""),
-            str(row.get("title") or ""),
-            str(row.get("path") or ""),
-            " ".join(row.get("entities") or []),
-        ]
-    )
+def _row_entity_hits(row: dict[str, Any], specific_terms: Sequence[str]) -> int:
+    source = " ".join(row.get("entities") or [])
     return _token_hits(set(_query_terms(source, drop_stopwords=False)), specific_terms)
 
 
@@ -1385,7 +1347,9 @@ def _fetch_parents(
     return {str(row["id"]): decode_artifact_row(row) for row in rows}
 
 
-def _select_candidates(candidates: Sequence[_Candidate]) -> list[_Candidate]:
+def _select_candidates(
+    candidates: Sequence[_Candidate], *, enforce_support_diversity: bool = True
+) -> list[_Candidate]:
     selected: list[_Candidate] = []
     emitted: set[str] = set()
     support_counts: dict[str, int] = {}
@@ -1394,7 +1358,7 @@ def _select_candidates(candidates: Sequence[_Candidate]) -> list[_Candidate]:
         if artifact_id in emitted:
             continue
         parent = _support_parent(candidate.row)
-        if parent:
+        if parent and enforce_support_diversity:
             count = support_counts.get(parent, 0)
             if count >= 1:
                 continue
@@ -1412,13 +1376,17 @@ def _rank_group(
     specific_terms: Sequence[str],
     *,
     lift_parents: bool,
+    enforce_support_diversity: bool,
 ) -> list[_Candidate]:
     ordered = sorted(
         candidates,
         key=lambda candidate: _rank_key(candidate, terms, requested_types, specific_terms),
     )
     if not lift_parents:
-        return _select_candidates(ordered)
+        return _select_candidates(
+            ordered,
+            enforce_support_diversity=enforce_support_diversity,
+        )
     existing = {str(candidate.row.get("id") or ""): candidate for candidate in ordered}
     missing_parent_ids = list(
         dict.fromkeys(
@@ -1444,7 +1412,30 @@ def _rank_group(
             if parent_candidate is not None:
                 expanded.append(parent_candidate)
         expanded.append(candidate)
-    return _select_candidates(expanded)
+    return _select_candidates(
+        expanded,
+        enforce_support_diversity=enforce_support_diversity,
+    )
+
+
+def _explicit_identity_terms(
+    candidates: Sequence[_Candidate],
+    requested_types: set[str],
+    specific_terms: Sequence[str],
+) -> set[str]:
+    families_by_term: dict[str, set[str]] = {term: set() for term in specific_terms}
+    for candidate in candidates:
+        row = candidate.row
+        if str(row.get("type") or "") not in requested_types:
+            continue
+        entity_terms = set(
+            _query_terms(" ".join(row.get("entities") or []), drop_stopwords=False)
+        )
+        family = _support_parent(row) or str(row.get("id") or "")
+        for term in specific_terms:
+            if term in entity_terms:
+                families_by_term[term].add(family)
+    return {term for term, families in families_by_term.items() if len(families) == 1}
 
 
 def _promote_explicit_type_candidate(
@@ -1454,10 +1445,14 @@ def _promote_explicit_type_candidate(
 ) -> list[_Candidate]:
     """Move one strong explicit-type match forward without crowding out its baseline neighbors."""
 
-    identity_terms = [
-        term for term in specific_terms if term not in EXPLICIT_TYPE_GENERIC_TERMS
-    ]
-    if len(specific_terms) < 2 or not identity_terms:
+    if len(specific_terms) < 2:
+        return selected
+    identity_terms = _explicit_identity_terms(
+        selected,
+        requested_types,
+        specific_terms,
+    )
+    if not identity_terms:
         return selected
     target = next(
         (
@@ -1465,7 +1460,8 @@ def _promote_explicit_type_candidate(
             for candidate in selected
             if str(candidate.row.get("type") or "") in requested_types
             and _row_specific_hits(candidate.row, specific_terms) == len(specific_terms)
-            and _row_identity_hits(candidate.row, identity_terms) > 0
+            and _row_entity_hits(candidate.row, sorted(identity_terms)) > 0
+            and _row_entity_hits(candidate.row, specific_terms) < len(specific_terms)
         ),
         None,
     )
@@ -1497,10 +1493,14 @@ def _finalize_candidates(
     explicit_type_intent: bool,
     output_limit: int,
 ) -> list[dict[str, Any]]:
-    selected = _select_candidates(candidates)
     if explicit_type_intent:
-        selected = _promote_explicit_type_candidate(selected, requested_types, specific_terms)
-    elif requested_types:
+        promoted = _promote_explicit_type_candidate(
+            list(candidates), requested_types, specific_terms
+        )
+        selected = _select_candidates(promoted)
+    else:
+        selected = _select_candidates(candidates)
+    if not explicit_type_intent and requested_types:
         selected.sort(
             key=lambda candidate: _operational_tier(
                 candidate,
@@ -1575,6 +1575,7 @@ def search_index(
             ranking_requested,
             specific_terms,
             lift_parents=lift_parents,
+            enforce_support_diversity=not explicit_type_intent,
         )
         strict_ids = {str(candidate.row.get("id") or "") for candidate in strict}
         if quoted_only:
@@ -1605,6 +1606,7 @@ def search_index(
                 ranking_requested,
                 specific_terms,
                 lift_parents=lift_parents,
+                enforce_support_diversity=not explicit_type_intent,
             )
         identity_ids = {str(candidate.row.get("id") or "") for candidate in identity}
         prioritized = [*strict, *identity] if exact_query else [*identity, *strict]
@@ -1634,6 +1636,7 @@ def search_index(
             ranking_requested,
             specific_terms,
             lift_parents=lift_parents,
+            enforce_support_diversity=not explicit_type_intent,
         )
         return _finalize_candidates(
             [*prioritized, *fallback],

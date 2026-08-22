@@ -229,6 +229,7 @@ def test_exact_artifact_nouns_promote_only_matching_service_evidence(
             title="Orchid reference",
             path="skills/orchid",
             summary=f"Orchid deployment service reference with {all_nouns}.",
+            entities=["Orchid"],
             search_text=f"orchid deployment service reference {all_nouns}",
         ),
         Artifact(
@@ -237,6 +238,7 @@ def test_exact_artifact_nouns_promote_only_matching_service_evidence(
             title="Orchid operations",
             path="docs/orchid-runbook.md",
             summary="Orchid deployment service runbook and procedure.",
+            entities=["Orchid"],
             search_text="orchid deployment service runbook runbooks procedure procedures",
         ),
         Artifact(
@@ -245,6 +247,7 @@ def test_exact_artifact_nouns_promote_only_matching_service_evidence(
             title="Orchid service documentation",
             path="docs/orchid-reference.md",
             summary="Orchid deployment service doc, document, documentation, and reference.",
+            entities=["Orchid"],
             search_text="orchid deployment service doc docs document documentation reference references",
         ),
         Artifact(
@@ -253,6 +256,7 @@ def test_exact_artifact_nouns_promote_only_matching_service_evidence(
             title="Orchid memory",
             path="memory/orchid.md",
             summary="Orchid deployment service memory.",
+            entities=["Orchid"],
             search_text="orchid deployment service memory memories",
         ),
         Artifact(
@@ -346,7 +350,12 @@ def test_explicit_type_intent_promotes_one_full_match_without_crowding() -> None
         strict=True,
     )
     best_runbook = index_owner._Candidate(
-        {"id": "runbook:orchid", "type": "runbook", "title": "Orchid deployment"},
+        {
+            "id": "runbook:orchid",
+            "type": "runbook",
+            "title": "Orchid deployment",
+            "entities": ["Orchid"],
+        },
         source_tier=1,
         strict=False,
     )
@@ -397,6 +406,39 @@ def test_explicit_type_intent_promotes_one_full_match_without_crowding() -> None
         {"runbook"},
         ["disaster", "recovery"],
     ) == [owner, topic_only_runbook]
+    incident_runbook = index_owner._Candidate(
+        {
+            "id": "runbook:incident-response",
+            "type": "runbook",
+            "title": "Incident response runbook",
+            "path": "docs/incident-response.md",
+        },
+        source_tier=1,
+        strict=True,
+    )
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, incident_runbook],
+        {"runbook"},
+        ["incident", "response"],
+    ) == [owner, incident_runbook]
+    docker_runbooks = [
+        index_owner._Candidate(
+            {
+                "id": f"runbook:docker-{name}",
+                "type": "runbook",
+                "title": f"Docker {name} update",
+                "entities": ["Docker"],
+            },
+            source_tier=1,
+            strict=True,
+        )
+        for name in ("alpha", "beta")
+    ]
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, *docker_runbooks],
+        {"runbook"},
+        ["docker", "update"],
+    ) == [owner, *docker_runbooks]
 
 
 def test_artifact_noun_intent_preserves_generic_quoted_filtered_reference_and_parent_behavior(
@@ -478,3 +520,48 @@ def test_artifact_noun_intent_preserves_generic_quoted_filtered_reference_and_pa
     assert specific_docs[1]["type"] == "skill_support_doc"
     assert len([row for row in specific_docs if row["type"] == "skill_support_doc"]) == 1
     assert index_owner.search_index(db_path, "orchid script", limit=5)[0]["id"] == "skill:orchid"
+
+
+def test_explicit_doc_promotion_selects_eligible_support_sibling_before_diversity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = [
+        Artifact(
+            id="skill:orchid",
+            type="skill",
+            title="Orchid router",
+            path="skills/orchid",
+            summary="Orchid deployment documentation.",
+            entities=["Orchid"],
+            search_text="orchid deployment docs",
+        ),
+        Artifact(
+            id="skill-support:orchid:generic",
+            type="skill_support_doc",
+            title="Orchid deployment docs",
+            path="skills/orchid/references/generic.md",
+            summary="General deployment documentation.",
+            related=["skill:orchid"],
+            search_text="orchid deployment docs",
+        ),
+        Artifact(
+            id="skill-support:orchid:reference",
+            type="skill_support_doc",
+            title="Orchid reference",
+            path="skills/orchid/references/deployment.md",
+            summary="Deployment docs.",
+            entities=["Orchid"],
+            related=["skill:orchid"],
+            search_text="orchid deployment docs",
+        ),
+    ]
+    db_path = build_fixture_index(tmp_path, monkeypatch, artifacts)
+
+    results = index_owner.search_index(db_path, "orchid deployment docs", limit=5)
+
+    assert [row["id"] for row in results[:2]] == [
+        "skill:orchid",
+        "skill-support:orchid:reference",
+    ]
+    assert "skill-support:orchid:generic" not in {row["id"] for row in results}
