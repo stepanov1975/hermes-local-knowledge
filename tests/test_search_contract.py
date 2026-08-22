@@ -370,6 +370,21 @@ def test_explicit_type_intent_promotes_one_full_match_without_crowding() -> None
         {"runbook"},
         ["backup", "operation"],
     ) == [owner, best_runbook]
+    topic_only_runbook = index_owner._Candidate(
+        {
+            "id": "runbook:generic",
+            "type": "runbook",
+            "title": "Generic operations guide",
+            "summary": "Disaster recovery procedure",
+        },
+        source_tier=1,
+        strict=False,
+    )
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, topic_only_runbook],
+        {"runbook"},
+        ["disaster", "recovery"],
+    ) == [owner, topic_only_runbook]
 
 
 def test_artifact_noun_intent_preserves_generic_quoted_filtered_reference_and_parent_behavior(

@@ -1144,6 +1144,18 @@ def _row_specific_hits(row: dict[str, Any], specific_terms: Sequence[str]) -> in
     return _token_hits(set(_query_terms(source, drop_stopwords=False)), specific_terms)
 
 
+def _row_identity_hits(row: dict[str, Any], specific_terms: Sequence[str]) -> int:
+    source = " ".join(
+        [
+            str(row.get("id") or ""),
+            str(row.get("title") or ""),
+            str(row.get("path") or ""),
+            " ".join(row.get("entities") or []),
+        ]
+    )
+    return _token_hits(set(_query_terms(source, drop_stopwords=False)), specific_terms)
+
+
 @dataclass(frozen=True)
 class _Candidate:
     row: dict[str, Any]
@@ -1428,9 +1440,10 @@ def _promote_explicit_type_candidate(
 ) -> list[_Candidate]:
     """Move one strong explicit-type match forward without crowding out its baseline neighbors."""
 
-    if len(specific_terms) < 2 or not any(
-        term not in EXPLICIT_TYPE_GENERIC_TERMS for term in specific_terms
-    ):
+    identity_terms = [
+        term for term in specific_terms if term not in EXPLICIT_TYPE_GENERIC_TERMS
+    ]
+    if len(specific_terms) < 2 or not identity_terms:
         return selected
     target = next(
         (
@@ -1438,6 +1451,7 @@ def _promote_explicit_type_candidate(
             for candidate in selected
             if str(candidate.row.get("type") or "") in requested_types
             and _row_specific_hits(candidate.row, specific_terms) == len(specific_terms)
+            and _row_identity_hits(candidate.row, identity_terms) > 0
         ),
         None,
     )

@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
-- Expanded artifact-type intent with query-terminal, single-noun promotion for runbooks, skills, docs/references, and memory documents. At most one fully matching artifact moves forward, only when at least two high-signal non-type terms remain and at least one is non-generic service/project evidence; mixed, underspecified, generic-only, and conversational noun uses retain baseline ranking. Added a lower-bound implicit consumed-rank diagnostic based on unassisted search baselines.
+- Expanded artifact-type intent with query-terminal, single-noun promotion for runbooks, skills, docs/references, and memory documents. At most one fully matching artifact moves forward, only when at least two high-signal non-type terms remain and at least one non-generic term matches the artifact's identity fields; mixed, underspecified, generic-only, and conversational noun uses retain baseline ranking. Added a lower-bound implicit consumed-rank diagnostic based on unassisted search baselines.
 
 ### Changed
 
