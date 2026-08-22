@@ -1438,9 +1438,21 @@ def _explicit_identity_terms(
         entity_terms = set(
             _query_terms(" ".join(row.get("entities") or []), drop_stopwords=False)
         )
+        identity_terms = set(
+            _query_terms(
+                " ".join(
+                    [
+                        str(row.get("id") or ""),
+                        str(row.get("title") or ""),
+                        str(row.get("path") or ""),
+                    ]
+                ),
+                drop_stopwords=False,
+            )
+        )
         family = _support_parent(row) or str(row.get("id") or "")
         for term in specific_terms:
-            if term in entity_terms:
+            if term in entity_terms and term in identity_terms:
                 families_by_term[term].add(family)
     unique_families = {
         term: next(iter(families))

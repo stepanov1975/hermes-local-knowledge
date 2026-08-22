@@ -421,6 +421,23 @@ def test_explicit_type_intent_promotes_one_full_match_without_crowding() -> None
         {"runbook"},
         ["incident", "response"],
     ) == [owner, incident_runbook]
+    body_only_entity = index_owner._Candidate(
+        {
+            "id": "runbook:lotus-backup",
+            "type": "runbook",
+            "title": "Lotus backup",
+            "path": "docs/lotus-backup.md",
+            "summary": "Do not use this runbook for Orchid backup deployments.",
+            "entities": ["Orchid"],
+        },
+        source_tier=1,
+        strict=True,
+    )
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, body_only_entity],
+        {"runbook"},
+        ["orchid", "backup"],
+    ) == [owner, body_only_entity]
     docker_runbooks = [
         index_owner._Candidate(
             {
