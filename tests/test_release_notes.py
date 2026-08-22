@@ -305,6 +305,15 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert "python -m pip install --upgrade pip build twine" not in workflow
     assert 'repos/${GITHUB_REPOSITORY}/releases/tags/${tag}' in workflow
     assert "--json isImmutable,isDraft,isPrerelease,assets,body" in workflow
+    assert 'if [[ "$release_is_draft" == true ]]' in workflow
+    assert 'if [[ "$expected_sha" != "$HEAD_SHA" ]]' in workflow
+    assert "Draft assets are still mutable" in workflow
+    draft_repair = workflow.split('if [[ "$release_is_draft" == true ]]', maxsplit=1)[1].split(
+        'if [[ "$release_is_immutable" == true', maxsplit=1
+    )[0]
+    assert "build_needed=true" in draft_repair
+    assert "needed=true" in draft_repair
+    assert 'run: git checkout --detach "$EXPECTED_SHA"' in workflow
     assert workflow.count("            --draft \\\n") == 2
     assert 'gh release create "$RELEASE_TAG" dist/*' not in workflow
     assert '"dist/$EXPECTED_WHEEL"' in workflow

@@ -111,6 +111,16 @@ jobs:
             build_needed=$(jq -r '.build_needed' <<<"$release_state")
             needed=$(jq -r '.needed' <<<"$release_state")
 
+            if [[ "$release_is_draft" == true ]]; then
+              if [[ "$expected_sha" != "$HEAD_SHA" ]]; then
+                echo "Draft release ${tag} targets ${expected_sha}, not verified commit ${HEAD_SHA}." >&2
+                exit 1
+              fi
+              # Draft assets are still mutable. Rebuild and replace them from
+              # the verified commit before publication, regardless of names/sizes.
+              build_needed=true
+              needed=true
+            fi
             if [[ "$release_is_immutable" == true && "$build_needed" == true ]]; then
               echo "Immutable release ${tag} is missing an expected asset and cannot be repaired." >&2
               exit 1
@@ -143,13 +153,13 @@ jobs:
             exit 1
           fi
 
-      - name: Check out tagged source for release build or repair
+      - name: Check out verified source for release build or repair
         if: >-
           steps.release.outputs.build_needed == 'true' &&
           steps.release.outputs.tag_exists == 'true'
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: git checkout --detach "$RELEASE_TAG"
+          EXPECTED_SHA: ${{ steps.release.outputs.expected_sha }}
+        run: git checkout --detach "$EXPECTED_SHA"
 
       - name: Build and verify release artifacts
         if: steps.release.outputs.build_needed == 'true'
