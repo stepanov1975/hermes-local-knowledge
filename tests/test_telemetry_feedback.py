@@ -1076,3 +1076,121 @@ def test_usage_report_separates_current_native_search_quality_from_operations(
     assert cohorts["cli_doctor_maintenance"]["count"] == 1
     assert cohorts["current_other_native"]["count"] == 1
     assert cohorts["historical_native_search"]["count"] == 1
+
+
+def test_usage_report_implicit_consumed_rank_lower_bound_uses_current_baselines_only(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    other_root = tmp_path / "other-root"
+    usage_db = tmp_path / "usage.sqlite"
+
+    def search_event(
+        event_root: Path,
+        query: str,
+        baseline: list[str],
+        *,
+        final: list[str] | None = None,
+    ) -> int:
+        final_ids = baseline if final is None else final
+        event_id = telemetry._record_usage(
+            event_root,
+            tool="knowledge_search",
+            success=True,
+            query=query,
+            result_count=len(final_ids),
+            top_ids=final_ids,
+            baseline_top_ids=baseline,
+            usage_db_path=usage_db,
+        )
+        assert event_id is not None
+        return event_id
+
+    def consume(event_root: Path, event_id: int, query: str, artifact_id: str) -> None:
+        assert telemetry.record_implicit_feedback(
+            event_root,
+            search_event_id=event_id,
+            query=query,
+            artifact_id=artifact_id,
+            session_id="session",
+            task_id="task",
+            turn_id="turn",
+            usage_db_path=usage_db,
+        )
+
+    first = search_event(root, "orchid runbook", ["a", "b", "c", "d"])
+    for artifact_id in ("a", "c", "d"):
+        consume(root, first, "orchid runbook", artifact_id)
+    second = search_event(root, "orchid docs", ["x", "y"])
+    consume(root, second, "orchid docs", "y")
+    missing_baseline = search_event(root, "orchid memory", [], final=["missing"])
+    consume(root, missing_baseline, "orchid memory", "missing")
+    malformed_baseline = search_event(root, "orchid malformed", ["malformed"])
+    consume(root, malformed_baseline, "orchid malformed", "malformed")
+    failed = search_event(root, "failed query", ["failed"])
+    consume(root, failed, "failed query", "failed")
+
+    historical = search_event(root, "historical query", ["historical"])
+    consume(root, historical, "historical query", "historical")
+    probe = search_event(root, "demo", ["probe"])
+    consume(root, probe, "demo", "probe")
+    cross_root = search_event(other_root, "other root query", ["other"])
+    consume(other_root, cross_root, "other root query", "other")
+    with sqlite3.connect(usage_db) as connection:
+        connection.execute(
+            "UPDATE usage_events SET plugin_version = '0.1.0' WHERE id = ?",
+            (historical,),
+        )
+        connection.execute(
+            "UPDATE usage_events SET baseline_top_ids_json = ? WHERE id = ?",
+            ('{"unexpected": "malformed"}', malformed_baseline),
+        )
+        connection.execute(
+            "UPDATE usage_events SET success = 0 WHERE id = ?",
+            (failed,),
+        )
+        connection.commit()
+
+    report = telemetry._usage_report(root, days=30, limit=10, usage_db_path=usage_db)
+    diagnostic = report["current_native_search_quality"][
+        "implicit_consumed_rank_lower_bound"
+    ]
+
+    assert diagnostic == {
+        "consumed_artifact_count": 6,
+        "consumed_search_count": 4,
+        "ranked_consumption_count": 4,
+        "unranked_consumption_count": 2,
+        "consumed_at_rank_1": 1,
+        "consumed_in_top_3": 3,
+        "consumed_outside_top_3": 1,
+        "searches_with_consumed_rank_1": 1,
+        "searches_with_consumed_top_3": 2,
+        "median_consumed_rank": 2.5,
+        "rank_distribution": [
+            {"rank": 1, "count": 1},
+            {"rank": 2, "count": 1},
+            {"rank": 3, "count": 1},
+            {"rank": 4, "count": 1},
+        ],
+    }
+
+
+@pytest.mark.parametrize("existing_empty_file", [False, True])
+def test_usage_report_empty_or_missing_db_has_zero_consumed_rank_shape(
+    tmp_path: Path,
+    existing_empty_file: bool,
+) -> None:
+    usage_db = tmp_path / "usage.sqlite"
+    if existing_empty_file:
+        usage_db.touch()
+    report = telemetry._usage_report(
+        tmp_path / "root",
+        days=30,
+        limit=10,
+        usage_db_path=usage_db,
+    )
+
+    assert report["current_native_search_quality"][
+        "implicit_consumed_rank_lower_bound"
+    ] == telemetry._empty_implicit_consumed_rank_lower_bound()

@@ -193,3 +193,248 @@ def test_quoted_fallback_is_strict_for_pure_phrases_and_relaxed_for_mixed_querie
     results = index_owner.search_index(db_path, query, limit=5)
 
     assert {row["id"] for row in results} == expected_ids
+
+
+@pytest.mark.parametrize(
+    ("noun", "expected_id"),
+    [
+        ("runbook", "runbook:orchid"),
+        ("runbooks", "runbook:orchid"),
+        ("skill", "skill:orchid-reference"),
+        ("skills", "skill:orchid-reference"),
+        ("doc", "doc:orchid"),
+        ("docs", "doc:orchid"),
+        ("document", "doc:orchid"),
+        ("documentation", "doc:orchid"),
+        ("reference", "doc:orchid"),
+        ("references", "doc:orchid"),
+        ("memory", "memory:orchid"),
+        ("memories", "memory:orchid"),
+    ],
+)
+def test_exact_artifact_nouns_promote_only_matching_service_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    noun: str,
+    expected_id: str,
+) -> None:
+    all_nouns = (
+        "runbook runbooks procedure procedures skill skills doc docs document documentation "
+        "reference references memory memories"
+    )
+    artifacts = [
+        Artifact(
+            id="skill:orchid-reference",
+            type="skill",
+            title="Orchid reference",
+            path="skills/orchid",
+            summary=f"Orchid deployment service reference with {all_nouns}.",
+            search_text=f"orchid deployment service reference {all_nouns}",
+        ),
+        Artifact(
+            id="runbook:orchid",
+            type="runbook",
+            title="Orchid operations",
+            path="docs/orchid-runbook.md",
+            summary="Orchid deployment service runbook and procedure.",
+            search_text="orchid deployment service runbook runbooks procedure procedures",
+        ),
+        Artifact(
+            id="doc:orchid",
+            type="doc",
+            title="Orchid service documentation",
+            path="docs/orchid-reference.md",
+            summary="Orchid deployment service doc, document, documentation, and reference.",
+            search_text="orchid deployment service doc docs document documentation reference references",
+        ),
+        Artifact(
+            id="memory:orchid",
+            type="memory_doc",
+            title="Orchid memory",
+            path="memory/orchid.md",
+            summary="Orchid deployment service memory.",
+            search_text="orchid deployment service memory memories",
+        ),
+        Artifact(
+            id="runbook:lotus",
+            type="runbook",
+            title="Lotus runbook",
+            path="docs/lotus.md",
+            summary="Lotus service runbook only.",
+            search_text="lotus service runbook runbooks procedure procedures",
+        ),
+    ]
+    db_path = build_fixture_index(tmp_path, monkeypatch, artifacts)
+
+    results = index_owner.search_index(db_path, f"orchid deployment {noun}", limit=5)
+
+    assert results[0]["id"] == expected_id
+    assert [row["id"] for row in results].index("skill:orchid-reference") < next(
+        (index for index, row in enumerate(results) if row["id"] == "runbook:lotus"),
+        len(results),
+    )
+
+
+def test_new_type_intent_requires_one_terminal_artifact_noun() -> None:
+    assert index_owner._requested_operational_types(
+        index_owner._query_terms("local skill installation example")
+    ) == set()
+    assert index_owner._requested_operational_types(
+        index_owner._query_terms("local procedure")
+    ) == set()
+    assert index_owner._requested_operational_types(
+        index_owner._query_terms("paperless cron script runbook")
+    ) == {"cron_job", "script"}
+
+
+@pytest.mark.parametrize(
+    ("query", "artifact_type"),
+    [
+        ("cron", "cron_job"),
+        ("job", "cron_job"),
+        ("jobs", "cron_job"),
+        ("mcp", "mcp_server"),
+    ],
+)
+def test_legacy_type_only_intent_retains_operational_priority(
+    query: str,
+    artifact_type: str,
+) -> None:
+    requested = index_owner._requested_operational_types(index_owner._query_terms(query))
+    operational = index_owner._Candidate(
+        {"id": f"{artifact_type}:target", "type": artifact_type, "title": query},
+        source_tier=0,
+        strict=True,
+    )
+    guide = index_owner._Candidate(
+        {"id": "skill:guide", "type": "skill", "title": query},
+        source_tier=0,
+        strict=True,
+    )
+
+    assert index_owner._operational_tier(operational, requested, []) < index_owner._operational_tier(
+        guide,
+        requested,
+        [],
+    )
+
+
+def test_explicit_type_intent_promotes_one_full_match_without_crowding() -> None:
+    owner = index_owner._Candidate(
+        {"id": "skill:orchid", "type": "skill", "title": "Orchid deployment"},
+        source_tier=0,
+        strict=True,
+    )
+    best_runbook = index_owner._Candidate(
+        {"id": "runbook:orchid", "type": "runbook", "title": "Orchid deployment"},
+        source_tier=1,
+        strict=False,
+    )
+    second_runbook = index_owner._Candidate(
+        {"id": "runbook:orchid-2", "type": "runbook", "title": "Orchid deployment"},
+        source_tier=2,
+        strict=False,
+    )
+
+    promoted = index_owner._promote_explicit_type_candidate(
+        [owner, best_runbook, second_runbook],
+        {"runbook"},
+        ["orchid", "deployment"],
+    )
+
+    assert [candidate.row["id"] for candidate in promoted] == [
+        "runbook:orchid",
+        "skill:orchid",
+        "runbook:orchid-2",
+    ]
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, best_runbook],
+        {"runbook"},
+        ["orchid"],
+    ) == [owner, best_runbook]
+    assert index_owner._promote_explicit_type_candidate(
+        [owner, best_runbook],
+        {"runbook"},
+        ["update", "app", "upgrade", "docker"],
+    ) == [owner, best_runbook]
+
+
+def test_artifact_noun_intent_preserves_generic_quoted_filtered_reference_and_parent_behavior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = [
+        Artifact(
+            id="skill:orchid",
+            type="skill",
+            title="Orchid router",
+            path="skills/orchid",
+            summary="Orchid runbook script and service docs.",
+            search_text="orchid runbook script service docs",
+        ),
+        Artifact(
+            id="skill-support:orchid:reference",
+            type="skill_support_doc",
+            title="Orchid service reference",
+            path="skills/orchid/references/service.md",
+            summary="Orchid service docs.",
+            related=["skill:orchid"],
+            search_text="orchid service docs",
+        ),
+        Artifact(
+            id="skill-support:orchid:appendix",
+            type="skill_support_doc",
+            title="Orchid service appendix",
+            path="skills/orchid/references/appendix.md",
+            summary="Orchid service docs appendix.",
+            related=["skill:orchid"],
+            search_text="orchid service docs appendix",
+        ),
+        Artifact(
+            id="runbook:orchid",
+            type="runbook",
+            title="Orchid runbook",
+            path="docs/orchid.md",
+            summary="Orchid runbook.",
+            search_text="orchid runbook",
+        ),
+        Artifact(
+            id="script:orchid",
+            type="script",
+            title="Orchid script",
+            path="scripts/orchid.py",
+            summary="Orchid script.",
+            search_text="orchid script",
+        ),
+    ]
+    db_path = build_fixture_index(tmp_path, monkeypatch, artifacts)
+
+    assert index_owner.search_index(db_path, "runbook", limit=5)[0]["id"] == "runbook:orchid"
+    underspecified = [
+        row["id"] for row in index_owner.search_index(db_path, "orchid runbook", limit=5)
+    ]
+    with monkeypatch.context() as baseline_patch:
+        baseline_patch.setattr(index_owner, "_requested_operational_types", lambda _terms: set())
+        baseline_patch.setattr(index_owner, "_operational_intent_terms", lambda _terms: set())
+        baseline = [
+            row["id"] for row in index_owner.search_index(db_path, "orchid runbook", limit=5)
+        ]
+    assert underspecified == baseline
+    assert index_owner.search_index(db_path, '"orchid runbook"', limit=5)[0]["id"] == "runbook:orchid"
+    assert {
+        row["type"]
+        for row in index_owner.search_index(
+            db_path,
+            "orchid docs",
+            limit=5,
+            artifact_type="skill_support_doc",
+        )
+    } == {"skill_support_doc"}
+    docs = index_owner.search_index(db_path, "orchid docs", limit=5)
+    assert docs[0]["id"] == "skill:orchid"
+    assert len([row for row in docs if row["type"] == "skill_support_doc"]) == 1
+    specific_docs = index_owner.search_index(db_path, "orchid service docs", limit=5)
+    assert specific_docs[0]["id"] == "skill:orchid"
+    assert specific_docs[1]["type"] == "skill_support_doc"
+    assert len([row for row in specific_docs if row["type"] == "skill_support_doc"]) == 1
+    assert index_owner.search_index(db_path, "orchid script", limit=5)[0]["id"] == "skill:orchid"

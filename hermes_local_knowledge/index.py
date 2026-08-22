@@ -132,8 +132,52 @@ STOPWORDS = {
     "with",
 } | _runtime_stopwords()
 QUERY_STOPWORDS = {"find", "flow", "markdown", "need", "next", "show", "want", "what", "where", "which"}
+LEGACY_ARTIFACT_TYPE_INTENT: dict[str, set[str]] = {
+    "script": {"script"},
+    "cron": {"cron_job"},
+    "job": {"cron_job"},
+    "jobs": {"cron_job"},
+    "mcp": {"mcp_server", "script"},
+    "wrapper": {"mcp_server", "script"},
+}
+EXPLICIT_ARTIFACT_TYPE_INTENT: dict[str, set[str]] = {
+    "runbook": {"runbook"},
+    "skill": {"skill"},
+    "doc": {"doc", "skill_support_doc"},
+    "docs": {"doc", "skill_support_doc"},
+    "document": {"doc", "skill_support_doc"},
+    "documentation": {"doc", "skill_support_doc"},
+    "reference": {"doc", "skill_support_doc"},
+    "memory": {"memory_doc"},
+}
+EXPLICIT_TYPE_GENERIC_TERMS = {
+    "app",
+    "application",
+    "backup",
+    "compose",
+    "configuration",
+    "convention",
+    "deployment",
+    "docker",
+    "endpoint",
+    "guide",
+    "host",
+    "image",
+    "install",
+    "migration",
+    "production",
+    "procedure",
+    "proxy",
+    "resource",
+    "restore",
+    "reverse",
+    "self",
+    "service",
+    "update",
+    "upgrade",
+    "version",
+}
 ROUTING_HINT_TERMS = STOPWORDS | {"automation", "cron", "job", "runbook", "workflow"}
-OPERATIONAL_INTENT_TERMS = {"script", "cron", "job", "jobs", "mcp", "wrapper"}
 PROSE_ARTIFACT_TYPES = {"doc", "runbook", "memory_doc"}
 STRICT_REFERENCE_TYPES = {"skill", "skill_support_doc"}
 
@@ -1055,14 +1099,22 @@ def _type_priority(artifact_type: str) -> int:
 
 def _requested_operational_types(terms: Sequence[str]) -> set[str]:
     requested: set[str] = set()
-    term_set = set(terms)
-    if "script" in term_set:
-        requested.add("script")
-    if term_set & {"cron", "job", "jobs"}:
-        requested.add("cron_job")
-    if term_set & {"mcp", "wrapper"}:
-        requested.update({"mcp_server", "script"})
+    for term in terms:
+        requested.update(LEGACY_ARTIFACT_TYPE_INTENT.get(term, ()))
+    explicit_terms = [term for term in terms if term in EXPLICIT_ARTIFACT_TYPE_INTENT]
+    if not requested and len(explicit_terms) == 1 and terms and terms[-1] == explicit_terms[0]:
+        requested.update(EXPLICIT_ARTIFACT_TYPE_INTENT[explicit_terms[0]])
     return requested
+
+
+def _operational_intent_terms(terms: Sequence[str]) -> set[str]:
+    """Return only type terms that actually activated deterministic promotion."""
+
+    active = {term for term in terms if term in LEGACY_ARTIFACT_TYPE_INTENT}
+    explicit_terms = [term for term in terms if term in EXPLICIT_ARTIFACT_TYPE_INTENT]
+    if not active and len(explicit_terms) == 1 and terms and terms[-1] == explicit_terms[0]:
+        active.add(explicit_terms[0])
+    return active
 
 
 def _row_specific_hits(row: dict[str, Any], specific_terms: Sequence[str]) -> int:
@@ -1356,14 +1408,58 @@ def _rank_group(
     return _select_candidates(expanded)
 
 
+def _promote_explicit_type_candidate(
+    selected: list[_Candidate],
+    requested_types: set[str],
+    specific_terms: Sequence[str],
+) -> list[_Candidate]:
+    """Move one strong explicit-type match forward without crowding out its baseline neighbors."""
+
+    if len(specific_terms) < 2 or not any(
+        term not in EXPLICIT_TYPE_GENERIC_TERMS for term in specific_terms
+    ):
+        return selected
+    target = next(
+        (
+            candidate
+            for candidate in selected
+            if str(candidate.row.get("type") or "") in requested_types
+            and _row_specific_hits(candidate.row, specific_terms) == len(specific_terms)
+        ),
+        None,
+    )
+    if target is None:
+        return selected
+
+    promoted = [target]
+    parent_id = _support_parent(target.row)
+    if parent_id:
+        parent = next(
+            (candidate for candidate in selected if str(candidate.row.get("id") or "") == parent_id),
+            None,
+        )
+        if parent is not None:
+            promoted.insert(0, parent)
+    promoted_ids = {str(candidate.row.get("id") or "") for candidate in promoted}
+    remaining = [
+        candidate
+        for candidate in selected
+        if str(candidate.row.get("id") or "") not in promoted_ids
+    ]
+    return [*promoted, *remaining]
+
+
 def _finalize_candidates(
     candidates: Sequence[_Candidate],
     requested_types: set[str],
     specific_terms: Sequence[str],
+    explicit_type_intent: bool,
     output_limit: int,
 ) -> list[dict[str, Any]]:
     selected = _select_candidates(candidates)
-    if requested_types:
+    if explicit_type_intent:
+        selected = _promote_explicit_type_candidate(selected, requested_types, specific_terms)
+    elif requested_types:
         selected.sort(
             key=lambda candidate: _operational_tier(
                 candidate,
@@ -1414,7 +1510,12 @@ def search_index(
     quoted_only = _is_quoted_only_query(query)
     lift_parents = not exact_query and not type_filter
     requested = set() if exact_query else _requested_operational_types(terms)
-    specific_terms = [term for term in _high_signal_terms(terms) if term not in OPERATIONAL_INTENT_TERMS]
+    active_intent_terms = _operational_intent_terms(terms)
+    explicit_type_intent = any(term in EXPLICIT_ARTIFACT_TYPE_INTENT for term in active_intent_terms)
+    ranking_requested = set() if explicit_type_intent else requested
+    specific_terms = [
+        term for term in _high_signal_terms(terms) if term not in active_intent_terms
+    ]
     candidate_limit = max(output_limit * 20, 100)
 
     connection = connect_readonly(db_path)
@@ -1427,16 +1528,22 @@ def search_index(
                 strict=True,
             ),
             terms,
-            requested,
+            ranking_requested,
             specific_terms,
             lift_parents=lift_parents,
         )
         strict_ids = {str(candidate.row.get("id") or "") for candidate in strict}
         if quoted_only:
-            return _finalize_candidates(strict, requested, specific_terms, output_limit)
+            return _finalize_candidates(
+                strict,
+                requested,
+                specific_terms,
+                explicit_type_intent,
+                output_limit,
+            )
 
         identity: list[_Candidate] = []
-        if not requested:
+        if not requested or explicit_type_intent:
             identity_candidates = _decode_candidates(
                 _query_identity_rows(connection, terms, candidate_limit, type_filter),
                 source_tier=1 if exact_query else 0,
@@ -1451,7 +1558,7 @@ def search_index(
                     if _identity_match_tier(candidate.row, terms) < 3
                 ],
                 terms,
-                requested,
+                ranking_requested,
                 specific_terms,
                 lift_parents=lift_parents,
             )
@@ -1462,6 +1569,7 @@ def search_index(
                 prioritized,
                 requested,
                 specific_terms,
+                explicit_type_intent,
                 output_limit,
             )
 
@@ -1479,7 +1587,7 @@ def search_index(
                 excluded_ids=strict_ids | identity_ids,
             ),
             terms,
-            requested,
+            ranking_requested,
             specific_terms,
             lift_parents=lift_parents,
         )
@@ -1487,6 +1595,7 @@ def search_index(
             [*prioritized, *fallback],
             requested,
             specific_terms,
+            explicit_type_intent,
             output_limit,
         )
     finally:

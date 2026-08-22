@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.12] - 2026-08-22
+
+### Added
+
+- Expanded artifact-type intent with query-terminal, single-noun promotion for runbooks, skills, docs/references, and memory documents. At most one fully matching artifact moves forward, only when at least two high-signal non-type terms remain and at least one is non-generic service/project evidence; mixed, underspecified, generic-only, and conversational noun uses retain baseline ranking. Added a lower-bound implicit consumed-rank diagnostic based on unassisted search baselines.
+
+### Changed
+
+- Made the bounded discovery hint direct local Hermes/homelab questions to `knowledge_search` before broad file search while reminding callers to verify live state.
+
+[0.4.12]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.11...v0.4.12
+
 ## [0.4.11] - 2026-08-21
 
 ### Fixed
