@@ -303,16 +303,25 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert "--verify-complete" in workflow
     assert 'python -m pip install --requirement "$RELEASE_REQUIREMENTS_FILE"' in workflow
     assert "python -m pip install --upgrade pip build twine" not in workflow
-    assert 'repos/${GITHUB_REPOSITORY}/releases/tags/${tag}' in workflow
-    assert "--json isImmutable,isDraft,isPrerelease,assets,body" in workflow
+    assert 'releases?per_page=100&page=${page}' in workflow
+    assert 'select(.tag_name == $tag) | .id' in workflow
+    assert "Multiple releases claim ${tag}; refusing ambiguous repair." in workflow
+    assert 'repos/${GITHUB_REPOSITORY}/releases/tags/${tag}' not in workflow
+    assert "--json isImmutable,isDraft,isPrerelease,assets,body,targetCommitish" in workflow
     assert 'if [[ "$release_is_draft" == true ]]' in workflow
-    assert 'if [[ "$expected_sha" != "$HEAD_SHA" ]]' in workflow
     assert "Draft assets are still mutable" in workflow
     draft_repair = workflow.split('if [[ "$release_is_draft" == true ]]', maxsplit=1)[1].split(
         'if [[ "$release_is_immutable" == true', maxsplit=1
     )[0]
     assert "build_needed=true" in draft_repair
     assert "needed=true" in draft_repair
+    assert 'if [[ "$tag_exists" == false ]]' in draft_repair
+    assert 'expected_sha="$release_target"' in draft_repair
+    assert 'output "expected_sha=${expected_sha}"' in draft_repair
+    assert 'git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"' in draft_repair
+    assert "Untagged draft release" in draft_repair
+    assert "not tag commit" in draft_repair
+    assert "steps.release.outputs.release_is_draft == 'true'" in workflow
     assert 'run: git checkout --detach "$EXPECTED_SHA"' in workflow
     assert workflow.count("            --draft \\\n") == 2
     assert 'gh release create "$RELEASE_TAG" dist/*' not in workflow
@@ -325,6 +334,18 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert "release_is_prerelease == 'true'" in prerelease_repair
     assert "release_is_draft == 'false'" not in prerelease_repair
     assert "Verify draft tag target" in workflow
+    draft_tag_verification = workflow.split("- name: Verify draft tag target", maxsplit=1)[1].split(
+        "- name: Verify draft release content", maxsplit=1
+    )[0]
+    assert "GH_TOKEN: ${{ github.token }}" in draft_tag_verification
+    assert 'git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}"' in (
+        draft_tag_verification
+    )
+    assert 'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs"' in (
+        draft_tag_verification
+    )
+    assert '-f ref="refs/tags/${RELEASE_TAG}"' in draft_tag_verification
+    assert '-f sha="$EXPECTED_SHA"' in draft_tag_verification
     assert 'actual_sha=$(git rev-parse "${RELEASE_TAG}^{commit}")' in workflow
     assert "Verify draft release content" in workflow
     assert ".isDraft == true and .isPrerelease == false" in workflow
