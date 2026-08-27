@@ -9,6 +9,7 @@ Durable product, ranking, privacy, and state rationale for `hermes-local-knowled
 - Runtime dependencies remain standard-library-only. Generated state is local-only.
 - Runtime configuration follows Hermes' context-local active profile before process-wide environment fallbacks; profile state remains isolated by default, while an explicitly shared `state_dir` intentionally combines telemetry and learned feedback.
 - Stable boundaries are the `hermes_local_knowledge.plugin` entry point and `register`, the five documented tools/four hooks, the documented CLI/config behavior, and the eight names in `indexer.__all__`.
+- Model-facing native tool payloads are deliberately thinner than service/CLI data: routine calls expose only actionable routing and improvement evidence, while rich diagnostics stay in local telemetry and operator surfaces.
 
 ## Ownership
 

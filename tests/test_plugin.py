@@ -41,7 +41,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
-    assert hermes_local_knowledge.__version__ == "0.4.12"
+    assert hermes_local_knowledge.__version__ == "0.4.13"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
@@ -55,6 +55,220 @@ def test_packaging_discovery_excludes_mutation_workspace():
     assert find_config["include"] == ["hermes_local_knowledge*"]
     assert "mutants*" in find_config["exclude"]
     assert package_data["hermes_local_knowledge"] == ["skills/*/SKILL.md"]
+
+
+def test_search_handler_does_not_serialize_index_vocabulary_or_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeService:
+        db_path = tmp_path / "index.sqlite"
+
+        def search(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return [
+                {
+                    "id": "skill:target",
+                    "type": "skill",
+                    "title": "target",
+                    "path": "skills/target",
+                    "summary": "Useful routing summary.",
+                    "source": "runtime_skill",
+                    "updated_at": None,
+                    "related": [],
+                    "triggers": [f"internal-term-{index}" for index in range(200)],
+                    "entities": ["Internal"],
+                    "rank": -12.5,
+                }
+            ], {
+                "plugin_version": "999.0",
+                "root": "/private/source",
+                "state_dir": "/private/state",
+                "db_path": "/private/state/index.sqlite",
+                "artifact_count": 999999,
+                "jsonl_sha256": "a" * 64,
+                "warnings": ["Configured source requires operator attention."],
+                "rebuilt": True,
+            }
+
+        def record_usage(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return 17
+
+    monkeypatch.setattr(plugin, "_service", FakeService)
+
+    serialized = plugin._handle_search({"query": "target", "limit": 1})
+    payload = json.loads(serialized)
+
+    assert payload == {
+        "success": True,
+        "results": [
+            {
+                "id": "skill:target",
+                "type": "skill",
+                "title": "target",
+                "path": "skills/target",
+                "summary": "Useful routing summary.",
+                "source": "runtime_skill",
+            }
+        ],
+        "usage_event_id": 17,
+        "rebuilt": True,
+        "warnings": ["Configured source requires operator attention."],
+    }
+    assert len(serialized) < 450
+
+
+def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
+    raw_feedback = {
+        "type": "feedback_wrong_artifact",
+        "id": 73,
+        "rating": "wrong_artifact",
+        "query": "duplicated query",
+        "effective_query": "paperless reviewer",
+        "artifact_id": "skill:wrong",
+        "expected_artifact_id": "skill:right",
+        "note": "Prefer the current owner.",
+        "linkage_quality": "verified_event",
+        "artifact_type": "skill",
+        "feedback_root": "/private/live",
+        "event_root": "/private/live",
+        "event_top_ids_json": '["skill:wrong"]',
+        "event_id": 22,
+        "ts": "2026-08-27T12:00:00Z",
+    }
+    payload = plugin._agent_usage_report(
+        {
+            "success": True,
+            "days": 7,
+            "since": "2026-08-20T12:00:00Z",
+            "live_total_events": 4,
+            "live_feedback_count": 1,
+            "live_implicit_feedback_count": 2,
+            "implicit_feedback_by_consumer": [
+                {"consumer_tool": "knowledge_get", "count": 2, "last_seen": "now"}
+            ],
+            "current_native_search_quality": {
+                "count": 2,
+                "successes": 2,
+                "errors": 0,
+                "zero_results": 0,
+                "root": "/private/live",
+                "top_queries": [
+                    {
+                        "query": "paperless reviewer",
+                        "count": 2,
+                        "avg_results": 3.0,
+                        "last_seen": "now",
+                        "raw_private": "/private/live",
+                    }
+                ],
+            },
+            "route_outcomes": [
+                {
+                    "route_outcome": "already_first",
+                    "count": 1,
+                    "last_seen": "now",
+                    "raw_private": "/private/live",
+                }
+            ],
+            "event_cohorts": [
+                {
+                    "cohort": "current_native_search",
+                    "count": 2,
+                    "successes": 2,
+                    "errors": 0,
+                    "last_seen": "now",
+                    "raw_private": "/private/live",
+                }
+            ],
+            "top_tools": [{"tool": "historical_tool", "count": 99}],
+            "top_artifacts": [{"artifact_id": "skill:historical", "count": 99}],
+            "feedback_rating_buckets": [{"rating": "useful", "count": 99}],
+            "improvement_candidates": [
+                raw_feedback,
+                dict(raw_feedback),
+                {
+                    "type": "zero_result_query",
+                    "query": "missing runbook",
+                    "count": 2,
+                    "last_seen": "now",
+                    "root": "/private/live",
+                },
+                {
+                    "type": "tool_error",
+                    "client": "native",
+                    "tool": "knowledge_search",
+                    "error": "index unavailable",
+                    "count": 1,
+                    "last_seen": "now",
+                    "root": "/private/live",
+                },
+            ],
+        }
+    )
+
+    assert set(payload) == {
+        "success",
+        "window",
+        "event_count",
+        "search_quality",
+        "feedback",
+        "event_cohorts",
+        "improvement_candidates",
+    }
+    assert payload["search_quality"] == {
+        "count": 2,
+        "successes": 2,
+        "errors": 0,
+        "zero_results": 0,
+        "top_queries": [
+            {
+                "query": "paperless reviewer",
+                "count": 2,
+                "avg_results": 3.0,
+                "last_seen": "now",
+            }
+        ],
+        "route_outcomes": [
+            {"route_outcome": "already_first", "count": 1, "last_seen": "now"}
+        ],
+    }
+    assert payload["feedback"] == {
+        "count": 1,
+        "implicit_count": 2,
+        "implicit_feedback_by_consumer": [
+            {"consumer_tool": "knowledge_get", "count": 2, "last_seen": "now"}
+        ],
+    }
+    assert payload["improvement_candidates"] == [
+        {
+            "type": "feedback_wrong_artifact",
+            "query": "paperless reviewer",
+            "feedback_id": 73,
+            "rating": "wrong_artifact",
+            "artifact_id": "skill:wrong",
+            "expected_artifact_id": "skill:right",
+            "note": "Prefer the current owner.",
+            "linkage_quality": "verified_event",
+            "artifact_type": "skill",
+        },
+        {
+            "type": "zero_result_query",
+            "query": "missing runbook",
+            "count": 2,
+            "last_seen": "now",
+        },
+        {
+            "type": "tool_error",
+            "client": "native",
+            "tool": "knowledge_search",
+            "error": "index unavailable",
+            "count": 1,
+            "last_seen": "now",
+        },
+    ]
+    serialized = json.dumps(payload)
+    assert "/private" not in serialized
+    assert "raw_private" not in serialized
 
 
 def make_temp_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -464,8 +678,7 @@ def test_feedback_handler_forwards_verified_fields_and_uses_atomic_usage_event(
         )
     )
 
-    assert payload["feedback_id"] == 41
-    assert payload["usage_event_id"] == 42
+    assert payload == {"success": True, "feedback_id": 41}
     assert captured["expected_artifact_id"] == "skill:accepted"
     assert captured["resolves_feedback_id"] == 9
     assert isinstance(captured["usage_started_at"], float)
@@ -514,8 +727,8 @@ def test_native_search_telemetry_keeps_the_complete_bounded_page(
 
     payload = json.loads(plugin._handle_search({"query": "  exact  spacing  ", "limit": 999}))
 
-    assert payload["limit"] == 30
     assert len(payload["results"]) == 30
+    assert "limit" not in payload
     assert captured["query"] == "exact  spacing"
     assert captured["top_ids"] == [row["id"] for row in rows]
     assert captured["top_types"] == [row["type"] for row in rows]
@@ -901,8 +1114,8 @@ def test_search_get_and_neighbors_build_missing_index_in_state_dir(tmp_path, mon
     )
     assert search["success"] is True
     assert search["rebuilt"] is True
-    assert search["root"] == str(repo.resolve())
-    assert search["state_dir"] == str(state_dir.resolve())
+    assert "root" not in search
+    assert "state_dir" not in search
     assert isinstance(search["usage_event_id"], int)
     ids = [row["id"] for row in search["results"]]
     assert "skill:paperless-review-automation" in ids
@@ -955,9 +1168,9 @@ def test_plugin_service_environment_overrides_hermes_config_yaml(tmp_path, monke
     payload = json.loads(plugin._handle_search({"query": "environment selected", "rebuild": True}))
 
     assert payload["success"] is True
-    assert payload["root"] == str(env_repo.resolve())
-    assert payload["state_dir"] == str(env_state.resolve())
     assert [row["id"] for row in payload["results"]] == ["script:scripts-env-helper-py"]
+    assert "root" not in payload
+    assert "state_dir" not in payload
 
 
 def test_handle_search_uses_one_service_and_records_usage_context(
@@ -1047,7 +1260,6 @@ def test_handler_service_construction_error_stays_in_error_payload(
     assert payload == {
         "error": "knowledge_search failed: RuntimeError: service unavailable",
         "success": False,
-        "usage_event_id": None,
     }
 
 
@@ -1085,7 +1297,6 @@ def test_lookup_error_telemetry_is_fail_open(
     assert payload == {
         "error": "knowledge_search failed: RuntimeError: lookup unavailable",
         "success": False,
-        "usage_event_id": None,
     }
 
 
@@ -1115,7 +1326,7 @@ def test_successful_search_telemetry_is_fail_open(
     payload = json.loads(plugin._handle_search({"query": "demo"}))
 
     assert payload["success"] is True
-    assert payload["usage_event_id"] is None
+    assert "usage_event_id" not in payload
     assert payload["results"] == [{"id": "skill:demo", "type": "skill"}]
 
 
@@ -1158,7 +1369,6 @@ def test_feedback_nonlock_failure_retains_best_effort_error_telemetry(
             "knowledge_feedback failed: OperationalError: feedback unavailable"
         ),
         "success": False,
-        "usage_event_id": 91,
     }
     assert captured["root"] == config.source_root
     usage = captured["kwargs"]
@@ -1211,7 +1421,6 @@ def test_feedback_lock_failure_does_not_open_a_second_telemetry_write(
             "feedback database is temporarily locked; try again"
         ),
         "success": False,
-        "usage_event_id": None,
     }
     assert record_calls == 0
 
@@ -1253,7 +1462,7 @@ def test_explicit_source_root_can_disable_markdown_docs(tmp_path, monkeypatch):
 
     assert payload["success"] is True
     assert payload["results"] == []
-    assert payload["include_markdown_docs_source"] == "config"
+    assert "include_markdown_docs_source" not in payload
 
 
 def test_implicit_hermes_home_source_warns_when_source_checkout_exists(tmp_path, monkeypatch):
@@ -1311,9 +1520,9 @@ def test_empty_usage_report_before_any_lookup_returns_zero_counts(tmp_path, monk
     payload = json.loads(plugin._handle_usage_report({"days": 7, "limit": 5}))
 
     assert payload["success"] is True
-    assert payload["total_events"] == 0
-    assert payload["feedback_count"] == 0
-    assert payload["improvement_candidates"] == []
+    assert payload["event_count"] == 0
+    assert payload["feedback"] == {"count": 0, "implicit_count": 0}
+    assert "improvement_candidates" not in payload
     assert (state_dir / "usage.sqlite").exists()
 
 
@@ -1477,22 +1686,31 @@ def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):
     report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
 
     assert report["success"] is True
-    assert report["total_events"] >= 3
-    assert report["feedback_count"] == 1
-    assert report["live_total_events"] == report["total_events"]
-    assert report["root_breakdown"][0]["root_scope"] == "live"
-    assert any(row["query"] == "zzzzzzzz unlikely" for row in report["zero_result_queries"])
-    assert any(row["query"] == "zzzzzzzz unlikely" for row in report["unresolved_zero_result_queries"])
-    assert any(row["rating"] == "wrong_artifact" for row in report["recent_negative_feedback"])
-    assert any(row["rating"] == "wrong_artifact" for row in report["live_recent_negative_feedback"])
-    assert any(item["type"] == "zero_result_query" for item in report["improvement_candidates"])
-    assert any(item["type"] == "feedback_wrong_artifact" for item in report["improvement_candidates"])
-    assert report["latest_index_metadata"]["plugin_version"] == hermes_local_knowledge.__version__
-    assert report["latest_index_metadata"]["source_root_source"] == "env"
-    assert report["latest_index_metadata"]["index_artifact_count"] >= 3
-    assert report["latest_index_metadata"]["index_artifact_counts"]["skill"] == 2
-    assert report["recent_builds"]
-    assert report["recent_builds"][0]["index_artifact_counts"]["script"] == 1
+    assert report["event_count"] >= 3
+    assert report["feedback"]["count"] == 1
+    candidates = report["improvement_candidates"]
+    zero_candidate = next(item for item in candidates if item["type"] == "zero_result_query")
+    feedback_candidate = next(
+        item for item in candidates if item["type"] == "feedback_wrong_artifact"
+    )
+    assert zero_candidate["query"] == "zzzzzzzz unlikely"
+    assert feedback_candidate["rating"] == "wrong_artifact"
+    assert feedback_candidate["query"] == "paperless review automation"
+    assert set(feedback_candidate) <= {
+        "type",
+        "query",
+        "feedback_id",
+        "rating",
+        "artifact_id",
+        "expected_artifact_id",
+        "note",
+        "linkage_quality",
+        "artifact_type",
+    }
+    assert "top_tools" not in report
+    assert "top_artifacts" not in report
+    assert "latest_index_metadata" not in report
+    assert "recent_builds" not in report
 
 
 def test_usage_report_separates_roots_and_suppresses_resolved_zero_results(tmp_path, monkeypatch):
@@ -1542,7 +1760,7 @@ def test_usage_report_separates_roots_and_suppresses_resolved_zero_results(tmp_p
         usage_db_path=usage_db_path,
     )
 
-    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+    report = LocalKnowledgeService(resolve_config()).usage_report(days=30, limit=10)
 
     scopes = {row["root_scope"]: row for row in report["root_breakdown"]}
     assert scopes["live"]["count"] == 6
@@ -1572,7 +1790,7 @@ def test_usage_report_buckets_unknown_feedback_ratings(tmp_path, monkeypatch):
     lci_telemetry._record_feedback(repo, rating="great", event_id=None, query="", artifact_id="", note="legacy", context={})
     lci_telemetry._record_feedback(repo, rating="other", event_id=None, query="", artifact_id="", note="current", context={})
 
-    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+    report = LocalKnowledgeService(resolve_config()).usage_report(days=30, limit=10)
 
     raw_ratings = {row["rating"]: row["count"] for row in report["feedback_by_rating"]}
     bucketed_ratings = {row["rating"]: row["count"] for row in report["feedback_rating_buckets"]}
@@ -1641,7 +1859,7 @@ def test_usage_report_suppresses_negative_feedback_after_later_useful_feedback(t
         context={},
     )
 
-    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+    report = LocalKnowledgeService(resolve_config()).usage_report(days=30, limit=10)
 
     assert report["live_recent_negative_feedback"][0]["effective_query"] == "stale feedback query"
     assert report["resolved_negative_feedback"][0]["effective_query"] == "stale feedback query"
@@ -1674,7 +1892,7 @@ def test_usage_report_recent_builds_exclude_failed_build_attempts(tmp_path, monk
         },
     )
 
-    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+    report = LocalKnowledgeService(resolve_config()).usage_report(days=30, limit=10)
 
     assert report["recent_builds"]
     assert all(row["rebuilt"] == 1 for row in report["recent_builds"])
@@ -1703,7 +1921,7 @@ def test_usage_report_persists_index_metadata_errors(tmp_path, monkeypatch):
     )
     assert isinstance(event_id, int)
 
-    report = json.loads(plugin._handle_usage_report({"days": 30, "limit": 10}))
+    report = LocalKnowledgeService(resolve_config()).usage_report(days=30, limit=10)
 
     assert report["latest_index_metadata"]["index_exists"] == 1
     assert "malformed database" in report["latest_index_metadata"]["index_metadata_error"]
@@ -1715,7 +1933,9 @@ def test_usage_report_masks_obvious_credentials_only_at_model_boundary(monkeypat
         "total_events": 1,
         "improvement_candidates": [
             {
+                "type": "feedback_other",
                 "id": 73,
+                "rating": "other",
                 "query": (
                     "open https://alex:hunter2@example.test/run "
                     "with api_key=sk-local api_key=\"quoted-local\" "
@@ -1758,6 +1978,6 @@ def test_usage_report_masks_obvious_credentials_only_at_model_boundary(monkeypat
     ):
         assert private_marker not in serialized
     assert "https://" + "<" + "redacted" + ">@example.test/run" in serialized
-    assert payload["improvement_candidates"][0]["id"] == 73
+    assert payload["improvement_candidates"][0]["feedback_id"] == 73
     assert payload["improvement_candidates"][0]["artifact_id"] == "skill:keep-stable-identity"
     assert "hunter2" in raw_report["improvement_candidates"][0]["query"]

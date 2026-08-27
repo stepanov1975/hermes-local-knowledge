@@ -87,9 +87,9 @@ EXPECTED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "knowledge_get": {
         "name": "knowledge_get",
         "description": (
-            "Fetch one artifact from the local capability index by id, including "
-            "its path, summary, triggers, entities, and related artifact ids. Use after "
-            "knowledge_search returns an artifact id. Usage is logged locally."
+            "Fetch concise routing metadata for one artifact from the local capability "
+            "index by id. Use after knowledge_search returns an artifact id. Usage is "
+            "logged locally."
         ),
         "parameters": {
             "type": "object",
@@ -217,8 +217,9 @@ EXPECTED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "knowledge_usage_report": {
         "name": "knowledge_usage_report",
         "description": (
-            "Summarize local knowledge tool usage and feedback to guide self-improvement. "
-            "Use before changing index ranking, triggers, docs, or graph edges."
+            "Return a concise summary of local knowledge usage, search quality, feedback, "
+            "and repair candidates. Use before changing index ranking, triggers, docs, "
+            "or graph edges."
         ),
         "parameters": {
             "type": "object",
@@ -262,6 +263,16 @@ ARTIFACT_RESULT_KEYS = {
     "source",
 }
 SEARCH_RESULT_KEYS = ARTIFACT_RESULT_KEYS | {"rank"}
+MODEL_ARTIFACT_RESULT_KEYS = {
+    "id",
+    "type",
+    "title",
+    "path",
+    "summary",
+    "source",
+    "related",
+}
+MODEL_NEIGHBOR_RESULT_KEYS = MODEL_ARTIFACT_RESULT_KEYS | {"edge_kind", "edge_evidence"}
 BASE_INDEX_METADATA_KEYS = {
     "plugin_version",
     "root",
@@ -751,79 +762,47 @@ def test_registered_handlers_return_stable_json_success_envelopes(workspace: Wor
         session_id="public-contract-session",
         api_request_id="public-contract-request",
     )
-    assert set(search) == {
-        "success",
-        "query",
-        "artifact_type",
-        "limit",
-        "results",
-        "usage_event_id",
-        "build_duration_ms",
-        *BASE_INDEX_METADATA_KEYS,
-        *PERSISTED_INDEX_METADATA_KEYS,
-    }
+    assert set(search) == {"success", "results", "usage_event_id", "rebuilt"}
     assert search["success"] is True
-    assert search["query"] == "quartz inventory operations"
-    assert search["artifact_type"] is None
-    assert search["limit"] == 5
     assert isinstance(search["usage_event_id"], int)
     with sqlite3.connect(workspace.state_dir / "usage.sqlite") as connection:
         assert connection.execute(
             "SELECT api_request_id FROM usage_events WHERE id = ?",
             (search["usage_event_id"],),
         ).fetchone() == ("public-contract-request",)
-    assert search["root"] == str(workspace.root.resolve())
-    assert search["state_dir"] == str(workspace.state_dir.resolve())
-    assert search["source_root_source"] == "env"
-    assert search["state_dir_source"] == "env"
     assert search["rebuilt"] is True
-    assert search["index_exists"] is True
-    assert search["index_format_version"] == search["expected_index_format_version"]
-    assert search["artifact_counts_by_type"] == {"skill": 2}
     assert search["results"][0]["id"] == "skill:quartz-router"
-    assert set(search["results"][0]) == SEARCH_RESULT_KEYS
+    assert set(search["results"][0]) == MODEL_ARTIFACT_RESULT_KEYS
 
     fetched = invoke_tool(
         ctx,
         "knowledge_get",
         {"artifact_id": "skill:quartz-router", "include_neighbors": True},
     )
-    assert set(fetched) == {
-        "success",
-        "artifact",
-        "neighbors",
-        "usage_event_id",
-        *BASE_INDEX_METADATA_KEYS,
-        *PERSISTED_INDEX_METADATA_KEYS,
-    }
+    assert set(fetched) == {"success", "artifact", "neighbors", "usage_event_id"}
     assert fetched["success"] is True
     assert fetched["artifact"]["id"] == "skill:quartz-router"
-    assert set(fetched["artifact"]) == ARTIFACT_RESULT_KEYS
+    assert set(fetched["artifact"]) == MODEL_ARTIFACT_RESULT_KEYS
     assert isinstance(fetched["usage_event_id"], int)
     assert [row["id"] for row in fetched["neighbors"]] == ["skill:quartz-helper"]
-    assert set(fetched["neighbors"][0]) == ARTIFACT_RESULT_KEYS | {"edge_kind", "edge_evidence"}
+    assert set(fetched["neighbors"][0]) <= MODEL_NEIGHBOR_RESULT_KEYS
+    assert {"id", "type", "title", "path", "summary", "source", "edge_kind"} <= set(
+        fetched["neighbors"][0]
+    )
+    assert fetched["neighbors"][0]["edge_evidence"] == "skill:quartz-helper"
 
     neighbors = invoke_tool(ctx, "knowledge_neighbors", {"artifact_id": "skill:quartz-router"})
-    assert set(neighbors) == {
-        "success",
-        "artifact_id",
-        "neighbors",
-        "limit",
-        "usage_event_id",
-        *BASE_INDEX_METADATA_KEYS,
-        *PERSISTED_INDEX_METADATA_KEYS,
-    }
+    assert set(neighbors) == {"success", "neighbors", "usage_event_id"}
     assert neighbors["success"] is True
-    assert neighbors["artifact_id"] == "skill:quartz-router"
-    assert neighbors["limit"] == 20
     assert isinstance(neighbors["usage_event_id"], int)
     assert [row["id"] for row in neighbors["neighbors"]] == ["skill:quartz-helper"]
+    assert neighbors["neighbors"][0]["edge_evidence"] == "skill:quartz-helper"
 
     option_cases: list[tuple[str, dict[str, Any], dict[str, Any], tuple[str, ...]]] = [
         (
             "knowledge_search",
             {"query": "quartz", "artifact_type": "script", "rebuild": False},
-            {"artifact_type": "script", "results": [], "rebuilt": False},
+            {"results": []},
             (),
         ),
         (
@@ -835,7 +814,7 @@ def test_registered_handlers_return_stable_json_success_envelopes(workspace: Wor
         (
             "knowledge_neighbors",
             {"artifact_id": "skill:quartz-router", "limit": 1, "rebuild": True},
-            {"limit": 1, "rebuilt": True},
+            {"rebuilt": True},
             (),
         ),
     ]
@@ -858,28 +837,24 @@ def test_registered_handlers_return_stable_json_success_envelopes(workspace: Wor
             "note": "public fixture routed correctly",
         },
     )
-    assert set(feedback) == {
-        "success",
-        "feedback_id",
-        "usage_event_id",
-        "rating",
-        "event_id",
-        "usage_db_path",
-    }
+    assert set(feedback) == {"success", "feedback_id"}
     assert feedback["success"] is True
     assert isinstance(feedback["feedback_id"], int)
-    assert isinstance(feedback["usage_event_id"], int)
-    assert feedback["event_id"] == search["usage_event_id"]
-    assert feedback["usage_db_path"] == str(workspace.state_dir.resolve() / "usage.sqlite")
 
     report = invoke_tool(ctx, "knowledge_usage_report", {"days": 30, "limit": 10})
-    assert set(report) == USAGE_REPORT_KEYS
+    assert set(report) == {
+        "success",
+        "window",
+        "event_count",
+        "search_quality",
+        "feedback",
+        "event_cohorts",
+        "improvement_candidates",
+    }
     assert report["success"] is True
-    assert report["total_events"] == 7
-    assert report["live_total_events"] == 7
-    assert report["feedback_count"] == 1
-    assert report["live_feedback_count"] == 1
-    assert isinstance(report["usage_event_id"], int)
+    assert report["event_count"] == 7
+    assert report["feedback"]["count"] == 1
+
 
 
 def test_registered_handlers_keep_expected_bad_input_inside_error_envelopes(
@@ -915,7 +890,8 @@ def test_registered_handlers_keep_expected_bad_input_inside_error_envelopes(
         {"query": "quartz inventory", "limit": "not-an-integer", "rebuild": []},
     )
     assert coerced["success"] is True
-    assert coerced["limit"] == 8
+    assert len(coerced["results"]) <= 8
+    assert "limit" not in coerced
     assert isinstance(coerced["usage_event_id"], int)
 
     missing = invoke_tool(ctx, "knowledge_get", {"artifact_id": "skill:missing"})
@@ -2522,23 +2498,37 @@ def test_usage_sqlite_schema_report_rows_and_public_keys(
             f"SELECT {feedback_columns} FROM feedback WHERE id = 5001"
         ).fetchone() == seeded_feedback
 
-    assert set(report) == USAGE_REPORT_KEYS
-    assert report["total_events"] >= 4
-    assert report["feedback_count"] == 2
-    assert any(row["query"] == "seeded historical quartz" for row in report["top_queries"])
+    assert report["success"] is True
+    assert report["event_count"] >= 4
+    assert report["feedback"]["count"] == 2
+    assert "usage_db_path" not in report
+    assert "latest_index_metadata" not in report
+    assert "recent_builds" not in report
+
+    raw_report = plugin._service().usage_report(days=30, limit=10)
+    assert set(raw_report) == USAGE_REPORT_KEYS - {"usage_event_id"}
+    assert raw_report["total_events"] >= 4
+    assert raw_report["feedback_count"] == 2
+    assert any(
+        row["query"] == "seeded historical quartz" for row in raw_report["top_queries"]
+    )
     assert any(
         row["rating"] == "useful" and row["count"] == 2
-        for row in report["feedback_by_rating"]
+        for row in raw_report["feedback_by_rating"]
     )
-    assert set(report["root_breakdown"][0]) == {
+    assert set(raw_report["root_breakdown"][0]) == {
         "root_scope",
         "count",
         "successes",
         "errors",
         "last_seen",
     }
-    assert set(report["feedback_root_breakdown"][0]) == {"root_scope", "count", "last_seen"}
-    assert set(report["top_tools"][0]) == {
+    assert set(raw_report["feedback_root_breakdown"][0]) == {
+        "root_scope",
+        "count",
+        "last_seen",
+    }
+    assert set(raw_report["top_tools"][0]) == {
         "client",
         "tool",
         "count",
@@ -2546,11 +2536,20 @@ def test_usage_sqlite_schema_report_rows_and_public_keys(
         "errors",
         "avg_latency_ms",
     }
-    assert set(report["top_queries"][0]) == {"query", "count", "avg_results", "last_seen"}
-    assert set(report["top_artifacts"][0]) == {"artifact_id", "count", "last_seen"}
-    assert set(report["feedback_by_rating"][0]) == {"rating", "count", "last_seen"}
-    assert set(report["feedback_rating_buckets"][0]) == {"rating", "count", "last_seen"}
-    assert set(report["latest_index_metadata"]) == {
+    assert set(raw_report["top_queries"][0]) == {
+        "query",
+        "count",
+        "avg_results",
+        "last_seen",
+    }
+    assert set(raw_report["top_artifacts"][0]) == {"artifact_id", "count", "last_seen"}
+    assert set(raw_report["feedback_by_rating"][0]) == {"rating", "count", "last_seen"}
+    assert set(raw_report["feedback_rating_buckets"][0]) == {
+        "rating",
+        "count",
+        "last_seen",
+    }
+    assert set(raw_report["latest_index_metadata"]) == {
         "id",
         "ts",
         "client",
@@ -2571,7 +2570,7 @@ def test_usage_sqlite_schema_report_rows_and_public_keys(
         "rebuilt",
         "index_artifact_counts",
     }
-    assert set(report["recent_builds"][0]) == {
+    assert set(raw_report["recent_builds"][0]) == {
         "id",
         "ts",
         "client",

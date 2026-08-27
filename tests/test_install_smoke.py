@@ -196,8 +196,6 @@ tags: [demo, reusable]
                 "success": payload["success"],
                 "rebuilt": payload["rebuilt"],
                 "ids": [row["id"] for row in payload["results"]],
-                "root": payload["root"],
-                "state_dir": payload["state_dir"],
                 "module_files": module_files,
             }, sort_keys=True))
             """
@@ -212,8 +210,6 @@ tags: [demo, reusable]
     assert payload["success"] is True
     assert payload["rebuilt"] is True
     assert "skill:demo-local" in payload["ids"]
-    assert payload["root"] == str(source_root.resolve())
-    assert payload["state_dir"] == str(state_dir.resolve())
     assert (state_dir / "index.sqlite").exists()
     assert (state_dir / "usage.sqlite").exists()
     assert not (source_root / "knowledge" / "index.sqlite").exists()
