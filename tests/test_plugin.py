@@ -186,6 +186,7 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
             "improvement_candidates": [
                 raw_feedback,
                 dict(raw_feedback),
+                {**raw_feedback, "type": "correction_candidate", "id": 74},
                 {
                     "type": "zero_result_query",
                     "query": "missing runbook",
@@ -244,6 +245,17 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
             "type": "feedback_wrong_artifact",
             "query": "paperless reviewer",
             "feedback_id": 73,
+            "rating": "wrong_artifact",
+            "artifact_id": "skill:wrong",
+            "expected_artifact_id": "skill:right",
+            "note": "Prefer the current owner.",
+            "linkage_quality": "verified_event",
+            "artifact_type": "skill",
+        },
+        {
+            "type": "correction_candidate",
+            "query": "paperless reviewer",
+            "feedback_id": 74,
             "rating": "wrong_artifact",
             "artifact_id": "skill:wrong",
             "expected_artifact_id": "skill:right",

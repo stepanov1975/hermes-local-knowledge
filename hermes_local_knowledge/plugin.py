@@ -289,7 +289,7 @@ def _agent_improvement_candidate(row: Mapping[str, Any]) -> dict[str, Any]:
             "type": candidate_type,
             **_nonempty_projection(row, ("client", "tool", "error", "count", "last_seen")),
         }
-    if candidate_type.startswith("feedback_"):
+    if candidate_type.startswith("feedback_") or candidate_type == "correction_candidate":
         query = row.get("effective_query") or row.get("query")
         candidate = {
             "type": candidate_type,
