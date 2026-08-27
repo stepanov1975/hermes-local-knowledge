@@ -1208,11 +1208,13 @@ def _usage_report(
                 "last_seen": None,
                 "top_queries": [],
                 "zero_result_queries": [],
+                "active_zero_result_queries": [],
                 "errors_by_message": [],
                 "route_outcomes": [],
                 "route_verification_failures": [],
                 "implicit_consumed_rank_lower_bound": _empty_implicit_consumed_rank_lower_bound(),
             },
+            "current_native_errors": [],
             "event_cohorts": [],
             "root_breakdown": [],
             "feedback_root_breakdown": [],
@@ -1350,9 +1352,25 @@ def _usage_report(
               AND COALESCE(result_count, 0) = 0 AND query IS NOT NULL
             GROUP BY query
             ORDER BY count DESC, last_seen DESC
-            LIMIT ?
             """,
-            (since, root_text, __version__, *probe_queries, limit),
+            (since, root_text, __version__, *probe_queries),
+        )
+        current_search_successful_queries = _rows(
+            conn,
+            f"""
+            SELECT query, MAX(ts) AS last_success, MAX(result_count) AS max_result_count
+            FROM usage_events
+            WHERE {current_search_where} AND success = 1
+              AND COALESCE(result_count, 0) > 0 AND query IS NOT NULL
+            GROUP BY query
+            """,
+            (since, root_text, __version__, *probe_queries),
+        )
+        current_active_zero_result_queries, _current_resolved_zero_result_queries = (
+            _split_resolved_zero_results(
+                current_search_zero_results,
+                current_search_successful_queries,
+            )
         )
         current_search_errors = _rows(
             conn,
@@ -1361,6 +1379,23 @@ def _usage_report(
             FROM usage_events
             WHERE {current_search_where} AND success = 0 AND error IS NOT NULL
             GROUP BY error
+            ORDER BY count DESC, last_seen DESC
+            LIMIT ?
+            """,
+            (since, root_text, __version__, *probe_queries, limit),
+        )
+        current_native_errors = _rows(
+            conn,
+            f"""
+            SELECT tool, error, COUNT(*) AS count, MAX(ts) AS last_seen
+            FROM usage_events
+            WHERE ts >= ? AND root = ? AND client = 'native' AND plugin_version = ?
+              AND success = 0 AND error IS NOT NULL
+              AND NOT (
+                  tool = 'knowledge_search'
+                  AND LOWER(TRIM(COALESCE(query, ''))) IN ({probe_placeholders})
+              )
+            GROUP BY tool, error
             ORDER BY count DESC, last_seen DESC
             LIMIT ?
             """,
@@ -1408,7 +1443,8 @@ def _usage_report(
             "avg_latency_ms": current_search_row["avg_latency_ms"],
             "last_seen": current_search_row["last_seen"],
             "top_queries": current_search_top_queries,
-            "zero_result_queries": current_search_zero_results,
+            "zero_result_queries": current_search_zero_results[:limit],
+            "active_zero_result_queries": current_active_zero_result_queries[:limit],
             "errors_by_message": current_search_errors,
             "route_outcomes": current_search_route_outcomes,
             "route_verification_failures": current_search_route_verification_failures,
@@ -1962,6 +1998,7 @@ def _usage_report(
         "live_implicit_feedback_count": live_implicit_feedback_count,
         "implicit_feedback_by_consumer": implicit_feedback_by_consumer,
         "current_native_search_quality": current_native_search_quality,
+        "current_native_errors": current_native_errors,
         "event_cohorts": event_cohorts,
         "avg_latency_ms": None if avg_latency is None else round(float(avg_latency), 1),
         "root_breakdown": root_breakdown,

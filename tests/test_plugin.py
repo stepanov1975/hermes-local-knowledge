@@ -170,6 +170,20 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
                 ],
                 "zero_result_queries": [
                     {
+                        "query": "resolved runbook",
+                        "count": 1,
+                        "last_seen": "old",
+                        "raw_private": "/private/live",
+                    },
+                    {
+                        "query": "missing runbook",
+                        "count": 2,
+                        "last_seen": "now",
+                        "raw_private": "/private/live",
+                    },
+                ],
+                "active_zero_result_queries": [
+                    {
                         "query": "missing runbook",
                         "count": 2,
                         "last_seen": "now",
@@ -203,6 +217,22 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
                     }
                 ],
             },
+            "current_native_errors": [
+                {
+                    "tool": "knowledge_search",
+                    "error": "index unavailable",
+                    "count": 1,
+                    "last_seen": "now",
+                    "raw_private": "/private/live",
+                },
+                {
+                    "tool": "knowledge_get",
+                    "error": "artifact lookup failed",
+                    "count": 1,
+                    "last_seen": "now",
+                    "raw_private": "/private/live",
+                },
+            ],
             "route_outcomes": [
                 {
                     "route_outcome": "historical_probe",
@@ -320,6 +350,14 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
             "client": "native",
             "tool": "knowledge_search",
             "error": "index unavailable",
+            "count": 1,
+            "last_seen": "now",
+        },
+        {
+            "type": "tool_error",
+            "client": "native",
+            "tool": "knowledge_get",
+            "error": "artifact lookup failed",
             "count": 1,
             "last_seen": "now",
         },

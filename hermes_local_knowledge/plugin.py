@@ -337,7 +337,11 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(search_quality_raw, Mapping):
         for source_field, target_field, fields in (
             ("top_queries", "top_queries", ("query", "count", "avg_results", "last_seen")),
-            ("zero_result_queries", "zero_result_queries", ("query", "count", "last_seen")),
+            (
+                "active_zero_result_queries",
+                "zero_result_queries",
+                ("query", "count", "last_seen"),
+            ),
             ("errors_by_message", "errors_by_message", ("error", "count", "last_seen")),
         ):
             rows = _project_rows(search_quality_raw.get(source_field), fields)
@@ -446,7 +450,7 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
                     add_candidate(row)
 
     if isinstance(search_quality_raw, Mapping):
-        zero_rows = search_quality_raw.get("zero_result_queries")
+        zero_rows = search_quality_raw.get("active_zero_result_queries")
         if isinstance(zero_rows, list):
             for row in zero_rows:
                 if isinstance(row, Mapping):
@@ -463,6 +467,11 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
                             **row,
                         }
                     )
+    current_native_error_rows = report.get("current_native_errors")
+    if isinstance(current_native_error_rows, list):
+        for row in current_native_error_rows:
+            if isinstance(row, Mapping):
+                add_candidate({"type": "tool_error", "client": "native", **row})
 
     window = _nonempty_projection(report, ("days", "since"))
     payload: dict[str, Any] = {

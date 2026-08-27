@@ -1388,11 +1388,55 @@ def test_current_search_route_details_exclude_probes_and_historical_versions(
         route_outcome="promoted_retry",
         usage_db_path=usage_db,
     )
+    resolved_zero_id = telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="resolved zero",
+        result_count=0,
+        usage_db_path=usage_db,
+    )
+    telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="resolved zero",
+        result_count=1,
+        usage_db_path=usage_db,
+    )
+    telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="active zero",
+        result_count=0,
+        usage_db_path=usage_db,
+    )
+    telemetry._record_usage(
+        root,
+        tool="knowledge_get",
+        success=False,
+        error="artifact lookup failed",
+        usage_db_path=usage_db,
+    )
+    historical_error_id = telemetry._record_usage(
+        root,
+        tool="knowledge_neighbors",
+        success=False,
+        error="historical neighbor failure",
+        usage_db_path=usage_db,
+    )
     assert historical_id is not None
+    assert historical_error_id is not None
+    assert resolved_zero_id is not None
     with sqlite3.connect(usage_db) as connection:
         connection.execute(
-            "UPDATE usage_events SET plugin_version = '0.0.0' WHERE id = ?",
-            (historical_id,),
+            "UPDATE usage_events SET plugin_version = '0.0.0' WHERE id IN (?, ?)",
+            (historical_id, historical_error_id),
+        )
+        connection.execute(
+            "UPDATE usage_events SET ts = datetime('now', '-1 minute') WHERE id = ?",
+            (resolved_zero_id,),
         )
 
     report = telemetry._usage_report(root, days=30, limit=10, usage_db_path=usage_db)
@@ -1405,6 +1449,18 @@ def test_current_search_route_details_exclude_probes_and_historical_versions(
     assert [row["count"] for row in current["route_outcomes"]] == [1, 1]
     assert len(current["route_verification_failures"]) == 1
     assert current["route_verification_failures"][0]["query"] == "current verification"
+    assert [row["query"] for row in current["active_zero_result_queries"]] == ["active zero"]
+    assert len(report["current_native_errors"]) == 1
+    assert {
+        key: value
+        for key, value in report["current_native_errors"][0].items()
+        if key != "last_seen"
+    } == {
+        "tool": "knowledge_get",
+        "error": "artifact lookup failed",
+        "count": 1,
+    }
+    assert report["current_native_errors"][0]["last_seen"]
     assert {row["route_outcome"] for row in report["route_outcomes"]} == {
         "promoted_existing",
         "promoted_retry",
