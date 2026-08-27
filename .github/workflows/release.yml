@@ -38,6 +38,37 @@ jobs:
           output() {
             printf '%s\n' "$@" >> "$GITHUB_OUTPUT"
           }
+          version_at_commit() {
+            python - "$1" <<'PY'
+          import re
+          import subprocess
+          import sys
+          import tomllib
+
+          sha = sys.argv[1]
+
+          def show(path: str) -> str:
+              return subprocess.run(
+                  ["git", "show", f"{sha}:{path}"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+
+          project_version = tomllib.loads(show("pyproject.toml"))["project"]["version"]
+          plugin_match = re.search(r"(?m)^version:\s*['\"]?([^\s'\"]+)", show("plugin.yaml"))
+          package_match = re.search(
+              r"(?m)^__version__\s*=\s*['\"]([^'\"]+)",
+              show("hermes_local_knowledge/__init__.py"),
+          )
+          if plugin_match is None or package_match is None:
+              raise SystemExit("Could not read all target version metadata")
+          versions = {project_version, plugin_match.group(1), package_match.group(1)}
+          if len(versions) != 1:
+              raise SystemExit(f"Target version metadata is not synchronized: {sorted(versions)}")
+          print(project_version)
+          PY
+          }
           cp requirements-release.txt "$RELEASE_REQUIREMENTS_FILE"
           version=$(python - <<'PY'
           import pathlib
@@ -125,16 +156,28 @@ jobs:
               "release_is_prerelease=${release_is_prerelease}"
 
             if [[ "$release_is_draft" == true ]]; then
+              recover_tag=false
               if [[ "$tag_exists" == false ]]; then
                 if [[ ! "$release_target" =~ ^[0-9a-f]{40}$ ]]; then
                   echo "Untagged draft release ${tag} has non-immutable target ${release_target}." >&2
                   exit 1
                 fi
                 expected_sha="$release_target"
-                if ! git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"; then
-                  echo "Draft release ${tag} target ${expected_sha} is not an ancestor of ${HEAD_SHA}." >&2
-                  exit 1
-                fi
+                recover_tag=true
+              elif [[ "$release_target" =~ ^[0-9a-f]{40}$ && "$release_target" != "$expected_sha" ]]; then
+                echo "Draft release ${tag} targets ${release_target}, not tag commit ${expected_sha}." >&2
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"; then
+                echo "Draft release ${tag} target ${expected_sha} is not an ancestor of ${HEAD_SHA}." >&2
+                exit 1
+              fi
+              target_version=$(version_at_commit "$expected_sha")
+              if [[ "$target_version" != "$version" ]]; then
+                echo "Draft release ${tag} target version ${target_version} does not match ${version}." >&2
+                exit 1
+              fi
+              if [[ "$recover_tag" == true ]]; then
                 gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
                   -f ref="refs/tags/${tag}" \
                   -f sha="$expected_sha" >/dev/null
@@ -151,13 +194,6 @@ jobs:
                   --version "$version" \
                   --changelog "$notes_changelog" \
                   --output "$RELEASE_NOTES_FILE"
-              elif [[ "$release_target" =~ ^[0-9a-f]{40}$ && "$release_target" != "$expected_sha" ]]; then
-                echo "Draft release ${tag} targets ${release_target}, not tag commit ${expected_sha}." >&2
-                exit 1
-              fi
-              if ! git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"; then
-                echo "Draft release ${tag} target ${expected_sha} is not an ancestor of ${HEAD_SHA}." >&2
-                exit 1
               fi
             fi
 

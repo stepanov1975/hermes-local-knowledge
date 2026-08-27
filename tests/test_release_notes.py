@@ -320,9 +320,15 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert 'expected_sha="$release_target"' in draft_repair
     assert 'output "tag_exists=${tag_exists}" "expected_sha=${expected_sha}"' in draft_repair
     assert 'git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"' in draft_repair
+    assert 'target_version=$(version_at_commit "$expected_sha")' in draft_repair
+    assert '"$target_version" != "$version"' in draft_repair
+    assert "target version ${target_version} does not match ${version}" in draft_repair
     assert "Untagged draft release" in draft_repair
     assert "not tag commit" in draft_repair
     assert 'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs"' in draft_repair
+    assert draft_repair.index('target_version=$(version_at_commit "$expected_sha")') < (
+        draft_repair.index('gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs"')
+    )
     assert 'git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"' in draft_repair
     assert 'git show "${expected_sha}:CHANGELOG.md"' in draft_repair
     assert 'git show "${expected_sha}:scripts/render_release_notes.py"' in draft_repair
