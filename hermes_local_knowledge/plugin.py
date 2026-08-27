@@ -425,18 +425,44 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
 
     candidates: list[dict[str, Any]] = []
     seen_candidates: set[str] = set()
-    raw_candidates = report.get("improvement_candidates")
-    if isinstance(raw_candidates, list):
-        for row in raw_candidates:
-            if not isinstance(row, Mapping):
-                continue
-            candidate = _agent_improvement_candidate(row)
-            if not candidate:
-                continue
-            identity = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
-            if identity not in seen_candidates:
-                seen_candidates.add(identity)
-                candidates.append(candidate)
+
+    def add_candidate(row: Mapping[str, Any]) -> None:
+        candidate = _agent_improvement_candidate(row)
+        if not candidate:
+            return
+        identity = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+        if identity not in seen_candidates:
+            seen_candidates.add(identity)
+            candidates.append(candidate)
+
+    for source_field in (
+        "unresolved_negative_with_current_expected_target",
+        "unresolved_negative_without_current_expected_target",
+    ):
+        feedback_rows = report.get(source_field)
+        if isinstance(feedback_rows, list):
+            for row in feedback_rows:
+                if isinstance(row, Mapping):
+                    add_candidate(row)
+
+    if isinstance(search_quality_raw, Mapping):
+        zero_rows = search_quality_raw.get("zero_result_queries")
+        if isinstance(zero_rows, list):
+            for row in zero_rows:
+                if isinstance(row, Mapping):
+                    add_candidate({"type": "zero_result_query", **row})
+        error_rows = search_quality_raw.get("errors_by_message")
+        if isinstance(error_rows, list):
+            for row in error_rows:
+                if isinstance(row, Mapping):
+                    add_candidate(
+                        {
+                            "type": "tool_error",
+                            "client": "native",
+                            "tool": "knowledge_search",
+                            **row,
+                        }
+                    )
 
     window = _nonempty_projection(report, ("days", "since"))
     payload: dict[str, Any] = {

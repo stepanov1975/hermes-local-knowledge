@@ -136,6 +136,12 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
         "event_id": 22,
         "ts": "2026-08-27T12:00:00Z",
     }
+    correction_feedback = {
+        **raw_feedback,
+        "type": "correction_candidate",
+        "candidate_kind": "correction_candidate",
+        "id": 74,
+    }
     payload = plugin._agent_usage_report(
         {
             "success": True,
@@ -158,6 +164,22 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
                         "query": "paperless reviewer",
                         "count": 2,
                         "avg_results": 3.0,
+                        "last_seen": "now",
+                        "raw_private": "/private/live",
+                    }
+                ],
+                "zero_result_queries": [
+                    {
+                        "query": "missing runbook",
+                        "count": 2,
+                        "last_seen": "now",
+                        "raw_private": "/private/live",
+                    }
+                ],
+                "errors_by_message": [
+                    {
+                        "error": "index unavailable",
+                        "count": 1,
                         "last_seen": "now",
                         "raw_private": "/private/live",
                     }
@@ -202,31 +224,15 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
             "top_tools": [{"tool": "historical_tool", "count": 99}],
             "top_artifacts": [{"artifact_id": "skill:historical", "count": 99}],
             "feedback_rating_buckets": [{"rating": "useful", "count": 99}],
+            "unresolved_negative_with_current_expected_target": [correction_feedback],
+            "unresolved_negative_without_current_expected_target": [raw_feedback],
             "improvement_candidates": [
-                raw_feedback,
-                dict(raw_feedback),
-                {
-                    **raw_feedback,
-                    "type": "correction_candidate",
-                    "candidate_kind": "correction_candidate",
-                    "id": 74,
-                },
                 {
                     "type": "zero_result_query",
-                    "query": "missing runbook",
-                    "count": 2,
-                    "last_seen": "now",
-                    "root": "/private/live",
-                },
-                {
-                    "type": "tool_error",
-                    "client": "native",
-                    "tool": "knowledge_search",
-                    "error": "index unavailable",
+                    "query": f"starving candidate {index}",
                     "count": 1,
-                    "last_seen": "now",
-                    "root": "/private/live",
-                },
+                }
+                for index in range(10)
             ],
         }
     )
@@ -253,6 +259,12 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
                 "last_seen": "now",
             }
         ],
+        "zero_result_queries": [
+            {"query": "missing runbook", "count": 2, "last_seen": "now"}
+        ],
+        "errors_by_message": [
+            {"error": "index unavailable", "count": 1, "last_seen": "now"}
+        ],
         "route_outcomes": [
             {"route_outcome": "already_first", "count": 1, "last_seen": "now"}
         ],
@@ -275,6 +287,17 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
     }
     assert payload["improvement_candidates"] == [
         {
+            "type": "correction_candidate",
+            "query": "paperless reviewer",
+            "feedback_id": 74,
+            "rating": "wrong_artifact",
+            "artifact_id": "skill:wrong",
+            "expected_artifact_id": "skill:right",
+            "note": "Prefer the current owner.",
+            "linkage_quality": "verified_event",
+            "artifact_type": "skill",
+        },
+        {
             "type": "feedback_wrong_artifact",
             "query": "paperless reviewer",
             "feedback_id": 73,
@@ -285,17 +308,6 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
             "linkage_quality": "verified_event",
             "artifact_type": "skill",
             "candidate_kind": "current_state_unavailable",
-        },
-        {
-            "type": "correction_candidate",
-            "query": "paperless reviewer",
-            "feedback_id": 74,
-            "rating": "wrong_artifact",
-            "artifact_id": "skill:wrong",
-            "expected_artifact_id": "skill:right",
-            "note": "Prefer the current owner.",
-            "linkage_quality": "verified_event",
-            "artifact_type": "skill",
         },
         {
             "type": "zero_result_query",
@@ -1975,26 +1987,25 @@ def test_usage_report_persists_index_metadata_errors(tmp_path, monkeypatch):
 
 
 def test_usage_report_masks_obvious_credentials_only_at_model_boundary(monkeypatch):
+    raw_candidate = {
+        "type": "feedback_other",
+        "id": 73,
+        "rating": "other",
+        "query": (
+            "open https://alex:hunter2@example.test/run "
+            "with api_key=sk-local api_key=\"quoted-local\" "
+            "password='single-local' {\"api_key\":\"json-local\"} "
+            "Authorization: Bearer bare-auth "
+            "Authorization: Bearer \"quoted-auth\" "
+            "Authorization: Bearer 'single-auth' "
+            '{"Authorization":"Bearer json-auth"}'
+        ),
+        "artifact_id": "skill:keep-stable-identity",
+    }
     raw_report = {
         "success": True,
         "total_events": 1,
-        "improvement_candidates": [
-            {
-                "type": "feedback_other",
-                "id": 73,
-                "rating": "other",
-                "query": (
-                    "open https://alex:hunter2@example.test/run "
-                    "with api_key=sk-local api_key=\"quoted-local\" "
-                    "password='single-local' {\"api_key\":\"json-local\"} "
-                    "Authorization: Bearer bare-auth "
-                    "Authorization: Bearer \"quoted-auth\" "
-                    "Authorization: Bearer 'single-auth' "
-                    '{"Authorization":"Bearer json-auth"}'
-                ),
-                "artifact_id": "skill:keep-stable-identity",
-            }
-        ],
+        "unresolved_negative_without_current_expected_target": [raw_candidate],
     }
 
     class FakeService:
@@ -2027,4 +2038,4 @@ def test_usage_report_masks_obvious_credentials_only_at_model_boundary(monkeypat
     assert "https://" + "<" + "redacted" + ">@example.test/run" in serialized
     assert payload["improvement_candidates"][0]["feedback_id"] == 73
     assert payload["improvement_candidates"][0]["artifact_id"] == "skill:keep-stable-identity"
-    assert "hunter2" in raw_report["improvement_candidates"][0]["query"]
+    assert "hunter2" in raw_candidate["query"]
