@@ -29,7 +29,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.sha }}
           RELEASE_JSON_FILE: ${{ runner.temp }}/release.json
-          RELEASE_LOOKUP_ERROR_FILE: ${{ runner.temp }}/release-lookup-error.txt
           RELEASE_NOTES_FILE: ${{ runner.temp }}/release-notes.md
           RELEASE_NOTES_SCRIPT: ${{ runner.temp }}/render-release-notes.py
           RELEASE_REQUIREMENTS_FILE: ${{ runner.temp }}/requirements-release.txt
@@ -38,6 +37,37 @@ jobs:
           set -euo pipefail
           output() {
             printf '%s\n' "$@" >> "$GITHUB_OUTPUT"
+          }
+          version_at_commit() {
+            python - "$1" <<'PY'
+          import re
+          import subprocess
+          import sys
+          import tomllib
+
+          sha = sys.argv[1]
+
+          def show(path: str) -> str:
+              return subprocess.run(
+                  ["git", "show", f"{sha}:{path}"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+
+          project_version = tomllib.loads(show("pyproject.toml"))["project"]["version"]
+          plugin_match = re.search(r"(?m)^version:\s*['\"]?([^\s'\"]+)", show("plugin.yaml"))
+          package_match = re.search(
+              r"(?m)^__version__\s*=\s*['\"]([^'\"]+)",
+              show("hermes_local_knowledge/__init__.py"),
+          )
+          if plugin_match is None or package_match is None:
+              raise SystemExit("Could not read all target version metadata")
+          versions = {project_version, plugin_match.group(1), package_match.group(1)}
+          if len(versions) != 1:
+              raise SystemExit(f"Target version metadata is not synchronized: {sorted(versions)}")
+          print(project_version)
+          PY
           }
           cp requirements-release.txt "$RELEASE_REQUIREMENTS_FILE"
           version=$(python - <<'PY'
@@ -81,25 +111,92 @@ jobs:
             cp scripts/render_release_notes.py "$RELEASE_NOTES_SCRIPT"
           fi
           notes_changelog="$TAG_CHANGELOG_FILE"
-          output "tag_exists=${tag_exists}" "expected_sha=${expected_sha}"
 
           python "$RELEASE_NOTES_SCRIPT" \
             --version "$version" \
             --changelog "$notes_changelog" \
             --output "$RELEASE_NOTES_FILE"
 
-          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
-            >/dev/null 2>"$RELEASE_LOOKUP_ERROR_FILE"; then
-            gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-              --json isImmutable,isDraft,isPrerelease,assets,body > "$RELEASE_JSON_FILE"
+          release_ids=()
+          page=1
+          while :; do
+            release_page=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}")
+            mapfile -t page_ids < <(
+              jq -r --arg tag "$tag" '.[] | select(.tag_name == $tag) | .id' <<<"$release_page"
+            )
+            release_ids+=("${page_ids[@]}")
+            page_count=$(jq 'length' <<<"$release_page")
+            if (( page_count < 100 )); then
+              break
+            fi
+            ((page += 1))
+          done
+          if (( ${#release_ids[@]} > 1 )); then
+            echo "Multiple releases claim ${tag}; refusing ambiguous repair." >&2
+            exit 1
+          fi
+
+          if (( ${#release_ids[@]} == 1 )); then
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${release_ids[0]}" | jq '{
+              isImmutable: (.immutable // false),
+              isDraft: .draft,
+              isPrerelease: .prerelease,
+              assets: .assets,
+              body: .body,
+              targetCommitish: .target_commitish
+            }' > "$RELEASE_JSON_FILE"
             release_is_draft=$(jq -r '.isDraft' "$RELEASE_JSON_FILE")
             release_is_immutable=$(jq -r '.isImmutable' "$RELEASE_JSON_FILE")
             release_is_prerelease=$(jq -r '.isPrerelease' "$RELEASE_JSON_FILE")
+            release_target=$(jq -r '.targetCommitish' "$RELEASE_JSON_FILE")
             output \
               "release_exists=true" \
               "release_is_draft=${release_is_draft}" \
               "release_is_immutable=${release_is_immutable}" \
               "release_is_prerelease=${release_is_prerelease}"
+
+            if [[ "$release_is_draft" == true ]]; then
+              recover_tag=false
+              if [[ "$tag_exists" == false ]]; then
+                if [[ ! "$release_target" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "Untagged draft release ${tag} has non-immutable target ${release_target}." >&2
+                  exit 1
+                fi
+                expected_sha="$release_target"
+                recover_tag=true
+              elif [[ "$release_target" =~ ^[0-9a-f]{40}$ && "$release_target" != "$expected_sha" ]]; then
+                echo "Draft release ${tag} targets ${release_target}, not tag commit ${expected_sha}." >&2
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"; then
+                echo "Draft release ${tag} target ${expected_sha} is not an ancestor of ${HEAD_SHA}." >&2
+                exit 1
+              fi
+              target_version=$(version_at_commit "$expected_sha")
+              if [[ "$target_version" != "$version" ]]; then
+                echo "Draft release ${tag} target version ${target_version} does not match ${version}." >&2
+                exit 1
+              fi
+              if [[ "$recover_tag" == true ]]; then
+                gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                  -f ref="refs/tags/${tag}" \
+                  -f sha="$expected_sha" >/dev/null
+                git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+                actual_sha=$(git rev-parse "${tag}^{commit}")
+                if [[ "$actual_sha" != "$expected_sha" ]]; then
+                  echo "Recovered draft tag ${tag} points to ${actual_sha}, not ${expected_sha}." >&2
+                  exit 1
+                fi
+                tag_exists=true
+                git show "${expected_sha}:CHANGELOG.md" > "$TAG_CHANGELOG_FILE"
+                git show "${expected_sha}:scripts/render_release_notes.py" > "$RELEASE_NOTES_SCRIPT"
+                python "$RELEASE_NOTES_SCRIPT" \
+                  --version "$version" \
+                  --changelog "$notes_changelog" \
+                  --output "$RELEASE_NOTES_FILE"
+              fi
+            fi
+
             release_state=$(python "$RELEASE_NOTES_SCRIPT" \
               --version "$version" \
               --changelog "$notes_changelog" \
@@ -112,15 +209,12 @@ jobs:
             needed=$(jq -r '.needed' <<<"$release_state")
 
             if [[ "$release_is_draft" == true ]]; then
-              if [[ "$expected_sha" != "$HEAD_SHA" ]]; then
-                echo "Draft release ${tag} targets ${expected_sha}, not verified commit ${HEAD_SHA}." >&2
-                exit 1
-              fi
               # Draft assets are still mutable. Rebuild and replace them from
               # the verified commit before publication, regardless of names/sizes.
               build_needed=true
               needed=true
             fi
+            output "tag_exists=${tag_exists}" "expected_sha=${expected_sha}"
             if [[ "$release_is_immutable" == true && "$build_needed" == true ]]; then
               echo "Immutable release ${tag} is missing an expected asset and cannot be repaired." >&2
               exit 1
@@ -135,17 +229,13 @@ jobs:
             exit 0
           fi
 
-          release_lookup_error=$(<"$RELEASE_LOOKUP_ERROR_FILE")
-          if [[ "$release_lookup_error" != *"(HTTP 404)"* ]]; then
-            printf '%s\n' "$release_lookup_error" >&2
-            exit 1
-          fi
-
           output \
+            "tag_exists=${tag_exists}" \
             "release_exists=false" \
             "release_is_draft=false" \
             "release_is_immutable=false" \
             "release_is_prerelease=false" \
+            "expected_sha=${expected_sha}" \
             "needed=true" \
             "build_needed=true"
           if [[ "$tag_exists" == true && "$expected_sha" != "$HEAD_SHA" ]]; then
@@ -156,7 +246,8 @@ jobs:
       - name: Check out verified source for release build or repair
         if: >-
           steps.release.outputs.build_needed == 'true' &&
-          steps.release.outputs.tag_exists == 'true'
+          (steps.release.outputs.tag_exists == 'true' ||
+          steps.release.outputs.release_is_draft == 'true')
         env:
           EXPECTED_SHA: ${{ steps.release.outputs.expected_sha }}
         run: git checkout --detach "$EXPECTED_SHA"
@@ -297,9 +388,15 @@ jobs:
           steps.release.outputs.release_is_draft == 'true')
         env:
           EXPECTED_SHA: ${{ steps.release.outputs.expected_sha }}
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" \
+              -f sha="$EXPECTED_SHA" >/dev/null
+          fi
           git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
           actual_sha=$(git rev-parse "${RELEASE_TAG}^{commit}")
           if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
