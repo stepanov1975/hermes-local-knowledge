@@ -1209,6 +1209,8 @@ def _usage_report(
                 "top_queries": [],
                 "zero_result_queries": [],
                 "errors_by_message": [],
+                "route_outcomes": [],
+                "route_verification_failures": [],
                 "implicit_consumed_rank_lower_bound": _empty_implicit_consumed_rank_lower_bound(),
             },
             "event_cohorts": [],
@@ -1364,6 +1366,30 @@ def _usage_report(
             """,
             (since, root_text, __version__, *probe_queries, limit),
         )
+        current_search_route_outcomes = _rows(
+            conn,
+            f"""
+            SELECT route_outcome, COUNT(*) AS count, MAX(ts) AS last_seen
+            FROM usage_events
+            WHERE {current_search_where} AND success = 1 AND route_outcome <> 'none'
+            GROUP BY route_outcome
+            ORDER BY count DESC, route_outcome
+            """,
+            (since, root_text, __version__, *probe_queries),
+        )
+        current_search_route_verification_failures = _rows(
+            conn,
+            f"""
+            SELECT id AS usage_event_id, ts, query, artifact_type,
+                   route_feedback_id, route_artifact_id, route_outcome
+            FROM usage_events
+            WHERE {current_search_where} AND success = 1
+              AND route_outcome = 'verification_failed'
+            ORDER BY ts DESC, id DESC
+            LIMIT ?
+            """,
+            (since, root_text, __version__, *probe_queries, limit),
+        )
         implicit_consumed_rank_lower_bound = _implicit_consumed_rank_lower_bound(
             conn,
             since=since,
@@ -1384,6 +1410,8 @@ def _usage_report(
             "top_queries": current_search_top_queries,
             "zero_result_queries": current_search_zero_results,
             "errors_by_message": current_search_errors,
+            "route_outcomes": current_search_route_outcomes,
+            "route_verification_failures": current_search_route_verification_failures,
             "implicit_consumed_rank_lower_bound": implicit_consumed_rank_lower_bound,
         }
         event_cohorts = _rows(

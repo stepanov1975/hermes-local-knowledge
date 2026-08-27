@@ -129,6 +129,7 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
         "note": "Prefer the current owner.",
         "linkage_quality": "verified_event",
         "artifact_type": "skill",
+        "candidate_kind": "current_state_unavailable",
         "feedback_root": "/private/live",
         "event_root": "/private/live",
         "event_top_ids_json": '["skill:wrong"]',
@@ -161,13 +162,31 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
                         "raw_private": "/private/live",
                     }
                 ],
+                "route_outcomes": [
+                    {
+                        "route_outcome": "already_first",
+                        "count": 1,
+                        "last_seen": "now",
+                        "raw_private": "/private/live",
+                    }
+                ],
+                "route_verification_failures": [
+                    {
+                        "query": "paperless reviewer",
+                        "artifact_type": "skill",
+                        "route_feedback_id": 73,
+                        "route_artifact_id": "skill:right",
+                        "route_outcome": "verification_failed",
+                        "raw_private": "/private/live",
+                    }
+                ],
             },
             "route_outcomes": [
                 {
-                    "route_outcome": "already_first",
-                    "count": 1,
-                    "last_seen": "now",
-                    "raw_private": "/private/live",
+                    "route_outcome": "historical_probe",
+                    "count": 99,
+                    "last_seen": "old",
+                    "raw_private": "/private/historical",
                 }
             ],
             "event_cohorts": [
@@ -186,7 +205,12 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
             "improvement_candidates": [
                 raw_feedback,
                 dict(raw_feedback),
-                {**raw_feedback, "type": "correction_candidate", "id": 74},
+                {
+                    **raw_feedback,
+                    "type": "correction_candidate",
+                    "candidate_kind": "correction_candidate",
+                    "id": 74,
+                },
                 {
                     "type": "zero_result_query",
                     "query": "missing runbook",
@@ -232,6 +256,15 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
         "route_outcomes": [
             {"route_outcome": "already_first", "count": 1, "last_seen": "now"}
         ],
+        "route_verification_failures": [
+            {
+                "query": "paperless reviewer",
+                "artifact_type": "skill",
+                "route_feedback_id": 73,
+                "route_artifact_id": "skill:right",
+                "route_outcome": "verification_failed",
+            }
+        ],
     }
     assert payload["feedback"] == {
         "count": 1,
@@ -251,6 +284,7 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
             "note": "Prefer the current owner.",
             "linkage_quality": "verified_event",
             "artifact_type": "skill",
+            "candidate_kind": "current_state_unavailable",
         },
         {
             "type": "correction_candidate",
@@ -1718,6 +1752,7 @@ def test_feedback_and_usage_report_close_loop(tmp_path, monkeypatch):
         "note",
         "linkage_quality",
         "artifact_type",
+        "candidate_kind",
     }
     assert "top_tools" not in report
     assert "top_artifacts" not in report

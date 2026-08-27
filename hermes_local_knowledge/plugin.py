@@ -307,6 +307,9 @@ def _agent_improvement_candidate(row: Mapping[str, Any]) -> dict[str, Any]:
                 ),
             ),
         }
+        candidate_kind = row.get("candidate_kind")
+        if candidate_kind and candidate_kind != candidate_type:
+            candidate["candidate_kind"] = candidate_kind
         return _prune_agent_value(candidate)
     return _nonempty_projection(row, ("type", "query", "tool", "error", "count"))
 
@@ -365,12 +368,21 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
             if rank_distribution:
                 consumed_rank["rank_distribution"] = rank_distribution
             search_quality["implicit_consumed_rank_lower_bound"] = consumed_rank
-    route_outcomes = _project_rows(
-        report.get("route_outcomes"), ("route_outcome", "count", "last_seen")
+    route_outcomes = (
+        _project_rows(
+            search_quality_raw.get("route_outcomes"),
+            ("route_outcome", "count", "last_seen"),
+        )
+        if isinstance(search_quality_raw, Mapping)
+        else []
     )
     if route_outcomes:
         search_quality["route_outcomes"] = route_outcomes
-    route_failures = report.get("route_verification_failures")
+    route_failures = (
+        search_quality_raw.get("route_verification_failures")
+        if isinstance(search_quality_raw, Mapping)
+        else None
+    )
     if isinstance(route_failures, list):
         projected_failures = [
             _nonempty_projection(
