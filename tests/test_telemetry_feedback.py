@@ -1412,6 +1412,15 @@ def test_current_search_route_details_exclude_probes_and_historical_versions(
         result_count=0,
         usage_db_path=usage_db,
     )
+    for index in range(12):
+        telemetry._record_usage(
+            root,
+            tool="knowledge_search",
+            success=False,
+            query=f"search failure {index}",
+            error=f"search error {index}",
+            usage_db_path=usage_db,
+        )
     telemetry._record_usage(
         root,
         tool="knowledge_get",
@@ -1450,17 +1459,18 @@ def test_current_search_route_details_exclude_probes_and_historical_versions(
     assert len(current["route_verification_failures"]) == 1
     assert current["route_verification_failures"][0]["query"] == "current verification"
     assert [row["query"] for row in current["active_zero_result_queries"]] == ["active zero"]
-    assert len(report["current_native_errors"]) == 1
+    assert len(current["errors_by_message"]) == 10
+    assert len(report["current_non_search_native_errors"]) == 1
     assert {
         key: value
-        for key, value in report["current_native_errors"][0].items()
+        for key, value in report["current_non_search_native_errors"][0].items()
         if key != "last_seen"
     } == {
         "tool": "knowledge_get",
         "error": "artifact lookup failed",
         "count": 1,
     }
-    assert report["current_native_errors"][0]["last_seen"]
+    assert report["current_non_search_native_errors"][0]["last_seen"]
     assert {row["route_outcome"] for row in report["route_outcomes"]} == {
         "promoted_existing",
         "promoted_retry",

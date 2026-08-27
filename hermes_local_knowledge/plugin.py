@@ -245,12 +245,35 @@ def _add_usage_event(payload: dict[str, Any], event_id: int | None) -> None:
         payload["usage_event_id"] = event_id
 
 
+def _agent_warnings(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    projected: list[str] = []
+    for warning in value:
+        text = str(warning or "").strip()
+        if not text:
+            continue
+        if text.startswith("local_knowledge.source_root is unset; defaulting to HERMES_HOME"):
+            safe = (
+                "source_root defaults to HERMES_HOME; indexing may be noisy. "
+                "Configure local_knowledge.source_root."
+            )
+        else:
+            safe = (
+                "Local knowledge reported an operator-actionable warning; run "
+                "`hermes plugins doctor local_knowledge` for details."
+            )
+        if safe not in projected:
+            projected.append(safe)
+    return projected
+
+
 def _add_actionable_lookup_metadata(payload: dict[str, Any], metadata: Mapping[str, Any]) -> None:
     """Expose lookup lifecycle details only when they change what the agent should know."""
 
     if metadata.get("rebuilt") is True:
         payload["rebuilt"] = True
-    warnings = metadata.get("warnings")
+    warnings = _agent_warnings(metadata.get("warnings"))
     if warnings:
         payload["warnings"] = warnings
 
@@ -467,7 +490,7 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
                             **row,
                         }
                     )
-    current_native_error_rows = report.get("current_native_errors")
+    current_native_error_rows = report.get("current_non_search_native_errors")
     if isinstance(current_native_error_rows, list):
         for row in current_native_error_rows:
             if isinstance(row, Mapping):

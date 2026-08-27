@@ -309,7 +309,7 @@ USAGE_REPORT_KEYS = {
     "live_implicit_feedback_count",
     "implicit_feedback_by_consumer",
     "current_native_search_quality",
-    "current_native_errors",
+    "current_non_search_native_errors",
     "event_cohorts",
     "avg_latency_ms",
     "root_breakdown",

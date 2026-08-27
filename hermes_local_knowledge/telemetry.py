@@ -1214,7 +1214,7 @@ def _usage_report(
                 "route_verification_failures": [],
                 "implicit_consumed_rank_lower_bound": _empty_implicit_consumed_rank_lower_bound(),
             },
-            "current_native_errors": [],
+            "current_non_search_native_errors": [],
             "event_cohorts": [],
             "root_breakdown": [],
             "feedback_root_breakdown": [],
@@ -1384,22 +1384,18 @@ def _usage_report(
             """,
             (since, root_text, __version__, *probe_queries, limit),
         )
-        current_native_errors = _rows(
+        current_non_search_native_errors = _rows(
             conn,
-            f"""
+            """
             SELECT tool, error, COUNT(*) AS count, MAX(ts) AS last_seen
             FROM usage_events
             WHERE ts >= ? AND root = ? AND client = 'native' AND plugin_version = ?
-              AND success = 0 AND error IS NOT NULL
-              AND NOT (
-                  tool = 'knowledge_search'
-                  AND LOWER(TRIM(COALESCE(query, ''))) IN ({probe_placeholders})
-              )
+              AND tool <> 'knowledge_search' AND success = 0 AND error IS NOT NULL
             GROUP BY tool, error
             ORDER BY count DESC, last_seen DESC
             LIMIT ?
             """,
-            (since, root_text, __version__, *probe_queries, limit),
+            (since, root_text, __version__, limit),
         )
         current_search_route_outcomes = _rows(
             conn,
@@ -1998,7 +1994,7 @@ def _usage_report(
         "live_implicit_feedback_count": live_implicit_feedback_count,
         "implicit_feedback_by_consumer": implicit_feedback_by_consumer,
         "current_native_search_quality": current_native_search_quality,
-        "current_native_errors": current_native_errors,
+        "current_non_search_native_errors": current_non_search_native_errors,
         "event_cohorts": event_cohorts,
         "avg_latency_ms": None if avg_latency is None else round(float(avg_latency), 1),
         "root_breakdown": root_breakdown,

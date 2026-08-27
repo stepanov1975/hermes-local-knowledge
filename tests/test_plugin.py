@@ -86,7 +86,10 @@ def test_search_handler_does_not_serialize_index_vocabulary_or_diagnostics(
                 "db_path": "/private/state/index.sqlite",
                 "artifact_count": 999999,
                 "jsonl_sha256": "a" * 64,
-                "warnings": ["Configured source requires operator attention."],
+                "warnings": [
+                    "local_knowledge.source_root is unset; defaulting to HERMES_HOME "
+                    "(/private/hermes). Because HERMES_HOME/hermes-agent exists, indexing may be noisy."
+                ],
                 "rebuilt": True,
             }
 
@@ -112,8 +115,12 @@ def test_search_handler_does_not_serialize_index_vocabulary_or_diagnostics(
         ],
         "usage_event_id": 17,
         "rebuilt": True,
-        "warnings": ["Configured source requires operator attention."],
+        "warnings": [
+            "source_root defaults to HERMES_HOME; indexing may be noisy. "
+            "Configure local_knowledge.source_root."
+        ],
     }
+    assert "/private/hermes" not in serialized
     assert len(serialized) < 450
 
 
@@ -217,14 +224,7 @@ def test_usage_report_projects_only_live_scoped_actionable_rows() -> None:
                     }
                 ],
             },
-            "current_native_errors": [
-                {
-                    "tool": "knowledge_search",
-                    "error": "index unavailable",
-                    "count": 1,
-                    "last_seen": "now",
-                    "raw_private": "/private/live",
-                },
+            "current_non_search_native_errors": [
                 {
                     "tool": "knowledge_get",
                     "error": "artifact lookup failed",
@@ -1571,7 +1571,11 @@ def test_implicit_hermes_home_source_warns_when_source_checkout_exists(tmp_path,
     payload = json.loads(plugin._handle_search({"query": "anything", "rebuild": True}))
 
     assert payload["success"] is True
-    assert any("local_knowledge.source_root is unset" in warning for warning in payload["warnings"])
+    assert payload["warnings"] == [
+        "source_root defaults to HERMES_HOME; indexing may be noisy. "
+        "Configure local_knowledge.source_root."
+    ]
+    assert str(hermes_home) not in json.dumps(payload)
 
 
 def test_missing_artifact_returns_tool_error(tmp_path, monkeypatch):
