@@ -80,7 +80,6 @@ jobs:
             cp scripts/render_release_notes.py "$RELEASE_NOTES_SCRIPT"
           fi
           notes_changelog="$TAG_CHANGELOG_FILE"
-          output "tag_exists=${tag_exists}"
 
           python "$RELEASE_NOTES_SCRIPT" \
             --version "$version" \
@@ -107,9 +106,14 @@ jobs:
           fi
 
           if (( ${#release_ids[@]} == 1 )); then
-            gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-              --json isImmutable,isDraft,isPrerelease,assets,body,targetCommitish \
-              > "$RELEASE_JSON_FILE"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${release_ids[0]}" | jq '{
+              isImmutable: (.immutable // false),
+              isDraft: .draft,
+              isPrerelease: .prerelease,
+              assets: .assets,
+              body: .body,
+              targetCommitish: .target_commitish
+            }' > "$RELEASE_JSON_FILE"
             release_is_draft=$(jq -r '.isDraft' "$RELEASE_JSON_FILE")
             release_is_immutable=$(jq -r '.isImmutable' "$RELEASE_JSON_FILE")
             release_is_prerelease=$(jq -r '.isPrerelease' "$RELEASE_JSON_FILE")
@@ -119,6 +123,44 @@ jobs:
               "release_is_draft=${release_is_draft}" \
               "release_is_immutable=${release_is_immutable}" \
               "release_is_prerelease=${release_is_prerelease}"
+
+            if [[ "$release_is_draft" == true ]]; then
+              if [[ "$tag_exists" == false ]]; then
+                if [[ ! "$release_target" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "Untagged draft release ${tag} has non-immutable target ${release_target}." >&2
+                  exit 1
+                fi
+                expected_sha="$release_target"
+                if ! git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"; then
+                  echo "Draft release ${tag} target ${expected_sha} is not an ancestor of ${HEAD_SHA}." >&2
+                  exit 1
+                fi
+                gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                  -f ref="refs/tags/${tag}" \
+                  -f sha="$expected_sha" >/dev/null
+                git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+                actual_sha=$(git rev-parse "${tag}^{commit}")
+                if [[ "$actual_sha" != "$expected_sha" ]]; then
+                  echo "Recovered draft tag ${tag} points to ${actual_sha}, not ${expected_sha}." >&2
+                  exit 1
+                fi
+                tag_exists=true
+                git show "${expected_sha}:CHANGELOG.md" > "$TAG_CHANGELOG_FILE"
+                git show "${expected_sha}:scripts/render_release_notes.py" > "$RELEASE_NOTES_SCRIPT"
+                python "$RELEASE_NOTES_SCRIPT" \
+                  --version "$version" \
+                  --changelog "$notes_changelog" \
+                  --output "$RELEASE_NOTES_FILE"
+              elif [[ "$release_target" =~ ^[0-9a-f]{40}$ && "$release_target" != "$expected_sha" ]]; then
+                echo "Draft release ${tag} targets ${release_target}, not tag commit ${expected_sha}." >&2
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"; then
+                echo "Draft release ${tag} target ${expected_sha} is not an ancestor of ${HEAD_SHA}." >&2
+                exit 1
+              fi
+            fi
+
             release_state=$(python "$RELEASE_NOTES_SCRIPT" \
               --version "$version" \
               --changelog "$notes_changelog" \
@@ -131,26 +173,12 @@ jobs:
             needed=$(jq -r '.needed' <<<"$release_state")
 
             if [[ "$release_is_draft" == true ]]; then
-              if [[ "$tag_exists" == false ]]; then
-                if [[ ! "$release_target" =~ ^[0-9a-f]{40}$ ]]; then
-                  echo "Untagged draft release ${tag} has non-immutable target ${release_target}." >&2
-                  exit 1
-                fi
-                expected_sha="$release_target"
-              elif [[ "$release_target" =~ ^[0-9a-f]{40}$ && "$release_target" != "$expected_sha" ]]; then
-                echo "Draft release ${tag} targets ${release_target}, not tag commit ${expected_sha}." >&2
-                exit 1
-              fi
-              if ! git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"; then
-                echo "Draft release ${tag} target ${expected_sha} is not an ancestor of ${HEAD_SHA}." >&2
-                exit 1
-              fi
               # Draft assets are still mutable. Rebuild and replace them from
               # the verified commit before publication, regardless of names/sizes.
               build_needed=true
               needed=true
             fi
-            output "expected_sha=${expected_sha}"
+            output "tag_exists=${tag_exists}" "expected_sha=${expected_sha}"
             if [[ "$release_is_immutable" == true && "$build_needed" == true ]]; then
               echo "Immutable release ${tag} is missing an expected asset and cannot be repaired." >&2
               exit 1
@@ -166,6 +194,7 @@ jobs:
           fi
 
           output \
+            "tag_exists=${tag_exists}" \
             "release_exists=false" \
             "release_is_draft=false" \
             "release_is_immutable=false" \

@@ -307,7 +307,8 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert 'select(.tag_name == $tag) | .id' in workflow
     assert "Multiple releases claim ${tag}; refusing ambiguous repair." in workflow
     assert 'repos/${GITHUB_REPOSITORY}/releases/tags/${tag}' not in workflow
-    assert "--json isImmutable,isDraft,isPrerelease,assets,body,targetCommitish" in workflow
+    assert 'repos/${GITHUB_REPOSITORY}/releases/${release_ids[0]}' in workflow
+    assert "targetCommitish: .target_commitish" in workflow
     assert 'if [[ "$release_is_draft" == true ]]' in workflow
     assert "Draft assets are still mutable" in workflow
     draft_repair = workflow.split('if [[ "$release_is_draft" == true ]]', maxsplit=1)[1].split(
@@ -317,10 +318,15 @@ def test_release_workflow_uses_exact_changelog_notes_for_create_repair_and_verif
     assert "needed=true" in draft_repair
     assert 'if [[ "$tag_exists" == false ]]' in draft_repair
     assert 'expected_sha="$release_target"' in draft_repair
-    assert 'output "expected_sha=${expected_sha}"' in draft_repair
+    assert 'output "tag_exists=${tag_exists}" "expected_sha=${expected_sha}"' in draft_repair
     assert 'git merge-base --is-ancestor "$expected_sha" "$HEAD_SHA"' in draft_repair
     assert "Untagged draft release" in draft_repair
     assert "not tag commit" in draft_repair
+    assert 'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs"' in draft_repair
+    assert 'git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"' in draft_repair
+    assert 'git show "${expected_sha}:CHANGELOG.md"' in draft_repair
+    assert 'git show "${expected_sha}:scripts/render_release_notes.py"' in draft_repair
+    assert 'python "$RELEASE_NOTES_SCRIPT"' in draft_repair
     assert "steps.release.outputs.release_is_draft == 'true'" in workflow
     assert 'run: git checkout --detach "$EXPECTED_SHA"' in workflow
     assert workflow.count("            --draft \\\n") == 2
