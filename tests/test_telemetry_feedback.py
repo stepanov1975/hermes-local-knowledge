@@ -1342,3 +1342,137 @@ def test_usage_report_empty_or_missing_db_has_zero_consumed_rank_shape(
     assert report["current_native_search_quality"][
         "implicit_consumed_rank_lower_bound"
     ] == telemetry._empty_implicit_consumed_rank_lower_bound()
+
+
+def test_current_search_route_details_exclude_probes_and_historical_versions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    usage_db = tmp_path / "usage.sqlite"
+
+    telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="current verification",
+        result_count=1,
+        route_feedback_id=7,
+        route_artifact_id="skill:current",
+        route_outcome="verification_failed",
+        usage_db_path=usage_db,
+    )
+    telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="current promotion",
+        result_count=1,
+        route_outcome="promoted_existing",
+        usage_db_path=usage_db,
+    )
+    telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="demo",
+        result_count=1,
+        route_outcome="verification_failed",
+        usage_db_path=usage_db,
+    )
+    historical_id = telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="historical promotion",
+        result_count=1,
+        route_outcome="promoted_retry",
+        usage_db_path=usage_db,
+    )
+    resolved_zero_id = telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="resolved zero",
+        result_count=0,
+        usage_db_path=usage_db,
+    )
+    telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="resolved zero",
+        result_count=1,
+        usage_db_path=usage_db,
+    )
+    telemetry._record_usage(
+        root,
+        tool="knowledge_search",
+        success=True,
+        query="active zero",
+        result_count=0,
+        usage_db_path=usage_db,
+    )
+    for index in range(12):
+        telemetry._record_usage(
+            root,
+            tool="knowledge_search",
+            success=False,
+            query=f"search failure {index}",
+            error=f"search error {index}",
+            usage_db_path=usage_db,
+        )
+    telemetry._record_usage(
+        root,
+        tool="knowledge_get",
+        success=False,
+        error="artifact lookup failed",
+        usage_db_path=usage_db,
+    )
+    historical_error_id = telemetry._record_usage(
+        root,
+        tool="knowledge_neighbors",
+        success=False,
+        error="historical neighbor failure",
+        usage_db_path=usage_db,
+    )
+    assert historical_id is not None
+    assert historical_error_id is not None
+    assert resolved_zero_id is not None
+    with sqlite3.connect(usage_db) as connection:
+        connection.execute(
+            "UPDATE usage_events SET plugin_version = '0.0.0' WHERE id IN (?, ?)",
+            (historical_id, historical_error_id),
+        )
+        connection.execute(
+            "UPDATE usage_events SET ts = datetime('now', '-1 minute') WHERE id = ?",
+            (resolved_zero_id,),
+        )
+
+    report = telemetry._usage_report(root, days=30, limit=10, usage_db_path=usage_db)
+    current = report["current_native_search_quality"]
+
+    assert [row["route_outcome"] for row in current["route_outcomes"]] == [
+        "promoted_existing",
+        "verification_failed",
+    ]
+    assert [row["count"] for row in current["route_outcomes"]] == [1, 1]
+    assert len(current["route_verification_failures"]) == 1
+    assert current["route_verification_failures"][0]["query"] == "current verification"
+    assert [row["query"] for row in current["active_zero_result_queries"]] == ["active zero"]
+    assert len(current["errors_by_message"]) == 10
+    assert len(report["current_non_search_native_errors"]) == 1
+    assert {
+        key: value
+        for key, value in report["current_non_search_native_errors"][0].items()
+        if key != "last_seen"
+    } == {
+        "tool": "knowledge_get",
+        "error": "artifact lookup failed",
+        "count": 1,
+    }
+    assert report["current_non_search_native_errors"][0]["last_seen"]
+    assert {row["route_outcome"] for row in report["route_outcomes"]} == {
+        "promoted_existing",
+        "promoted_retry",
+        "verification_failed",
+    }

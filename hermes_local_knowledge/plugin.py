@@ -148,7 +148,9 @@ def _model_safe_usage_report_result(payload: dict[str, Any]) -> str:
 
 
 def _tool_error(message: object, **extra: Any) -> str:
-    return _tool_result({"error": str(message), **extra})
+    return _tool_result(
+        {"error": str(message), **{key: value for key, value in extra.items() if value is not None}}
+    )
 
 
 def _validate_args(args: Any) -> str | None:
@@ -196,6 +198,323 @@ def _record_handler_usage(
     **kwargs: Any,
 ) -> int | None:
     return service.record_usage(**kwargs) if service is not None else None
+
+
+_AGENT_ARTIFACT_FIELDS = (
+    "id",
+    "type",
+    "title",
+    "path",
+    "summary",
+    "source",
+    "updated_at",
+    "related",
+)
+_AGENT_EDGE_FIELDS = ("edge_kind", "edge_evidence")
+
+
+def _has_agent_value(value: Any) -> bool:
+    return value is not None and value != "" and value != [] and value != {}
+
+
+def _prune_agent_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: pruned
+            for key, item in value.items()
+            if _has_agent_value(pruned := _prune_agent_value(item))
+        }
+    if isinstance(value, list):
+        return [
+            pruned
+            for item in value
+            if _has_agent_value(pruned := _prune_agent_value(item))
+        ]
+    return value
+
+
+def _agent_artifact(row: Mapping[str, Any], *, include_edge: bool = False) -> dict[str, Any]:
+    """Project an index row to metadata that helps the model choose its next source."""
+
+    fields = _AGENT_ARTIFACT_FIELDS + (_AGENT_EDGE_FIELDS if include_edge else ())
+    return {field: row[field] for field in fields if field in row and _has_agent_value(row[field])}
+
+
+def _add_usage_event(payload: dict[str, Any], event_id: int | None) -> None:
+    if event_id is not None:
+        payload["usage_event_id"] = event_id
+
+
+def _agent_warnings(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    projected: list[str] = []
+    for warning in value:
+        text = str(warning or "").strip()
+        if not text:
+            continue
+        if text.startswith("local_knowledge.source_root is unset; defaulting to HERMES_HOME"):
+            safe = (
+                "source_root defaults to HERMES_HOME; indexing may be noisy. "
+                "Configure local_knowledge.source_root."
+            )
+        else:
+            safe = (
+                "Local knowledge reported an operator-actionable warning; run "
+                "`hermes plugins doctor local_knowledge` for details."
+            )
+        if safe not in projected:
+            projected.append(safe)
+    return projected
+
+
+def _add_actionable_lookup_metadata(payload: dict[str, Any], metadata: Mapping[str, Any]) -> None:
+    """Expose lookup lifecycle details only when they change what the agent should know."""
+
+    if metadata.get("rebuilt") is True:
+        payload["rebuilt"] = True
+    warnings = _agent_warnings(metadata.get("warnings"))
+    if warnings:
+        payload["warnings"] = warnings
+
+
+def _nonempty_projection(source: Mapping[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    projected: dict[str, Any] = {}
+    for field in fields:
+        if field not in source:
+            continue
+        value = _prune_agent_value(source[field])
+        if _has_agent_value(value):
+            projected[field] = value
+    return projected
+
+
+def _project_rows(value: Any, fields: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        projected
+        for row in value
+        if isinstance(row, Mapping)
+        and (projected := _nonempty_projection(row, fields))
+    ]
+
+
+def _agent_improvement_candidate(row: Mapping[str, Any]) -> dict[str, Any]:
+    candidate_type = str(row.get("type") or "")
+    if candidate_type == "zero_result_query":
+        return {
+            "type": candidate_type,
+            **_nonempty_projection(row, ("query", "count", "last_seen")),
+        }
+    if candidate_type == "tool_error":
+        return {
+            "type": candidate_type,
+            **_nonempty_projection(row, ("client", "tool", "error", "count", "last_seen")),
+        }
+    if candidate_type.startswith("feedback_") or candidate_type == "correction_candidate":
+        query = row.get("effective_query") or row.get("query")
+        candidate = {
+            "type": candidate_type,
+            "query": query,
+            "feedback_id": row.get("id"),
+            **_nonempty_projection(
+                row,
+                (
+                    "rating",
+                    "artifact_id",
+                    "expected_artifact_id",
+                    "note",
+                    "linkage_quality",
+                    "artifact_type",
+                ),
+            ),
+        }
+        candidate_kind = row.get("candidate_kind")
+        if candidate_kind and candidate_kind != candidate_type:
+            candidate["candidate_kind"] = candidate_kind
+        return _prune_agent_value(candidate)
+    return _nonempty_projection(row, ("type", "query", "tool", "error", "count"))
+
+
+def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep model-facing usage output focused on live quality and repair candidates."""
+
+    search_quality_raw = report.get("current_native_search_quality")
+    search_quality = (
+        _nonempty_projection(
+            search_quality_raw,
+            (
+                "count",
+                "successes",
+                "errors",
+                "zero_results",
+                "route_changes",
+                "avg_latency_ms",
+                "last_seen",
+            ),
+        )
+        if isinstance(search_quality_raw, Mapping)
+        else {}
+    )
+    if isinstance(search_quality_raw, Mapping):
+        for source_field, target_field, fields in (
+            ("top_queries", "top_queries", ("query", "count", "avg_results", "last_seen")),
+            (
+                "active_zero_result_queries",
+                "zero_result_queries",
+                ("query", "count", "last_seen"),
+            ),
+            ("errors_by_message", "errors_by_message", ("error", "count", "last_seen")),
+        ):
+            rows = _project_rows(search_quality_raw.get(source_field), fields)
+            if rows:
+                search_quality[target_field] = rows
+        consumed_rank_raw = search_quality_raw.get("implicit_consumed_rank_lower_bound")
+        if isinstance(consumed_rank_raw, Mapping) and consumed_rank_raw.get(
+            "consumed_artifact_count"
+        ):
+            consumed_rank = _nonempty_projection(
+                consumed_rank_raw,
+                (
+                    "consumed_artifact_count",
+                    "consumed_search_count",
+                    "ranked_consumption_count",
+                    "unranked_consumption_count",
+                    "consumed_at_rank_1",
+                    "consumed_in_top_3",
+                    "consumed_outside_top_3",
+                    "searches_with_consumed_rank_1",
+                    "searches_with_consumed_top_3",
+                    "median_consumed_rank",
+                ),
+            )
+            rank_distribution = _project_rows(
+                consumed_rank_raw.get("rank_distribution"), ("rank", "count")
+            )
+            if rank_distribution:
+                consumed_rank["rank_distribution"] = rank_distribution
+            search_quality["implicit_consumed_rank_lower_bound"] = consumed_rank
+    route_outcomes = (
+        _project_rows(
+            search_quality_raw.get("route_outcomes"),
+            ("route_outcome", "count", "last_seen"),
+        )
+        if isinstance(search_quality_raw, Mapping)
+        else []
+    )
+    if route_outcomes:
+        search_quality["route_outcomes"] = route_outcomes
+    route_failures = (
+        search_quality_raw.get("route_verification_failures")
+        if isinstance(search_quality_raw, Mapping)
+        else None
+    )
+    if isinstance(route_failures, list):
+        projected_failures = [
+            _nonempty_projection(
+                row,
+                (
+                    "query",
+                    "artifact_type",
+                    "route_feedback_id",
+                    "route_artifact_id",
+                    "route_outcome",
+                ),
+            )
+            for row in route_failures
+            if isinstance(row, Mapping)
+        ]
+        if projected_failures:
+            search_quality["route_verification_failures"] = projected_failures
+
+    feedback: dict[str, Any] = {
+        "count": int(report.get("live_feedback_count") or 0),
+        "implicit_count": int(report.get("live_implicit_feedback_count") or 0),
+    }
+    feedback_by_consumer = _project_rows(
+        report.get("implicit_feedback_by_consumer"),
+        ("consumer_tool", "count", "last_seen"),
+    )
+    if feedback_by_consumer:
+        feedback["implicit_feedback_by_consumer"] = feedback_by_consumer
+    replay_counts_raw = report.get("replay_ready_label_counts")
+    replay_counts = (
+        _nonempty_projection(
+            replay_counts_raw,
+            ("explicit_resolution", "verified_event", "direct_or_legacy", "total"),
+        )
+        if isinstance(replay_counts_raw, Mapping)
+        else {}
+    )
+    if replay_counts.get("total"):
+        feedback["replay_ready_label_counts"] = replay_counts
+
+    candidates: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+
+    def add_candidate(row: Mapping[str, Any]) -> None:
+        candidate = _agent_improvement_candidate(row)
+        if not candidate:
+            return
+        identity = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+        if identity not in seen_candidates:
+            seen_candidates.add(identity)
+            candidates.append(candidate)
+
+    for source_field in (
+        "unresolved_negative_with_current_expected_target",
+        "unresolved_negative_without_current_expected_target",
+    ):
+        feedback_rows = report.get(source_field)
+        if isinstance(feedback_rows, list):
+            for row in feedback_rows:
+                if isinstance(row, Mapping):
+                    add_candidate(row)
+
+    if isinstance(search_quality_raw, Mapping):
+        zero_rows = search_quality_raw.get("active_zero_result_queries")
+        if isinstance(zero_rows, list):
+            for row in zero_rows:
+                if isinstance(row, Mapping):
+                    add_candidate({"type": "zero_result_query", **row})
+        error_rows = search_quality_raw.get("errors_by_message")
+        if isinstance(error_rows, list):
+            for row in error_rows:
+                if isinstance(row, Mapping):
+                    add_candidate(
+                        {
+                            "type": "tool_error",
+                            "client": "native",
+                            "tool": "knowledge_search",
+                            **row,
+                        }
+                    )
+    current_native_error_rows = report.get("current_non_search_native_errors")
+    if isinstance(current_native_error_rows, list):
+        for row in current_native_error_rows:
+            if isinstance(row, Mapping):
+                add_candidate({"type": "tool_error", "client": "native", **row})
+
+    window = _nonempty_projection(report, ("days", "since"))
+    payload: dict[str, Any] = {
+        "success": bool(report.get("success", True)),
+        "event_count": int(report.get("live_total_events") or 0),
+        "feedback": feedback,
+    }
+    if window:
+        payload["window"] = window
+    if search_quality:
+        payload["search_quality"] = search_quality
+    event_cohorts = _project_rows(
+        report.get("event_cohorts"),
+        ("cohort", "count", "successes", "errors", "avg_latency_ms", "last_seen"),
+    )
+    if event_cohorts:
+        payload["event_cohorts"] = event_cohorts
+    if candidates:
+        payload["improvement_candidates"] = candidates
+    return payload
 
 
 def _handle_search(args: Any, **kwargs: Any) -> str:
@@ -273,20 +592,16 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
             context=context,
             index_metadata=meta,
         )
-        return _tool_result(
-            {
-                "success": True,
-                "query": query,
-                "artifact_type": artifact_type or None,
-                "limit": limit,
-                "results": rows,
-                "usage_event_id": event_id,
-                **meta,
-            }
-        )
+        payload: dict[str, Any] = {
+            "success": True,
+            "results": [_agent_artifact(row) for row in rows],
+        }
+        _add_usage_event(payload, event_id)
+        _add_actionable_lookup_metadata(payload, meta)
+        return _tool_result(payload)
     except Exception as exc:
         message = f"knowledge_search failed: {type(exc).__name__}: {exc}"
-        event_id = _record_handler_usage(
+        _record_handler_usage(
             service,
             tool="knowledge_search",
             success=False,
@@ -303,7 +618,6 @@ def _handle_search(args: Any, **kwargs: Any) -> str:
         return _tool_error(
             message,
             success=False,
-            usage_event_id=event_id,
             **_exception_fields(exc),
         )
 
@@ -341,13 +655,10 @@ def _handle_get(args: Any, **kwargs: Any) -> str:
                 context=context,
                 index_metadata=meta,
             )
-            return _tool_error(
-                message,
-                success=False,
-                artifact_id=artifact_id,
-                usage_event_id=event_id,
-                **meta,
-            )
+            error_payload = {"error": message, "success": False, "artifact_id": artifact_id}
+            _add_usage_event(error_payload, event_id)
+            _add_actionable_lookup_metadata(error_payload, meta)
+            return _tool_result(error_payload)
         neighbors = (
             service.neighbors(artifact_id, ensure=False)[0]
             if include_neighbors
@@ -367,16 +678,18 @@ def _handle_get(args: Any, **kwargs: Any) -> str:
         )
         payload: dict[str, Any] = {
             "success": True,
-            "artifact": artifact,
-            "usage_event_id": event_id,
-            **meta,
+            "artifact": _agent_artifact(artifact),
         }
+        _add_usage_event(payload, event_id)
+        _add_actionable_lookup_metadata(payload, meta)
         if neighbors is not None:
-            payload["neighbors"] = neighbors
+            payload["neighbors"] = [
+                _agent_artifact(row, include_edge=True) for row in neighbors
+            ]
         return _tool_result(payload)
     except Exception as exc:
         message = f"knowledge_get failed: {type(exc).__name__}: {exc}"
-        event_id = _record_handler_usage(
+        _record_handler_usage(
             service,
             tool="knowledge_get",
             success=False,
@@ -391,7 +704,6 @@ def _handle_get(args: Any, **kwargs: Any) -> str:
         return _tool_error(
             message,
             success=False,
-            usage_event_id=event_id,
             **_exception_fields(exc),
         )
 
@@ -431,13 +743,10 @@ def _handle_neighbors(args: Any, **kwargs: Any) -> str:
                 context=context,
                 index_metadata=meta,
             )
-            return _tool_error(
-                message,
-                success=False,
-                artifact_id=artifact_id,
-                usage_event_id=event_id,
-                **meta,
-            )
+            error_payload = {"error": message, "success": False, "artifact_id": artifact_id}
+            _add_usage_event(error_payload, event_id)
+            _add_actionable_lookup_metadata(error_payload, meta)
+            return _tool_result(error_payload)
         rows = rows[:limit]
         event_id = service.record_usage(
             tool="knowledge_neighbors",
@@ -454,19 +763,16 @@ def _handle_neighbors(args: Any, **kwargs: Any) -> str:
             context=context,
             index_metadata=meta,
         )
-        return _tool_result(
-            {
-                "success": True,
-                "artifact_id": artifact_id,
-                "neighbors": rows,
-                "limit": limit,
-                "usage_event_id": event_id,
-                **meta,
-            }
-        )
+        payload: dict[str, Any] = {
+            "success": True,
+            "neighbors": [_agent_artifact(row, include_edge=True) for row in rows],
+        }
+        _add_usage_event(payload, event_id)
+        _add_actionable_lookup_metadata(payload, meta)
+        return _tool_result(payload)
     except Exception as exc:
         message = f"knowledge_neighbors failed: {type(exc).__name__}: {exc}"
-        event_id = _record_handler_usage(
+        _record_handler_usage(
             service,
             tool="knowledge_neighbors",
             success=False,
@@ -482,7 +788,6 @@ def _handle_neighbors(args: Any, **kwargs: Any) -> str:
         return _tool_error(
             message,
             success=False,
-            usage_event_id=event_id,
             **_exception_fields(exc),
         )
 
@@ -523,7 +828,7 @@ def _handle_feedback(args: Any, **kwargs: Any) -> str:
     service: LocalKnowledgeService | None = None
     try:
         service = _service()
-        feedback_id, usage_event_id = service.feedback(
+        feedback_id, _usage_event_id = service.feedback(
             rating=rating,
             event_id=event_id,
             query=query,
@@ -534,24 +839,14 @@ def _handle_feedback(args: Any, **kwargs: Any) -> str:
             resolves_feedback_id=resolves_feedback_id,
             usage_started_at=started,
         )
-        return _tool_result(
-            {
-                "success": True,
-                "feedback_id": feedback_id,
-                "usage_event_id": usage_event_id,
-                "rating": rating,
-                "event_id": event_id,
-                "usage_db_path": str(service.usage_db_path),
-            }
-        )
+        return _tool_result({"success": True, "feedback_id": feedback_id})
     except Exception as exc:
         message = f"knowledge_feedback failed: {type(exc).__name__}: {exc}"
         # A lock failure already consumed the handler's bounded wait. Opening a
         # second connection would double that budget. Other argument/schema
         # failures retain the established best-effort failure event.
-        failed_usage_event_id: int | None = None
         if not isinstance(exc, FeedbackDatabaseLockedError):
-            failed_usage_event_id = _record_handler_usage(
+            _record_handler_usage(
                 service,
                 tool="knowledge_feedback",
                 success=False,
@@ -561,11 +856,7 @@ def _handle_feedback(args: Any, **kwargs: Any) -> str:
                 latency_ms=_latency_ms(started),
                 context=context,
             )
-        return _tool_error(
-            message,
-            success=False,
-            usage_event_id=failed_usage_event_id,
-        )
+        return _tool_error(message, success=False)
 
 
 def _handle_usage_report(args: Any, **kwargs: Any) -> str:
@@ -579,7 +870,7 @@ def _handle_usage_report(args: Any, **kwargs: Any) -> str:
     try:
         service = _service()
         report = service.usage_report(days=days, limit=limit)
-        usage_event_id = service.record_usage(
+        service.record_usage(
             tool="knowledge_usage_report",
             success=True,
             limit_value=limit,
@@ -588,11 +879,10 @@ def _handle_usage_report(args: Any, **kwargs: Any) -> str:
             db_path=service.usage_db_path,
             context=context,
         )
-        report["usage_event_id"] = usage_event_id
-        return _model_safe_usage_report_result(report)
+        return _model_safe_usage_report_result(_agent_usage_report(report))
     except Exception as exc:
         message = f"knowledge_usage_report failed: {type(exc).__name__}: {exc}"
-        usage_event_id = _record_handler_usage(
+        _record_handler_usage(
             service,
             tool="knowledge_usage_report",
             success=False,
@@ -600,7 +890,7 @@ def _handle_usage_report(args: Any, **kwargs: Any) -> str:
             latency_ms=_latency_ms(started),
             context=context,
         )
-        return _tool_error(message, success=False, usage_event_id=usage_event_id)
+        return _tool_error(message, success=False)
 
 
 def _bundled_router_skill() -> Path:
@@ -710,9 +1000,9 @@ def register(ctx: Any) -> None:
             {
                 "name": "knowledge_get",
                 "description": (
-                    "Fetch one artifact from the local capability index by id, including "
-                    "its path, summary, triggers, entities, and related artifact ids. Use after "
-                    "knowledge_search returns an artifact id. Usage is logged locally."
+                    "Fetch concise routing metadata for one artifact from the local capability "
+                    "index by id. Use after knowledge_search returns an artifact id. Usage is "
+                    "logged locally."
                 ),
                 "parameters": {
                     "type": "object",
@@ -869,9 +1159,9 @@ def register(ctx: Any) -> None:
             {
                 "name": "knowledge_usage_report",
                 "description": (
-                    "Summarize local knowledge tool usage and feedback to guide "
-                    "self-improvement. Use before changing index ranking, triggers, docs, "
-                    "or graph edges."
+                    "Return a concise summary of local knowledge usage, search quality, "
+                    "feedback, and repair candidates. Use before changing index ranking, "
+                    "triggers, docs, or graph edges."
                 ),
                 "parameters": {
                     "type": "object",

@@ -44,6 +44,7 @@ These instructions apply to the whole repository.
 - Parent-equivalent evaluation only relates a `skill_support_doc` to its owning skill; graph neighbors are not evaluation equivalence.
 - Script search text uses routing-safe metadata, never arbitrary body literals.
 - Environment names may be routing signals. Environment values, MCP credential values, raw tool arguments/output, transcripts, OCR/private document text, and secret-like schema values must not enter indexed or generated artifacts.
+- Keep native model-facing tool responses concise: expose only routing decisions, actionable lookup state, feedback handles, and improvement evidence. Preserve rich index/configuration diagnostics in internal telemetry and CLI/operator surfaces rather than routine agent context.
 - `$HERMES_HOME/skills/.archive` is excluded from active routing.
 - Feedback/evaluation data stays local. Keep public docs/tests free of raw telemetry and private content.
 - Feedback-assisted routing is current-index-root-only and bounded to the latest significant explicit query/artifact rating. Among accepted current ratings, only `useful` is positive; legacy persisted `great` rows remain positive compatibility input. A newer rejection for the route or matching current query vetoes an older overlapping positive. Promote an artifact only when the current index returns it, with at most one no-longer-than-current artifact-type retry. Explicit caller-owned indexes remain unassisted.

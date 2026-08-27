@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.13] - 2026-08-27
+
+### Changed
+
+- Made all five native tools return concise model-facing payloads: routine lookups now omit index diagnostics, trigger vocabularies, ranks, null fields, echoed arguments, and internal paths while preserving actionable warnings, rebuild state, feedback handles, and graph-edge evidence. Usage telemetry remains rich internally, and the usage-report tool now projects it to current search quality, feedback, errors, and repair candidates.
+
+[0.4.13]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.12...v0.4.13
+
 ## [0.4.12] - 2026-08-22
 
 ### Added
