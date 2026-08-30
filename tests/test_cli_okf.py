@@ -63,11 +63,13 @@ def seed_candidate(state_dir: Path, *, tool_name: str = "mcp__paperless__paperle
 
 def okf_markdown(tool_name: str, schema_hash: str) -> str:
     return f"""---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: {tool_name}
 toolset: paperless
 schema_hash: {schema_hash}
 generator_version: {okf.OKF_GENERATOR_VERSION}
+generated: {{"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}}
 aliases:
   - latest paperless document metadata
 triggers:

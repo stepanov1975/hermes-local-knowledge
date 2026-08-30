@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 from hermes_local_knowledge import okf, plugin
 from hermes_local_knowledge.config import resolve_config
@@ -215,11 +216,13 @@ def test_validation_uses_claim_time_related_tool_snapshot_across_ranking_drift(t
 
     def content(related_tool: str) -> str:
         return f"""---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: target_tool
 toolset: demo
 schema_hash: {okf.schema_hash(schema)}
 generator_version: {okf.OKF_GENERATOR_VERSION}
+generated: {{"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}}
 aliases:
   - operate the target demo tool
 triggers:
@@ -254,11 +257,13 @@ def test_validation_rejects_fabricated_toolset_when_claim_has_none(tmp_path: Pat
     write(
         target_path,
         f"""---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: unscoped_tool
 toolset: fabricated
 schema_hash: {okf.schema_hash(schema)}
 generator_version: {okf.OKF_GENERATOR_VERSION}
+generated: {{"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}}
 aliases:
   - use the unscoped demo tool
 triggers:
@@ -634,6 +639,13 @@ def test_worker_uses_one_structured_call_for_one_bounded_batch(tmp_path: Path, m
     assert okf.queue_counts(state_dir) == {"done": 2, "pending": 1}
     assert len(list(okf.okf_dir(state_dir).glob("*.md"))) == 2
     assert list(okf.okf_dir(state_dir).glob(".*.tmp")) == []
+    rendered = okf.okf_file_path(state_dir, "alpha_tool").read_text(encoding="utf-8")
+    frontmatter = okf._parse_frontmatter(rendered)
+    generated = okf._frontmatter_mapping(frontmatter, "generated")
+    assert frontmatter["type"] == okf.OKF_CONCEPT_TYPE
+    assert generated["by"] == f"hermes-local-knowledge-okf/{okf.OKF_GENERATOR_VERSION}"
+    assert okf._is_explicit_iso8601_datetime(str(generated["at"]))
+    assert "generated_at:" not in rendered
 
 
 def configure_auto_generation(
@@ -679,6 +691,87 @@ def generated_item(packet: dict[str, Any], *, label: str = "generated") -> dict[
         "related_tools": [],
         "body": f"Use {packet['tool']} for matching demo operations.",
     }
+
+
+def test_worker_opportunistically_migrates_legacy_okf_without_model_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hermes_home, state_dir = configure_auto_generation(tmp_path, monkeypatch, max_candidates=1)
+    schema = {"type": "object"}
+    tool_name = "legacy_tool"
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=tool_name,
+        toolset="demo",
+        schema=schema,
+        args={},
+    )
+    row = okf.claim_candidates(state_dir, limit=1, claim_token="legacy-seed")[0]
+    target = okf.okf_file_path(state_dir, tool_name)
+    legacy_alias = 'route "priority" demo requests through legacy tool'
+    write(
+        target,
+        f"""---
+artifact_type: tool_okf
+tool: {tool_name}
+toolset: demo
+schema_hash: {row["schema_hash"]}
+generator_version: {okf.LEGACY_OKF_GENERATOR_VERSION}
+title: Legacy tool router
+generated_at: "2026-07-10T12:00:00Z"
+aliases:
+  - {json.dumps(legacy_alias)}
+triggers:
+  - use legacy tool for matching demo operations
+when_not_to_use:
+related_tools:
+---
+
+# Legacy tool router
+
+Use legacy_tool for matching demo operations.
+""",
+    )
+    assert okf.mark_candidate_done(
+        state_dir,
+        tool_name=tool_name,
+        claim_token="legacy-seed",
+        okf_path=target,
+    )
+    with sqlite3.connect(okf.okf_queue_db_path(state_dir)) as conn:
+        conn.execute(
+            "UPDATE okf_candidates SET generator_version = ? WHERE tool_name = ?",
+            (okf.LEGACY_OKF_GENERATOR_VERSION, tool_name),
+        )
+
+    legacy_text = target.read_text(encoding="utf-8")
+    write(target, legacy_text.replace("title: Legacy tool router", "custom_extension: preserve-me\ntitle: Legacy tool router"))
+    assert okf._legacy_okf_migration(state_dir, row) is None
+    write(target, legacy_text)
+
+    assert okf.has_generation_work(state_dir, min_use_count=1, stale_after_seconds=60)
+
+    class Llm:
+        def complete_structured(self, **kwargs: Any) -> Any:
+            raise AssertionError(f"legacy format migration called the model: {kwargs}")
+
+    assert okf.run_worker(llm=Llm(), hermes_home=hermes_home) == 0
+
+    migrated = target.read_text(encoding="utf-8")
+    frontmatter = okf._parse_frontmatter(migrated)
+    assert frontmatter["type"] == okf.OKF_CONCEPT_TYPE
+    assert frontmatter["generator_version"] == okf.OKF_GENERATOR_VERSION
+    assert okf._frontmatter_mapping(frontmatter, "generated") == {
+        "by": f"hermes-local-knowledge-okf/{okf.LEGACY_OKF_GENERATOR_VERSION}",
+        "at": "2026-07-10T12:00:00Z",
+    }
+    assert "generated_at:" not in migrated
+    assert "Use legacy_tool for matching demo operations." in migrated
+    parsed = yaml.safe_load(migrated.split("---", 2)[1])
+    assert parsed["aliases"] == [legacy_alias]
+    assert okf.queue_counts(state_dir) == {"done": 1}
+    assert not okf.has_generation_work(state_dir, min_use_count=1, stale_after_seconds=60)
 
 
 def test_worker_normalizes_only_claimed_v0312_schema_projection(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -843,6 +936,7 @@ def valid_claimed_okf(row: dict[str, Any], *, label: str = "Generated") -> str:
     toolset = str(row.get("toolset") or "").strip()
     lines = [
         "---",
+        "type: Hermes Tool",
         "artifact_type: tool_okf",
         f"tool: {json.dumps(tool_name)}",
     ]
@@ -852,6 +946,7 @@ def valid_claimed_okf(row: dict[str, Any], *, label: str = "Generated") -> str:
         [
             f"schema_hash: {json.dumps(str(row['schema_hash']))}",
             f"generator_version: {json.dumps(okf.OKF_GENERATOR_VERSION)}",
+            'generated: {"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}',
             f"title: {json.dumps(f'{label} router for {tool_name}')}",
             "aliases:",
             f"  - {json.dumps(f'route matching demo requests through {tool_name}')}",
@@ -1921,11 +2016,13 @@ def test_worker_recovers_valid_canonical_file_before_attempt_cap_without_model_c
     write(
         target,
         f"""---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: recovery_tool
 toolset: demo
 schema_hash: {okf.schema_hash(schema)}
 generator_version: {okf.OKF_GENERATOR_VERSION}
+generated: {{"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}}
 title: Recovery tool router
 aliases:
   - route recovery tool requests

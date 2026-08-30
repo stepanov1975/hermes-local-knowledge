@@ -682,7 +682,7 @@ def create_current_okf_queue(
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
-                "generator_version": "3",
+                "generator_version": "4",
                 "first_seen": "2026-07-01T00:00:00Z",
                 "last_seen": "2026-07-01T00:00:00Z",
                 "use_count": use_count,
@@ -2635,7 +2635,7 @@ def test_okf_cli_reads_current_queue_and_preserves_command_exit_contract(
     assert candidate["tool"] == "public_demo_tool"
     assert candidate["tool_name"] == "public_demo_tool"
     assert candidate["toolset"] == "local_knowledge"
-    assert candidate["generator_version"] == "3"
+    assert candidate["generator_version"] == "4"
     assert candidate["allowed_related_tools"] == []
     assert candidate["target_path"] == str(
         state_dir.resolve() / "okfs" / "tools" / "public-demo-tool.md"
@@ -2718,11 +2718,13 @@ def test_okf_cli_reads_current_queue_and_preserves_command_exit_contract(
     write(
         target,
         """---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: public_demo_tool
 toolset: local_knowledge
 schema_hash: sha256:public-fixture
-generator_version: "3"
+generator_version: "4"
+generated: {"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}
 title: Public demo router
 aliases:
   - route quartz inventory records

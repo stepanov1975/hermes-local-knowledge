@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.14] - 2026-08-30
+
+### Changed
+
+- Updated generated tool-routing notes to Open Knowledge Format v0.2 metadata and made the existing bounded worker opportunistically convert generator-v3 notes without a model call, preserving their routing content and original generation timestamp while falling back to normal regeneration when lossless conversion is not possible.
+
+[0.4.14]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.13...v0.4.14
+
 ## [0.4.13] - 2026-08-27
 
 ### Changed

@@ -41,7 +41,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
-    assert hermes_local_knowledge.__version__ == "0.4.13"
+    assert hermes_local_knowledge.__version__ == "0.4.14"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
