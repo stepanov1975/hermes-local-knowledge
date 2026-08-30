@@ -987,6 +987,22 @@ def test_opportunistic_migration_does_not_reclaim_future_generator_rows(tmp_path
             "SELECT status, generator_version, claim_generator_version FROM okf_candidates WHERE tool_name = ?",
             (tool_name,),
         ).fetchone() == ("claimed", "5", "5")
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET status = 'error', attempt_count = 3,
+                claimed_at = NULL, claim_token = NULL, claim_generator_version = NULL
+            WHERE tool_name = ?
+            """,
+            (tool_name,),
+        )
+
+    assert okf.retry_error_candidate(tmp_path, tool_name=tool_name) is False
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        assert conn.execute(
+            "SELECT status, generator_version, attempt_count FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone() == ("error", "5", 3)
 
 
 def test_future_generator_guard_is_atomic_with_candidate_upsert(

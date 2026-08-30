@@ -1094,10 +1094,15 @@ def retry_error_candidate(state_dir: Path, *, tool_name: str) -> bool:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
         row = conn.execute(
-            "SELECT COALESCE(status, 'pending') AS status FROM okf_candidates WHERE tool_name = ?",
+            "SELECT COALESCE(status, 'pending') AS status, generator_version "
+            "FROM okf_candidates WHERE tool_name = ?",
             (tool_name,),
         ).fetchone()
-        if row is None or row["status"] != "error":
+        if (
+            row is None
+            or row["status"] != "error"
+            or _is_newer_generator_version(row["generator_version"])
+        ):
             conn.rollback()
             return False
         cursor = conn.execute(
