@@ -79,7 +79,7 @@ Existing-artifact lookup works without model calls. `local_knowledge.okf.auto_ge
 Before enabling automatic generation, an installer must explain that:
 
 - a detached worker invokes the active Hermes model and consumes additional model tokens;
-- one worker claims at most `max_candidates_per_session` candidates (default `2`) and makes one structured batch call when it has claims;
+- one worker claims at most `max_candidates_per_session` candidates (default `2`) and makes at most one structured batch call when new content must be authored;
 - `max_generation_seconds` is passed as the provider-request timeout, while provider retry/fallback policy can extend total elapsed time and token use behind that host call;
 - session finalization does not wait for generation.
 
@@ -95,6 +95,8 @@ hermes config set local_knowledge.okf.auto_generate true
 ```
 
 If it is already enabled, report that instead of asking again. If the user declines, leave `auto_generate` disabled and report that existing lookup and manual OKF management remain available, but new tool-routing notes will not be generated automatically.
+
+Generated tool notes use Open Knowledge Format v0.2 concept metadata (`type` plus structured `generated.by`/`generated.at` provenance). When automatic generation is enabled, the same bounded worker opportunistically claims completed generator-v3 notes and converts their deterministic frontmatter to v0.2 without a model call, preserving the existing routing content and generation timestamp. A legacy note that cannot be converted losslessly falls back to normal model-backed regeneration.
 
 ### Install the proactive router skill
 

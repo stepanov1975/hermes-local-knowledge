@@ -25,7 +25,9 @@ logger = logging.getLogger(__name__)
 
 QUEUE_DB_NAME = "okf_queue.sqlite"
 INDEX_DIRTY_MARKER_NAME = "okf_index_dirty"
-OKF_GENERATOR_VERSION = "3"
+OKF_GENERATOR_VERSION = "4"
+OKF_CONCEPT_TYPE = "Hermes Tool"
+LEGACY_OKF_GENERATOR_VERSION = "3"
 DEFAULT_MAX_ARG_ITEMS = 8
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_RELATED_TOOLS = 32
@@ -109,6 +111,10 @@ _EPHEMERAL_OKF_TEXT = re.compile(
 _GENERIC_NEGATIVE_GUIDANCE = re.compile(
     r"(?i)\b(?:credentials?|secret values?|raw transcripts?|raw tool outputs?)\b"
 )
+_LEGACY_FLOW_LIST = re.compile(
+    r"^\s*(?:aliases|triggers|when_not_to_use|related_tools):\s*\[",
+    re.MULTILINE,
+)
 
 
 def _path_is_relative_to(path: Path, root: Path) -> bool:
@@ -132,11 +138,33 @@ def _safe_read_text(path: Path, *, max_chars: int) -> str:
         return ""
 
 
+def _parse_frontmatter_scalar(value: str) -> str:
+    clean = value.strip()
+    if len(clean) >= 2 and clean.startswith('"') and clean.endswith('"'):
+        try:
+            parsed = json.loads(clean)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if isinstance(parsed, str):
+                return parsed
+    if len(clean) >= 2 and clean.startswith("'") and clean.endswith("'"):
+        return clean[1:-1].replace("''", "'")
+    return clean
+
+
 def _parse_bracket_list(value: str) -> list[str]:
     clean = value.strip()
     if clean.startswith("[") and clean.endswith("]"):
-        clean = clean[1:-1]
-    return [item.strip().strip("'\"") for item in clean.split(",") if item.strip().strip("'\"")]
+        try:
+            parsed = json.loads(clean)
+        except (TypeError, ValueError):
+            clean = clean[1:-1]
+        else:
+            if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+                return [item.strip() for item in parsed if item.strip()]
+            return []
+    return [_parse_frontmatter_scalar(item) for item in clean.split(",") if item.strip()]
 
 
 def _parse_frontmatter(text: str) -> dict[str, Any]:
@@ -146,6 +174,7 @@ def _parse_frontmatter(text: str) -> dict[str, Any]:
     current_key: str | None = None
     for line in text.splitlines()[1:]:
         stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
         if stripped == "---":
             break
         if not stripped or stripped.startswith("#"):
@@ -154,12 +183,20 @@ def _parse_frontmatter(text: str) -> dict[str, Any]:
         if list_item and current_key:
             current_value = frontmatter.get(current_key)
             if isinstance(current_value, list):
-                current_value.append(list_item.group(1).strip().strip("'\""))
+                current_value.append(_parse_frontmatter_scalar(list_item.group(1)))
             continue
         match = re.match(r"^([A-Za-z0-9_.-]+):\s*(.*)$", stripped)
         if not match:
             continue
         key, value = match.groups()
+        if indent and current_key:
+            current_value = frontmatter.get(current_key)
+            if current_value == []:
+                current_value = {}
+                frontmatter[current_key] = current_value
+            if isinstance(current_value, dict):
+                current_value[key] = _parse_frontmatter_scalar(value)
+                continue
         current_key = key
         value = value.strip()
         if not value:
@@ -167,12 +204,52 @@ def _parse_frontmatter(text: str) -> dict[str, Any]:
         elif value.startswith("[") and value.endswith("]"):
             frontmatter[key] = _parse_bracket_list(value)
         else:
-            frontmatter[key] = value.strip("'\"")
+            frontmatter[key] = _parse_frontmatter_scalar(value)
     return frontmatter
+
+
+def _frontmatter_mapping(frontmatter: Mapping[str, Any], key: str) -> dict[str, Any]:
+    value = frontmatter.get(key)
+    if isinstance(value, Mapping):
+        return {str(item_key): item_value for item_key, item_value in value.items()}
+    if not isinstance(value, str):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        clean = value.strip()
+        if not (clean.startswith("{") and clean.endswith("}")):
+            return {}
+        parsed = {}
+        for item in clean[1:-1].split(","):
+            if ":" not in item:
+                return {}
+            item_key, item_value = item.split(":", 1)
+            parsed[item_key.strip().strip("'\"")] = _parse_frontmatter_scalar(item_value)
+    if not isinstance(parsed, Mapping):
+        return {}
+    return {str(item_key): item_value for item_key, item_value in parsed.items()}
+
+
+def _is_explicit_iso8601_datetime(value: str) -> bool:
+    if not value or not (value.endswith("Z") or re.search(r"[+-]\d{2}:\d{2}$", value)):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _is_newer_generator_version(value: Any) -> bool:
+    try:
+        return int(str(value)) > int(OKF_GENERATOR_VERSION)
+    except ValueError:
+        return False
 
 
 def okf_queue_db_path(state_dir: Path) -> Path:
@@ -772,6 +849,13 @@ def upsert_tool_candidate(
     error_increment = 1 if success is False else 0
     clean_error_type = _safe_error_type(error_type)
     with _connect(state_dir) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT generator_version FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone()
+        if existing is not None and _is_newer_generator_version(existing["generator_version"]):
+            return
         conn.execute(
             """
             INSERT INTO okf_candidates (
@@ -941,8 +1025,18 @@ def has_generation_work(
             SELECT CASE WHEN
               EXISTS (
                 SELECT 1 FROM okf_candidates
-                WHERE (COALESCE(status, 'pending') = 'pending' AND COALESCE(use_count, 0) >= ?)
-                   OR (status = 'claimed' AND COALESCE(claimed_at, '') < ?)
+                WHERE (
+                        COALESCE(status, 'pending') = 'pending'
+                        AND COALESCE(generator_version, '') IN (?, ?)
+                        AND COALESCE(use_count, 0) >= ?
+                      )
+                   OR (status = 'done' AND COALESCE(generator_version, '') = ?
+                       AND COALESCE(use_count, 0) >= ?)
+                   OR (
+                        status = 'claimed'
+                        AND COALESCE(claim_generator_version, '') IN (?, ?)
+                        AND COALESCE(claimed_at, '') < ?
+                      )
                 LIMIT 1
               )
               AND NOT EXISTS (
@@ -951,7 +1045,18 @@ def has_generation_work(
               )
             THEN 1 ELSE 0 END
             """,
-            (min_use_count, cutoff, GENERATION_LEASE_NAME, current_dt.timestamp()),
+            (
+                OKF_GENERATOR_VERSION,
+                LEGACY_OKF_GENERATOR_VERSION,
+                min_use_count,
+                LEGACY_OKF_GENERATOR_VERSION,
+                min_use_count,
+                OKF_GENERATOR_VERSION,
+                LEGACY_OKF_GENERATOR_VERSION,
+                cutoff,
+                GENERATION_LEASE_NAME,
+                current_dt.timestamp(),
+            ),
         ).fetchone()
         return row is not None and row[0] == 1
     except sqlite3.DatabaseError:
@@ -989,10 +1094,15 @@ def retry_error_candidate(state_dir: Path, *, tool_name: str) -> bool:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
         row = conn.execute(
-            "SELECT COALESCE(status, 'pending') AS status FROM okf_candidates WHERE tool_name = ?",
+            "SELECT COALESCE(status, 'pending') AS status, generator_version "
+            "FROM okf_candidates WHERE tool_name = ?",
             (tool_name,),
         ).fetchone()
-        if row is None or row["status"] != "error":
+        if (
+            row is None
+            or row["status"] != "error"
+            or _is_newer_generator_version(row["generator_version"])
+        ):
             conn.rollback()
             return False
         cursor = conn.execute(
@@ -1037,8 +1147,9 @@ def _recover_stale_claims_on_connection(
 ) -> int:
     stale_rows = conn.execute(
         f"SELECT {_CANDIDATE_SELECT} FROM okf_candidates "
-        "WHERE status = 'claimed' AND COALESCE(claimed_at, '') < ?",
-        (cutoff,),
+        "WHERE status = 'claimed' AND COALESCE(claim_generator_version, '') IN (?, ?) "
+        "AND COALESCE(claimed_at, '') < ?",
+        (OKF_GENERATOR_VERSION, LEGACY_OKF_GENERATOR_VERSION, cutoff),
     ).fetchall()
     completed = 0
     for stale_row in stale_rows:
@@ -1073,9 +1184,16 @@ def _recover_stale_claims_on_connection(
             related_tools_json = '[]',
             okf_path = NULL,
             last_attempt_error = '<redacted>'
-        WHERE status = 'claimed' AND COALESCE(claimed_at, '') < ?
+        WHERE status = 'claimed' AND COALESCE(claim_generator_version, '') IN (?, ?)
+          AND COALESCE(claimed_at, '') < ?
         """,
-        (max_attempts, OKF_GENERATOR_VERSION, cutoff),
+        (
+            max_attempts,
+            OKF_GENERATOR_VERSION,
+            OKF_GENERATOR_VERSION,
+            LEGACY_OKF_GENERATOR_VERSION,
+            cutoff,
+        ),
     )
     return completed + cursor.rowcount
 
@@ -1104,12 +1222,35 @@ def claim_candidates(
         conn.execute(
             """
             UPDATE okf_candidates
+            SET status = 'pending', generator_version = ?, attempt_count = 0,
+                claim_token = NULL, claimed_at = NULL, claim_generator_version = NULL,
+                related_tools_json = '[]', okf_path = NULL, last_attempt_error = NULL
+            WHERE status = 'done' AND COALESCE(generator_version, '') = ?
+              AND COALESCE(use_count, 0) >= ?
+            """,
+            (OKF_GENERATOR_VERSION, LEGACY_OKF_GENERATOR_VERSION, min_use_count),
+        )
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET generator_version = ?
+            WHERE COALESCE(status, 'pending') = 'pending'
+              AND COALESCE(generator_version, '') = ?
+              AND COALESCE(use_count, 0) >= ?
+            """,
+            (OKF_GENERATOR_VERSION, LEGACY_OKF_GENERATOR_VERSION, min_use_count),
+        )
+        conn.execute(
+            """
+            UPDATE okf_candidates
             SET status = 'error', generator_version = ?, claim_token = NULL, claimed_at = NULL,
                 claim_generator_version = NULL, related_tools_json = '[]',
                 okf_path = NULL, last_attempt_error = '<redacted>'
-            WHERE COALESCE(attempt_count, 0) >= ? AND COALESCE(status, 'pending') = 'pending'
+            WHERE COALESCE(attempt_count, 0) >= ?
+              AND COALESCE(status, 'pending') = 'pending'
+              AND COALESCE(generator_version, '') = ?
             """,
-            (OKF_GENERATOR_VERSION, max_attempts),
+            (OKF_GENERATOR_VERSION, max_attempts, OKF_GENERATOR_VERSION),
         )
         rows = conn.execute(
             f"""
@@ -1117,10 +1258,11 @@ def claim_candidates(
             WHERE COALESCE(use_count, 0) >= ?
               AND COALESCE(attempt_count, 0) < ?
               AND COALESCE(status, 'pending') = 'pending'
+              AND COALESCE(generator_version, '') = ?
             ORDER BY COALESCE(use_count, 0) DESC, COALESCE(last_seen, '') ASC, tool_name ASC
             LIMIT ?
             """,
-            (min_use_count, max_attempts, limit),
+            (min_use_count, max_attempts, OKF_GENERATOR_VERSION, limit),
         ).fetchall()
         schema_updates: list[tuple[str, str]] = []
         for row in rows:
@@ -1484,6 +1626,16 @@ def validate_okf_file(
     artifact_type = str(frontmatter.get("artifact_type") or "").strip()
     if artifact_type != "tool_okf":
         errors.append("frontmatter artifact_type must be tool_okf")
+    concept_type = str(frontmatter.get("type") or "").strip()
+    if concept_type != OKF_CONCEPT_TYPE:
+        errors.append(f"frontmatter type must be {OKF_CONCEPT_TYPE}")
+    generated = _frontmatter_mapping(frontmatter, "generated")
+    generated_by = str(generated.get("by") or "").strip()
+    generated_at = str(generated.get("at") or "").strip()
+    if not re.fullmatch(r"[^/\s]+/[^/\s]+", generated_by):
+        errors.append("frontmatter generated.by must use producer/version format")
+    if not _is_explicit_iso8601_datetime(generated_at):
+        errors.append("frontmatter generated.at must be an ISO 8601 datetime with an explicit offset")
     tool_name = str(frontmatter.get("tool") or "").strip()
     if not tool_name:
         errors.append("frontmatter tool is required")
@@ -1786,13 +1938,20 @@ def _quoted(value: Any, *, max_chars: int = 500) -> str:
     return json.dumps(clean, ensure_ascii=False)
 
 
-def _render_okf(item: Mapping[str, Any], *, toolset: str | None) -> str:
+def _render_okf(
+    item: Mapping[str, Any],
+    *,
+    toolset: str | None,
+    generated_by: str | None = None,
+    generated_at: str | None = None,
+) -> str:
     tool_name = str(item.get("tool") or "").strip()
     schema_digest = str(item.get("schema_hash") or "").strip()
     title = str(item.get("title") or f"Tool OKF: {tool_name}").strip()[:500]
     body = str(item.get("body") or "").replace("\x00", "").strip()[:4_000]
     lines = [
         "---",
+        f"type: {_quoted(OKF_CONCEPT_TYPE)}",
         "artifact_type: tool_okf",
         f"tool: {_quoted(tool_name)}",
     ]
@@ -1803,7 +1962,9 @@ def _render_okf(item: Mapping[str, Any], *, toolset: str | None) -> str:
             f"schema_hash: {_quoted(schema_digest)}",
             f"generator_version: {_quoted(OKF_GENERATOR_VERSION)}",
             f"title: {_quoted(title)}",
-            f"generated_at: {_quoted(utc_now())}",
+            "generated:",
+            f"  by: {_quoted(generated_by or f'hermes-local-knowledge-okf/{OKF_GENERATOR_VERSION}')}",
+            f"  at: {_quoted(generated_at or utc_now())}",
         ]
     )
     for key in ("aliases", "triggers", "when_not_to_use", "related_tools"):
@@ -1861,6 +2022,9 @@ def _write_and_complete_item(
     row: Mapping[str, Any],
     item: Mapping[str, Any],
     lease_owner: str,
+    generated_by: str | None = None,
+    generated_at: str | None = None,
+    mark_validation_error: bool = True,
 ) -> bool:
     tool_name = str(row.get("tool_name") or "")
     claim_token = str(row.get("claim_token") or "")
@@ -1879,7 +2043,14 @@ def _write_and_complete_item(
         suffix=".tmp",
         delete=False,
     ) as handle:
-        handle.write(_render_okf(item, toolset=str(row.get("toolset") or "").strip() or None))
+        handle.write(
+            _render_okf(
+                item,
+                toolset=str(row.get("toolset") or "").strip() or None,
+                generated_by=generated_by,
+                generated_at=generated_at,
+            )
+        )
         temp_path = Path(handle.name)
     previous: bytes | None = None
     published = False
@@ -1907,12 +2078,13 @@ def _write_and_complete_item(
             _content_path=temp_path,
         )
         if not prevalidation["valid"]:
-            mark_candidate_error(
-                cfg.state_dir,
-                tool_name=tool_name,
-                claim_token=claim_token,
-                error="generated validation failed",
-            )
+            if mark_validation_error:
+                mark_candidate_error(
+                    cfg.state_dir,
+                    tool_name=tool_name,
+                    claim_token=claim_token,
+                    error="generated validation failed",
+                )
             return False
         try:
             outcome = publish_claimed_okf(
@@ -1932,7 +2104,7 @@ def _write_and_complete_item(
                 error="OKF target path belongs to a different tool",
             )
             return False
-        if outcome == "invalid":
+        if outcome == "invalid" and mark_validation_error:
             mark_candidate_error(
                 cfg.state_dir,
                 tool_name=tool_name,
@@ -1956,6 +2128,74 @@ def _fail_claimed_rows(cfg: Config, rows: Sequence[Mapping[str, Any]], *, error:
         )
 
 
+def _legacy_okf_migration(
+    state_dir: Path,
+    row: Mapping[str, Any],
+) -> tuple[dict[str, Any], str, str] | None:
+    """Return a lossless v0.1-era item when the canonical file is safe to migrate."""
+
+    tool_name = str(row.get("tool_name") or "").strip()
+    path = okf_file_path(state_dir, tool_name)
+    text = _safe_read_text(path, max_chars=80_000)
+    lines = text.splitlines()
+    try:
+        closing_index = lines.index("---", 1)
+    except ValueError:
+        return None
+    if _LEGACY_FLOW_LIST.search("\n".join(lines[1:closing_index])):
+        return None
+    frontmatter = _parse_frontmatter(text)
+    legacy_version = str(frontmatter.get("generator_version") or "").strip()
+    allowed_legacy_fields = {
+        "artifact_type",
+        "tool",
+        "toolset",
+        "schema_hash",
+        "generator_version",
+        "title",
+        "generated_at",
+        "aliases",
+        "triggers",
+        "when_not_to_use",
+        "related_tools",
+    }
+    if (
+        not text
+        or bool(set(frontmatter) - allowed_legacy_fields)
+        or str(frontmatter.get("artifact_type") or "").strip() != "tool_okf"
+        or str(frontmatter.get("type") or "").strip()
+        or _frontmatter_mapping(frontmatter, "generated")
+        or legacy_version != LEGACY_OKF_GENERATOR_VERSION
+        or str(frontmatter.get("tool") or "").strip() != tool_name
+        or str(frontmatter.get("schema_hash") or "").strip() != str(row.get("schema_hash") or "").strip()
+        or str(frontmatter.get("toolset") or "").strip() != str(row.get("toolset") or "").strip()
+    ):
+        return None
+
+    generated_at = str(frontmatter.get("generated_at") or "").strip()
+    title = str(frontmatter.get("title") or "").strip()
+    if not _is_explicit_iso8601_datetime(generated_at) or not title:
+        return None
+    rendered_body = "\n".join(lines[closing_index + 1 :]).strip()
+    heading = f"# {title}"
+    if rendered_body == heading or not rendered_body.startswith(heading + "\n"):
+        return None
+    body = rendered_body[len(heading) :].strip()
+    item = {
+        "tool": tool_name,
+        "schema_hash": str(row.get("schema_hash") or "").strip(),
+        "title": title,
+        "aliases": _frontmatter_list(frontmatter, "aliases"),
+        "triggers": _frontmatter_list(frontmatter, "triggers"),
+        "when_not_to_use": _frontmatter_list(frontmatter, "when_not_to_use"),
+        "related_tools": _frontmatter_list(frontmatter, "related_tools"),
+        "body": body,
+    }
+    if _generated_item_error(item, row=row) is not None:
+        return None
+    return item, f"hermes-local-knowledge-okf/{legacy_version}", generated_at
+
+
 def _generate_claimed_okfs(
     cfg: Config,
     *,
@@ -1965,7 +2205,29 @@ def _generate_claimed_okfs(
 ) -> bool:
     usable_rows: list[dict[str, Any]] = []
     packets: list[dict[str, Any]] = []
+    completed = 0
     for row in rows:
+        migration = _legacy_okf_migration(cfg.state_dir, row)
+        if migration is not None:
+            item, generated_by, generated_at = migration
+            migrated = _write_and_complete_item(
+                cfg,
+                row=row,
+                item=item,
+                lease_owner=lease_owner,
+                generated_by=generated_by,
+                generated_at=generated_at,
+                mark_validation_error=False,
+            )
+            if migrated:
+                completed += 1
+                continue
+            if claimed_candidate(
+                cfg.state_dir,
+                tool_name=str(row.get("tool_name") or ""),
+                claim_token=str(row.get("claim_token") or ""),
+            ) is None:
+                continue
         try:
             packet = _generation_packet(row)
         except (TypeError, ValueError):
@@ -1979,7 +2241,7 @@ def _generate_claimed_okfs(
         usable_rows.append(row)
         packets.append(packet)
     if not usable_rows:
-        return False
+        return completed > 0
 
     result = llm.complete_structured(
         instructions=(
@@ -2015,7 +2277,6 @@ def _generate_claimed_okfs(
         _fail_claimed_rows(cfg, usable_rows, error="structured response missing okfs")
         return False
 
-    completed = 0
     for row in usable_rows:
         tool_name = str(row.get("tool_name") or "")
         matching = [

@@ -123,11 +123,14 @@ General local routing notes.
     write(
         okf_root / "paperless-find.md",
         """---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: mcp__paperless__find_latest
 toolset: paperless
 schema_hash: sha256:abc123
-generated_at: '2026-07-27T00:00:00Z'
+generated:
+  by: test-generator/1
+  at: '2026-07-27T00:00:00Z'
 title: Find latest Paperless document
 aliases:
   - newest Paperless document metadata

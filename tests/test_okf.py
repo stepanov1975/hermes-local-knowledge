@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 from hermes_local_knowledge import okf, plugin
 from hermes_local_knowledge.config import resolve_config
@@ -25,6 +26,24 @@ def db_text(state_dir: Path) -> str:
     with sqlite3.connect(okf.okf_queue_db_path(state_dir)) as conn:
         rows = conn.execute("SELECT * FROM okf_candidates").fetchall()
     return repr(rows)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-08-30T15:00:00Z", True),
+        ("2026-08-30 15:00:00+02:00", True),
+        ("2026-08-30Z", False),
+        ("2026-08-30", False),
+        ("2026-08-30T15:00:00", False),
+    ],
+)
+def test_explicit_iso8601_datetime_requires_time_and_offset(value: str, expected: bool) -> None:
+    assert okf._is_explicit_iso8601_datetime(value) is expected
+
+
+def test_frontmatter_flow_list_preserves_quoted_commas() -> None:
+    assert okf._parse_bracket_list('["find invoices, receipts"]') == ["find invoices, receipts"]
 
 
 def test_safe_arg_shape_does_not_persist_values(tmp_path: Path) -> None:
@@ -215,11 +234,13 @@ def test_validation_uses_claim_time_related_tool_snapshot_across_ranking_drift(t
 
     def content(related_tool: str) -> str:
         return f"""---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: target_tool
 toolset: demo
 schema_hash: {okf.schema_hash(schema)}
 generator_version: {okf.OKF_GENERATOR_VERSION}
+generated: {{"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}}
 aliases:
   - operate the target demo tool
 triggers:
@@ -254,11 +275,13 @@ def test_validation_rejects_fabricated_toolset_when_claim_has_none(tmp_path: Pat
     write(
         target_path,
         f"""---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: unscoped_tool
 toolset: fabricated
 schema_hash: {okf.schema_hash(schema)}
 generator_version: {okf.OKF_GENERATOR_VERSION}
+generated: {{"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}}
 aliases:
   - use the unscoped demo tool
 triggers:
@@ -634,6 +657,13 @@ def test_worker_uses_one_structured_call_for_one_bounded_batch(tmp_path: Path, m
     assert okf.queue_counts(state_dir) == {"done": 2, "pending": 1}
     assert len(list(okf.okf_dir(state_dir).glob("*.md"))) == 2
     assert list(okf.okf_dir(state_dir).glob(".*.tmp")) == []
+    rendered = okf.okf_file_path(state_dir, "alpha_tool").read_text(encoding="utf-8")
+    frontmatter = okf._parse_frontmatter(rendered)
+    generated = okf._frontmatter_mapping(frontmatter, "generated")
+    assert frontmatter["type"] == okf.OKF_CONCEPT_TYPE
+    assert generated["by"] == f"hermes-local-knowledge-okf/{okf.OKF_GENERATOR_VERSION}"
+    assert okf._is_explicit_iso8601_datetime(str(generated["at"]))
+    assert "generated_at:" not in rendered
 
 
 def configure_auto_generation(
@@ -679,6 +709,359 @@ def generated_item(packet: dict[str, Any], *, label: str = "generated") -> dict[
         "related_tools": [],
         "body": f"Use {packet['tool']} for matching demo operations.",
     }
+
+
+def test_worker_opportunistically_migrates_legacy_okf_without_model_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hermes_home, state_dir = configure_auto_generation(tmp_path, monkeypatch, max_candidates=1)
+    schema = {"type": "object"}
+    tool_name = "legacy_tool"
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=tool_name,
+        toolset="demo",
+        schema=schema,
+        args={},
+    )
+    row = okf.claim_candidates(state_dir, limit=1, claim_token="legacy-seed")[0]
+    target = okf.okf_file_path(state_dir, tool_name)
+    legacy_alias = 'route "priority" demo requests through legacy tool'
+    write(
+        target,
+        f"""---
+artifact_type: tool_okf
+tool: {tool_name}
+toolset: demo
+schema_hash: {row["schema_hash"]}
+generator_version: {okf.LEGACY_OKF_GENERATOR_VERSION}
+title: Legacy tool router
+generated_at: "2026-07-10T12:00:00Z"
+aliases:
+  - {json.dumps(legacy_alias)}
+triggers:
+  - use legacy tool for matching demo operations
+when_not_to_use:
+related_tools:
+---
+
+# Legacy tool router
+
+Use legacy_tool for matching demo operations.
+""",
+    )
+    assert okf.mark_candidate_done(
+        state_dir,
+        tool_name=tool_name,
+        claim_token="legacy-seed",
+        okf_path=target,
+    )
+    with sqlite3.connect(okf.okf_queue_db_path(state_dir)) as conn:
+        conn.execute(
+            "UPDATE okf_candidates SET generator_version = ? WHERE tool_name = ?",
+            (okf.LEGACY_OKF_GENERATOR_VERSION, tool_name),
+        )
+
+    legacy_text = target.read_text(encoding="utf-8")
+    write(target, legacy_text.replace("title: Legacy tool router", "custom_extension: preserve-me\ntitle: Legacy tool router"))
+    assert okf._legacy_okf_migration(state_dir, row) is None
+    flow_list_text = legacy_text.replace(
+        f"aliases:\n  - {json.dumps(legacy_alias)}",
+        "  aliases: ['find invoices, receipts']",
+    )
+    write(target, flow_list_text)
+    assert okf._legacy_okf_migration(state_dir, row) is None
+    write(target, legacy_text)
+
+    assert okf.has_generation_work(state_dir, min_use_count=1, stale_after_seconds=60)
+
+    class Llm:
+        def complete_structured(self, **kwargs: Any) -> Any:
+            raise AssertionError(f"legacy format migration called the model: {kwargs}")
+
+    assert okf.run_worker(llm=Llm(), hermes_home=hermes_home) == 0
+
+    migrated = target.read_text(encoding="utf-8")
+    frontmatter = okf._parse_frontmatter(migrated)
+    assert frontmatter["type"] == okf.OKF_CONCEPT_TYPE
+    assert frontmatter["generator_version"] == okf.OKF_GENERATOR_VERSION
+    assert okf._frontmatter_mapping(frontmatter, "generated") == {
+        "by": f"hermes-local-knowledge-okf/{okf.LEGACY_OKF_GENERATOR_VERSION}",
+        "at": "2026-07-10T12:00:00Z",
+    }
+    assert "generated_at:" not in migrated
+    assert "Use legacy_tool for matching demo operations." in migrated
+    parsed = yaml.safe_load(migrated.split("---", 2)[1])
+    assert parsed["aliases"] == [legacy_alias]
+    assert okf.queue_counts(state_dir) == {"done": 1}
+    assert not okf.has_generation_work(state_dir, min_use_count=1, stale_after_seconds=60)
+
+
+def test_legacy_validation_failure_falls_back_to_model_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hermes_home, state_dir = configure_auto_generation(tmp_path, monkeypatch, max_candidates=1)
+    schema = {"type": "object"}
+    tool_name = "legacy_secret_tool"
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name=tool_name,
+        toolset="demo",
+        schema=schema,
+        args={},
+    )
+    row = okf.claim_candidates(state_dir, limit=1, claim_token="legacy-secret-seed")[0]
+    target = okf.okf_file_path(state_dir, tool_name)
+    write(
+        target,
+        f"""---
+artifact_type: tool_okf
+tool: {tool_name}
+toolset: demo
+schema_hash: {row["schema_hash"]}
+generator_version: {okf.LEGACY_OKF_GENERATOR_VERSION}
+title: Legacy secret tool router
+generated_at: "2026-07-10T12:00:00Z"
+aliases:
+  - route matching demo requests through legacy secret tool
+triggers:
+  - use legacy secret tool for matching demo operations
+when_not_to_use:
+related_tools:
+---
+
+# Legacy secret tool router
+
+Use legacy_secret_tool for matching demo operations; api_key=secret-value.
+""",
+    )
+    assert okf.mark_candidate_done(
+        state_dir,
+        tool_name=tool_name,
+        claim_token="legacy-secret-seed",
+        okf_path=target,
+    )
+    with sqlite3.connect(okf.okf_queue_db_path(state_dir)) as conn:
+        conn.execute(
+            "UPDATE okf_candidates SET generator_version = ? WHERE tool_name = ?",
+            (okf.LEGACY_OKF_GENERATOR_VERSION, tool_name),
+        )
+
+    calls: list[dict[str, Any]] = []
+
+    class Llm:
+        def complete_structured(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            packet = json.loads(kwargs["input"][0]["text"])["candidates"][0]
+            return SimpleNamespace(parsed={"okfs": [generated_item(packet, label="Repaired")]})
+
+    assert okf.run_worker(llm=Llm(), hermes_home=hermes_home) == 0
+
+    assert len(calls) == 1
+    repaired = target.read_text(encoding="utf-8")
+    assert "# Repaired router" in repaired
+    assert "secret-value" not in repaired
+    assert okf.queue_counts(state_dir) == {"done": 1}
+
+
+def test_claim_promotes_legacy_pending_rows(tmp_path: Path) -> None:
+    tool_name = "legacy_pending_tool"
+    okf.upsert_tool_candidate(
+        tmp_path,
+        tool_name=tool_name,
+        toolset="demo",
+        schema={"type": "object"},
+        args={},
+    )
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET generator_version = ?, attempt_count = 2
+            WHERE tool_name = ?
+            """,
+            (okf.LEGACY_OKF_GENERATOR_VERSION, tool_name),
+        )
+
+    assert okf.has_generation_work(tmp_path, min_use_count=1, stale_after_seconds=60)
+    claimed = okf.claim_candidates(tmp_path, limit=1, claim_token="legacy-pending-claim")
+    assert [(row["tool_name"], row["generator_version"], row["attempt_count"]) for row in claimed] == [
+        (tool_name, okf.OKF_GENERATOR_VERSION, 3)
+    ]
+
+
+def test_claim_preserves_legacy_pending_retry_exhaustion(tmp_path: Path) -> None:
+    tool_name = "legacy_exhausted_tool"
+    okf.upsert_tool_candidate(
+        tmp_path,
+        tool_name=tool_name,
+        toolset="demo",
+        schema={"type": "object"},
+        args={},
+    )
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET generator_version = ?, attempt_count = ?
+            WHERE tool_name = ?
+            """,
+            (okf.LEGACY_OKF_GENERATOR_VERSION, okf.DEFAULT_MAX_ATTEMPTS, tool_name),
+        )
+
+    assert okf.has_generation_work(tmp_path, min_use_count=1, stale_after_seconds=60)
+    assert okf.claim_candidates(tmp_path, limit=1, claim_token="must-not-replenish") == []
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        assert conn.execute(
+            "SELECT status, generator_version, attempt_count FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone() == ("error", okf.OKF_GENERATOR_VERSION, okf.DEFAULT_MAX_ATTEMPTS)
+
+
+def test_opportunistic_migration_does_not_reclaim_future_generator_rows(tmp_path: Path) -> None:
+    schema = {"type": "object"}
+    tool_name = "future_tool"
+    okf.upsert_tool_candidate(tmp_path, tool_name=tool_name, toolset="demo", schema=schema, args={})
+    assert okf.claim_candidates(tmp_path, limit=1, claim_token="future-seed")
+    assert okf.mark_candidate_done(
+        tmp_path,
+        tool_name=tool_name,
+        claim_token="future-seed",
+        okf_path=okf.okf_file_path(tmp_path, tool_name),
+    )
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        conn.execute(
+            "UPDATE okf_candidates SET generator_version = '5' WHERE tool_name = ?",
+            (tool_name,),
+        )
+
+    okf.upsert_tool_candidate(
+        tmp_path,
+        tool_name=tool_name,
+        toolset="demo",
+        schema=schema,
+        args={"newer": "must remain untouched"},
+    )
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        assert conn.execute(
+            "SELECT status, generator_version, use_count FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone() == ("done", "5", 1)
+        conn.execute(
+            "UPDATE okf_candidates SET status = 'pending' WHERE tool_name = ?",
+            (tool_name,),
+        )
+
+    assert not okf.has_generation_work(tmp_path, min_use_count=1, stale_after_seconds=60)
+    assert okf.claim_candidates(tmp_path, limit=1, claim_token="must-not-claim") == []
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        assert conn.execute(
+            "SELECT status, generator_version, use_count FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone() == ("pending", "5", 1)
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET status = 'claimed', claimed_at = '2026-01-01T00:00:00Z',
+                claim_token = 'future-claim', claim_generator_version = '5'
+            WHERE tool_name = ?
+            """,
+            (tool_name,),
+        )
+
+    assert not okf.has_generation_work(
+        tmp_path,
+        min_use_count=1,
+        stale_after_seconds=60,
+        now="2026-08-30T00:00:00Z",
+    )
+    assert okf.recover_stale_claims(
+        tmp_path,
+        stale_after_seconds=60,
+        now="2026-08-30T00:00:00Z",
+    ) == 0
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        assert conn.execute(
+            "SELECT status, generator_version, claim_generator_version FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone() == ("claimed", "5", "5")
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET status = 'error', attempt_count = 3,
+                claimed_at = NULL, claim_token = NULL, claim_generator_version = NULL
+            WHERE tool_name = ?
+            """,
+            (tool_name,),
+        )
+
+    assert okf.retry_error_candidate(tmp_path, tool_name=tool_name) is False
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        assert conn.execute(
+            "SELECT status, generator_version, attempt_count FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone() == ("error", "5", 3)
+
+
+def test_future_generator_guard_is_atomic_with_candidate_upsert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_name = "atomic_future_tool"
+    schema = {"type": "object"}
+    okf.upsert_tool_candidate(tmp_path, tool_name=tool_name, toolset="demo", schema=schema, args={})
+    checked = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    original = okf._is_newer_generator_version
+
+    def guarded_version_check(value: Any) -> bool:
+        checked.set()
+        assert release.wait(timeout=5)
+        return original(value)
+
+    monkeypatch.setattr(okf, "_is_newer_generator_version", guarded_version_check)
+
+    def old_writer() -> None:
+        try:
+            okf.upsert_tool_candidate(
+                tmp_path,
+                tool_name=tool_name,
+                toolset="demo",
+                schema=schema,
+                args={"writer": "old"},
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=old_writer)
+    thread.start()
+    assert checked.wait(timeout=5)
+    concurrent = sqlite3.connect(okf.okf_queue_db_path(tmp_path), timeout=0.05)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            concurrent.execute(
+                "UPDATE okf_candidates SET generator_version = '5' WHERE tool_name = ?",
+                (tool_name,),
+            )
+    finally:
+        concurrent.close()
+        release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        conn.execute(
+            "UPDATE okf_candidates SET generator_version = '5' WHERE tool_name = ?",
+            (tool_name,),
+        )
+        assert conn.execute(
+            "SELECT generator_version, use_count FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone() == ("5", 2)
 
 
 def test_worker_normalizes_only_claimed_v0312_schema_projection(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -843,6 +1226,7 @@ def valid_claimed_okf(row: dict[str, Any], *, label: str = "Generated") -> str:
     toolset = str(row.get("toolset") or "").strip()
     lines = [
         "---",
+        "type: Hermes Tool",
         "artifact_type: tool_okf",
         f"tool: {json.dumps(tool_name)}",
     ]
@@ -852,6 +1236,7 @@ def valid_claimed_okf(row: dict[str, Any], *, label: str = "Generated") -> str:
         [
             f"schema_hash: {json.dumps(str(row['schema_hash']))}",
             f"generator_version: {json.dumps(okf.OKF_GENERATOR_VERSION)}",
+            'generated: {"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}',
             f"title: {json.dumps(f'{label} router for {tool_name}')}",
             "aliases:",
             f"  - {json.dumps(f'route matching demo requests through {tool_name}')}",
@@ -1921,11 +2306,13 @@ def test_worker_recovers_valid_canonical_file_before_attempt_cap_without_model_c
     write(
         target,
         f"""---
+type: Hermes Tool
 artifact_type: tool_okf
 tool: recovery_tool
 toolset: demo
 schema_hash: {okf.schema_hash(schema)}
 generator_version: {okf.OKF_GENERATOR_VERSION}
+generated: {{"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}}
 title: Recovery tool router
 aliases:
   - route recovery tool requests
