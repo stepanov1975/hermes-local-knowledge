@@ -230,7 +230,14 @@ def _parse_frontmatter_scalar(value: str) -> str:
 def _parse_bracket_list(value: str) -> list[str]:
     clean = value.strip()
     if clean.startswith("[") and clean.endswith("]"):
-        clean = clean[1:-1]
+        try:
+            parsed = json.loads(clean)
+        except (TypeError, ValueError):
+            clean = clean[1:-1]
+        else:
+            if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+                return [item.strip() for item in parsed if item.strip()]
+            return []
     return [_parse_frontmatter_scalar(item) for item in clean.split(",") if item.strip()]
 
 

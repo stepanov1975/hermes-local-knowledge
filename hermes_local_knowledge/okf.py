@@ -111,6 +111,10 @@ _EPHEMERAL_OKF_TEXT = re.compile(
 _GENERIC_NEGATIVE_GUIDANCE = re.compile(
     r"(?i)\b(?:credentials?|secret values?|raw transcripts?|raw tool outputs?)\b"
 )
+_LEGACY_FLOW_LIST = re.compile(
+    r"^\s*(?:aliases|triggers|when_not_to_use|related_tools):\s*\[",
+    re.MULTILINE,
+)
 
 
 def _path_is_relative_to(path: Path, root: Path) -> bool:
@@ -152,7 +156,14 @@ def _parse_frontmatter_scalar(value: str) -> str:
 def _parse_bracket_list(value: str) -> list[str]:
     clean = value.strip()
     if clean.startswith("[") and clean.endswith("]"):
-        clean = clean[1:-1]
+        try:
+            parsed = json.loads(clean)
+        except (TypeError, ValueError):
+            clean = clean[1:-1]
+        else:
+            if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+                return [item.strip() for item in parsed if item.strip()]
+            return []
     return [_parse_frontmatter_scalar(item) for item in clean.split(",") if item.strip()]
 
 
@@ -224,14 +235,21 @@ def _is_explicit_iso8601_datetime(value: str) -> bool:
     if not value or not (value.endswith("Z") or re.search(r"[+-]\d{2}:\d{2}$", value)):
         return False
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return False
-    return True
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _is_newer_generator_version(value: Any) -> bool:
+    try:
+        return int(str(value)) > int(OKF_GENERATOR_VERSION)
+    except ValueError:
+        return False
 
 
 def okf_queue_db_path(state_dir: Path) -> Path:
@@ -831,6 +849,13 @@ def upsert_tool_candidate(
     error_increment = 1 if success is False else 0
     clean_error_type = _safe_error_type(error_type)
     with _connect(state_dir) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT generator_version FROM okf_candidates WHERE tool_name = ?",
+            (tool_name,),
+        ).fetchone()
+        if existing is not None and _is_newer_generator_version(existing["generator_version"]):
+            return
         conn.execute(
             """
             INSERT INTO okf_candidates (
@@ -1000,10 +1025,18 @@ def has_generation_work(
             SELECT CASE WHEN
               EXISTS (
                 SELECT 1 FROM okf_candidates
-                WHERE (COALESCE(status, 'pending') = 'pending' AND COALESCE(use_count, 0) >= ?)
-                   OR (status = 'done' AND COALESCE(generator_version, '') != ?
+                WHERE (
+                        COALESCE(status, 'pending') = 'pending'
+                        AND COALESCE(generator_version, '') IN (?, ?)
+                        AND COALESCE(use_count, 0) >= ?
+                      )
+                   OR (status = 'done' AND COALESCE(generator_version, '') = ?
                        AND COALESCE(use_count, 0) >= ?)
-                   OR (status = 'claimed' AND COALESCE(claimed_at, '') < ?)
+                   OR (
+                        status = 'claimed'
+                        AND COALESCE(claim_generator_version, '') IN (?, ?)
+                        AND COALESCE(claimed_at, '') < ?
+                      )
                 LIMIT 1
               )
               AND NOT EXISTS (
@@ -1013,9 +1046,13 @@ def has_generation_work(
             THEN 1 ELSE 0 END
             """,
             (
+                OKF_GENERATOR_VERSION,
+                LEGACY_OKF_GENERATOR_VERSION,
+                min_use_count,
+                LEGACY_OKF_GENERATOR_VERSION,
                 min_use_count,
                 OKF_GENERATOR_VERSION,
-                min_use_count,
+                LEGACY_OKF_GENERATOR_VERSION,
                 cutoff,
                 GENERATION_LEASE_NAME,
                 current_dt.timestamp(),
@@ -1105,8 +1142,9 @@ def _recover_stale_claims_on_connection(
 ) -> int:
     stale_rows = conn.execute(
         f"SELECT {_CANDIDATE_SELECT} FROM okf_candidates "
-        "WHERE status = 'claimed' AND COALESCE(claimed_at, '') < ?",
-        (cutoff,),
+        "WHERE status = 'claimed' AND COALESCE(claim_generator_version, '') IN (?, ?) "
+        "AND COALESCE(claimed_at, '') < ?",
+        (OKF_GENERATOR_VERSION, LEGACY_OKF_GENERATOR_VERSION, cutoff),
     ).fetchall()
     completed = 0
     for stale_row in stale_rows:
@@ -1141,9 +1179,16 @@ def _recover_stale_claims_on_connection(
             related_tools_json = '[]',
             okf_path = NULL,
             last_attempt_error = '<redacted>'
-        WHERE status = 'claimed' AND COALESCE(claimed_at, '') < ?
+        WHERE status = 'claimed' AND COALESCE(claim_generator_version, '') IN (?, ?)
+          AND COALESCE(claimed_at, '') < ?
         """,
-        (max_attempts, OKF_GENERATOR_VERSION, cutoff),
+        (
+            max_attempts,
+            OKF_GENERATOR_VERSION,
+            OKF_GENERATOR_VERSION,
+            LEGACY_OKF_GENERATOR_VERSION,
+            cutoff,
+        ),
     )
     return completed + cursor.rowcount
 
@@ -1175,10 +1220,20 @@ def claim_candidates(
             SET status = 'pending', generator_version = ?, attempt_count = 0,
                 claim_token = NULL, claimed_at = NULL, claim_generator_version = NULL,
                 related_tools_json = '[]', okf_path = NULL, last_attempt_error = NULL
-            WHERE status = 'done' AND COALESCE(generator_version, '') != ?
+            WHERE status = 'done' AND COALESCE(generator_version, '') = ?
               AND COALESCE(use_count, 0) >= ?
             """,
-            (OKF_GENERATOR_VERSION, OKF_GENERATOR_VERSION, min_use_count),
+            (OKF_GENERATOR_VERSION, LEGACY_OKF_GENERATOR_VERSION, min_use_count),
+        )
+        conn.execute(
+            """
+            UPDATE okf_candidates
+            SET generator_version = ?
+            WHERE COALESCE(status, 'pending') = 'pending'
+              AND COALESCE(generator_version, '') = ?
+              AND COALESCE(use_count, 0) >= ?
+            """,
+            (OKF_GENERATOR_VERSION, LEGACY_OKF_GENERATOR_VERSION, min_use_count),
         )
         conn.execute(
             """
@@ -1186,9 +1241,11 @@ def claim_candidates(
             SET status = 'error', generator_version = ?, claim_token = NULL, claimed_at = NULL,
                 claim_generator_version = NULL, related_tools_json = '[]',
                 okf_path = NULL, last_attempt_error = '<redacted>'
-            WHERE COALESCE(attempt_count, 0) >= ? AND COALESCE(status, 'pending') = 'pending'
+            WHERE COALESCE(attempt_count, 0) >= ?
+              AND COALESCE(status, 'pending') = 'pending'
+              AND COALESCE(generator_version, '') = ?
             """,
-            (OKF_GENERATOR_VERSION, max_attempts),
+            (OKF_GENERATOR_VERSION, max_attempts, OKF_GENERATOR_VERSION),
         )
         rows = conn.execute(
             f"""
@@ -1196,10 +1253,11 @@ def claim_candidates(
             WHERE COALESCE(use_count, 0) >= ?
               AND COALESCE(attempt_count, 0) < ?
               AND COALESCE(status, 'pending') = 'pending'
+              AND COALESCE(generator_version, '') = ?
             ORDER BY COALESCE(use_count, 0) DESC, COALESCE(last_seen, '') ASC, tool_name ASC
             LIMIT ?
             """,
-            (min_use_count, max_attempts, limit),
+            (min_use_count, max_attempts, OKF_GENERATOR_VERSION, limit),
         ).fetchall()
         schema_updates: list[tuple[str, str]] = []
         for row in rows:
@@ -1961,6 +2019,7 @@ def _write_and_complete_item(
     lease_owner: str,
     generated_by: str | None = None,
     generated_at: str | None = None,
+    mark_validation_error: bool = True,
 ) -> bool:
     tool_name = str(row.get("tool_name") or "")
     claim_token = str(row.get("claim_token") or "")
@@ -2014,12 +2073,13 @@ def _write_and_complete_item(
             _content_path=temp_path,
         )
         if not prevalidation["valid"]:
-            mark_candidate_error(
-                cfg.state_dir,
-                tool_name=tool_name,
-                claim_token=claim_token,
-                error="generated validation failed",
-            )
+            if mark_validation_error:
+                mark_candidate_error(
+                    cfg.state_dir,
+                    tool_name=tool_name,
+                    claim_token=claim_token,
+                    error="generated validation failed",
+                )
             return False
         try:
             outcome = publish_claimed_okf(
@@ -2039,7 +2099,7 @@ def _write_and_complete_item(
                 error="OKF target path belongs to a different tool",
             )
             return False
-        if outcome == "invalid":
+        if outcome == "invalid" and mark_validation_error:
             mark_candidate_error(
                 cfg.state_dir,
                 tool_name=tool_name,
@@ -2072,6 +2132,13 @@ def _legacy_okf_migration(
     tool_name = str(row.get("tool_name") or "").strip()
     path = okf_file_path(state_dir, tool_name)
     text = _safe_read_text(path, max_chars=80_000)
+    lines = text.splitlines()
+    try:
+        closing_index = lines.index("---", 1)
+    except ValueError:
+        return None
+    if _LEGACY_FLOW_LIST.search("\n".join(lines[1:closing_index])):
+        return None
     frontmatter = _parse_frontmatter(text)
     legacy_version = str(frontmatter.get("generator_version") or "").strip()
     allowed_legacy_fields = {
@@ -2103,11 +2170,6 @@ def _legacy_okf_migration(
     generated_at = str(frontmatter.get("generated_at") or "").strip()
     title = str(frontmatter.get("title") or "").strip()
     if not _is_explicit_iso8601_datetime(generated_at) or not title:
-        return None
-    lines = text.splitlines()
-    try:
-        closing_index = lines.index("---", 1)
-    except ValueError:
         return None
     rendered_body = "\n".join(lines[closing_index + 1 :]).strip()
     heading = f"# {title}"
@@ -2143,17 +2205,24 @@ def _generate_claimed_okfs(
         migration = _legacy_okf_migration(cfg.state_dir, row)
         if migration is not None:
             item, generated_by, generated_at = migration
-            completed += int(
-                _write_and_complete_item(
-                    cfg,
-                    row=row,
-                    item=item,
-                    lease_owner=lease_owner,
-                    generated_by=generated_by,
-                    generated_at=generated_at,
-                )
+            migrated = _write_and_complete_item(
+                cfg,
+                row=row,
+                item=item,
+                lease_owner=lease_owner,
+                generated_by=generated_by,
+                generated_at=generated_at,
+                mark_validation_error=False,
             )
-            continue
+            if migrated:
+                completed += 1
+                continue
+            if claimed_candidate(
+                cfg.state_dir,
+                tool_name=str(row.get("tool_name") or ""),
+                claim_token=str(row.get("claim_token") or ""),
+            ) is None:
+                continue
         try:
             packet = _generation_packet(row)
         except (TypeError, ValueError):
