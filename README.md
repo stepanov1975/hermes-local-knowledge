@@ -72,6 +72,13 @@ hermes plugins install git@github.com:stepanov1975/hermes-local-knowledge.git --
 
 The Python package exposes the `local_knowledge = hermes_local_knowledge.plugin` entry point for environments that install plugins into Hermes' Python environment.
 
+If updating to v0.4.14 caused Hermes' plugin scan to disable the plugin, update to v0.4.15 and then re-enable the reviewed plugin once:
+
+```bash
+hermes plugins update local_knowledge
+hermes plugins enable local_knowledge
+```
+
 ### Automatic tool-OKF generation is opt-in
 
 Existing-artifact lookup works without model calls. `local_knowledge.okf.auto_generate` defaults to `false`; while it is off, safe tool-use candidates can be recorded but are not automatically converted into new routing notes.

@@ -82,9 +82,9 @@ jobs:
       - name: Detect Python dependencies
         id: python-deps
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
+          python - "$RUNNER_TEMP/project-dependencies.txt" <<'PY' >> "$GITHUB_OUTPUT"
           import glob
-          import os
+          import sys
           import tomllib
           from pathlib import Path
 
@@ -98,7 +98,7 @@ jobs:
               for group in project.get("optional-dependencies", {}).values():
                   dependencies.extend(group)
 
-          dependency_file = Path(os.environ["RUNNER_TEMP"]) / "project-dependencies.txt"
+          dependency_file = Path(sys.argv[1])
           dependency_file.write_text("\n".join(dependencies), encoding="utf-8")
           present = requirements_present or bool(dependencies)
           print(f"present={str(present).lower()}")
