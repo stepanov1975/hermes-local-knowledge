@@ -197,7 +197,7 @@ def test_install_router_skill_reports_target_read_error_as_json(
     assert "target read denied" in str(payload["error"])
 
 
-def test_doctor_warns_for_missing_router_skill_and_disabled_auto_generation(
+def test_doctor_warns_for_missing_router_skill_and_reports_default_auto_generation(
     tmp_path: Path,
     capsys,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -212,18 +212,18 @@ def test_doctor_warns_for_missing_router_skill_and_disabled_auto_generation(
     assert payload["success"] is True
     assert checks["router_skill_installed"]["ok"] is False
     assert "install-router-skill" in str(checks["router_skill_installed"]["detail"])
-    assert checks["okf_auto_generate"]["ok"] is False
+    assert checks["okf_auto_generate"]["ok"] is True
     assert "additional model tokens" in str(checks["okf_auto_generate"]["detail"])
 
 
-def test_doctor_accepts_current_router_skill_and_enabled_auto_generation(
+def test_doctor_reports_explicitly_disabled_auto_generation(
     tmp_path: Path,
     capsys,
 ) -> None:  # type: ignore[no-untyped-def]
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        "local_knowledge:\n  okf:\n    auto_generate: true\n",
+        "local_knowledge:\n  okf:\n    auto_generate: false\n",
         encoding="utf-8",
     )
     assert lci_cli.main(
@@ -238,7 +238,8 @@ def test_doctor_accepts_current_router_skill_and_enabled_auto_generation(
     assert status == 0
     assert checks["router_skill_installed"]["ok"] is True
     assert checks["router_skill_matches_plugin"]["ok"] is True
-    assert checks["okf_auto_generate"]["ok"] is True
+    assert checks["okf_auto_generate"]["ok"] is False
+    assert "additional model tokens" in str(checks["okf_auto_generate"]["detail"])
 
 
 def test_doctor_warns_when_router_skill_differs_from_plugin(

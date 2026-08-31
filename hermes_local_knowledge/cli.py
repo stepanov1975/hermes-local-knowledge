@@ -894,8 +894,8 @@ def _doctor_payload(
         "enabled; automatic OKF generation uses additional model tokens"
         if cfg.okf.auto_generate
         else (
-            "disabled; full automatic OKF generation is unavailable. After the user accepts "
-            "additional model tokens, run `hermes config set local_knowledge.okf.auto_generate true`"
+            "disabled; full automatic OKF generation is unavailable. Enabling it uses additional "
+            "model tokens: `hermes config set local_knowledge.okf.auto_generate true`"
         ),
         fatal=False,
     )

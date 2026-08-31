@@ -94,13 +94,13 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
     )
     assert resolved.okf == OKFSettings(
         enabled=True,
-        auto_generate=False,
+        auto_generate=True,
         max_candidates_per_session=2,
         max_generation_seconds=120,
         min_use_count=1,
     )
     assert resolved.okf.max_worker_seconds == 120
-    assert resolved.implicit_feedback == ImplicitFeedbackSettings()
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings(enabled=True)
     with pytest.raises(FrozenInstanceError):
         resolved.state_dir = tmp_path / "other"  # type: ignore[misc]
 
@@ -327,14 +327,14 @@ def test_implicit_feedback_settings_are_nested_and_bounded(tmp_path: Path) -> No
         hermes_home,
         """local_knowledge:
   implicit_feedback:
-    enabled: true
+    enabled: false
     min_confirmations: 999
     max_generic_queries: 999
 """,
     )
 
     assert resolve_config(hermes_home).implicit_feedback == ImplicitFeedbackSettings(
-        enabled=True,
+        enabled=False,
         min_confirmations=10,
         max_generic_queries=100,
     )

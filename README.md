@@ -44,7 +44,7 @@ Native tool responses are intentionally model-facing and concise. Search, get, a
 
 The plugin also registers `pre_llm_call`, `post_tool_call`, `on_session_end`, and `on_session_finalize` hooks. When the configured source is available, Hermes hosts with cache-safe plugin prompt sections add one concise system-prompt hint for each new session: use `knowledge_search` before broad file search for local Hermes/homelab artifacts, then verify live state directly. Older hosts use the same hint through a deduplicated `pre_llm_call` compatibility fallback. In either case, `pre_llm_call` continues to bind optional same-turn implicit search-result feedback; the remaining lifecycle hooks support exact successful consumption through `knowledge_get`, `skill_view`, or `read_file` plus tool-OKF capture/generation while keeping correlation inside the plugin when Hermes dispatches local-knowledge tools through its deferred-tool bridge.
 
-Implicit feedback is disabled by default. In a private controlled installation, it can learn a routing hint when the same artifact is consumed after distinct matching searches, with each supported consumer tied to that search's unassisted baseline in the same Hermes session, task, and turn:
+Implicit feedback is enabled by default. It learns a local routing hint when the same artifact is consumed after distinct matching searches, with each supported consumer tied to that search's unassisted baseline in the same Hermes session, task, and turn:
 
 ```yaml
 local_knowledge:
@@ -56,7 +56,7 @@ local_knowledge:
 
 Only a recent search from the same Hermes session, task, and turn is eligible. `skill_view` and `read_file` must run in a later model request, after the search result is available, and count only when their successful result resolves by canonical source path to exactly one baseline artifact in the same current index snapshot. Repeated consumption from one search is deduplicated, and overly generic artifacts stop receiving implicit promotion. Explicit feedback remains authoritative, and implicit evidence is not used as evaluation ground truth.
 
-## Install and model consent
+## Install and model-token notice
 
 Install and enable the directory plugin:
 
@@ -79,29 +79,22 @@ hermes plugins update local_knowledge
 hermes plugins enable local_knowledge
 ```
 
-### Automatic tool-OKF generation is opt-in
+### Automatic tool-OKF generation and token use
 
-Existing-artifact lookup works without model calls. `local_knowledge.okf.auto_generate` defaults to `false`; while it is off, safe tool-use candidates can be recorded but are not automatically converted into new routing notes.
+Existing-artifact lookup works without model calls. `local_knowledge.okf.auto_generate` defaults to `true` because generated routing notes significantly improve future tool discovery.
 
-Before enabling automatic generation, an installer must explain that:
+Installers and agents should tell users that automatic generation:
 
 - a detached worker invokes the active Hermes model and consumes additional model tokens;
 - one worker claims at most `max_candidates_per_session` candidates (default `2`) and makes at most one structured batch call when new content must be authored;
 - `max_generation_seconds` is passed as the provider-request timeout, while provider retry/fallback policy can extend total elapsed time and token use behind that host call;
 - session finalization does not wait for generation.
 
-Then ask explicitly:
-
-> Enable automatic OKF generation now? (Recommended; uses additional model tokens.)
-
-Only after the user agrees, run:
+Users who do not want the additional model calls can disable automatic generation while retaining existing lookup and manual OKF management:
 
 ```bash
-hermes config set local_knowledge.okf.enabled true
-hermes config set local_knowledge.okf.auto_generate true
+hermes config set local_knowledge.okf.auto_generate false
 ```
-
-If it is already enabled, report that instead of asking again. If the user declines, leave `auto_generate` disabled and report that existing lookup and manual OKF management remain available, but new tool-routing notes will not be generated automatically.
 
 Generated tool notes use Open Knowledge Format v0.2 concept metadata (`type` plus structured `generated.by`/`generated.at` provenance). When automatic generation is enabled, the same bounded worker opportunistically claims completed generator-v3 notes and converts their deterministic frontmatter to v0.2 without a model call, preserving the existing routing content and generation timestamp. A legacy note that cannot be converted losslessly falls back to normal model-backed regeneration.
 
@@ -151,7 +144,7 @@ local_knowledge:
   known_entities: [Hermes, GitHub, MCP, Cron]
   okf:
     enabled: true
-    auto_generate: false  # change only after explicit model-token consent
+    auto_generate: true  # uses additional model tokens in a bounded background worker
     max_candidates_per_session: 2
     max_generation_seconds: 120
     min_use_count: 1
@@ -173,11 +166,11 @@ Canonical settings, aliases, and defaults:
 | `include_markdown_docs` | — | `true` with an explicit source root; `false` when the root falls back to `$HERMES_HOME` |
 | `exclude_dir_names` | — | `[]`, merged with built-in exclusions |
 | `okf.enabled` | flat `okf_enabled` | `true` |
-| `okf.auto_generate` | flat `okf_auto_generate` | `false` |
+| `okf.auto_generate` | flat `okf_auto_generate` | `true` |
 | `okf.max_candidates_per_session` | flat `okf_max_candidates_per_session` | `2` |
 | `okf.max_generation_seconds` | flat `okf_max_generation_seconds`; `okf.max_worker_seconds` or flat `okf_max_worker_seconds` is a fallback when it is absent | `120` seconds |
 | `okf.min_use_count` | flat `okf_min_use_count` | `1` |
-| `implicit_feedback.enabled` | — | `false` |
+| `implicit_feedback.enabled` | — | `true` |
 | `implicit_feedback.min_confirmations` | — | `2` |
 | `implicit_feedback.max_generic_queries` | — | `5` |
 
@@ -263,7 +256,7 @@ Lookup telemetry and feedback stay in `<state_dir>/usage.sqlite`. Tool handlers 
 
 Managed searches may use one deterministic feedback prior when the index was built for the configured source root. Only the latest significant explicit rating for a query/artifact pair is eligible. Among ratings accepted by the current tool, only `useful` is positive; legacy persisted `great` rows remain positive compatibility input. A newer rejection for that route or matching current query suppresses an older overlap route. A matching artifact already present in current results may move to rank one. If it is absent, the plugin performs at most one retry with an accepted query no longer than the current query and the mapped artifact type, and promotes only the exact artifact when that live retry rediscovers it. Searches against an explicit caller-owned `--db` remain unassisted.
 
-When opt-in implicit feedback is enabled and no explicit route matches, mature same-turn evidence may supply the lower-priority route. Consumption through `skill_view` and `read_file` is accepted only from a later model request when a successful call resolves to exactly one caller-visible baseline artifact in the same current index snapshot; same-request parallel calls and route-assisted-only results remain ineligible. It uses the same current-index promotion or one verified typed-retry path, and a matching explicit rejection can veto it.
+When implicit feedback is enabled and no explicit route matches, mature same-turn evidence may supply the lower-priority route. Consumption through `skill_view` and `read_file` is accepted only from a later model request when a successful call resolves to exactly one caller-visible baseline artifact in the same current index snapshot; same-request parallel calls and route-assisted-only results remain ineligible. It uses the same current-index promotion or one verified typed-retry path, and a matching explicit rejection can veto it.
 
 `knowledge_usage_report` summarizes recent activity before changing ranking, triggers, source coverage, or graph edges. Its model-facing `search_quality` section isolates live native searches from the current plugin version while excluding known probe queries. When observed consumption exists, the nested `implicit_consumed_rank_lower_bound` aggregates where it fell in each search's unassisted `baseline_top_ids_json`; it is a lower-bound operational diagnostic, never evaluation ground truth. `event_cohorts` separates current searches, probes, hourly doctor runs, other CLI/native activity, and historical-version searches, while the nested feedback summary distinguishes learned `knowledge_get`, `skill_view`, and `read_file` signals. Empty sections and duplicated aggregate/configuration diagnostics are omitted from the native response; the complete local telemetry report remains available to service, CLI, and evaluation code.
 
@@ -315,7 +308,7 @@ This project benefits from people who contribute code, share ideas, or inspire f
 ## Owner map
 
 - `config.py` — configuration models, aliases, defaults, and the single resolver.
-- `implicit.py` — opt-in same-turn search-result consumption attribution.
+- `implicit.py` — default-enabled same-turn search-result consumption attribution.
 - `artifacts.py` — whole-artifact models, source collection, privacy-safe metadata extraction, and graph edges.
 - `index.py` — format-4 SQLite/JSONL publication, cross-version and SQLite build locking, managed rebuild classification, and deterministic search/get/neighbors.
 - `telemetry.py` — local usage and feedback persistence/reporting.
