@@ -1324,6 +1324,34 @@ def test_usage_report_consumed_rank_excludes_malformed_implicit_linkage(
     ] == telemetry._empty_implicit_consumed_rank_lower_bound()
 
 
+def test_usage_report_missing_and_initialized_empty_db_have_same_top_level_shape(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    missing_db = tmp_path / "missing.sqlite"
+    initialized_db = tmp_path / "initialized.sqlite"
+    connection = telemetry._usage_connect(root, initialized_db)
+    connection.close()
+
+    missing_report = telemetry._usage_report(
+        root,
+        days=30,
+        limit=10,
+        usage_db_path=missing_db,
+    )
+    initialized_report = telemetry._usage_report(
+        root,
+        days=30,
+        limit=10,
+        usage_db_path=initialized_db,
+    )
+
+    assert missing_report.keys() == initialized_report.keys()
+    assert "avg_latency_ms" in missing_report
+    assert missing_report["avg_latency_ms"] is None
+    assert initialized_report["avg_latency_ms"] is None
+
+
 @pytest.mark.parametrize("existing_empty_file", [False, True])
 def test_usage_report_empty_or_missing_db_has_zero_consumed_rank_shape(
     tmp_path: Path,

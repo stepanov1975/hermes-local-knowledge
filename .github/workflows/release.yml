@@ -262,29 +262,20 @@ jobs:
           python -m pip install --requirement "$RELEASE_REQUIREMENTS_FILE"
           python -m build --outdir dist
           python -m twine check dist/*
+          python scripts/verify_release_artifacts.py --sdist dist/*.tar.gz
 
           for artifact in dist/*.whl dist/*.tar.gz; do
-            smoke_dir=$(mktemp -d /tmp/release-smoke.XXXXXX)
-            python -m venv "$smoke_dir"
-            "$smoke_dir/bin/python" -m pip install "$artifact"
-            "$smoke_dir/bin/python" - <<'PY'
-          import importlib.metadata as metadata
-          import hermes_local_knowledge.okf as okf
-
-          entries = [
-              entry
-              for entry in metadata.entry_points().select(group="hermes_agent.plugins")
-              if entry.name == "local_knowledge"
-          ]
-          if len(entries) != 1:
-              raise SystemExit(f"Expected one local_knowledge entry point, found {entries!r}")
-          module = entries[0].load()
-          if not callable(getattr(module, "register", None)):
-              raise SystemExit("Plugin register entry point is not callable")
-          if not callable(getattr(okf, "run_worker", None)):
-              raise SystemExit("Packaged OKF worker entry point is not callable")
-          PY
-            rm -rf "$smoke_dir"
+            smoke_root=$(mktemp -d /tmp/release-smoke.XXXXXX)
+            python -m venv "$smoke_root/venv"
+            mkdir "$smoke_root/empty"
+            "$smoke_root/venv/bin/python" -m pip install "$artifact"
+            (
+              cd "$smoke_root/empty"
+              env -u PYTHONPATH -u VIRTUAL_ENV \
+                "$smoke_root/venv/bin/python" -I \
+                "$GITHUB_WORKSPACE/scripts/verify_release_artifacts.py" --installed-smoke
+            )
+            rm -rf "$smoke_root"
           done
 
       - name: Upload repaired release artifacts

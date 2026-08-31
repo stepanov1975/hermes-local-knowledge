@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.17] - 2026-08-31
+
+### Fixed
+
+- Made release artifact smoke tests load each installed wheel and source distribution from an isolated empty working directory and verify every loaded package module comes from that environment's `site-packages`.
+- Made source distributions intentionally omit repository tests and release/evaluation tooling, with a positive-payload archive validator and negative controls that reject regressions.
+- Kept the raw usage-report schema identical before and after an empty telemetry database is initialized, including top-level `avg_latency_ms: null`.
+
+[0.4.17]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.16...v0.4.17
+
 ## [0.4.16] - 2026-08-31
 
 ### Changed

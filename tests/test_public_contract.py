@@ -8,7 +8,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tarfile
 import textwrap
 import tomllib
 import zipfile
@@ -27,6 +26,7 @@ from hermes_local_knowledge import cli as lci_cli
 from hermes_local_knowledge import config as lci_config
 from hermes_local_knowledge import index as lci_index
 from hermes_local_knowledge import indexer, plugin
+from scripts.verify_release_artifacts import validate_sdist
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1844,18 +1844,8 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
     ctx = registered_surface()
     assert ctx.skills == [("local-knowledge-router", root_skill)]
 
-    expected_sdist_files = {
-        "scripts/compare_historical_query_versions.py",
-        "scripts/evaluate_ref.py",
-        "scripts/evaluation_fixture.py",
-        "tests/search_regression_cases.json",
-    }
-    manifest_entries = {
-        line.removeprefix("include ").strip()
-        for line in (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
-        if line.startswith("include ")
-    }
-    assert expected_sdist_files <= manifest_entries
+    manifest_lines = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+    assert manifest_lines == ["include CHANGELOG.md", "prune tests"]
 
     source_copy = tmp_path / "source"
     dist_dir = tmp_path / "dist"
@@ -1895,13 +1885,7 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
     [sdist_path] = list(dist_dir.glob("*.tar.gz"))
     [wheel_path] = list(dist_dir.glob("*.whl"))
 
-    with tarfile.open(sdist_path, "r:gz") as sdist_archive:
-        sdist_names = {
-            member.name.split("/", 1)[1]
-            for member in sdist_archive.getmembers()
-            if "/" in member.name
-        }
-    assert expected_sdist_files <= sdist_names
+    validate_sdist(sdist_path)
 
     with zipfile.ZipFile(wheel_path) as wheel_archive:
         wheel_names = set(wheel_archive.namelist())
