@@ -886,7 +886,8 @@ def test_claim_promotes_legacy_pending_rows(tmp_path: Path) -> None:
         )
 
     assert okf.has_generation_work(tmp_path, min_use_count=1, stale_after_seconds=60)
-    claimed = okf.claim_candidates(tmp_path, limit=1, claim_token="legacy-pending-claim")
+    claim_id = "legacy-pending-claim"
+    claimed = okf.claim_candidates(tmp_path, limit=1, claim_token=claim_id)
     assert [(row["tool_name"], row["generator_version"], row["attempt_count"]) for row in claimed] == [
         (tool_name, okf.OKF_GENERATOR_VERSION, 3)
     ]
@@ -2420,10 +2421,11 @@ def test_direct_claim_reconciles_valid_stale_artifact_before_attempt_cap(tmp_pat
         schema={"type": "object"},
         args={},
     )
+    crashed_claim_id = "crashed-direct-claim"
     row = okf.claim_candidates(
         state_dir,
         limit=1,
-        claim_token="crashed-direct-claim",
+        claim_token=crashed_claim_id,
         max_attempts=1,
         now="2000-01-01T00:00:00Z",
     )[0]

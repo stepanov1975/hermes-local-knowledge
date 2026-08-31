@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.15] - 2026-08-31
+
+### Fixed
+
+- Prevented Hermes' default plugin security scan from falsely blocking the standard Git install or disabling the plugin after an update because of synthetic test values, release-policy prose, and a GitHub Actions temporary-path lookup. The intentional bounded OKF worker subprocess remains visible as an informational finding.
+
+[0.4.15]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.14...v0.4.15
+
 ## [0.4.14] - 2026-08-30
 
 ### Changed

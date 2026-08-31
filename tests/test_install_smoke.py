@@ -92,6 +92,8 @@ tags: [demo, reusable]
         env=env,
         cwd=plugin_source,
     )
+    # This real public install is also the compatibility gate for Hermes'
+    # default-on plugin security scanner. Do not disable scanning in this home.
     run_command(["hermes", "plugins", "install", f"file://{plugin_source}", "--enable"], env=env)
     listing = run_command(["hermes", "plugins", "list", "--user", "--json"], env=env)
     plugins = json.loads(listing.stdout)

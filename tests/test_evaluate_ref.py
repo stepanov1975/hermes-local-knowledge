@@ -191,7 +191,7 @@ def test_main_emits_one_json_object_for_lookup_payload_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     evaluator = load_evaluator()
-    secret = "private-main-payload"
+    private_payload = "private-main-payload"
     cases = {
         "labels": {"positive": [], "negative": []},
         "replay": {
@@ -215,7 +215,7 @@ def test_main_emits_one_json_object_for_lookup_payload_error(
         ),
         encoding="utf-8",
     )
-    module = FakeLookupModule(search=[], artifact=PrivateObject(secret), neighbors=[])
+    module = FakeLookupModule(search=[], artifact=PrivateObject(private_payload), neighbors=[])
     monkeypatch.setattr(
         evaluator,
         "_import_api",
@@ -232,7 +232,7 @@ def test_main_emits_one_json_object_for_lookup_payload_error(
     assert payload["ok"] is True
     assert error["status"] == "error"
     assert error["error_type"] == "LookupPayloadError"
-    assert secret not in stdout
+    assert private_payload not in stdout
 
 
 def test_production_services_apply_recorded_disabled_state_without_thresholds(

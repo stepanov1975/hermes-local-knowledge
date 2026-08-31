@@ -67,7 +67,7 @@ A version bump is required when release-relevant paths differ from the base, inc
 - `__init__.py`, `plugin.yaml`, `pyproject.toml`, `after-install.md`;
 - `hermes_local_knowledge/**`, `examples/**`, and `skills/**`.
 
-Docs-only edits to `README.md`, `CONTRIBUTING.md`, `memory.md`, or `AGENTS.md` normally do not require a bump unless accompanied by a release-relevant path.
+Documentation-only edits normally do not require a bump unless accompanied by a release-relevant path.
 
 ## Verification
 
