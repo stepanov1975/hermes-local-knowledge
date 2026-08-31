@@ -39,6 +39,17 @@ SQLITE_REPLACE_ATTEMPTS = 20
 SQLITE_REPLACE_RETRY_SECONDS = 0.05
 DIRTY_MARKER_NAME = "okf_index_dirty"
 FTS_BM25_WEIGHTS = "0.0, 0.2, 6.0, 1.0, 3.0, 2.0, 5.0, 0.4"
+_ARTIFACT_TYPE_PRIORITY_SQL = (
+    "CASE a.type "
+    "WHEN 'skill' THEN 0 "
+    "WHEN 'script' THEN 1 "
+    "WHEN 'cron_job' THEN 2 "
+    "WHEN 'mcp_server' THEN 3 "
+    "WHEN 'memory_doc' THEN 4 "
+    "WHEN 'runbook' THEN 5 "
+    "WHEN 'tool_okf' THEN 6 "
+    "ELSE 7 END"
+)
 _INDEX_BUILD_LOCK_STATE = threading.local()
 _LEGACY_INDEX_BUILD_LOCK_FDS: set[int] = set()
 _SQLITE_INDEX_BUILD_LOCK_CONNECTIONS: dict[int, sqlite3.Connection] = {}
@@ -1133,16 +1144,7 @@ def _query_fts_rows(
     return connection.execute(
         f"""
         SELECT a.*, bm25(artifact_fts, {FTS_BM25_WEIGHTS}) AS rank,
-               CASE a.type
-                 WHEN 'skill' THEN 0
-                 WHEN 'script' THEN 1
-                 WHEN 'cron_job' THEN 2
-                 WHEN 'mcp_server' THEN 3
-                 WHEN 'memory_doc' THEN 4
-                 WHEN 'runbook' THEN 5
-                 WHEN 'tool_okf' THEN 6
-                 ELSE 7
-               END AS type_priority
+               {_ARTIFACT_TYPE_PRIORITY_SQL} AS type_priority
         FROM artifact_fts JOIN artifacts a ON a.id=artifact_fts.id
         WHERE {where}
         ORDER BY rank, type_priority, a.title, a.id
@@ -1181,11 +1183,7 @@ def _query_identity_rows(
     return connection.execute(
         f"""
         SELECT a.*, 0.0 AS rank, ({" + ".join(score_parts)}) AS metadata_score,
-               CASE a.type
-                 WHEN 'skill' THEN 0 WHEN 'script' THEN 1 WHEN 'cron_job' THEN 2
-                 WHEN 'mcp_server' THEN 3 WHEN 'memory_doc' THEN 4 WHEN 'runbook' THEN 5
-                 WHEN 'tool_okf' THEN 6 ELSE 7
-               END AS type_priority
+               {_ARTIFACT_TYPE_PRIORITY_SQL} AS type_priority
         FROM artifacts a
         WHERE {where}
         ORDER BY metadata_score DESC, type_priority, a.title, a.id
@@ -1232,11 +1230,7 @@ def _query_metadata_rows(
     return connection.execute(
         f"""
         SELECT a.*, 0.0 AS rank, ({" + ".join(score_parts)}) AS metadata_score,
-               CASE a.type
-                 WHEN 'skill' THEN 0 WHEN 'script' THEN 1 WHEN 'cron_job' THEN 2
-                 WHEN 'mcp_server' THEN 3 WHEN 'memory_doc' THEN 4 WHEN 'runbook' THEN 5
-                 WHEN 'tool_okf' THEN 6 ELSE 7
-               END AS type_priority
+               {_ARTIFACT_TYPE_PRIORITY_SQL} AS type_priority
         FROM artifacts a
         WHERE {where}
         ORDER BY metadata_score DESC, type_priority, a.title, a.id

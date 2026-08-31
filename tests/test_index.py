@@ -677,6 +677,54 @@ def test_success_removes_only_dirty_tokens_covered_at_build_start(
     assert (marker / "arrived-during-build").is_file()
 
 
+def test_all_sql_candidate_paths_share_artifact_type_priority(tmp_path: Path) -> None:
+    expected_types = [
+        "skill",
+        "script",
+        "cron_job",
+        "mcp_server",
+        "memory_doc",
+        "runbook",
+        "tool_okf",
+        "doc",
+    ]
+    artifacts = [
+        Artifact(
+            id=f"{artifact_type}:shared-alpha-{position}",
+            type=artifact_type,
+            title="Shared Alpha",
+            path=f"shared-alpha/{position}",
+            summary="Quartz inventory",
+            triggers=["quartz inventory"],
+            entities=["Quartz"],
+            search_text="shared alpha quartz inventory",
+        )
+        for position, artifact_type in enumerate(expected_types)
+    ]
+    db_path = tmp_path / "index.sqlite"
+    index._build_sqlite(
+        db_path,
+        artifacts,
+        [],
+        source_root=tmp_path,
+        build_duration_ms=0,
+    )
+
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        with connection:
+            # Keep the FTS rank tied so type priority is the observable secondary order.
+            connection.execute("UPDATE artifact_fts SET type='shared'")
+        candidates = {
+            "fts": index._query_fts_rows(connection, "quartz", 20, ""),
+            "identity": index._query_identity_rows(connection, ["shared", "alpha"], 20, ""),
+            "metadata": index._query_metadata_rows(connection, ["quartz", "inventory"], 20, ""),
+        }
+
+    for rows in candidates.values():
+        assert [str(row["type"]) for row in rows] == expected_types
+
+
 def test_candidate_union_uses_one_ranker_then_parent_lifting_and_diversity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
