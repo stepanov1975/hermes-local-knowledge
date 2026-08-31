@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.18] - 2026-08-31
+
+### Changed
+
+- Simplified internal ownership for index building, CLI telemetry, frontmatter parsing, lexical policy, and SQL artifact priority while preserving existing index publication, routing, privacy, and telemetry behavior.
+
+[0.4.18]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.17...v0.4.18
+
 ## [0.4.17] - 2026-08-31
 
 ### Fixed
