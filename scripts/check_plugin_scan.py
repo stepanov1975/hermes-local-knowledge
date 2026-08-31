@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tools.plugin_guard import format_scan_report, scan_plugin  # type: ignore[import-not-found]
+from tools.plugin_guard import format_scan_report, scan_plugin  # type: ignore[import-not-found,import-untyped]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
