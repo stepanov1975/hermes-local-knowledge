@@ -13,13 +13,21 @@ from typing import Any
 import pytest
 import yaml  # type: ignore[import-untyped]
 
-from hermes_local_knowledge import okf, plugin
+from hermes_local_knowledge import _frontmatter, artifacts, okf, plugin
 from hermes_local_knowledge.config import resolve_config
 
 
 def write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def test_frontmatter_parser_has_one_private_owner() -> None:
+    assert artifacts._parse_frontmatter_scalar is _frontmatter._parse_frontmatter_scalar
+    assert artifacts._parse_bracket_list is _frontmatter._parse_bracket_list
+    assert artifacts._parse_frontmatter is _frontmatter._parse_frontmatter
+    assert okf._parse_frontmatter_scalar is _frontmatter._parse_frontmatter_scalar
+    assert okf._parse_frontmatter is _frontmatter._parse_frontmatter
 
 
 def db_text(state_dir: Path) -> str:
@@ -43,7 +51,7 @@ def test_explicit_iso8601_datetime_requires_time_and_offset(value: str, expected
 
 
 def test_frontmatter_flow_list_preserves_quoted_commas() -> None:
-    assert okf._parse_bracket_list('["find invoices, receipts"]') == ["find invoices, receipts"]
+    assert _frontmatter._parse_bracket_list('["find invoices, receipts"]') == ["find invoices, receipts"]
 
 
 def test_safe_arg_shape_does_not_persist_values(tmp_path: Path) -> None:

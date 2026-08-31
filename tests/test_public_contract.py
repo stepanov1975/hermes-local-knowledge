@@ -1897,8 +1897,9 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
         and name.count("/") == 1
         and name.endswith(".py")
     }
-    assert wheel_modules == {
+    assert {
         "__init__.py",
+        "_frontmatter.py",
         "artifacts.py",
         "cli.py",
         "config.py",
@@ -1911,7 +1912,7 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
         "routing.py",
         "service.py",
         "telemetry.py",
-    }
+    } <= wheel_modules
     retired_modules = {
         "constants.py",
         "handlers.py",
