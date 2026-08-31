@@ -11,7 +11,6 @@ import sqlite3
 import tempfile
 import threading
 import time
-from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -689,9 +688,6 @@ def _build_locked(
     output_dir: Path,
     hermes_home: Path,
     settings: IndexSettings,
-    *,
-    collect_artifacts_fn: Callable[..., list[Artifact]],
-    build_edges_fn: Callable[[Sequence[Artifact]], list[Edge]],
 ) -> tuple[list[Artifact], list[Edge]]:
     db_path = output_dir / "index.sqlite"
     jsonl_path = output_dir / "index.jsonl"
@@ -699,11 +695,11 @@ def _build_locked(
     covered_tokens = _dirty_tokens(output_dir)
     started = time.perf_counter()
     artifacts = sorted(
-        collect_artifacts_fn(root, hermes_home, settings, okf_root=output_dir / "okfs"),
+        collect_artifacts(root, hermes_home, settings, okf_root=output_dir / "okfs"),
         key=lambda artifact: artifact.id,
     )
     edges = sorted(
-        build_edges_fn(artifacts),
+        build_edges(artifacts),
         key=lambda edge: (edge.source, edge.target, edge.kind, edge.evidence),
     )
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -755,43 +751,6 @@ def _build_locked(
             jsonl_backup.unlink(missing_ok=True)
 
 
-def _build_index_with_dependencies(
-    root: Path,
-    output_dir: Path,
-    hermes_home: Path,
-    settings: IndexSettings | None = None,
-    *,
-    force: bool = True,
-    acquire_lock: bool = True,
-    collect_artifacts_fn: Callable[..., list[Artifact]] | None = None,
-    build_edges_fn: Callable[[Sequence[Artifact]], list[Edge]] | None = None,
-) -> tuple[list[Artifact], list[Edge]] | None:
-    root = root.expanduser().resolve()
-    output_dir = output_dir.expanduser().resolve()
-    hermes_home = hermes_home.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    resolved_settings = settings or IndexSettings()
-    collector = collect_artifacts_fn or collect_artifacts
-    edge_builder = build_edges_fn or build_edges
-
-    def build_once() -> tuple[list[Artifact], list[Edge]] | None:
-        if not force and not index_needs_rebuild(output_dir / "index.sqlite") and not _dirty_tokens(output_dir):
-            return None
-        return _build_locked(
-            root,
-            output_dir,
-            hermes_home,
-            resolved_settings,
-            collect_artifacts_fn=collector,
-            build_edges_fn=edge_builder,
-        )
-
-    if not acquire_lock:
-        return build_once()
-    with index_build_lock(output_dir):
-        return build_once()
-
-
 @overload
 def build_index(
     root: Path,
@@ -835,13 +794,16 @@ def build_index(
 ) -> tuple[list[Artifact], list[Edge]] | None:
     """Collect and publish a validated, recoverable format-4 index pair."""
 
-    return _build_index_with_dependencies(
-        root,
-        output_dir,
-        hermes_home,
-        settings,
-        force=force,
-    )
+    root = root.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    hermes_home = hermes_home.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_settings = settings or IndexSettings()
+
+    with index_build_lock(output_dir):
+        if not force and not index_needs_rebuild(output_dir / "index.sqlite") and not _dirty_tokens(output_dir):
+            return None
+        return _build_locked(root, output_dir, hermes_home, resolved_settings)
 
 
 def artifact_type_counts(artifacts: Sequence[Artifact]) -> dict[str, int]:
