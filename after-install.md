@@ -8,24 +8,19 @@ Skip this if installation used `--enable`:
 hermes plugins enable local_knowledge
 ```
 
-## 2. Obtain explicit model-token consent
+## 2. Explain automatic generation token use
 
-Existing-artifact lookup works with automatic tool-OKF generation disabled. Automatic generation is off by default because a detached worker invokes the active Hermes model and consumes additional tokens.
+Automatic tool-OKF generation is enabled by default because its generated routing notes significantly improve future tool discovery. Existing-artifact lookup itself does not require model calls.
 
-Before changing the setting, explain that one worker claims at most `max_candidates_per_session` candidates (default `2`), makes one structured batch call when it has claims, and passes `max_generation_seconds` as the provider-request timeout. Provider retry/fallback policy can extend elapsed time and token use behind that host call, but session finalization does not wait for the worker.
+Tell the user that one detached worker claims at most `max_candidates_per_session` candidates (default `2`), makes one structured batch call when it has claims, and therefore consumes additional model tokens. It passes `max_generation_seconds` as the provider-request timeout. Provider retry/fallback policy can extend elapsed time and token use behind that host call, but session finalization does not wait for the worker.
 
-Ask:
-
-> Enable automatic OKF generation now? (Recommended; uses additional model tokens.)
-
-Only after the user agrees:
+Users who do not want the additional model calls can disable automatic generation:
 
 ```bash
-hermes config set local_knowledge.okf.enabled true
-hermes config set local_knowledge.okf.auto_generate true
+hermes config set local_knowledge.okf.auto_generate false
 ```
 
-If it is already enabled, report that. If the user declines, leave `auto_generate` disabled and report that search and manual OKF management work, but new routing notes will not be generated automatically.
+Search and manual OKF management continue to work when automatic generation is disabled, but new routing notes are not generated automatically.
 
 ## 3. Install the proactive router skill
 
@@ -61,12 +56,12 @@ local_knowledge:
   include_markdown_docs: true
   exclude_dir_names: [build, dist]
   implicit_feedback:
-    enabled: false  # optional; enable only for a private controlled installation
+    enabled: true
     min_confirmations: 2
     max_generic_queries: 5
   okf:
     enabled: true
-    auto_generate: false  # set true only after the consent step
+    auto_generate: true  # uses additional model tokens in a bounded background worker
 ```
 
 CLI-safe scalar/list form:
@@ -82,7 +77,7 @@ hermes config set local_knowledge.exclude_dir_names build,dist
 
 If `source_root` is omitted, it defaults to `$HERMES_HOME`; arbitrary root-level Markdown is then excluded by default to avoid a noisy broad scan.
 
-Implicit feedback is also opt-in. When enabled, a recent `knowledge_get` can become routing evidence only when the artifact appeared in an unassisted `knowledge_search` baseline from the same Hermes session, task, and turn. Repeated consumption from one search is deduplicated, confirmations require distinct search events, generic evidence is suppressed, and explicit feedback takes precedence. Leave it disabled outside a private controlled installation.
+Implicit feedback is enabled by default. A recent `knowledge_get` can become routing evidence only when the artifact appeared in an unassisted `knowledge_search` baseline from the same Hermes session, task, and turn. Repeated consumption from one search is deduplicated, confirmations require distinct search events, generic evidence is suppressed, and explicit feedback takes precedence.
 
 ## 5. Run the doctor
 

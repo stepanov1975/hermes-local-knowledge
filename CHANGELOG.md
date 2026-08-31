@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.16] - 2026-08-31
+
+### Changed
+
+- Enabled implicit consumption feedback by default for private Hermes installations while preserving its same-turn attribution, confirmation, generic-query, and explicit-feedback safeguards.
+- Enabled automatic tool-OKF generation by default because generated routing notes significantly improve future tool discovery. Installation guidance now warns that the bounded background worker consumes additional model tokens and documents how to disable it.
+
+[0.4.16]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.15...v0.4.16
+
 ## [0.4.15] - 2026-08-31
 
 ### Fixed

@@ -22,7 +22,7 @@ These instructions apply to the whole repository.
 ## Current owners
 
 - `config.py`: configuration models and resolution.
-- `implicit.py`: opt-in search-result consumption feedback.
+- `implicit.py`: default-enabled search-result consumption feedback.
 - `artifacts.py`: whole-artifact models, collection, privacy-safe metadata, graph edges.
 - `index.py`: format-4 persistence, cross-version/SQLite build locks, rebuild classification, deterministic retrieval.
 - `telemetry.py`: usage/feedback persistence and reports.
@@ -48,7 +48,7 @@ These instructions apply to the whole repository.
 - `$HERMES_HOME/skills/.archive` is excluded from active routing.
 - Feedback/evaluation data stays local. Keep public docs/tests free of raw telemetry and private content.
 - Feedback-assisted routing is current-index-root-only and bounded to the latest significant explicit query/artifact rating. Among accepted current ratings, only `useful` is positive; legacy persisted `great` rows remain positive compatibility input. A newer rejection for the route or matching current query vetoes an older overlapping positive. Promote an artifact only when the current index returns it, with at most one no-longer-than-current artifact-type retry. Explicit caller-owned indexes remain unassisted.
-- Optional implicit routing uses recent same-turn baseline search-result consumption, deduplicates one search/artifact pair, and requires confirmations from distinct search events. Route-assisted-only results are not evidence. Mature evidence from too many query shapes is treated as generic. Explicit routes take precedence, and implicit evidence never becomes an evaluation label or unbounded historical replay input.
+- Default-enabled implicit routing uses recent same-turn baseline search-result consumption, deduplicates one search/artifact pair, and requires confirmations from distinct search events. Route-assisted-only results are not evidence. Mature evidence from too many query shapes is treated as generic. Explicit routes take precedence, and implicit evidence never becomes an evaluation label or unbounded historical replay input.
 - Read-only evaluation measures the unassisted index ranking. Do not train on and score the same feedback replay.
 
 ## State and concurrency invariants
@@ -57,7 +57,7 @@ Generated state includes `index.sqlite`, `index.jsonl`, `usage.sqlite`, `okf_que
 
 - Managed lookups rebuild missing, corrupt, older-format, or OKF-dirty indexes. Ordinary source changes require `rebuild=true`, an explicit CLI build, or an optional operator schedule; no schedule is required.
 - Reject newer index formats before publication. Build and validate temporary SQLite/JSONL outputs before publishing them as a recoverable, hash-bound pair under both build locks.
-- OKF automatic generation requires explicit model-token consent. The finalizer only checks and launches; the detached worker uses one fixed lease, one structured batch call when claims exist, and claim/lease-fenced validation/publication.
+- OKF automatic generation is enabled by default and must be disclosed as consuming additional model tokens. The finalizer only checks and launches; the detached worker uses one fixed lease, one structured batch call when claims exist, and claim/lease-fenced validation/publication.
 - Version 0.4.0 supports the current v0.3.12 queue shape through selected-claim normalization, not a general migration ladder.
 
 ## Release policy

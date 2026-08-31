@@ -43,7 +43,7 @@ class OKFSettings:
     """Settings for opportunistic tool-OKF generation."""
 
     enabled: bool = True
-    auto_generate: bool = False
+    auto_generate: bool = True
     max_candidates_per_session: int = 2
     max_generation_seconds: int = 120
     min_use_count: int = 1
@@ -59,7 +59,7 @@ class OKFSettings:
 class ImplicitFeedbackSettings:
     """Settings for learning from consumed search results."""
 
-    enabled: bool = False
+    enabled: bool = True
     min_confirmations: int = 2
     max_generic_queries: int = 5
 

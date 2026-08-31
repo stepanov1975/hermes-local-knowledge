@@ -1381,7 +1381,7 @@ def test_cli_doctor_and_router_skill_install_status_and_exit_contract(
         "okf_auto_generate",
     }
     assert checks["router_skill_installed"]["ok"] is False
-    assert checks["okf_auto_generate"]["ok"] is False
+    assert checks["okf_auto_generate"]["ok"] is True
 
     install_args = [
         "install-router-skill",
@@ -2073,7 +2073,7 @@ def test_config_implicit_and_explicit_root_markdown_defaults_via_cli_and_plugin(
     assert implicit["state_dir_source"] == "config"
     assert implicit["include_markdown_docs_source"] == "default"
     implicit_checks = {row["name"]: row for row in implicit["checks"]}
-    assert implicit_checks["okf_auto_generate"]["ok"] is False
+    assert implicit_checks["okf_auto_generate"]["ok"] is True
 
     status, explicit = run_cli_json(
         capsys,
