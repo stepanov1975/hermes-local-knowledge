@@ -915,6 +915,40 @@ def test_search_feedback_prior_ignores_feedback_from_another_root(tmp_path: Path
     assert calls == ["docker image version report needs update"]
 
 
+def test_record_usage_owns_paths_and_merges_base_metadata(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    captured: dict[str, Any] = {}
+
+    def record(root: Path, **kwargs: Any) -> int:
+        captured["root"] = root
+        captured.update(kwargs)
+        return 41
+
+    service = LocalKnowledgeService(config, record_usage_fn=record)
+    target = tmp_path / "external" / "index.sqlite"
+
+    event_id = service.record_usage(
+        tool="knowledge_search",
+        success=True,
+        db_path=target,
+        index_metadata={"index_exists": True, "plugin_version": "provided-version"},
+    )
+
+    assert event_id == 41
+    assert captured["root"] == config.source_root
+    assert captured["usage_db_path"] == service.usage_db_path
+    metadata = captured["index_metadata"]
+    assert metadata["root"] == str(config.source_root)
+    assert metadata["state_dir"] == str(config.state_dir)
+    assert metadata["db_path"] == str(target)
+    assert metadata["source_root_source"] == "config"
+    assert metadata["state_dir_source"] == "config"
+    assert metadata["include_markdown_docs_source"] == "config"
+    assert metadata["warnings"] == ["test warning"]
+    assert metadata["index_exists"] is True
+    assert metadata["plugin_version"] == "provided-version"
+
+
 def test_usage_success_error_and_failures_are_best_effort(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     service = LocalKnowledgeService(config)

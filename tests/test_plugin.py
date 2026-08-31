@@ -842,6 +842,23 @@ def test_native_search_telemetry_keeps_the_complete_bounded_page(
     assert ROUTING_TRACE_METADATA_KEY not in index_metadata
 
 
+def test_cli_doctor_skips_telemetry_when_config_resolution_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_config(_hermes_home: Path | None = None) -> None:
+        raise RuntimeError("synthetic config failure")
+
+    monkeypatch.setattr(lci_cli, "resolve_config", fail_config)
+
+    status = lci_cli.main(["doctor", "--json"])
+
+    assert status == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["success"] is False
+    assert payload["errors"] == ["doctor failed: RuntimeError: synthetic config failure"]
+
+
 def test_cli_search_telemetry_keeps_the_complete_page_and_explicit_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
