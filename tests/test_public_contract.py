@@ -1900,6 +1900,7 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
     assert {
         "__init__.py",
         "_frontmatter.py",
+        "_lexical.py",
         "artifacts.py",
         "cli.py",
         "config.py",

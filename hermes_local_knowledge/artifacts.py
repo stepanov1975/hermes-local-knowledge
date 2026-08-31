@@ -7,7 +7,6 @@ The configuration module owns how those settings are resolved.
 
 from __future__ import annotations
 
-import getpass
 import json
 import os
 import re
@@ -21,6 +20,7 @@ from ._frontmatter import (
     _parse_frontmatter,
     _parse_frontmatter_scalar,
 )
+from ._lexical import COMMON_STOPWORDS as _STOPWORDS
 
 _SCRIPT_SUFFIXES = frozenset({".py", ".sh", ".bash", ".cjs", ".mjs", ".js"})
 _EXCLUDED_DIR_NAMES = frozenset(
@@ -40,63 +40,6 @@ _EXCLUDED_DIR_NAMES = frozenset(
     }
 )
 
-
-def _runtime_stopwords() -> set[str]:
-    try:
-        username = getpass.getuser().strip().lower()
-    except Exception:
-        return set()
-    return {username} if len(username) >= 3 else set()
-
-
-_STOPWORDS = frozenset(
-    {
-        "about",
-        "after",
-        "again",
-        "against",
-        "agent",
-        "and",
-        "are",
-        "before",
-        "build",
-        "can",
-        "code",
-        "config",
-        "data",
-        "default",
-        "doc",
-        "docs",
-        "file",
-        "files",
-        "for",
-        "from",
-        "has",
-        "have",
-        "hermes",
-        "into",
-        "local",
-        "markdown",
-        "not",
-        "note",
-        "repo",
-        "review",
-        "run",
-        "script",
-        "server",
-        "skill",
-        "that",
-        "the",
-        "this",
-        "tool",
-        "tools",
-        "use",
-        "using",
-        "when",
-        "with",
-    }
-    | _runtime_stopwords()
-)
 
 _MCP_URI_AUTHORITY_RE = re.compile(r"(?i)(?P<prefix>[a-z][a-z0-9+.-]*://)(?P<authority>[^/?#\s]*)")
 _MCP_URL_PARAMETER_RE = re.compile(

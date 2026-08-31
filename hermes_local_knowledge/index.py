@@ -1,7 +1,6 @@
 """Format-4 persistence and deterministic search for local knowledge artifacts."""
 from __future__ import annotations
 
-import getpass
 import hashlib
 import json
 import os
@@ -18,6 +17,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterator, Literal, Sequence, overload
 
 from . import __version__
+from ._lexical import COMMON_STOPWORDS
 from .artifacts import Artifact, Edge, build_edges, collect_artifacts
 from .config import IndexSettings
 
@@ -77,59 +77,7 @@ _TABLE_SIGNATURES = {
 _QUOTED_QUERY_SPAN_RE = re.compile(r'"(?P<double>[^"\n]+)"|(?<!\w)\'(?P<single>[^\'\n]+)\'(?!\w)')
 
 
-def _runtime_stopwords() -> set[str]:
-    try:
-        username = getpass.getuser().strip().lower()
-    except Exception:
-        return set()
-    return {username} if len(username) >= 3 else set()
-
-
-STOPWORDS = {
-    "about",
-    "after",
-    "again",
-    "against",
-    "agent",
-    "and",
-    "are",
-    "before",
-    "build",
-    "can",
-    "code",
-    "config",
-    "data",
-    "default",
-    "doc",
-    "docs",
-    "file",
-    "files",
-    "for",
-    "from",
-    "has",
-    "have",
-    "hermes",
-    "into",
-    "local",
-    "markdown",
-    "not",
-    "note",
-    "repo",
-    "review",
-    "run",
-    "script",
-    "server",
-    "skill",
-    "that",
-    "the",
-    "this",
-    "tool",
-    "tools",
-    "use",
-    "using",
-    "when",
-    "with",
-} | _runtime_stopwords()
+STOPWORDS = set(COMMON_STOPWORDS)
 QUERY_STOPWORDS = {"find", "flow", "markdown", "need", "next", "show", "want", "what", "where", "which"}
 EXPLICIT_ARTIFACT_TYPE_ALIASES: dict[str, frozenset[str]] = {
     "runbook": frozenset({"runbook"}),
