@@ -238,9 +238,12 @@ class LocalKnowledgeService:
     def record_usage(self, *, tool: str, success: bool, **kwargs: Any) -> int | None:
         """Record lookup telemetry without allowing telemetry failures to escape."""
 
-        usage_kwargs = dict(kwargs)
-        usage_kwargs["usage_db_path"] = self.usage_db_path
         try:
+            usage_kwargs = dict(kwargs)
+            metadata = self._base_metadata(usage_kwargs.get("db_path") or self.db_path)
+            metadata.update(dict(usage_kwargs.get("index_metadata") or {}))
+            usage_kwargs["index_metadata"] = metadata
+            usage_kwargs["usage_db_path"] = self.usage_db_path
             return self._record_usage_fn(
                 self.config.source_root,
                 tool=tool,

@@ -7,7 +7,6 @@ The configuration module owns how those settings are resolved.
 
 from __future__ import annotations
 
-import getpass
 import json
 import os
 import re
@@ -15,6 +14,13 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator, Protocol, Sequence
 from urllib.parse import unquote_plus
+
+from ._frontmatter import (
+    _parse_bracket_list,
+    _parse_frontmatter,
+    _parse_frontmatter_scalar,
+)
+from ._lexical import COMMON_STOPWORDS as _STOPWORDS
 
 _SCRIPT_SUFFIXES = frozenset({".py", ".sh", ".bash", ".cjs", ".mjs", ".js"})
 _EXCLUDED_DIR_NAMES = frozenset(
@@ -34,63 +40,6 @@ _EXCLUDED_DIR_NAMES = frozenset(
     }
 )
 
-
-def _runtime_stopwords() -> set[str]:
-    try:
-        username = getpass.getuser().strip().lower()
-    except Exception:
-        return set()
-    return {username} if len(username) >= 3 else set()
-
-
-_STOPWORDS = frozenset(
-    {
-        "about",
-        "after",
-        "again",
-        "against",
-        "agent",
-        "and",
-        "are",
-        "before",
-        "build",
-        "can",
-        "code",
-        "config",
-        "data",
-        "default",
-        "doc",
-        "docs",
-        "file",
-        "files",
-        "for",
-        "from",
-        "has",
-        "have",
-        "hermes",
-        "into",
-        "local",
-        "markdown",
-        "not",
-        "note",
-        "repo",
-        "review",
-        "run",
-        "script",
-        "server",
-        "skill",
-        "that",
-        "the",
-        "this",
-        "tool",
-        "tools",
-        "use",
-        "using",
-        "when",
-        "with",
-    }
-    | _runtime_stopwords()
-)
 
 _MCP_URI_AUTHORITY_RE = re.compile(r"(?i)(?P<prefix>[a-z][a-z0-9+.-]*://)(?P<authority>[^/?#\s]*)")
 _MCP_URL_PARAMETER_RE = re.compile(
@@ -210,76 +159,6 @@ def _safe_read_text(path: Path, *, max_chars: int = 200_000) -> str:
             return handle.read(max_chars)
     except OSError:
         return ""
-
-
-def _parse_frontmatter_scalar(value: str) -> str:
-    clean = value.strip()
-    if len(clean) >= 2 and clean.startswith('"') and clean.endswith('"'):
-        try:
-            parsed = json.loads(clean)
-        except (TypeError, ValueError):
-            pass
-        else:
-            if isinstance(parsed, str):
-                return parsed
-    if len(clean) >= 2 and clean.startswith("'") and clean.endswith("'"):
-        return clean[1:-1].replace("''", "'")
-    return clean
-
-
-def _parse_bracket_list(value: str) -> list[str]:
-    clean = value.strip()
-    if clean.startswith("[") and clean.endswith("]"):
-        try:
-            parsed = json.loads(clean)
-        except (TypeError, ValueError):
-            clean = clean[1:-1]
-        else:
-            if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
-                return [item.strip() for item in parsed if item.strip()]
-            return []
-    return [_parse_frontmatter_scalar(item) for item in clean.split(",") if item.strip()]
-
-
-def _parse_frontmatter(text: str) -> dict[str, Any]:
-    if not text.startswith("---"):
-        return {}
-    frontmatter: dict[str, Any] = {}
-    current_key: str | None = None
-    for line in text.splitlines()[1:]:
-        stripped = line.strip()
-        indent = len(line) - len(line.lstrip())
-        if stripped == "---":
-            break
-        if not stripped or stripped.startswith("#"):
-            continue
-        list_item = re.match(r"^[-*]\s+(.+)$", stripped)
-        if list_item and current_key:
-            current_value = frontmatter.get(current_key)
-            if isinstance(current_value, list):
-                current_value.append(_parse_frontmatter_scalar(list_item.group(1)))
-            continue
-        match = re.match(r"^([A-Za-z0-9_.-]+):\s*(.*)$", stripped)
-        if not match:
-            continue
-        key, value = match.groups()
-        if indent and current_key:
-            current_value = frontmatter.get(current_key)
-            if current_value == []:
-                current_value = {}
-                frontmatter[current_key] = current_value
-            if isinstance(current_value, dict):
-                current_value[key] = _parse_frontmatter_scalar(value)
-                continue
-        current_key = key
-        value = value.strip()
-        if not value:
-            frontmatter[key] = []
-        elif value.startswith("[") and value.endswith("]"):
-            frontmatter[key] = _parse_bracket_list(value)
-        else:
-            frontmatter[key] = _parse_frontmatter_scalar(value)
-    return frontmatter
 
 
 def _frontmatter_list(frontmatter: dict[str, Any], key: str) -> list[str]:

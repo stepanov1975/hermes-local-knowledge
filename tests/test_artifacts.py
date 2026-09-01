@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import getpass
 import json
 import os
+import runpy
 import sys
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path, PureWindowsPath
 
 import pytest
 
-from hermes_local_knowledge import artifacts as artifacts_module
+from hermes_local_knowledge import _lexical, artifacts as artifacts_module, index as index_module
 from hermes_local_knowledge.artifacts import (
     Artifact,
     Edge,
@@ -169,6 +171,23 @@ def test_models_are_frozen_and_keep_the_public_field_contract() -> None:
         setattr(artifact, "title", "changed")
     with pytest.raises(AttributeError):
         setattr(edge, "kind", "changed")
+
+
+def test_collection_and_search_share_one_lexical_policy() -> None:
+    assert artifacts_module._STOPWORDS is _lexical.COMMON_STOPWORDS
+    assert isinstance(artifacts_module._STOPWORDS, frozenset)
+    assert isinstance(index_module.STOPWORDS, set)
+    assert index_module.STOPWORDS == set(_lexical.COMMON_STOPWORDS)
+
+
+def test_shared_lexical_policy_suppresses_username_at_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(getpass, "getuser", lambda: "  PrivateUser  ")
+
+    namespace = runpy.run_path(str(Path(_lexical.__file__)))
+
+    assert "privateuser" in namespace["COMMON_STOPWORDS"]
 
 
 def test_four_scanner_families_preserve_stable_ids_and_model_fields(tmp_path: Path) -> None:

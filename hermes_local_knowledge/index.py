@@ -1,7 +1,6 @@
 """Format-4 persistence and deterministic search for local knowledge artifacts."""
 from __future__ import annotations
 
-import getpass
 import hashlib
 import json
 import os
@@ -11,7 +10,6 @@ import sqlite3
 import tempfile
 import threading
 import time
-from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -19,6 +17,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterator, Literal, Sequence, overload
 
 from . import __version__
+from ._lexical import COMMON_STOPWORDS
 from .artifacts import Artifact, Edge, build_edges, collect_artifacts
 from .config import IndexSettings
 
@@ -40,6 +39,17 @@ SQLITE_REPLACE_ATTEMPTS = 20
 SQLITE_REPLACE_RETRY_SECONDS = 0.05
 DIRTY_MARKER_NAME = "okf_index_dirty"
 FTS_BM25_WEIGHTS = "0.0, 0.2, 6.0, 1.0, 3.0, 2.0, 5.0, 0.4"
+_ARTIFACT_TYPE_PRIORITY_SQL = (
+    "CASE a.type "
+    "WHEN 'skill' THEN 0 "
+    "WHEN 'script' THEN 1 "
+    "WHEN 'cron_job' THEN 2 "
+    "WHEN 'mcp_server' THEN 3 "
+    "WHEN 'memory_doc' THEN 4 "
+    "WHEN 'runbook' THEN 5 "
+    "WHEN 'tool_okf' THEN 6 "
+    "ELSE 7 END"
+)
 _INDEX_BUILD_LOCK_STATE = threading.local()
 _LEGACY_INDEX_BUILD_LOCK_FDS: set[int] = set()
 _SQLITE_INDEX_BUILD_LOCK_CONNECTIONS: dict[int, sqlite3.Connection] = {}
@@ -78,59 +88,7 @@ _TABLE_SIGNATURES = {
 _QUOTED_QUERY_SPAN_RE = re.compile(r'"(?P<double>[^"\n]+)"|(?<!\w)\'(?P<single>[^\'\n]+)\'(?!\w)')
 
 
-def _runtime_stopwords() -> set[str]:
-    try:
-        username = getpass.getuser().strip().lower()
-    except Exception:
-        return set()
-    return {username} if len(username) >= 3 else set()
-
-
-STOPWORDS = {
-    "about",
-    "after",
-    "again",
-    "against",
-    "agent",
-    "and",
-    "are",
-    "before",
-    "build",
-    "can",
-    "code",
-    "config",
-    "data",
-    "default",
-    "doc",
-    "docs",
-    "file",
-    "files",
-    "for",
-    "from",
-    "has",
-    "have",
-    "hermes",
-    "into",
-    "local",
-    "markdown",
-    "not",
-    "note",
-    "repo",
-    "review",
-    "run",
-    "script",
-    "server",
-    "skill",
-    "that",
-    "the",
-    "this",
-    "tool",
-    "tools",
-    "use",
-    "using",
-    "when",
-    "with",
-} | _runtime_stopwords()
+STOPWORDS = set(COMMON_STOPWORDS)
 QUERY_STOPWORDS = {"find", "flow", "markdown", "need", "next", "show", "want", "what", "where", "which"}
 EXPLICIT_ARTIFACT_TYPE_ALIASES: dict[str, frozenset[str]] = {
     "runbook": frozenset({"runbook"}),
@@ -689,9 +647,6 @@ def _build_locked(
     output_dir: Path,
     hermes_home: Path,
     settings: IndexSettings,
-    *,
-    collect_artifacts_fn: Callable[..., list[Artifact]],
-    build_edges_fn: Callable[[Sequence[Artifact]], list[Edge]],
 ) -> tuple[list[Artifact], list[Edge]]:
     db_path = output_dir / "index.sqlite"
     jsonl_path = output_dir / "index.jsonl"
@@ -699,11 +654,11 @@ def _build_locked(
     covered_tokens = _dirty_tokens(output_dir)
     started = time.perf_counter()
     artifacts = sorted(
-        collect_artifacts_fn(root, hermes_home, settings, okf_root=output_dir / "okfs"),
+        collect_artifacts(root, hermes_home, settings, okf_root=output_dir / "okfs"),
         key=lambda artifact: artifact.id,
     )
     edges = sorted(
-        build_edges_fn(artifacts),
+        build_edges(artifacts),
         key=lambda edge: (edge.source, edge.target, edge.kind, edge.evidence),
     )
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -755,43 +710,6 @@ def _build_locked(
             jsonl_backup.unlink(missing_ok=True)
 
 
-def _build_index_with_dependencies(
-    root: Path,
-    output_dir: Path,
-    hermes_home: Path,
-    settings: IndexSettings | None = None,
-    *,
-    force: bool = True,
-    acquire_lock: bool = True,
-    collect_artifacts_fn: Callable[..., list[Artifact]] | None = None,
-    build_edges_fn: Callable[[Sequence[Artifact]], list[Edge]] | None = None,
-) -> tuple[list[Artifact], list[Edge]] | None:
-    root = root.expanduser().resolve()
-    output_dir = output_dir.expanduser().resolve()
-    hermes_home = hermes_home.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    resolved_settings = settings or IndexSettings()
-    collector = collect_artifacts_fn or collect_artifacts
-    edge_builder = build_edges_fn or build_edges
-
-    def build_once() -> tuple[list[Artifact], list[Edge]] | None:
-        if not force and not index_needs_rebuild(output_dir / "index.sqlite") and not _dirty_tokens(output_dir):
-            return None
-        return _build_locked(
-            root,
-            output_dir,
-            hermes_home,
-            resolved_settings,
-            collect_artifacts_fn=collector,
-            build_edges_fn=edge_builder,
-        )
-
-    if not acquire_lock:
-        return build_once()
-    with index_build_lock(output_dir):
-        return build_once()
-
-
 @overload
 def build_index(
     root: Path,
@@ -835,13 +753,16 @@ def build_index(
 ) -> tuple[list[Artifact], list[Edge]] | None:
     """Collect and publish a validated, recoverable format-4 index pair."""
 
-    return _build_index_with_dependencies(
-        root,
-        output_dir,
-        hermes_home,
-        settings,
-        force=force,
-    )
+    root = root.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    hermes_home = hermes_home.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_settings = settings or IndexSettings()
+
+    with index_build_lock(output_dir):
+        if not force and not index_needs_rebuild(output_dir / "index.sqlite") and not _dirty_tokens(output_dir):
+            return None
+        return _build_locked(root, output_dir, hermes_home, resolved_settings)
 
 
 def artifact_type_counts(artifacts: Sequence[Artifact]) -> dict[str, int]:
@@ -1223,16 +1144,7 @@ def _query_fts_rows(
     return connection.execute(
         f"""
         SELECT a.*, bm25(artifact_fts, {FTS_BM25_WEIGHTS}) AS rank,
-               CASE a.type
-                 WHEN 'skill' THEN 0
-                 WHEN 'script' THEN 1
-                 WHEN 'cron_job' THEN 2
-                 WHEN 'mcp_server' THEN 3
-                 WHEN 'memory_doc' THEN 4
-                 WHEN 'runbook' THEN 5
-                 WHEN 'tool_okf' THEN 6
-                 ELSE 7
-               END AS type_priority
+               {_ARTIFACT_TYPE_PRIORITY_SQL} AS type_priority
         FROM artifact_fts JOIN artifacts a ON a.id=artifact_fts.id
         WHERE {where}
         ORDER BY rank, type_priority, a.title, a.id
@@ -1271,11 +1183,7 @@ def _query_identity_rows(
     return connection.execute(
         f"""
         SELECT a.*, 0.0 AS rank, ({" + ".join(score_parts)}) AS metadata_score,
-               CASE a.type
-                 WHEN 'skill' THEN 0 WHEN 'script' THEN 1 WHEN 'cron_job' THEN 2
-                 WHEN 'mcp_server' THEN 3 WHEN 'memory_doc' THEN 4 WHEN 'runbook' THEN 5
-                 WHEN 'tool_okf' THEN 6 ELSE 7
-               END AS type_priority
+               {_ARTIFACT_TYPE_PRIORITY_SQL} AS type_priority
         FROM artifacts a
         WHERE {where}
         ORDER BY metadata_score DESC, type_priority, a.title, a.id
@@ -1322,11 +1230,7 @@ def _query_metadata_rows(
     return connection.execute(
         f"""
         SELECT a.*, 0.0 AS rank, ({" + ".join(score_parts)}) AS metadata_score,
-               CASE a.type
-                 WHEN 'skill' THEN 0 WHEN 'script' THEN 1 WHEN 'cron_job' THEN 2
-                 WHEN 'mcp_server' THEN 3 WHEN 'memory_doc' THEN 4 WHEN 'runbook' THEN 5
-                 WHEN 'tool_okf' THEN 6 ELSE 7
-               END AS type_priority
+               {_ARTIFACT_TYPE_PRIORITY_SQL} AS type_priority
         FROM artifacts a
         WHERE {where}
         ORDER BY metadata_score DESC, type_priority, a.title, a.id

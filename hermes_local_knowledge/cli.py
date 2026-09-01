@@ -17,7 +17,6 @@ from .artifacts import Artifact, Edge
 from .config import Config, IndexSettings, resolve_config
 from .routing import ROUTING_TRACE_METADATA_KEY, SearchRoutingTrace
 from .service import LocalKnowledgeService
-from .telemetry import _record_usage
 
 NewerIndexFormatError = index.NewerIndexFormatError
 build_index = index.build_index
@@ -188,23 +187,6 @@ def _print_warnings(warnings: Sequence[str]) -> None:
         print(f"WARNING: {warning}", file=sys.stderr)
 
 
-def _cfg_metadata(cfg: Config, db_path: Path | None = None) -> dict[str, Any]:
-    return {
-        "plugin_version": __version__,
-        "root": str(cfg.source_root),
-        "source_root_source": cfg.source_root_source,
-        "state_dir": str(cfg.state_dir),
-        "state_dir_source": cfg.state_dir_source,
-        "include_markdown_docs_source": cfg.include_markdown_docs_source,
-        "db_path": str(db_path or (cfg.state_dir / "index.sqlite")),
-        "warnings": list(cfg.warnings),
-    }
-
-
-def _usage_db_for_state_dir(state_dir: Path) -> Path:
-    return state_dir / "usage.sqlite"
-
-
 BuildIndexFn = Callable[..., tuple[list[Artifact], list[Edge]] | None]
 
 
@@ -226,7 +208,7 @@ def _service(
 
 
 def _record_cli_usage(
-    cfg: Config | None,
+    service: LocalKnowledgeService | None,
     *,
     tool: str,
     success: bool,
@@ -252,19 +234,10 @@ def _record_cli_usage(
     latency_ms: int | None = None,
     db_path: Path | None = None,
     index_meta: dict[str, Any] | None = None,
-    usage_db_path: Path | None = None,
-    service: LocalKnowledgeService | None = None,
 ) -> int | None:
-    root = cfg.source_root if cfg is not None else None
-    metadata = _cfg_metadata(cfg, db_path) if cfg is not None else {"plugin_version": __version__}
-    metadata.update(index_meta or {})
-    if usage_db_path is None:
-        if cfg is None:
-            usage_db_path = (db_path.parent / "usage.sqlite") if db_path is not None else None
-        else:
-            usage_db_path = _usage_db_for_state_dir(cfg.state_dir)
-    record = service.record_usage if service is not None else lambda **kwargs: _record_usage(root, **kwargs)
-    return record(
+    if service is None:
+        return None
+    return service.record_usage(
         tool=tool,
         success=success,
         query=query,
@@ -289,8 +262,7 @@ def _record_cli_usage(
         latency_ms=latency_ms,
         db_path=db_path,
         client="cli",
-        index_metadata=metadata,
-        usage_db_path=usage_db_path,
+        index_metadata=index_meta or {},
     )
 
 
@@ -1000,7 +972,7 @@ def main(
         except Exception as exc:
             message = f"cli_build failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
-                cfg,
+                service,
                 tool="cli_build",
                 success=False,
                 rebuild_requested=True,
@@ -1009,7 +981,6 @@ def main(
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
                 index_meta=index.index_metadata(db_path),
-                service=service,
             )
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=False)
@@ -1018,7 +989,7 @@ def main(
         build_duration_ms = int(meta.get("build_duration_ms") or (time.perf_counter() - started) * 1000)
         counts = index.artifact_type_counts(artifacts)
         _record_cli_usage(
-            cfg,
+            service,
             tool="cli_build",
             success=True,
             rebuild_requested=True,
@@ -1027,7 +998,6 @@ def main(
             latency_ms=build_duration_ms,
             db_path=db_path,
             index_meta=meta,
-            service=service,
         )
         print(f"Built {len(artifacts)} artifacts and {len(edges)} edges")
         for artifact_type, count in sorted(counts.items()):
@@ -1063,7 +1033,7 @@ def main(
         except Exception as exc:
             message = f"cli_search failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
-                cfg,
+                service,
                 tool="knowledge_search",
                 success=False,
                 query=args.query,
@@ -1072,7 +1042,6 @@ def main(
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
                 index_meta=meta or index.index_metadata(db_path),
-                service=service,
             )
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
@@ -1096,7 +1065,7 @@ def main(
             implicit_feedback_max_id = None
         implicit_settings = getattr(getattr(service, "config", None), "implicit_feedback", None)
         _record_cli_usage(
-            cfg,
+            service,
             tool="knowledge_search",
             success=True,
             query=args.query,
@@ -1125,7 +1094,6 @@ def main(
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             index_meta=meta,
-            service=service,
         )
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1155,7 +1123,7 @@ def main(
         except Exception as exc:
             message = f"cli_get failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
-                cfg,
+                service,
                 tool="knowledge_get",
                 success=False,
                 artifact_id=args.artifact_id,
@@ -1163,7 +1131,6 @@ def main(
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
                 index_meta=meta or index.index_metadata(db_path),
-                service=service,
             )
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
@@ -1171,7 +1138,7 @@ def main(
             raise
         if row is None:
             _record_cli_usage(
-                cfg,
+                service,
                 tool="knowledge_get",
                 success=False,
                 artifact_id=args.artifact_id,
@@ -1180,12 +1147,11 @@ def main(
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
                 index_meta=meta,
-                service=service,
             )
             print(f"Artifact not found: {args.artifact_id}", file=sys.stderr)
             return 1
         _record_cli_usage(
-            cfg,
+            service,
             tool="knowledge_get",
             success=True,
             artifact_id=args.artifact_id,
@@ -1194,7 +1160,6 @@ def main(
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             index_meta=meta,
-            service=service,
         )
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1224,7 +1189,7 @@ def main(
         except Exception as exc:
             message = f"cli_neighbors failed: {type(exc).__name__}: {exc}"
             _record_cli_usage(
-                cfg,
+                service,
                 tool="knowledge_neighbors",
                 success=False,
                 artifact_id=args.artifact_id,
@@ -1232,14 +1197,13 @@ def main(
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 db_path=db_path,
                 index_meta=meta or index.index_metadata(db_path),
-                service=service,
             )
             if isinstance(exc, NewerIndexFormatError):
                 _emit_newer_index_error(exc, json_output=args.json)
                 return 1
             raise
         _record_cli_usage(
-            cfg,
+            service,
             tool="knowledge_neighbors",
             success=True,
             artifact_id=args.artifact_id,
@@ -1250,7 +1214,6 @@ def main(
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=db_path,
             index_meta=meta,
-            service=service,
         )
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1322,11 +1285,8 @@ def main(
             }
             status = 1
         doctor_db_path = Path(str(payload["db_path"])) if payload.get("db_path") else None
-        doctor_usage_db_path = (
-            Path(str(payload["state_dir"])) / "usage.sqlite" if payload.get("state_dir") else None
-        )
         _record_cli_usage(
-            doctor_cfg,
+            doctor_service,
             tool="cli_doctor",
             success=status == 0,
             query=str(args.query or ""),
@@ -1338,8 +1298,6 @@ def main(
             latency_ms=int((time.perf_counter() - started) * 1000),
             db_path=doctor_db_path,
             index_meta=payload,
-            usage_db_path=doctor_usage_db_path,
-            service=doctor_service,
         )
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
