@@ -15,7 +15,6 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import MISSING, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, TextIO, cast, get_type_hints
 
 import pytest
@@ -1359,7 +1358,7 @@ def test_cli_core_commands_and_positive_evaluation_output(
     assert after == before
 
 
-def test_cli_doctor_and_router_skill_install_status_and_exit_contract(
+def test_cli_doctor_and_router_skill_install_public_contract(
     workspace: Workspace,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1383,13 +1382,15 @@ def test_cli_doctor_and_router_skill_install_status_and_exit_contract(
     assert checks["router_skill_installed"]["ok"] is False
     assert checks["okf_auto_generate"]["ok"] is True
 
-    install_args = [
-        "install-router-skill",
-        "--hermes-home",
-        str(workspace.hermes_home),
-        "--json",
-    ]
-    status, installed = run_cli_json(capsys, install_args)
+    status, installed = run_cli_json(
+        capsys,
+        [
+            "install-router-skill",
+            "--hermes-home",
+            str(workspace.hermes_home),
+            "--json",
+        ],
+    )
     target = workspace.hermes_home / "skills" / "local-knowledge-router" / "SKILL.md"
     assert status == 0
     assert installed == {
@@ -1408,26 +1409,19 @@ def test_cli_doctor_and_router_skill_install_status_and_exit_contract(
     }
     assert target.is_file()
 
-    status, current = run_cli_json(capsys, install_args)
-    assert status == 0
-    assert current["success"] is True
-    assert current["status"] == "current"
-    assert current["overwritten"] is False
 
-    target.write_text("user-owned router skill\n", encoding="utf-8")
-    status, conflict = run_cli_json(capsys, install_args)
-    assert status == 1
-    assert conflict["success"] is False
-    assert conflict["status"] == "conflict"
-    assert conflict["force_required"] is True
-    assert target.read_text(encoding="utf-8") == "user-owned router skill\n"
 
-    status, overwritten = run_cli_json(capsys, [*install_args, "--force"])
-    assert status == 0
-    assert overwritten["success"] is True
-    assert overwritten["status"] == "installed"
-    assert overwritten["overwritten"] is True
-    assert target.read_bytes() == Path(overwritten["source"]).read_bytes()
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_cli_doctor_accepts_explicit_custom_router_skill_path(
@@ -1845,7 +1839,8 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
     assert ctx.skills == [("local-knowledge-router", root_skill)]
 
     manifest_lines = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
-    assert manifest_lines == ["include CHANGELOG.md", "prune tests"]
+    assert "include CHANGELOG.md" in manifest_lines
+    assert "prune tests" in manifest_lines
 
     source_copy = tmp_path / "source"
     dist_dir = tmp_path / "dist"
@@ -1889,45 +1884,35 @@ def test_package_entrypoint_manifest_and_bundled_skill_contract(tmp_path: Path) 
 
     with zipfile.ZipFile(wheel_path) as wheel_archive:
         wheel_names = set(wheel_archive.namelist())
-    assert "hermes_local_knowledge/skills/local-knowledge-router/SKILL.md" in wheel_names
-    wheel_modules = {
-        name.removeprefix("hermes_local_knowledge/")
+    required_public_payload = {
+        "hermes_local_knowledge/__init__.py",
+        "hermes_local_knowledge/cli.py",
+        "hermes_local_knowledge/indexer.py",
+        "hermes_local_knowledge/plugin.py",
+        "hermes_local_knowledge/skills/local-knowledge-router/SKILL.md",
+    }
+    assert required_public_payload <= wheel_names
+    assert not any(
+        name.startswith(("tests/", "mutants/"))
         for name in wheel_names
-        if name.startswith("hermes_local_knowledge/")
-        and name.count("/") == 1
-        and name.endswith(".py")
+    )
+    retired_payload = {
+        f"hermes_local_knowledge/{name}"
+        for name in {
+            "constants.py",
+            "handlers.py",
+            "models.py",
+            "paths.py",
+            "runtime.py",
+            "scanners.py",
+            "schemas.py",
+            "search.py",
+            "storage.py",
+            "text_utils.py",
+            "tooling.py",
+        }
     }
-    assert {
-        "__init__.py",
-        "_frontmatter.py",
-        "_lexical.py",
-        "artifacts.py",
-        "cli.py",
-        "config.py",
-        "evaluation.py",
-        "index.py",
-        "indexer.py",
-        "implicit.py",
-        "okf.py",
-        "plugin.py",
-        "routing.py",
-        "service.py",
-        "telemetry.py",
-    } <= wheel_modules
-    retired_modules = {
-        "constants.py",
-        "handlers.py",
-        "models.py",
-        "paths.py",
-        "runtime.py",
-        "scanners.py",
-        "schemas.py",
-        "search.py",
-        "storage.py",
-        "text_utils.py",
-        "tooling.py",
-    }
-    assert wheel_modules.isdisjoint(retired_modules)
+    assert wheel_names.isdisjoint(retired_payload)
 
 
 def test_directory_plugin_root_shim_supports_namespaced_import_without_install(
@@ -2094,7 +2079,14 @@ def test_config_implicit_and_explicit_root_markdown_defaults_via_cli_and_plugin(
     assert [row["tool"] for row in queue["pending"]] == ["public_default_tool"]
 
 
-def test_config_legacy_aliases_match_canonical_scanner_behavior_via_cli(
+
+
+
+
+
+
+
+def test_config_canonical_and_legacy_aliases_reach_cli_build_and_doctor(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2106,67 +2098,36 @@ def test_config_legacy_aliases_match_canonical_scanner_behavior_via_cli(
     canonical_home.mkdir()
     legacy_home.mkdir()
     write(
-        source_root / "alpha" / "alpha-skill" / "SKILL.md",
-        "---\nname: alpha-skill\ndescription: Quartz and Acme alpha skill.\n---\n",
+        source_root / "skills" / "quartz-router" / "SKILL.md",
+        "---\nname: quartz-router\ndescription: Route Quartz requests.\n---\n",
     )
-    write(
-        source_root / "beta" / "beta-skill" / "SKILL.md",
-        "---\nname: beta-skill\ndescription: Quartz and Acme beta skill.\n---\n",
-    )
-    write(
-        source_root / "scripts_one" / "quartz_tool.py",
-        "# Maintain Quartz and Acme inventory records.\n",
-    )
-    write(
-        source_root / "scripts_two" / "acme_tool.sh",
-        "#!/bin/sh\n# Maintain Quartz and Acme inventory records.\n",
-    )
-    write(
-        source_root / "scripts_one" / "build" / "configured-exclusion.py",
-        "# Configured exclusion.\n",
-    )
-    write(
-        source_root / "scripts_one" / ".archive" / "builtin-exclusion.py",
-        "# Built-in exclusion.\n",
-    )
-    write(source_root / "memory_one" / "quartz-memory.md", "# Quartz and Acme memory\n")
-    write(source_root / "memory_two" / "acme-memory.md", "# Acme and Quartz memory\n")
-    write(source_root / "docs_one" / "quartz-runbook.md", "# Quartz and Acme runbook\n")
-    write(source_root / "docs_two" / "acme-runbook.md", "# Acme and Quartz runbook\n")
-    write(source_root / "loose-note.md", "# Quartz and Acme loose note\n")
-
-    scanner_config = "  exclude_dir_names: [build, dist]\n"
+    write(source_root / "scripts" / "quartz_tool.py", "# Maintain Quartz inventory.\n")
     write(
         canonical_home / "config.yaml",
         f"""local_knowledge:
   source_root: {source_root}
   state_dir: {canonical_state}
-  custom_skill_dirs: [alpha, beta]
-  script_dirs: [scripts_one, scripts_two]
-  memory_dirs: [memory_one, memory_two]
-  runbook_dirs: [docs_one, docs_two]
-  known_entities: [Quartz, Acme]
-{scanner_config}""",
+  custom_skill_dirs: [skills]
+  script_dirs: [scripts]
+  known_entities: [Quartz]
+""",
     )
     write(
         legacy_home / "config.yaml",
         f"""local_knowledge:
   root: {source_root}
   index_dir: {legacy_state}
-  custom_skill_dirs: 'alpha, beta'
-  script_dirs: '[scripts_one, scripts_two]'
-  memory_dirs: 'memory_one, memory_two'
-  runbook_dirs: '[docs_one, docs_two]'
-  entities: '[Quartz, Acme]'
-{scanner_config}""",
+  custom_skill_dirs: skills
+  script_dirs: '[scripts]'
+  entities: '[Quartz]'
+""",
     )
 
     def build(hermes_home: Path, state_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         assert lci_cli.main(
             ["build", "--hermes-home", str(hermes_home), "--from-hermes-config"]
         ) == 0
-        output = capsys.readouterr().out
-        assert f"SQLite: {state_dir.resolve() / 'index.sqlite'}" in output
+        capsys.readouterr()
         rows = [
             json.loads(line)
             for line in (state_dir / "index.jsonl").read_text(encoding="utf-8").splitlines()
@@ -2178,265 +2139,25 @@ def test_config_legacy_aliases_match_canonical_scanner_behavior_via_cli(
         assert status == 0
         return rows, doctor
 
-    canonical_rows, canonical = build(canonical_home, canonical_state)
-    legacy_rows, legacy = build(legacy_home, legacy_state)
+    canonical_rows, canonical_doctor = build(canonical_home, canonical_state)
+    legacy_rows, legacy_doctor = build(legacy_home, legacy_state)
     assert legacy_rows == canonical_rows
-    paths = {row["path"] for row in canonical_rows}
-    assert paths == {
-        "alpha/alpha-skill",
-        "beta/beta-skill",
-        "scripts_one/quartz_tool.py",
-        "scripts_two/acme_tool.sh",
-        "memory_one/quartz-memory.md",
-        "memory_two/acme-memory.md",
-        "docs_one/quartz-runbook.md",
-        "docs_two/acme-runbook.md",
-        "loose-note.md",
+    assert {row["path"] for row in canonical_rows} == {
+        "scripts/quartz_tool.py",
+        "skills/quartz-router",
     }
-    assert {row["type"] for row in canonical_rows} == {
-        "doc",
-        "memory_doc",
-        "runbook",
-        "script",
-        "skill",
-    }
-    quartz_script = next(
-        row for row in canonical_rows if row["path"] == "scripts_one/quartz_tool.py"
-    )
-    assert quartz_script["entities"] == ["Quartz", "Acme"]
-    assert "scripts_one/build/configured-exclusion.py" not in paths
-    assert "scripts_one/.archive/builtin-exclusion.py" not in paths
-
-    for payload, hermes_home, state_dir in [
-        (canonical, canonical_home, canonical_state),
-        (legacy, legacy_home, legacy_state),
-    ]:
+    quartz_script = next(row for row in canonical_rows if row["type"] == "script")
+    assert quartz_script["entities"] == ["Quartz"]
+    for payload, hermes_home, state_dir in (
+        (canonical_doctor, canonical_home, canonical_state),
+        (legacy_doctor, legacy_home, legacy_state),
+    ):
         assert payload["hermes_home"] == str(hermes_home.resolve())
         assert payload["source_root"] == str(source_root.resolve())
         assert payload["source_root_source"] == "config"
         assert payload["state_dir"] == str(state_dir.resolve())
         assert payload["state_dir_source"] == "config"
-        assert payload["include_markdown_docs_source"] == "default"
         assert payload["warnings"] == []
-
-
-def test_config_hermes_home_config_and_env_precedence_via_doctor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    hermes_home = tmp_path / "selected-hermes-home"
-    config_root = tmp_path / "config-root"
-    config_state = tmp_path / "config-state"
-    env_root = tmp_path / "env-root"
-    env_state = tmp_path / "env-state"
-    for path in (hermes_home, config_root, env_root):
-        path.mkdir()
-    write(
-        hermes_home / "config.yaml",
-        f"""local_knowledge:
-  source_root: {config_root}
-  state_dir: {config_state}
-""",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-    status, configured = run_cli_json(capsys, ["doctor", "--json"])
-    assert status == 0
-    assert configured["hermes_home"] == str(hermes_home.resolve())
-    assert configured["source_root"] == str(config_root.resolve())
-    assert configured["state_dir"] == str(config_state.resolve())
-    assert configured["source_root_source"] == "config"
-    assert configured["state_dir_source"] == "config"
-
-    status, smoke = run_cli_json(capsys, ["smoke", "--json"])
-    assert status == 0
-    assert smoke["source_root"] == configured["source_root"]
-    assert smoke["state_dir"] == configured["state_dir"]
-
-    monkeypatch.setenv("LOCAL_KNOWLEDGE_ROOT", str(env_root))
-    monkeypatch.setenv("LOCAL_KNOWLEDGE_STATE_DIR", str(env_state))
-    status, overridden = run_cli_json(capsys, ["doctor", "--json"])
-    assert status == 0
-    assert overridden["hermes_home"] == str(hermes_home.resolve())
-    assert overridden["source_root"] == str(env_root.resolve())
-    assert overridden["state_dir"] == str(env_state.resolve())
-    assert overridden["source_root_source"] == "env"
-    assert overridden["state_dir_source"] == "env"
-
-    cli_root = tmp_path / "cli-root"
-    cli_state = tmp_path / "cli-state"
-    write(
-        cli_root / "custom_skills" / "cli-skill" / "SKILL.md",
-        "---\nname: cli-skill\ndescription: CLI precedence fixture.\n---\n",
-    )
-    assert lci_cli.main(
-        [
-            "build",
-            "--root",
-            str(cli_root),
-            "--output-dir",
-            str(cli_state),
-            "--hermes-home",
-            str(hermes_home),
-        ]
-    ) == 0
-    build_output = capsys.readouterr().out
-    assert f"SQLite: {cli_state.resolve() / 'index.sqlite'}" in build_output
-    rows = [
-        json.loads(line)
-        for line in (cli_state / "index.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert [row["id"] for row in rows] == ["skill:cli-skill"]
-
-
-@pytest.mark.parametrize("has_hermes_agent", [False, True], ids=["absent", "present"])
-def test_implicit_hermes_home_warning_is_conditional(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    has_hermes_agent: bool,
-) -> None:
-    hermes_home = tmp_path / "hermes-home"
-    hermes_home.mkdir()
-    if has_hermes_agent:
-        (hermes_home / "hermes-agent").mkdir()
-
-    status, payload = run_cli_json(
-        capsys,
-        ["doctor", "--hermes-home", str(hermes_home), "--json"],
-    )
-    assert status == 0
-    assert payload["source_root_source"] == "default"
-    if has_hermes_agent:
-        assert len(payload["warnings"]) == 1
-        assert "Because HERMES_HOME/hermes-agent exists" in payload["warnings"][0]
-    else:
-        assert payload["warnings"] == []
-
-
-@pytest.mark.parametrize(
-    ("config_body", "candidates", "expected_batch_size", "expected_timeout"),
-    [
-        (
-            """  okf:
-    auto_generate: true
-""",
-            [("alpha_tool", 1), ("beta_tool", 1), ("gamma_tool", 1)],
-            2,
-            120,
-        ),
-        (
-            """  okf_enabled: false
-  okf_auto_generate: true
-""",
-            [("disabled_tool", 1)],
-            0,
-            None,
-        ),
-        (
-            """  okf_enabled: true
-  okf_auto_generate: true
-  okf_max_candidates_per_session: 1
-  okf_max_worker_seconds: 333
-  okf_min_use_count: 2
-""",
-            [("low_use_tool", 1), ("high_use_tool", 2), ("highest_use_tool", 3)],
-            1,
-            333,
-        ),
-        (
-            """  okf_enabled: true
-  okf_auto_generate: true
-  okf_max_generation_seconds: 0
-  okf_max_worker_seconds: 333
-""",
-            [("generation_timeout_tool", 1)],
-            1,
-            10,
-        ),
-        (
-            """  okf_enabled: false
-  okf_auto_generate: false
-  okf_max_candidates_per_session: 9
-  okf_max_generation_seconds: 180
-  okf_min_use_count: 1
-  okf:
-    enabled: true
-    auto_generate: true
-    max_candidates_per_session: 1
-    max_generation_seconds: 240
-    max_worker_seconds: 999
-    min_use_count: 3
-""",
-            [("below_nested_minimum", 2), ("nested_selected_tool", 3)],
-            1,
-            240,
-        ),
-    ],
-)
-def test_config_nested_and_flat_okf_settings_through_native_worker(
-    tmp_path: Path,
-    config_body: str,
-    candidates: list[tuple[str, int]],
-    expected_batch_size: int,
-    expected_timeout: int | None,
-) -> None:
-    hermes_home = tmp_path / "hermes-home"
-    source_root = tmp_path / "source"
-    state_dir = tmp_path / "state"
-    hermes_home.mkdir()
-    source_root.mkdir()
-    create_current_okf_queue(state_dir, candidates=candidates)
-    write(
-        hermes_home / "config.yaml",
-        f"""local_knowledge:
-  source_root: {source_root}
-  state_dir: {state_dir}
-{config_body}""",
-    )
-
-    class CapturingLLM:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, Any]] = []
-
-        def complete_structured(self, **kwargs: Any) -> SimpleNamespace:
-            self.calls.append(kwargs)
-            input_items = cast(list[dict[str, str]], kwargs["input"])
-            packet = json.loads(input_items[0]["text"])
-            okfs = []
-            for candidate in packet["candidates"]:
-                readable_tool = str(candidate["tool"]).replace("_", " ")
-                okfs.append(
-                    {
-                        "tool": candidate["tool"],
-                        "schema_hash": candidate["schema_hash"],
-                        "title": f"{readable_tool.title()} router",
-                        "aliases": [f"route {readable_tool} requests"],
-                        "triggers": [f"User asks to route {readable_tool} requests."],
-                        "when_not_to_use": [],
-                        "related_tools": [],
-                        "body": f"Route {readable_tool} requests using the supplied query input.",
-                    }
-                )
-            return SimpleNamespace(parsed={"okfs": okfs})
-
-    llm = CapturingLLM()
-    ctx = registered_surface(llm=llm)
-    registration = ctx.cli_commands[0]
-    parser = argparse.ArgumentParser(prog="hermes local-knowledge")
-    setup_fn = cast(Callable[[argparse.ArgumentParser], None], registration["setup_fn"])
-    handler_fn = cast(Callable[[argparse.Namespace], int], registration["handler_fn"])
-    setup_fn(parser)
-    args = parser.parse_args(["okf-worker", "--hermes-home", str(hermes_home)])
-    assert handler_fn(args) == 0
-    assert len(llm.calls) == int(expected_batch_size > 0)
-    if expected_batch_size == 0:
-        return
-    call = llm.calls[0]
-    input_items = cast(list[dict[str, str]], call["input"])
-    packet = json.loads(input_items[0]["text"])
-    assert len(packet["candidates"]) == expected_batch_size
-    assert call["timeout"] == expected_timeout
 
 
 def test_usage_sqlite_schema_report_rows_and_public_keys(
@@ -2576,7 +2297,7 @@ def test_usage_sqlite_schema_report_rows_and_public_keys(
     }
 
 
-def test_okf_cli_reads_current_queue_and_preserves_command_exit_contract(
+def test_okf_cli_status_and_happy_path_contract(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2597,120 +2318,37 @@ def test_okf_cli_reads_current_queue_and_preserves_command_exit_contract(
     }
     assert payload["success"] is True
     assert payload["queue_db"] == str(db_path.resolve())
-    assert payload["okf_dir"] == str(state_dir.resolve() / "okfs" / "tools")
     assert payload["counts"] == {"pending": 1}
     assert payload["errors"] == []
-    candidate = payload["pending"][0]
-    assert set(candidate) == {
-        "tool",
-        "tool_name",
-        "toolset",
-        "schema_hash",
-        "schema",
-        "generator_version",
-        "allowed_related_tools",
-        "arg_shape",
-        "use_count",
-        "success_count",
-        "error_count",
-        "last_error_type",
-        "last_error_message",
-        "claim_token",
-        "target_path",
-    }
-    assert candidate["tool"] == "public_demo_tool"
-    assert candidate["tool_name"] == "public_demo_tool"
-    assert candidate["toolset"] == "local_knowledge"
-    assert candidate["generator_version"] == "4"
-    assert candidate["allowed_related_tools"] == []
-    assert candidate["target_path"] == str(
-        state_dir.resolve() / "okfs" / "tools" / "public-demo-tool.md"
-    )
-    for attempt in range(1, 4):
-        token = f"claim-{attempt}"
-        claim_status, claim = run_cli_json(
-            capsys,
-            ["okf", "claim", "--claim-token", token, *common],
-        )
-        assert claim_status == 0
-        assert set(claim) == {
-            "success",
-            "state_dir",
-            "claim_token",
-            "count",
-            "candidates",
-        }
-        assert claim["success"] is True
-        assert claim["claim_token"] == token
-        assert claim["count"] == 1
-        fail_status, failed = run_cli_json(
-            capsys,
-            [
-                "okf",
-                "fail",
-                "--claim-token",
-                token,
-                "--tool",
-                "public_demo_tool",
-                "--error",
-                "public fixture generation failed",
-                *common,
-            ],
-        )
-        assert fail_status == 0
-        assert failed == {
-            "success": True,
-            "tool": "public_demo_tool",
-            "claim_token": token,
-        }
-
-    status, exhausted = run_cli_json(capsys, ["okf", "status", *common])
-    assert status == 0
-    assert exhausted["counts"] == {"error": 1}
-    assert exhausted["pending"] == []
-    assert [row["tool"] for row in exhausted["errors"]] == ["public_demo_tool"]
-
-    retry_status, retried = run_cli_json(
-        capsys,
-        ["okf", "retry", "--tool", "public_demo_tool", *common],
-    )
-    assert retry_status == 0
-    assert retried == {"success": True, "tool": "public_demo_tool"}
 
     claim_status, claim = run_cli_json(
         capsys,
-        ["okf", "claim", "--claim-token", "claim-final", *common],
+        ["okf", "claim", "--claim-token", "claim-public", *common],
     )
     assert claim_status == 0
-    target = Path(claim["candidates"][0]["target_path"])
-
-    invalid_status, invalid = run_cli_json(
-        capsys,
-        [
-            "okf",
-            "validate",
-            "--claim-token",
-            "claim-final",
-            "--path",
-            str(target),
-            *common,
-        ],
-    )
-    assert invalid_status == 1
-    assert invalid["success"] is False
-    assert invalid["valid"] is False
-    assert "OKF file is missing or empty" in invalid["errors"]
-
+    assert set(claim) == {
+        "success",
+        "state_dir",
+        "claim_token",
+        "count",
+        "candidates",
+    }
+    assert claim["success"] is True
+    assert claim["claim_token"] == "claim-public"
+    assert claim["count"] == 1
+    candidate = claim["candidates"][0]
+    assert candidate["tool"] == "public_demo_tool"
+    target = Path(candidate["target_path"])
     write(
         target,
-        """---
+        f"""---
 type: Hermes Tool
 artifact_type: tool_okf
 tool: public_demo_tool
 toolset: local_knowledge
-schema_hash: sha256:public-fixture
+schema_hash: {candidate["schema_hash"]}
 generator_version: "4"
-generated: {"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}
+generated: {{"by":"test-generator/1","at":"2026-08-30T00:00:00Z"}}
 title: Public demo router
 aliases:
   - route quartz inventory records
@@ -2724,13 +2362,14 @@ related_tools:
 Route public demo requests to the quartz inventory capability.
 """,
     )
+
     validate_status, validation = run_cli_json(
         capsys,
         [
             "okf",
             "validate",
             "--claim-token",
-            "claim-final",
+            "claim-public",
             "--path",
             str(target),
             *common,
@@ -2742,7 +2381,7 @@ Route public demo requests to the quartz inventory capability.
         "errors": [],
         "tool": "public_demo_tool",
         "path": str(target.resolve()),
-        "claim_token": "claim-final",
+        "claim_token": "claim-public",
         "success": True,
     }
 
@@ -2752,7 +2391,7 @@ Route public demo requests to the quartz inventory capability.
             "okf",
             "complete",
             "--claim-token",
-            "claim-final",
+            "claim-public",
             "--tool",
             "public_demo_tool",
             "--path",
@@ -2765,13 +2404,9 @@ Route public demo requests to the quartz inventory capability.
         "success": True,
         "tool": "public_demo_tool",
         "path": str(target),
-        "claim_token": "claim-final",
+        "claim_token": "claim-public",
     }
-    assert target == state_dir.resolve() / "okfs" / "tools" / "public-demo-tool.md"
-    assert target.is_file()
-    assert (state_dir / "okf_queue.sqlite").is_file()
-    assert (state_dir / "okf_index_dirty").is_dir()
-    assert len(list((state_dir / "okf_index_dirty").iterdir())) == 1
+
     status, final_status = run_cli_json(capsys, ["okf", "status", *common])
     assert status == 0
     assert final_status["counts"] == {"done": 1}

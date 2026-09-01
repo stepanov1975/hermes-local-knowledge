@@ -19,6 +19,8 @@ state/
 logs/
 tmp/
 docs/superpowers/
+.hermes/plans/*
+!.hermes/plans/2026-08-06-verified-feedback-replay-correction-routes.md
 dist/
 build/
 *.egg-info/
