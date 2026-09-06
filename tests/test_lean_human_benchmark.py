@@ -942,3 +942,72 @@ def test_cli_prepare_and_finalize_real_private_index(tmp_path: Path, capsys: pyt
     assert len(benchmark["cases"]) == 2
     assert capsys.readouterr().out.count('"output"') == 2
     assert _index_artifacts(index_path)["skill:owner"]["title"] == "Current owner"
+
+
+def test_cli_rejects_unpaired_unicode_surrogates_without_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX private-file contract")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    workspace.chmod(0o700)
+    index_path = workspace / "index.sqlite"
+    create_index(index_path)
+    index_path.chmod(0o600)
+
+    source_packet = packet()
+    private_mapping = mapping(source_packet, index_sha256=file_sha256(index_path))
+    review = label_review(
+        prepare_review(
+            source_packet,
+            private_mapping,
+            index_sha256=file_sha256(index_path),
+            valid_artifacts=index_artifacts(),
+        )
+    )
+    source_packet["cases"][0]["user_request"] = "\ud800"
+
+    packet_path = workspace / "packet.json"
+    mapping_path = workspace / "mapping.json"
+    review_path = workspace / "review.json"
+    write_secure_json(packet_path, source_packet)
+    write_secure_json(mapping_path, private_mapping)
+    write_secure_json(review_path, review)
+
+    commands = (
+        [
+            "prepare",
+            "--packet",
+            str(packet_path),
+            "--mapping",
+            str(mapping_path),
+            "--index",
+            str(index_path),
+            "--output",
+            str(workspace / "prepared.json"),
+        ],
+        [
+            "finalize",
+            "--review",
+            str(review_path),
+            "--packet",
+            str(packet_path),
+            "--mapping",
+            str(mapping_path),
+            "--index",
+            str(index_path),
+            "--output",
+            str(workspace / "benchmark.json"),
+        ],
+    )
+    for command in commands:
+        with pytest.raises(SystemExit) as exc_info:
+            main(command)
+        assert exc_info.value.code == 2
+
+    captured = capsys.readouterr()
+    assert captured.err.count("unpaired Unicode surrogates") == 2
+    assert "Traceback" not in captured.err
+    assert not (workspace / "prepared.json").exists()
+    assert not (workspace / "benchmark.json").exists()

@@ -38,7 +38,7 @@ Packet authors must provide only deliberately redacted or synthetic `user_reques
 
 Set a top-level `reviewer` identifier using 1–64 ASCII letters, digits, `.`, `_`, `@`, or `-`, then fill every decision field. The review accepts no free-form human text. Do not remove or edit the copied instructions, task, query, case/item numbers, or opaque handles.
 
-`finalize` reloads the original packet, mapping, and frozen index; reconstructs all static review content; requires exact case/item coverage and explicit labels; and rejects source, identity, metadata, or static-field drift. The benchmark records canonical JSON content hashes for the packet, mapping, and completed review, plus the exact byte SHA-256 of the frozen index snapshot.
+`finalize` reloads the original packet, mapping, and frozen index; reconstructs all static review content; requires exact case/item coverage and explicit labels; and rejects source, identity, metadata, or static-field drift. Both commands reject duplicate JSON keys, non-finite numbers, and unpaired Unicode surrogates with a validation error rather than a traceback. The benchmark records canonical JSON content hashes for the packet, mapping, and completed review, plus the exact byte SHA-256 of the frozen index snapshot.
 
 ## Commands
 

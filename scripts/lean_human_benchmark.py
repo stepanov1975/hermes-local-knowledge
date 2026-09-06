@@ -132,9 +132,11 @@ def _canonical_json_bytes(value: object) -> bytes:
             ensure_ascii=False,
             allow_nan=False,
         )
+        return payload.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValidationError("value must not contain unpaired Unicode surrogates") from exc
     except (TypeError, ValueError) as exc:
         raise ValidationError(f"value must be JSON-serializable without non-finite numbers: {exc}") from exc
-    return payload.encode("utf-8")
 
 
 def canonical_sha256(value: object) -> str:
