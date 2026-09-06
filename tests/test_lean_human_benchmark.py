@@ -5,14 +5,17 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import tempfile
 from typing import Any
 
 import pytest
 
 from scripts.lean_human_benchmark import (
     _frozen_index_snapshot,
-    _index_artifact_ids,
+    _index_artifacts,
     _reject_output_alias,
+    _verify_baseline_replay,
+    REPOSITORY_ROOT,
     ValidationError,
     apply_explicit_supersession,
     build_candidate_rankings,
@@ -196,12 +199,20 @@ def accepted_decisions(review: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def index_artifacts() -> dict[str, dict[str, Any]]:
+    return {
+        "skill:owner": {"type": "skill", "title": "Current owner", "path": "skills/current"},
+        "doc:old": {"type": "doc", "title": "Old plan", "path": "plans/old"},
+        "doc:noise": {"type": "doc", "title": "Unrelated", "path": "docs/noise"},
+    }
+
+
 def finalize_for_test(
     review: dict[str, Any],
     decisions: dict[str, Any],
     private_mapping: dict[str, Any],
     *,
-    valid_artifact_ids: set[str] | None = None,
+    valid_artifacts: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     source_packet = packet()
     return finalize_benchmark(
@@ -212,8 +223,7 @@ def finalize_for_test(
         annotation(source_packet),
         annotation(source_packet, second=True),
         index_sha256=INDEX_SHA,
-        valid_artifact_ids=valid_artifact_ids
-        or {"skill:owner", "doc:old", "doc:noise"},
+        valid_artifacts=valid_artifacts or index_artifacts(),
     )
 
 
@@ -236,6 +246,29 @@ def test_prepare_review_is_deterministic_and_conservative() -> None:
     old = first["cases"][0]["proposal"]["items"][1]
     assert old["harmful_if_primary"] is True
     assert first["cases"][1]["proposal"]["none_needed"] is True
+
+
+def test_omitted_preceding_context_stays_an_empty_message_list() -> None:
+    source_packet = packet()
+    source_packet["cases"][0].pop("preceding_context")
+    private_mapping = mapping(source_packet)
+    left = annotation(source_packet)
+    right = annotation(source_packet, second=True)
+
+    review = prepare_review(source_packet, private_mapping, left, right, index_sha256=INDEX_SHA)
+    assert review["cases"][0]["preceding_context"] == []
+
+    benchmark = finalize_benchmark(
+        review,
+        accepted_decisions(review),
+        source_packet,
+        private_mapping,
+        left,
+        right,
+        index_sha256=INDEX_SHA,
+        valid_artifacts=index_artifacts(),
+    )
+    assert benchmark["cases"][0]["preceding_context"] == []
 
 
 def test_prepare_review_rejects_incomplete_annotation_and_wrong_index() -> None:
@@ -379,7 +412,21 @@ def test_finalize_rejects_binding_and_identity_failures() -> None:
             review,
             decisions,
             private_mapping,
-            valid_artifact_ids={"skill:owner", "doc:noise"},
+            valid_artifacts={
+                artifact_id: metadata
+                for artifact_id, metadata in index_artifacts().items()
+                if artifact_id != "doc:old"
+            },
+        )
+
+    mismatched = index_artifacts()
+    mismatched["doc:old"] = {**mismatched["doc:old"], "title": "Different document"}
+    with pytest.raises(ValidationError, match="does not match frozen index artifact"):
+        finalize_for_test(
+            review,
+            decisions,
+            private_mapping,
+            valid_artifacts=mismatched,
         )
 
 
@@ -436,6 +483,19 @@ def test_explicit_supersession_moves_only_the_target_and_rejects_cycles() -> Non
     with pytest.raises(ValidationError, match="cycle"):
         apply_explicit_supersession(["a", "b"], cyclic)
 
+    distributed_cycle = [
+        {
+            "artifact_id": source,
+            "status": "historical",
+            "confidence": "high",
+            "policy_eligible": True,
+            "relationships": [{"kind": "superseded_by", "target_artifact_id": target}],
+        }
+        for source, target in (("a", "b"), ("b", "c"), ("c", "a"))
+    ]
+    with pytest.raises(ValidationError, match="cycle"):
+        apply_explicit_supersession(["a", "b"], distributed_cycle)
+
 
 def test_replay_candidate_and_comparison_are_same_membership_and_decision_focused() -> None:
     review, private_mapping = prepared_review()
@@ -453,6 +513,12 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
         return ["doc:noise"]
 
     baseline = replay_benchmark(benchmark, search)
+    _verify_baseline_replay(baseline, copy.deepcopy(baseline))
+    altered_baseline = copy.deepcopy(baseline)
+    altered_baseline["cases"][0]["ids"].reverse()
+    with pytest.raises(ValidationError, match="do not match replay"):
+        _verify_baseline_replay(altered_baseline, baseline)
+
     authority = {
         "records": [
             {
@@ -538,13 +604,32 @@ def test_frozen_index_snapshot_survives_source_replacement(tmp_path: Path) -> No
         assert snapshot.read_bytes() == b"frozen"
 
 
+def test_frozen_index_snapshot_rejects_repository_temp_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "index.sqlite"
+    source.write_bytes(b"private")
+    monkeypatch.setattr(tempfile, "tempdir", str(REPOSITORY_ROOT))
+
+    with pytest.raises(ValidationError, match="must be outside"):
+        with _frozen_index_snapshot(source):
+            pass
+
+
 def test_index_reader_handles_sqlite_uri_characters(tmp_path: Path) -> None:
     index = tmp_path / "frozen?#index.sqlite"
     with sqlite3.connect(index) as connection:
-        connection.execute("CREATE TABLE artifacts (id TEXT PRIMARY KEY)")
-        connection.execute("INSERT INTO artifacts (id) VALUES ('skill:owner')")
+        connection.execute(
+            "CREATE TABLE artifacts (id TEXT PRIMARY KEY, type TEXT, title TEXT, path TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO artifacts (id, type, title, path) VALUES (?, ?, ?, ?)",
+            ("skill:owner", "skill", "Current owner", "skills/current"),
+        )
 
-    assert _index_artifact_ids(index) == {"skill:owner"}
+    assert _index_artifacts(index) == {
+        "skill:owner": {"type": "skill", "title": "Current owner", "path": "skills/current"}
+    }
 
 
 def test_output_must_not_alias_an_input(tmp_path: Path) -> None:

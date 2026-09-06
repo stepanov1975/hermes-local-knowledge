@@ -111,7 +111,14 @@ def write_private_json(path: Path, value: object) -> None:
 @contextmanager
 def _frozen_index_snapshot(path: Path) -> Iterator[Path]:
     source_path = path.expanduser().resolve()
-    with tempfile.TemporaryDirectory(prefix="hermes-local-knowledge-index-") as directory:
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    if temporary_root.is_relative_to(REPOSITORY_ROOT):
+        raise ValidationError(
+            f"temporary directory for private index snapshots must be outside {REPOSITORY_ROOT}"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix="hermes-local-knowledge-index-", dir=temporary_root
+    ) as directory:
         snapshot = Path(directory) / "index.sqlite"
         try:
             with source_path.open("rb") as source, snapshot.open("xb") as target:
@@ -390,7 +397,7 @@ def prepare_review(
             {
                 "case_id": case_id,
                 "user_request": case["user_request"],
-                "preceding_context": case.get("preceding_context", ""),
+                "preceding_context": case.get("preceding_context", []),
                 "search_query": case["search_query"],
                 "artifact_type": case.get("artifact_type"),
                 "high_impact": case["high_impact"],
@@ -475,7 +482,7 @@ def finalize_benchmark(
     annotation_b: JsonDict,
     *,
     index_sha256: str,
-    valid_artifact_ids: set[str],
+    valid_artifacts: dict[str, JsonDict],
 ) -> JsonDict:
     """Reconstruct sources, then materialize exact human-approved decisions."""
 
@@ -488,6 +495,7 @@ def finalize_benchmark(
     )
     if canonical_sha256(reconstructed_review) != canonical_sha256(review):
         raise ValidationError("supplied review does not match reconstructed review from bound sources")
+    packet_cases = _packet_cases(packet)
     review_cases = _validate_review(review)
     review_hash = canonical_sha256(review)
     if decisions.get("schema_version") != 1:
@@ -557,12 +565,26 @@ def finalize_benchmark(
         mapped_items = _dict(mapped_case.get("items"), f"mapping case {case_id}.items")
         if set(mapped_items) != set(resolved_items):
             raise ValidationError(f"mapping item coverage does not match review for {case_id}")
+        packet_items = _unique_map(
+            packet_cases[case_id].get("items"), "item_id", f"packet case {case_id}.items"
+        )
         output_items: list[JsonDict] = []
         for item_id in proposal_items:
             mapped_item = _dict(mapped_items[item_id], f"mapping item {item_id}")
             artifact_id = _str(mapped_item.get("artifact_id"), f"mapping item {item_id}.artifact_id")
-            if artifact_id not in valid_artifact_ids:
+            artifact = valid_artifacts.get(artifact_id)
+            if artifact is None:
                 raise ValidationError(f"artifact {artifact_id!r} is not present in the frozen index")
+            packet_item = packet_items[item_id]
+            for index_field, packet_field in (
+                ("type", "artifact_type"),
+                ("title", "title"),
+                ("path", "source_locator"),
+            ):
+                if artifact[index_field] != packet_item[packet_field]:
+                    raise ValidationError(
+                        f"mapping item {item_id} {index_field} does not match frozen index artifact"
+                    )
             resolved = resolved_items[item_id]
             output_items.append(
                 {
@@ -577,7 +599,7 @@ def finalize_benchmark(
             {
                 "case_id": case_id,
                 "user_request": review_case["user_request"],
-                "preceding_context": review_case.get("preceding_context", ""),
+                "preceding_context": review_case.get("preceding_context", []),
                 "search_query": review_case["search_query"],
                 "artifact_type": review_case.get("artifact_type"),
                 "high_impact": review_case["high_impact"],
@@ -655,14 +677,11 @@ def replay_benchmark(benchmark: JsonDict, search: SearchFn, *, limit: int = 10) 
     }
 
 
-def _supersession_edges(records: object, ranking: list[str]) -> list[tuple[str, str]]:
-    present = set(ranking)
+def _eligible_supersession_edges(records: object) -> list[tuple[str, str]]:
     edges: list[tuple[str, str]] = []
     for index, raw in enumerate(_list(records, "authority.records")):
         record = _dict(raw, f"authority.records[{index}]")
         source = _str(record.get("artifact_id"), f"authority.records[{index}].artifact_id")
-        if source not in present:
-            continue
         if record.get("policy_eligible") is not True or record.get("confidence") != "high":
             continue
         if record.get("status") not in {"historical", "plan", "retired"}:
@@ -677,9 +696,17 @@ def _supersession_edges(records: object, ranking: list[str]) -> list[tuple[str, 
                 relationship.get("target_artifact_id"),
                 f"authority relationship {source}[{rel_index}].target_artifact_id",
             )
-            if target in present and source != target:
+            if source != target:
                 edges.append((source, target))
-    return sorted(set(edges), key=lambda pair: (ranking.index(pair[0]), ranking.index(pair[1])))
+    return sorted(set(edges))
+
+
+def _supersession_edges(records: object, ranking: list[str]) -> list[tuple[str, str]]:
+    all_edges = _eligible_supersession_edges(records)
+    _reject_cycles(all_edges)
+    present = set(ranking)
+    edges = [edge for edge in all_edges if edge[0] in present and edge[1] in present]
+    return sorted(edges, key=lambda pair: (ranking.index(pair[0]), ranking.index(pair[1])))
 
 
 def _reject_cycles(edges: Iterable[tuple[str, str]]) -> None:
@@ -856,17 +883,58 @@ def compare_rankings(benchmark: JsonDict, baseline: JsonDict, authority: JsonDic
     }
 
 
-def _index_artifact_ids(path: Path) -> set[str]:
+def _index_artifacts(path: Path) -> dict[str, JsonDict]:
     try:
         uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
         connection = sqlite3.connect(uri, uri=True)
         try:
-            rows = connection.execute("SELECT id FROM artifacts").fetchall()
+            rows = connection.execute("SELECT id, type, title, path FROM artifacts").fetchall()
         finally:
             connection.close()
     except sqlite3.Error as exc:
         raise ValidationError(f"cannot read frozen index: {exc}") from exc
-    return {str(row[0]) for row in rows}
+    artifacts: dict[str, JsonDict] = {}
+    for row in rows:
+        artifact_id = _str(row[0], "frozen index artifact id")
+        if artifact_id in artifacts:
+            raise ValidationError(f"duplicate artifact {artifact_id!r} in frozen index")
+        artifacts[artifact_id] = {
+            "type": _str(row[1], f"frozen index artifact {artifact_id}.type"),
+            "title": _str(row[2], f"frozen index artifact {artifact_id}.title"),
+            "path": _str(row[3], f"frozen index artifact {artifact_id}.path"),
+        }
+    return artifacts
+
+
+def _checkout_index_module() -> Any:
+    from hermes_local_knowledge import index as index_module
+
+    expected_module = (REPOSITORY_ROOT / "hermes_local_knowledge" / "index.py").resolve()
+    loaded_module = Path(index_module.__file__ or "").resolve()
+    if loaded_module != expected_module:
+        raise ValidationError(
+            f"replay must load index code from reviewed checkout {expected_module}, got {loaded_module}"
+        )
+    return index_module
+
+
+def _replay_frozen_index(benchmark: JsonDict, snapshot: Path, *, limit: int) -> JsonDict:
+    index_module = _checkout_index_module()
+
+    def search(query: str, artifact_type: str | None, search_limit: int) -> list[str]:
+        return [
+            str(row["id"])
+            for row in index_module.search_index(
+                snapshot, query, limit=search_limit, artifact_type=artifact_type
+            )
+        ]
+
+    return replay_benchmark(benchmark, search, limit=limit)
+
+
+def _verify_baseline_replay(baseline: JsonDict, replayed: JsonDict) -> None:
+    if canonical_sha256(baseline) != canonical_sha256(replayed):
+        raise ValidationError("baseline rankings do not match replay of the bound frozen index")
 
 
 def _cli_prepare(args: argparse.Namespace) -> JsonDict:
@@ -911,22 +979,13 @@ def _cli_finalize(args: argparse.Namespace) -> JsonDict:
             load_json(Path(args.rater_a)),
             load_json(Path(args.rater_b)),
             index_sha256=file_sha256(snapshot),
-            valid_artifact_ids=_index_artifact_ids(snapshot),
+            valid_artifacts=_index_artifacts(snapshot),
         )
     write_private_json(output, benchmark)
     return {"output": str(Path(args.output)), "cases": len(benchmark["cases"]), "human_gold": True}
 
 
 def _cli_replay(args: argparse.Namespace) -> JsonDict:
-    from hermes_local_knowledge import index as index_module
-
-    expected_module = (REPOSITORY_ROOT / "hermes_local_knowledge" / "index.py").resolve()
-    loaded_module = Path(index_module.__file__ or "").resolve()
-    if loaded_module != expected_module:
-        raise ValidationError(
-            f"replay must load index code from reviewed checkout {expected_module}, got {loaded_module}"
-        )
-
     benchmark = load_json(Path(args.benchmark))
     index = Path(args.index)
     output = Path(args.output)
@@ -934,31 +993,28 @@ def _cli_replay(args: argparse.Namespace) -> JsonDict:
     with _frozen_index_snapshot(index) as snapshot:
         if file_sha256(snapshot) != benchmark["source"]["index_sha256"]:
             raise ValidationError("frozen index hash does not match benchmark")
-
-        def search(query: str, artifact_type: str | None, limit: int) -> list[str]:
-            return [
-                str(row["id"])
-                for row in index_module.search_index(
-                    snapshot, query, limit=limit, artifact_type=artifact_type
-                )
-            ]
-
-        rankings = replay_benchmark(benchmark, search, limit=args.limit)
+        rankings = _replay_frozen_index(benchmark, snapshot, limit=args.limit)
     write_private_json(output, rankings)
     return {"output": str(Path(args.output)), "cases": len(rankings["cases"])}
 
 
 def _cli_compare(args: argparse.Namespace) -> JsonDict:
+    index = Path(args.index)
     output = Path(args.output)
     _reject_output_alias(
         output,
-        (Path(args.benchmark), Path(args.baseline), Path(args.authority)),
+        (Path(args.benchmark), Path(args.baseline), Path(args.authority), index),
     )
-    report = compare_rankings(
-        load_json(Path(args.benchmark)),
-        load_json(Path(args.baseline)),
-        load_json(Path(args.authority)),
-    )
+    benchmark = load_json(Path(args.benchmark))
+    baseline = load_json(Path(args.baseline))
+    authority = load_json(Path(args.authority))
+    _ranking_cases(baseline, benchmark, "baseline")
+    with _frozen_index_snapshot(index) as snapshot:
+        if file_sha256(snapshot) != benchmark["source"]["index_sha256"]:
+            raise ValidationError("frozen index hash does not match benchmark")
+        replayed = _replay_frozen_index(benchmark, snapshot, limit=baseline["limit"])
+    _verify_baseline_replay(baseline, replayed)
+    report = compare_rankings(benchmark, baseline, authority)
     write_private_json(output, report)
     return {"output": str(Path(args.output)), "changed_top_1": len(report["changed_top_1"])}
 
@@ -995,7 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare = subparsers.add_parser(
         "compare", help="generate and compare the explicit-supersession candidate"
     )
-    for name in ("benchmark", "baseline", "authority", "output"):
+    for name in ("benchmark", "baseline", "authority", "index", "output"):
         compare.add_argument(f"--{name}", required=True)
     compare.set_defaults(handler=_cli_compare)
     return parser

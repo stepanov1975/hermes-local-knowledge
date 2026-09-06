@@ -59,6 +59,7 @@ python scripts/lean_human_benchmark.py compare \
   --benchmark "$PRIVATE/benchmark.json" \
   --baseline "$PRIVATE/incumbent.json" \
   --authority "$PRIVATE/authority.json" \
+  --index "$PRIVATE/index.sqlite" \
   --output "$PRIVATE/report.json"
 ```
 
@@ -66,4 +67,4 @@ python scripts/lean_human_benchmark.py compare \
 
 The included candidate is intentionally narrow. It only uses high-confidence, policy-eligible `superseded_by` relationships from historical, plan, or retired artifacts. When both source and successor already appear in an incumbent result, it moves the successor before the source and preserves membership and unrelated ordering. It does not inject artifacts, interpret broad role labels, or automatically authorize release.
 
-The `compare` command generates this candidate internally from the bound authority input; it never accepts an externally supplied candidate ordering. The report binds the exact benchmark, baseline, authority, and generated candidate hashes, then compares acceptable top-1/top-3, canonical-current top-1, harmful top-1, unjudged top-1, and `none_needed` behavior. Every changed top-1 case still requires manual inspection. A report never produces an automatic release verdict.
+The `compare` command first replays the bound frozen index and requires an exact match with the supplied incumbent rankings. It then generates the candidate internally from the bound authority input; it never accepts an externally supplied candidate ordering. The report binds the exact benchmark, verified baseline, authority, and generated candidate hashes, then compares acceptable top-1/top-3, canonical-current top-1, harmful top-1, unjudged top-1, and `none_needed` behavior. Every changed top-1 case still requires manual inspection. A report never produces an automatic release verdict.
