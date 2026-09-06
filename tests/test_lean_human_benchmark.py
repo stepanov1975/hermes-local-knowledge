@@ -616,6 +616,7 @@ def test_frozen_index_snapshot_rejects_repository_temp_root(
             pass
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain '?' or '#'")
 def test_index_reader_handles_sqlite_uri_characters(tmp_path: Path) -> None:
     index = tmp_path / "frozen?#index.sqlite"
     with sqlite3.connect(index) as connection:
