@@ -37,6 +37,7 @@ VALID_ARTIFACT_TYPES = {
 }
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REVIEWER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}")
+REVIEW_ITEM_KEY_DOMAIN = b"hermes-local-knowledge/lean-review-item-key/v1\0"
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
@@ -138,6 +139,10 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 def canonical_sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _review_mapping_key(mapping: JsonDict) -> bytes:
+    return hashlib.sha256(REVIEW_ITEM_KEY_DOMAIN + _canonical_json_bytes(mapping)).digest()
 
 
 def _review_item_id(mapping_key: bytes, case_id: str, item_id: str) -> str:
@@ -536,7 +541,7 @@ def _review_template(
     index_sha256: str,
 ) -> JsonDict:
     cases: list[JsonDict] = []
-    mapping_key = _canonical_json_bytes(mapping)
+    mapping_key = _review_mapping_key(mapping)
     for case_id, case in packet_cases.items():
         packet_items = _unique_rows(
             case.get("items"), "item_id", f"packet case {case_id}.items"
@@ -659,7 +664,7 @@ def _validate_labeled_review(
         for item_id in expected_items:
             item = items[item_id]
             _require_exact_fields(item, item_fields, f"review item {item_id}")
-            if item.get("item_number") != expected_items[item_id]["item_number"]:
+            if not _same_json(item.get("item_number"), expected_items[item_id]["item_number"]):
                 raise ValidationError(f"review item {item_id}.item_number does not match packet order")
             relevance = item.get("relevance")
             if type(relevance) is not int or relevance not in VALID_RELEVANCE:
@@ -693,7 +698,7 @@ def finalize_benchmark(
     )
     template = _review_template(packet, mapping, packet_cases, index_sha256=index_hash)
     reviewer, review_cases = _validate_labeled_review(review, template)
-    mapping_key = _canonical_json_bytes(mapping)
+    mapping_key = _review_mapping_key(mapping)
 
     finalized_cases: list[JsonDict] = []
     for case_id, packet_case in packet_cases.items():

@@ -188,6 +188,28 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
         [1, 2],
         [1],
     ]
+    public_mapping_digest = bytes.fromhex(first["source"]["mapping_sha256"])
+    private_mapping_key = benchmark_module._review_mapping_key(private_mapping)
+    for packet_case, review_case in zip(source_packet["cases"], first["cases"], strict=True):
+        for packet_item, review_item in zip(
+            packet_case["items"], review_case["items"], strict=True
+        ):
+            assert (
+                benchmark_module._review_item_id(
+                    private_mapping_key,
+                    packet_case["case_id"],
+                    packet_item["item_id"],
+                )
+                == review_item["item_id"]
+            )
+            assert (
+                benchmark_module._review_item_id(
+                    public_mapping_digest,
+                    packet_case["case_id"],
+                    packet_item["item_id"],
+                )
+                != review_item["item_id"]
+            )
     assert first["cases"][0]["none_needed"] is None
     assert first["cases"][0]["items"][0]["relevance"] is None
     assert "skill:owner" not in json.dumps(first, sort_keys=True)
@@ -389,6 +411,17 @@ def test_finalize_rejects_coverage_static_field_and_shape_drift() -> None:
     with pytest.raises(ValidationError, match="item_number"):
         finalize_benchmark(
             tampered_item_number,
+            source_packet,
+            private_mapping,
+            index_sha256=INDEX_SHA,
+            valid_artifacts=index_artifacts(),
+        )
+
+    float_item_number = label_review(review)
+    float_item_number["cases"][0]["items"][0]["item_number"] = 1.0
+    with pytest.raises(ValidationError, match="item_number"):
+        finalize_benchmark(
+            float_item_number,
             source_packet,
             private_mapping,
             index_sha256=INDEX_SHA,
