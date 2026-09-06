@@ -262,6 +262,8 @@ When implicit feedback is enabled and no explicit route matches, mature same-tur
 
 `evaluate` is read-only and intentionally measures the unassisted index ranking to avoid training/evaluation leakage. It replays positive local feedback against the current index and reports exact Hit@k/MRR plus parent-equivalent metrics. Parent equivalence is deliberately limited to a `skill_support_doc` and its owning skill; generic graph neighbors are not treated as successful equivalents.
 
+For a bounded blinded benchmark that requires explicit labels for every reviewed case and item, see [`docs/lean-human-benchmark.md`](docs/lean-human-benchmark.md). The finalizer creates private benchmark data only; it does not implement or approve a ranking candidate.
+
 For historical comparisons from a source checkout:
 
 ```bash
