@@ -7,9 +7,11 @@ import argparse
 from contextlib import contextmanager
 import copy
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import stat
@@ -34,6 +36,7 @@ VALID_ARTIFACT_TYPES = {
     "tool_okf",
 }
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+REVIEWER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}")
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
@@ -76,6 +79,15 @@ def _identifier(value: object, label: str) -> str:
     return text
 
 
+def _reviewer_identifier(value: object) -> str:
+    text = _identifier(value, "review.reviewer")
+    if REVIEWER_ID_PATTERN.fullmatch(text) is None:
+        raise ValidationError(
+            "review.reviewer must be a 1..64 character ASCII identifier using letters, digits, . _ @ or -"
+        )
+    return text
+
+
 def _boolean(value: object, label: str) -> bool:
     if not isinstance(value, bool):
         raise ValidationError(f"{label} must be a boolean")
@@ -110,7 +122,7 @@ def _require_exact_fields(value: JsonDict, expected: set[str], label: str) -> No
         raise ValidationError(f"{label} has invalid fields")
 
 
-def canonical_sha256(value: object) -> str:
+def _canonical_json_bytes(value: object) -> bytes:
     try:
         payload = json.dumps(
             value,
@@ -121,7 +133,17 @@ def canonical_sha256(value: object) -> str:
         )
     except (TypeError, ValueError) as exc:
         raise ValidationError(f"value must be JSON-serializable without non-finite numbers: {exc}") from exc
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return payload.encode("utf-8")
+
+
+def canonical_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _review_item_id(mapping_key: bytes, case_id: str, item_id: str) -> str:
+    message = f"{case_id}\0{item_id}".encode("utf-8")
+    digest = hmac.new(mapping_key, message, hashlib.sha256).hexdigest()
+    return f"item-{digest[:32]}"
 
 
 def _same_json(left: object, right: object) -> bool:
@@ -215,18 +237,55 @@ def _validate_private_input(path: Path, label: str) -> Path:
     return resolved
 
 
+def _ensure_private_output_directory(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while True:
+        try:
+            mode = current.stat().st_mode
+        except FileNotFoundError:
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                raise ValidationError(f"cannot create private output directory: {path}")
+            current = parent
+            continue
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect private output directory {current}: {exc}") from exc
+        if not stat.S_ISDIR(mode):
+            raise ValidationError(f"private output parent is not a directory: {current}")
+        break
+
+    for directory in reversed(missing):
+        created = False
+        try:
+            directory.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ValidationError(f"cannot create private output directory {directory}: {exc}") from exc
+        if created:
+            os.chmod(directory, 0o700)
+        try:
+            mode = directory.stat().st_mode
+        except OSError as exc:
+            raise ValidationError(f"cannot inspect private output directory {directory}: {exc}") from exc
+        if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
+            raise ValidationError(f"private output directory must have mode 0700: {directory}")
+
+    try:
+        mode = path.stat().st_mode
+    except OSError as exc:
+        raise ValidationError(f"cannot inspect private output directory {path}: {exc}") from exc
+    if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) != 0o700:
+        raise ValidationError(f"private output directory must have mode 0700: {path}")
+
+
 def write_private_json(path: Path, value: object) -> None:
     _require_private_filesystem_support()
     resolved = _resolved_private_path(path, "private output")
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=False, mode=0o700)
-    except FileExistsError:
-        if not resolved.parent.is_dir():
-            raise ValidationError(f"private output parent is not a directory: {resolved.parent}")
-    else:
-        os.chmod(resolved.parent, 0o700)
-    if stat.S_IMODE(resolved.parent.stat().st_mode) != 0o700:
-        raise ValidationError(f"private output directory must have mode 0700: {resolved.parent}")
+    _ensure_private_output_directory(resolved.parent)
     try:
         payload = json.dumps(
             value,
@@ -477,6 +536,7 @@ def _review_template(
     index_sha256: str,
 ) -> JsonDict:
     cases: list[JsonDict] = []
+    mapping_key = _canonical_json_bytes(mapping)
     for case_id, case in packet_cases.items():
         packet_items = _unique_rows(
             case.get("items"), "item_id", f"packet case {case_id}.items"
@@ -488,16 +548,16 @@ def _review_template(
                 "search_query": case["search_query"],
                 "artifact_type": case.get("artifact_type"),
                 "high_impact": case["high_impact"],
-                "rationale": None,
                 "none_needed": None,
                 "items": [
                     {
-                        "item_id": item_id,
+                        "item_id": _review_item_id(mapping_key, case_id, item_id),
+                        "item_number": item_number,
                         "relevance": None,
                         "canonical_current": None,
                         "harmful_if_primary": None,
                     }
-                    for item_id, item in packet_items.items()
+                    for item_number, item_id in enumerate(packet_items, start=1)
                 ],
             }
         )
@@ -552,7 +612,7 @@ def _validate_labeled_review(
         raise ValidationError("review must be an unresolved schema_version 1 packet")
     if review.get("review_id") != template["review_id"]:
         raise ValidationError("review identity does not match reconstructed template")
-    reviewer = _text(review.get("reviewer"), "review.reviewer").strip()
+    reviewer = _reviewer_identifier(review.get("reviewer"))
     if review.get("instructions") != template["instructions"]:
         raise ValidationError("review instructions do not match reconstructed template")
     if not _same_json(_object(review.get("source"), "review.source"), template["source"]):
@@ -568,12 +628,12 @@ def _validate_labeled_review(
         "search_query",
         "artifact_type",
         "high_impact",
-        "rationale",
         "none_needed",
         "items",
     }
     item_fields = {
         "item_id",
+        "item_number",
         "relevance",
         "canonical_current",
         "harmful_if_primary",
@@ -589,7 +649,6 @@ def _validate_labeled_review(
         ):
             if not _same_json(case[field], expected_case[field]):
                 raise ValidationError(f"review case {case_id} static fields do not match packet")
-        _text(case.get("rationale"), f"review case {case_id}.rationale")
         _boolean(case.get("none_needed"), f"review case {case_id}.none_needed")
         expected_items = _unique_rows(
             expected_case.get("items"), "item_id", f"template case {case_id}.items"
@@ -600,6 +659,8 @@ def _validate_labeled_review(
         for item_id in expected_items:
             item = items[item_id]
             _require_exact_fields(item, item_fields, f"review item {item_id}")
+            if item.get("item_number") != expected_items[item_id]["item_number"]:
+                raise ValidationError(f"review item {item_id}.item_number does not match packet order")
             relevance = item.get("relevance")
             if type(relevance) is not int or relevance not in VALID_RELEVANCE:
                 raise ValidationError(f"review item {item_id}.relevance must be 0..3")
@@ -632,6 +693,7 @@ def finalize_benchmark(
     )
     template = _review_template(packet, mapping, packet_cases, index_sha256=index_hash)
     reviewer, review_cases = _validate_labeled_review(review, template)
+    mapping_key = _canonical_json_bytes(mapping)
 
     finalized_cases: list[JsonDict] = []
     for case_id, packet_case in packet_cases.items():
@@ -644,7 +706,8 @@ def finalize_benchmark(
         )
         finalized_items: list[JsonDict] = []
         for item_id in packet_items:
-            item = review_items[item_id]
+            review_item_id = _review_item_id(mapping_key, case_id, item_id)
+            item = review_items[review_item_id]
             finalized_items.append(
                 {
                     "item_id": item_id,
@@ -662,7 +725,6 @@ def finalize_benchmark(
                 "artifact_type": packet_case.get("artifact_type"),
                 "high_impact": packet_case["high_impact"],
                 "none_needed": review_case["none_needed"],
-                "human_rationale": review_case["rationale"],
                 "items": finalized_items,
             }
         )

@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import subprocess
@@ -147,13 +148,13 @@ def label_review(review: dict[str, Any]) -> dict[str, Any]:
     labeled = copy.deepcopy(review)
     labeled["reviewer"] = "Alex"
     for case in labeled["cases"]:
-        case["rationale"] = "Explicitly reviewed."
         case["none_needed"] = case["case_id"] == "case-none"
-        for item in case["items"]:
-            item_id = item["item_id"]
-            item["relevance"] = 3 if item_id == "item-owner" else 0
-            item["canonical_current"] = item_id == "item-owner"
-            item["harmful_if_primary"] = item_id == "item-old"
+        for index, item in enumerate(case["items"]):
+            is_owner = case["case_id"] == "case-one" and index == 0
+            is_old = case["case_id"] == "case-one" and index == 1
+            item["relevance"] = 3 if is_owner else 0
+            item["canonical_current"] = is_owner
+            item["harmful_if_primary"] = is_old
     return labeled
 
 
@@ -180,6 +181,13 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
     assert first["instructions"] == source_packet["instructions"]
     assert "preceding_context" not in first["cases"][0]
     assert "card" not in first["cases"][0]["items"][0]
+    review_item_ids = [item["item_id"] for case in first["cases"] for item in case["items"]]
+    assert all(re.fullmatch(r"item-[0-9a-f]{32}", item_id) for item_id in review_item_ids)
+    assert not ({"item-owner", "item-old", "item-noise"} & set(review_item_ids))
+    assert [[item["item_number"] for item in case["items"]] for case in first["cases"]] == [
+        [1, 2],
+        [1],
+    ]
     assert first["cases"][0]["none_needed"] is None
     assert first["cases"][0]["items"][0]["relevance"] is None
     assert "skill:owner" not in json.dumps(first, sort_keys=True)
@@ -190,6 +198,34 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
         "packet_sha256": canonical_sha256(source_packet),
         "rubric_sha256": "2" * 64,
     }
+
+
+def test_prepare_reblinds_identity_bearing_source_item_ids() -> None:
+    source_packet = packet()
+    source_packet["cases"][0]["items"][0]["item_id"] = "skill:owner"
+    private_mapping = mapping(source_packet)
+    owner_mapping = private_mapping["cases"]["case-one"]["items"].pop("item-owner")
+    private_mapping["cases"]["case-one"]["items"]["skill:owner"] = owner_mapping
+
+    review = prepare_review(
+        source_packet,
+        private_mapping,
+        index_sha256=INDEX_SHA,
+        valid_artifacts=index_artifacts(),
+    )
+
+    assert "skill:owner" not in json.dumps(review, sort_keys=True)
+    assert re.fullmatch(r"item-[0-9a-f]{32}", review["cases"][0]["items"][0]["item_id"])
+
+    benchmark = finalize_benchmark(
+        label_review(review),
+        source_packet,
+        private_mapping,
+        index_sha256=INDEX_SHA,
+        valid_artifacts=index_artifacts(),
+    )
+    assert benchmark["cases"][0]["items"][0]["item_id"] == "skill:owner"
+    assert benchmark["cases"][0]["items"][0]["artifact_id"] == "skill:owner"
 
 
 def test_prepare_and_finalize_omit_source_only_context_and_item_cards() -> None:
@@ -223,6 +259,7 @@ def test_prepare_and_finalize_omit_source_only_context_and_item_cards() -> None:
         "canonical_current",
         "harmful_if_primary",
         "item_id",
+        "item_number",
         "relevance",
     }
 
@@ -257,7 +294,7 @@ def test_finalize_requires_explicit_human_labels_and_maps_private_ids() -> None:
     assert benchmark["instructions"] == source_packet["instructions"]
     assert "preceding_context" not in benchmark["cases"][0]
     assert benchmark["source"]["review_sha256"] == canonical_sha256(labeled)
-    assert benchmark["cases"][0]["human_rationale"] == "Explicitly reviewed."
+    assert "human_rationale" not in benchmark["cases"][0]
     assert benchmark["cases"][0]["items"][0] == {
         "artifact_id": "skill:owner",
         "canonical_current": True,
@@ -271,8 +308,7 @@ def test_finalize_requires_explicit_human_labels_and_maps_private_ids() -> None:
 def test_finalize_preserves_review_hash_and_packet_order() -> None:
     review, source_packet, private_mapping = prepared_review()
     labeled = label_review(review)
-    labeled["reviewer"] = "  Alex  "
-    labeled["cases"][0]["rationale"] = "  Explicitly reviewed.  "
+    labeled["reviewer"] = "Alex.Test"
     labeled["cases"].reverse()
     labeled["cases"][1]["items"].reverse()
     original = copy.deepcopy(labeled)
@@ -288,7 +324,7 @@ def test_finalize_preserves_review_hash_and_packet_order() -> None:
 
     assert labeled == original
     assert benchmark["source"]["review_sha256"] == review_hash
-    assert benchmark["reviewer"] == "Alex"
+    assert benchmark["reviewer"] == "Alex.Test"
     assert [case["case_id"] for case in benchmark["cases"]] == ["case-one", "case-none"]
     assert [item["item_id"] for item in benchmark["cases"][0]["items"]] == [
         "item-owner",
@@ -348,6 +384,17 @@ def test_finalize_rejects_coverage_static_field_and_shape_drift() -> None:
             valid_artifacts=index_artifacts(),
         )
 
+    tampered_item_number = label_review(review)
+    tampered_item_number["cases"][0]["items"][0]["item_number"] = 2
+    with pytest.raises(ValidationError, match="item_number"):
+        finalize_benchmark(
+            tampered_item_number,
+            source_packet,
+            private_mapping,
+            index_sha256=INDEX_SHA,
+            valid_artifacts=index_artifacts(),
+        )
+
     extra_field = label_review(review)
     extra_field["cases"][0]["typo"] = True
     with pytest.raises(ValidationError, match="fields"):
@@ -385,22 +432,22 @@ def test_finalize_rejects_unresolved_case_and_source_identity() -> None:
             valid_artifacts=index_artifacts(),
         )
 
-    no_case_decision = label_review(review)
-    no_case_decision["cases"][0]["none_needed"] = None
-    with pytest.raises(ValidationError, match="none_needed"):
+    free_form_reviewer = label_review(review)
+    free_form_reviewer["reviewer"] = "raw transcript-shaped text"
+    with pytest.raises(ValidationError, match="ASCII identifier"):
         finalize_benchmark(
-            no_case_decision,
+            free_form_reviewer,
             source_packet,
             private_mapping,
             index_sha256=INDEX_SHA,
             valid_artifacts=index_artifacts(),
         )
 
-    no_rationale = label_review(review)
-    no_rationale["cases"][0]["rationale"] = "  "
-    with pytest.raises(ValidationError, match="rationale"):
+    no_case_decision = label_review(review)
+    no_case_decision["cases"][0]["none_needed"] = None
+    with pytest.raises(ValidationError, match="none_needed"):
         finalize_benchmark(
-            no_rationale,
+            no_case_decision,
             source_packet,
             private_mapping,
             index_sha256=INDEX_SHA,
@@ -611,7 +658,7 @@ def test_private_writer_uses_restrictive_modes_and_rejects_repository_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    destination = tmp_path / "private" / "result.json"
+    destination = tmp_path / "private" / "nested" / "result.json"
     if os.name == "nt":
         with pytest.raises(ValidationError, match="unsupported on Windows"):
             write_private_json(destination, {"ok": True})
@@ -619,6 +666,7 @@ def test_private_writer_uses_restrictive_modes_and_rejects_repository_paths(
 
     write_private_json(destination, {"ok": True})
     assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(destination.parent.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(destination.stat().st_mode) == 0o600
 
     repository_path = REPOSITORY_ROOT / "PRIVATE" / "result.json"
