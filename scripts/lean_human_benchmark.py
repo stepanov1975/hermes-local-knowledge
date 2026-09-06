@@ -35,6 +35,17 @@ VALID_ROLES = {
     "unknown",
 }
 VALID_LIFECYCLES = {"current", "historical", "draft", "plan", "retired", "unknown"}
+VALID_ARTIFACT_TYPES = {
+    "cron_job",
+    "doc",
+    "mcp_server",
+    "memory_doc",
+    "runbook",
+    "script",
+    "skill",
+    "skill_support_doc",
+    "tool_okf",
+}
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -110,6 +121,20 @@ def _frozen_index_snapshot(path: Path) -> Iterator[Path]:
         except OSError as exc:
             raise ValidationError(f"cannot snapshot frozen index {source_path}: {exc}") from exc
         yield snapshot
+
+
+def _reject_output_alias(output: Path, inputs: Iterable[Path]) -> None:
+    resolved_output = output.expanduser().resolve(strict=False)
+    for input_path in inputs:
+        resolved_input = input_path.expanduser().resolve(strict=False)
+        same_path = resolved_output == resolved_input
+        same_file = (
+            resolved_output.exists()
+            and resolved_input.exists()
+            and resolved_output.samefile(resolved_input)
+        )
+        if same_path or same_file:
+            raise ValidationError(f"output must not alias evaluator input {resolved_input}")
 
 
 def _dict(value: object, label: str) -> JsonDict:
@@ -191,8 +216,10 @@ def _packet_cases(packet: JsonDict) -> dict[str, JsonDict]:
             )
         _str(case.get("search_query"), f"packet case {case_id}.search_query")
         artifact_type = case.get("artifact_type")
-        if artifact_type is not None:
-            _str(artifact_type, f"packet case {case_id}.artifact_type")
+        if artifact_type is not None and (
+            not isinstance(artifact_type, str) or artifact_type not in VALID_ARTIFACT_TYPES
+        ):
+            raise ValidationError(f"packet case {case_id}.artifact_type is invalid")
         _bool(case.get("high_impact"), f"packet case {case_id}.high_impact")
         items = _unique_map(case.get("items"), "item_id", f"packet case {case_id}.items")
         if not items:
@@ -293,6 +320,12 @@ def prepare_review(
     index_hash = _sha(index_sha256, "index hash")
     packet_cases = _packet_cases(packet)
     _mapping_cases(mapping, packet, packet_cases, index_hash)
+    if canonical_sha256(rater_a) == canonical_sha256(rater_b):
+        raise ValidationError("rater_a and rater_b annotation inputs must be distinct")
+    if _str(rater_a.get("annotator"), "rater_a.annotator") == _str(
+        rater_b.get("annotator"), "rater_b.annotator"
+    ):
+        raise ValidationError("rater_a and rater_b annotators must be distinct")
     left = _annotation_cases(rater_a, packet, packet_cases, "rater_a")
     right = _annotation_cases(rater_b, packet, packet_cases, "rater_b")
     review_cases: list[JsonDict] = []
@@ -577,6 +610,11 @@ def _benchmark_cases(benchmark: JsonDict) -> dict[str, JsonDict]:
     cases = _unique_map(benchmark.get("cases"), "case_id", "benchmark.cases")
     for case_id, case in cases.items():
         _str(case.get("search_query"), f"benchmark case {case_id}.search_query")
+        artifact_type = case.get("artifact_type")
+        if artifact_type is not None and (
+            not isinstance(artifact_type, str) or artifact_type not in VALID_ARTIFACT_TYPES
+        ):
+            raise ValidationError(f"benchmark case {case_id}.artifact_type is invalid")
         _bool(case.get("none_needed"), f"benchmark case {case_id}.none_needed")
         items = _unique_map(case.get("items"), "item_id", f"benchmark case {case_id}.items")
         artifact_ids: set[str] = set()
@@ -585,6 +623,11 @@ def _benchmark_cases(benchmark: JsonDict) -> dict[str, JsonDict]:
             if artifact_id in artifact_ids:
                 raise ValidationError(f"duplicate artifact_id {artifact_id!r} in benchmark case {case_id}")
             artifact_ids.add(artifact_id)
+            relevance = item.get("relevance")
+            if not isinstance(relevance, int) or isinstance(relevance, bool) or relevance not in VALID_RELEVANCE:
+                raise ValidationError(f"benchmark item {item_id}.relevance must be 0..3")
+            _bool(item.get("canonical_current"), f"benchmark item {item_id}.canonical_current")
+            _bool(item.get("harmful_if_primary"), f"benchmark item {item_id}.harmful_if_primary")
     return cases
 
 
@@ -815,7 +858,7 @@ def compare_rankings(benchmark: JsonDict, baseline: JsonDict, authority: JsonDic
 
 def _index_artifact_ids(path: Path) -> set[str]:
     try:
-        uri = f"file:{path.resolve()}?mode=ro&immutable=1"
+        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
         connection = sqlite3.connect(uri, uri=True)
         try:
             rows = connection.execute("SELECT id FROM artifacts").fetchall()
@@ -828,6 +871,11 @@ def _index_artifact_ids(path: Path) -> set[str]:
 
 def _cli_prepare(args: argparse.Namespace) -> JsonDict:
     index = Path(args.index)
+    output = Path(args.output)
+    _reject_output_alias(
+        output,
+        (Path(args.packet), Path(args.mapping), Path(args.rater_a), Path(args.rater_b), index),
+    )
     review = prepare_review(
         load_json(Path(args.packet)),
         load_json(Path(args.mapping)),
@@ -835,12 +883,25 @@ def _cli_prepare(args: argparse.Namespace) -> JsonDict:
         load_json(Path(args.rater_b)),
         index_sha256=file_sha256(index),
     )
-    write_private_json(Path(args.output), review)
+    write_private_json(output, review)
     return {"output": str(Path(args.output)), "cases": len(review["cases"]), "human_gold": False}
 
 
 def _cli_finalize(args: argparse.Namespace) -> JsonDict:
     index = Path(args.index)
+    output = Path(args.output)
+    _reject_output_alias(
+        output,
+        (
+            Path(args.review),
+            Path(args.decisions),
+            Path(args.packet),
+            Path(args.mapping),
+            Path(args.rater_a),
+            Path(args.rater_b),
+            index,
+        ),
+    )
     with _frozen_index_snapshot(index) as snapshot:
         benchmark = finalize_benchmark(
             load_json(Path(args.review)),
@@ -852,7 +913,7 @@ def _cli_finalize(args: argparse.Namespace) -> JsonDict:
             index_sha256=file_sha256(snapshot),
             valid_artifact_ids=_index_artifact_ids(snapshot),
         )
-    write_private_json(Path(args.output), benchmark)
+    write_private_json(output, benchmark)
     return {"output": str(Path(args.output)), "cases": len(benchmark["cases"]), "human_gold": True}
 
 
@@ -868,6 +929,8 @@ def _cli_replay(args: argparse.Namespace) -> JsonDict:
 
     benchmark = load_json(Path(args.benchmark))
     index = Path(args.index)
+    output = Path(args.output)
+    _reject_output_alias(output, (Path(args.benchmark), index))
     with _frozen_index_snapshot(index) as snapshot:
         if file_sha256(snapshot) != benchmark["source"]["index_sha256"]:
             raise ValidationError("frozen index hash does not match benchmark")
@@ -881,17 +944,22 @@ def _cli_replay(args: argparse.Namespace) -> JsonDict:
             ]
 
         rankings = replay_benchmark(benchmark, search, limit=args.limit)
-    write_private_json(Path(args.output), rankings)
+    write_private_json(output, rankings)
     return {"output": str(Path(args.output)), "cases": len(rankings["cases"])}
 
 
 def _cli_compare(args: argparse.Namespace) -> JsonDict:
+    output = Path(args.output)
+    _reject_output_alias(
+        output,
+        (Path(args.benchmark), Path(args.baseline), Path(args.authority)),
+    )
     report = compare_rankings(
         load_json(Path(args.benchmark)),
         load_json(Path(args.baseline)),
         load_json(Path(args.authority)),
     )
-    write_private_json(Path(args.output), report)
+    write_private_json(output, report)
     return {"output": str(Path(args.output)), "changed_top_1": len(report["changed_top_1"])}
 
 

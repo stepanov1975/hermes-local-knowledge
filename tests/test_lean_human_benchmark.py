@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 from pathlib import Path
+import sqlite3
 import stat
 from typing import Any
 
@@ -10,6 +11,8 @@ import pytest
 
 from scripts.lean_human_benchmark import (
     _frozen_index_snapshot,
+    _index_artifact_ids,
+    _reject_output_alias,
     ValidationError,
     apply_explicit_supersession,
     build_candidate_rankings,
@@ -255,6 +258,54 @@ def test_prepare_review_rejects_incomplete_annotation_and_wrong_index() -> None:
         )
 
 
+def test_prepare_review_requires_distinct_raters_and_valid_case_filters() -> None:
+    source_packet = packet()
+    private_mapping = mapping(source_packet)
+    left = annotation(source_packet)
+    right = annotation(source_packet, second=True)
+
+    with pytest.raises(ValidationError, match="annotation inputs must be distinct"):
+        prepare_review(
+            source_packet,
+            private_mapping,
+            left,
+            copy.deepcopy(left),
+            index_sha256=INDEX_SHA,
+        )
+
+    duplicate_annotator = copy.deepcopy(right)
+    duplicate_annotator["annotator"] = left["annotator"]
+    with pytest.raises(ValidationError, match="annotators must be distinct"):
+        prepare_review(
+            source_packet,
+            private_mapping,
+            left,
+            duplicate_annotator,
+            index_sha256=INDEX_SHA,
+        )
+
+    bad_type_packet = copy.deepcopy(source_packet)
+    bad_type_packet["cases"][0]["artifact_type"] = "skills"
+    with pytest.raises(ValidationError, match="artifact_type"):
+        prepare_review(
+            bad_type_packet,
+            private_mapping,
+            left,
+            right,
+            index_sha256=INDEX_SHA,
+        )
+
+    bad_type_packet["cases"][0]["artifact_type"] = ["skill"]
+    with pytest.raises(ValidationError, match="artifact_type"):
+        prepare_review(
+            bad_type_packet,
+            private_mapping,
+            left,
+            right,
+            index_sha256=INDEX_SHA,
+        )
+
+
 def test_prepare_rejects_duplicate_artifact_mapping() -> None:
     source_packet = packet()
     private_mapping = mapping(source_packet)
@@ -441,6 +492,21 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
     with pytest.raises(ValidationError, match="at least 3"):
         replay_benchmark(benchmark, search, limit=2)
 
+    malformed_benchmark = copy.deepcopy(benchmark)
+    malformed_benchmark["cases"][0]["items"][0]["relevance"] = "3"
+    with pytest.raises(ValidationError, match="relevance"):
+        replay_benchmark(malformed_benchmark, search)
+
+    malformed_benchmark = copy.deepcopy(benchmark)
+    malformed_benchmark["cases"][0]["items"][0]["canonical_current"] = 1
+    with pytest.raises(ValidationError, match="canonical_current"):
+        replay_benchmark(malformed_benchmark, search)
+
+    malformed_benchmark = copy.deepcopy(benchmark)
+    malformed_benchmark["cases"][0]["artifact_type"] = ["skill"]
+    with pytest.raises(ValidationError, match="artifact_type"):
+        replay_benchmark(malformed_benchmark, search)
+
 
 def test_private_writer_uses_restrictive_modes(tmp_path: Path) -> None:
     destination = tmp_path / "private" / "result.json"
@@ -470,6 +536,28 @@ def test_frozen_index_snapshot_survives_source_replacement(tmp_path: Path) -> No
     with _frozen_index_snapshot(source) as snapshot:
         source.write_bytes(b"replacement")
         assert snapshot.read_bytes() == b"frozen"
+
+
+def test_index_reader_handles_sqlite_uri_characters(tmp_path: Path) -> None:
+    index = tmp_path / "frozen?#index.sqlite"
+    with sqlite3.connect(index) as connection:
+        connection.execute("CREATE TABLE artifacts (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO artifacts (id) VALUES ('skill:owner')")
+
+    assert _index_artifact_ids(index) == {"skill:owner"}
+
+
+def test_output_must_not_alias_an_input(tmp_path: Path) -> None:
+    source = tmp_path / "benchmark.json"
+    source.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="must not alias"):
+        _reject_output_alias(source, (source,))
+
+    alias = tmp_path / "alias.json"
+    alias.hardlink_to(source)
+    with pytest.raises(ValidationError, match="must not alias"):
+        _reject_output_alias(alias, (source,))
 
 
 def test_private_writer_rejects_public_repository_paths() -> None:

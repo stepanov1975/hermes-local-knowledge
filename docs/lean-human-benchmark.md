@@ -16,6 +16,7 @@ The script is the single authoritative validator. It binds a finalized benchmark
 - the exact human-review packet.
 
 Finalization and replay use one private snapshot of the supplied frozen index for hashing and every subsequent read, so an atomic index rebuild cannot mix snapshots under one recorded hash. Replay always loads ranking code from the reviewed checkout and requires a result limit of at least three because the report includes Hit@3.
+The two draft annotation inputs must have distinct annotator identities, case filters must name a supported index artifact type, finalized item labels are validated before scoring, and an output path may not alias any command input.
 
 Every case must have an explicit human decision. `accepted_proposal` accepts the deterministic draft proposal for that case; `edited` accepts the proposal except for explicit `none_needed` or item-field overrides. Finalization rejects missing or extra cases, unknown item handles, mapping drift, index drift, unresolved decisions, and mapped artifacts absent from the frozen index.
 
