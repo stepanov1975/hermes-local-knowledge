@@ -300,6 +300,7 @@ def _packet_cases(packet: JsonDict) -> dict[str, JsonDict]:
     _require_schema_version_one(packet.get("schema_version"), "packet.schema_version")
     _identifier(packet.get("packet_id"), "packet.packet_id")
     _sha256(packet.get("rubric_sha256"), "packet.rubric_sha256")
+    _text(packet.get("instructions"), "packet.instructions")
     cases = _unique_rows(packet.get("cases"), "case_id", "packet.cases")
     if not cases:
         raise ValidationError("packet must contain cases")
@@ -484,7 +485,6 @@ def _review_template(
             {
                 "case_id": case_id,
                 "user_request": case["user_request"],
-                "preceding_context": copy.deepcopy(case.get("preceding_context", [])),
                 "search_query": case["search_query"],
                 "artifact_type": case.get("artifact_type"),
                 "high_impact": case["high_impact"],
@@ -507,6 +507,7 @@ def _review_template(
         "review_id": f"lean-{packet['packet_id']}",
         "human_gold_created": False,
         "reviewer": None,
+        "instructions": packet["instructions"],
         "source": _review_source(packet, mapping, index_sha256),
         "cases": cases,
     }
@@ -541,6 +542,7 @@ def _validate_labeled_review(
             "review_id",
             "human_gold_created",
             "reviewer",
+            "instructions",
             "source",
             "cases",
         },
@@ -552,6 +554,8 @@ def _validate_labeled_review(
     if review.get("review_id") != template["review_id"]:
         raise ValidationError("review identity does not match reconstructed template")
     reviewer = _text(review.get("reviewer"), "review.reviewer").strip()
+    if review.get("instructions") != template["instructions"]:
+        raise ValidationError("review instructions do not match reconstructed template")
     if not _same_json(_object(review.get("source"), "review.source"), template["source"]):
         raise ValidationError("review source does not match reconstructed template")
 
@@ -562,7 +566,6 @@ def _validate_labeled_review(
     case_fields = {
         "case_id",
         "user_request",
-        "preceding_context",
         "search_query",
         "artifact_type",
         "high_impact",
@@ -582,7 +585,6 @@ def _validate_labeled_review(
         _require_exact_fields(case, case_fields, f"review case {case_id}")
         for field in (
             "user_request",
-            "preceding_context",
             "search_query",
             "artifact_type",
             "high_impact",
@@ -660,7 +662,6 @@ def finalize_benchmark(
             {
                 "case_id": case_id,
                 "user_request": packet_case["user_request"],
-                "preceding_context": copy.deepcopy(packet_case.get("preceding_context", [])),
                 "search_query": packet_case["search_query"],
                 "artifact_type": packet_case.get("artifact_type"),
                 "high_impact": packet_case["high_impact"],
@@ -674,6 +675,7 @@ def finalize_benchmark(
         "benchmark_id": f"{template['review_id']}-human-v1",
         "human_gold_created": True,
         "reviewer": reviewer,
+        "instructions": packet["instructions"],
         "source": {
             **copy.deepcopy(template["source"]),
             "review_sha256": canonical_sha256(review),

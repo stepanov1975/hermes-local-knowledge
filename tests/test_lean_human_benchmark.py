@@ -177,6 +177,8 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
     assert first == second
     assert first["human_gold_created"] is False
     assert first["reviewer"] is None
+    assert first["instructions"] == source_packet["instructions"]
+    assert "preceding_context" not in first["cases"][0]
     assert first["cases"][0]["none_needed"] is None
     assert first["cases"][0]["items"][0]["relevance"] is None
     assert "skill:owner" not in json.dumps(first, sort_keys=True)
@@ -187,6 +189,34 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
         "packet_sha256": canonical_sha256(source_packet),
         "rubric_sha256": "2" * 64,
     }
+
+
+def test_prepare_and_finalize_omit_source_only_preceding_context() -> None:
+    source_packet = packet()
+    private_text = "synthetic transcript-shaped context that must not be copied"
+    source_packet["cases"][0]["preceding_context"] = [
+        {"role": "user", "content": private_text}
+    ]
+    private_mapping = mapping(source_packet)
+
+    review = prepare_review(
+        source_packet,
+        private_mapping,
+        index_sha256=INDEX_SHA,
+        valid_artifacts=index_artifacts(),
+    )
+    assert private_text not in json.dumps(review, sort_keys=True)
+    assert "preceding_context" not in review["cases"][0]
+
+    benchmark = finalize_benchmark(
+        label_review(review),
+        source_packet,
+        private_mapping,
+        index_sha256=INDEX_SHA,
+        valid_artifacts=index_artifacts(),
+    )
+    assert private_text not in json.dumps(benchmark, sort_keys=True)
+    assert "preceding_context" not in benchmark["cases"][0]
 
 
 def test_finalize_requires_explicit_human_labels_and_maps_private_ids() -> None:
@@ -203,6 +233,8 @@ def test_finalize_requires_explicit_human_labels_and_maps_private_ids() -> None:
 
     assert benchmark["human_gold_created"] is True
     assert benchmark["reviewer"] == "Alex"
+    assert benchmark["instructions"] == source_packet["instructions"]
+    assert "preceding_context" not in benchmark["cases"][0]
     assert benchmark["source"]["review_sha256"] == canonical_sha256(labeled)
     assert benchmark["cases"][0]["human_rationale"] == "Explicitly reviewed."
     assert benchmark["cases"][0]["items"][0] == {
@@ -300,6 +332,17 @@ def test_finalize_rejects_coverage_static_field_and_shape_drift() -> None:
     with pytest.raises(ValidationError, match="fields"):
         finalize_benchmark(
             extra_field,
+            source_packet,
+            private_mapping,
+            index_sha256=INDEX_SHA,
+            valid_artifacts=index_artifacts(),
+        )
+
+    tampered_instructions = label_review(review)
+    tampered_instructions["instructions"] = "Different labeling contract."
+    with pytest.raises(ValidationError, match="instructions"):
+        finalize_benchmark(
+            tampered_instructions,
             source_packet,
             private_mapping,
             index_sha256=INDEX_SHA,
@@ -423,6 +466,16 @@ def test_packet_validation_rejects_bad_context_filter_and_empty_items() -> None:
         prepare_review(
             bad_context,
             private_mapping,
+            index_sha256=INDEX_SHA,
+            valid_artifacts=index_artifacts(),
+        )
+
+    missing_instructions = copy.deepcopy(source_packet)
+    missing_instructions["instructions"] = ""
+    with pytest.raises(ValidationError, match="instructions"):
+        prepare_review(
+            missing_instructions,
+            mapping(missing_instructions),
             index_sha256=INDEX_SHA,
             valid_artifacts=index_artifacts(),
         )
