@@ -37,7 +37,7 @@ VALID_ARTIFACT_TYPES = {
 }
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REVIEWER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}")
-REVIEW_ITEM_KEY_DOMAIN = b"hermes-local-knowledge/lean-review-item-key/v1\0"
+REVIEW_HANDLE_KEY_DOMAIN = b"hermes-local-knowledge/lean-review-handle-key/v1\0"
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
@@ -142,13 +142,25 @@ def canonical_sha256(value: object) -> str:
 
 
 def _review_mapping_key(mapping: JsonDict) -> bytes:
-    return hashlib.sha256(REVIEW_ITEM_KEY_DOMAIN + _canonical_json_bytes(mapping)).digest()
+    return hashlib.sha256(REVIEW_HANDLE_KEY_DOMAIN + _canonical_json_bytes(mapping)).digest()
+
+
+def _review_case_id(mapping_key: bytes, case_id: str) -> str:
+    message = f"case\0{case_id}".encode("utf-8")
+    digest = hmac.new(mapping_key, message, hashlib.sha256).hexdigest()
+    return f"case-{digest[:32]}"
 
 
 def _review_item_id(mapping_key: bytes, case_id: str, item_id: str) -> str:
-    message = f"{case_id}\0{item_id}".encode("utf-8")
+    message = f"item\0{case_id}\0{item_id}".encode("utf-8")
     digest = hmac.new(mapping_key, message, hashlib.sha256).hexdigest()
     return f"item-{digest[:32]}"
+
+
+def _review_id(mapping_key: bytes, packet: JsonDict, index_sha256: str) -> str:
+    message = f"review\0{canonical_sha256(packet)}\0{index_sha256}".encode("ascii")
+    digest = hmac.new(mapping_key, message, hashlib.sha256).hexdigest()
+    return f"review-{digest[:32]}"
 
 
 def _same_json(left: object, right: object) -> bool:
@@ -525,7 +537,6 @@ def _validated_inputs(
 
 def _review_source(packet: JsonDict, mapping: JsonDict, index_sha256: str) -> JsonDict:
     return {
-        "packet_id": packet["packet_id"],
         "packet_sha256": canonical_sha256(packet),
         "mapping_sha256": canonical_sha256(mapping),
         "index_sha256": index_sha256,
@@ -542,13 +553,14 @@ def _review_template(
 ) -> JsonDict:
     cases: list[JsonDict] = []
     mapping_key = _review_mapping_key(mapping)
-    for case_id, case in packet_cases.items():
+    for case_number, (case_id, case) in enumerate(packet_cases.items(), start=1):
         packet_items = _unique_rows(
             case.get("items"), "item_id", f"packet case {case_id}.items"
         )
         cases.append(
             {
-                "case_id": case_id,
+                "case_id": _review_case_id(mapping_key, case_id),
+                "case_number": case_number,
                 "user_request": case["user_request"],
                 "search_query": case["search_query"],
                 "artifact_type": case.get("artifact_type"),
@@ -568,7 +580,7 @@ def _review_template(
         )
     return {
         "schema_version": 1,
-        "review_id": f"lean-{packet['packet_id']}",
+        "review_id": _review_id(mapping_key, packet, index_sha256),
         "human_gold_created": False,
         "reviewer": None,
         "instructions": packet["instructions"],
@@ -629,6 +641,7 @@ def _validate_labeled_review(
         raise ValidationError("review case coverage does not match packet")
     case_fields = {
         "case_id",
+        "case_number",
         "user_request",
         "search_query",
         "artifact_type",
@@ -647,6 +660,7 @@ def _validate_labeled_review(
         case = review_cases[case_id]
         _require_exact_fields(case, case_fields, f"review case {case_id}")
         for field in (
+            "case_number",
             "user_request",
             "search_query",
             "artifact_type",
@@ -702,7 +716,8 @@ def finalize_benchmark(
 
     finalized_cases: list[JsonDict] = []
     for case_id, packet_case in packet_cases.items():
-        review_case = review_cases[case_id]
+        review_case_id = _review_case_id(mapping_key, case_id)
+        review_case = review_cases[review_case_id]
         review_items = _unique_rows(
             review_case["items"], "item_id", f"review case {case_id}.items"
         )
@@ -741,6 +756,7 @@ def finalize_benchmark(
         "instructions": packet["instructions"],
         "source": {
             **copy.deepcopy(template["source"]),
+            "packet_id": packet["packet_id"],
             "review_sha256": canonical_sha256(review),
         },
         "cases": finalized_cases,

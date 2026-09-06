@@ -148,10 +148,10 @@ def label_review(review: dict[str, Any]) -> dict[str, Any]:
     labeled = copy.deepcopy(review)
     labeled["reviewer"] = "Alex"
     for case in labeled["cases"]:
-        case["none_needed"] = case["case_id"] == "case-none"
+        case["none_needed"] = case["case_number"] == 2
         for index, item in enumerate(case["items"]):
-            is_owner = case["case_id"] == "case-one" and index == 0
-            is_old = case["case_id"] == "case-one" and index == 1
+            is_owner = case["case_number"] == 1 and index == 0
+            is_old = case["case_number"] == 1 and index == 1
             item["relevance"] = 3 if is_owner else 0
             item["canonical_current"] = is_owner
             item["harmful_if_primary"] = is_old
@@ -179,6 +179,11 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
     assert first["human_gold_created"] is False
     assert first["reviewer"] is None
     assert first["instructions"] == source_packet["instructions"]
+    assert re.fullmatch(r"review-[0-9a-f]{32}", first["review_id"])
+    review_case_ids = [case["case_id"] for case in first["cases"]]
+    assert all(re.fullmatch(r"case-[0-9a-f]{32}", case_id) for case_id in review_case_ids)
+    assert not ({"case-one", "case-none"} & set(review_case_ids))
+    assert [case["case_number"] for case in first["cases"]] == [1, 2]
     assert "preceding_context" not in first["cases"][0]
     assert "card" not in first["cases"][0]["items"][0]
     review_item_ids = [item["item_id"] for case in first["cases"] for item in case["items"]]
@@ -191,6 +196,14 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
     public_mapping_digest = bytes.fromhex(first["source"]["mapping_sha256"])
     private_mapping_key = benchmark_module._review_mapping_key(private_mapping)
     for packet_case, review_case in zip(source_packet["cases"], first["cases"], strict=True):
+        assert (
+            benchmark_module._review_case_id(private_mapping_key, packet_case["case_id"])
+            == review_case["case_id"]
+        )
+        assert (
+            benchmark_module._review_case_id(public_mapping_digest, packet_case["case_id"])
+            != review_case["case_id"]
+        )
         for packet_item, review_item in zip(
             packet_case["items"], review_case["items"], strict=True
         ):
@@ -216,18 +229,22 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
     assert first["source"] == {
         "index_sha256": INDEX_SHA,
         "mapping_sha256": canonical_sha256(private_mapping),
-        "packet_id": "packet-v1",
         "packet_sha256": canonical_sha256(source_packet),
         "rubric_sha256": "2" * 64,
     }
 
 
-def test_prepare_reblinds_identity_bearing_source_item_ids() -> None:
+def test_prepare_reblinds_identity_bearing_source_identifiers() -> None:
     source_packet = packet()
+    source_packet["packet_id"] = "artifact:expected-owner-packet"
+    source_packet["cases"][0]["case_id"] = "artifact:expected-owner-case"
     source_packet["cases"][0]["items"][0]["item_id"] = "skill:owner"
     private_mapping = mapping(source_packet)
-    owner_mapping = private_mapping["cases"]["case-one"]["items"].pop("item-owner")
-    private_mapping["cases"]["case-one"]["items"]["skill:owner"] = owner_mapping
+    private_mapping["packet_id"] = source_packet["packet_id"]
+    case_mapping = private_mapping["cases"].pop("case-one")
+    owner_mapping = case_mapping["items"].pop("item-owner")
+    case_mapping["items"]["skill:owner"] = owner_mapping
+    private_mapping["cases"]["artifact:expected-owner-case"] = case_mapping
 
     review = prepare_review(
         source_packet,
@@ -236,7 +253,12 @@ def test_prepare_reblinds_identity_bearing_source_item_ids() -> None:
         valid_artifacts=index_artifacts(),
     )
 
-    assert "skill:owner" not in json.dumps(review, sort_keys=True)
+    serialized_review = json.dumps(review, sort_keys=True)
+    assert "artifact:expected-owner-packet" not in serialized_review
+    assert "artifact:expected-owner-case" not in serialized_review
+    assert "skill:owner" not in serialized_review
+    assert re.fullmatch(r"review-[0-9a-f]{32}", review["review_id"])
+    assert re.fullmatch(r"case-[0-9a-f]{32}", review["cases"][0]["case_id"])
     assert re.fullmatch(r"item-[0-9a-f]{32}", review["cases"][0]["items"][0]["item_id"])
 
     benchmark = finalize_benchmark(
@@ -246,6 +268,8 @@ def test_prepare_reblinds_identity_bearing_source_item_ids() -> None:
         index_sha256=INDEX_SHA,
         valid_artifacts=index_artifacts(),
     )
+    assert benchmark["source"]["packet_id"] == "artifact:expected-owner-packet"
+    assert benchmark["cases"][0]["case_id"] == "artifact:expected-owner-case"
     assert benchmark["cases"][0]["items"][0]["item_id"] == "skill:owner"
     assert benchmark["cases"][0]["items"][0]["artifact_id"] == "skill:owner"
 
@@ -400,6 +424,17 @@ def test_finalize_rejects_coverage_static_field_and_shape_drift() -> None:
     with pytest.raises(ValidationError, match="static fields"):
         finalize_benchmark(
             tampered_query,
+            source_packet,
+            private_mapping,
+            index_sha256=INDEX_SHA,
+            valid_artifacts=index_artifacts(),
+        )
+
+    float_case_number = label_review(review)
+    float_case_number["cases"][0]["case_number"] = 1.0
+    with pytest.raises(ValidationError, match="static fields"):
+        finalize_benchmark(
+            float_case_number,
             source_packet,
             private_mapping,
             index_sha256=INDEX_SHA,
