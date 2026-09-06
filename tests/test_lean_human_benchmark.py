@@ -589,6 +589,39 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
     with pytest.raises(ValidationError, match="not present in the frozen index"):
         replay_benchmark(nonexistent_label, search, valid_artifacts=valid_artifacts)
 
+    empty_benchmark = copy.deepcopy(benchmark)
+    empty_benchmark["cases"] = []
+    with pytest.raises(ValidationError, match="must not be empty"):
+        replay_benchmark(empty_benchmark, search, valid_artifacts=valid_artifacts)
+
+
+def test_hit_metrics_are_rates_across_eligible_cases() -> None:
+    review, private_mapping = prepared_review()
+    benchmark = finalize_for_test(review, accepted_decisions(review), private_mapping)
+    second = copy.deepcopy(benchmark["cases"][0])
+    second["case_id"] = "case-two"
+    second["search_query"] = "second current owner"
+    benchmark["cases"].append(second)
+    valid_artifacts = index_artifacts()
+    baseline = replay_benchmark(
+        benchmark,
+        lambda _query, _artifact_type, _limit: ["skill:owner"],
+        valid_artifacts=valid_artifacts,
+    )
+
+    report = compare_rankings(
+        benchmark,
+        baseline,
+        {"records": []},
+        valid_artifacts=valid_artifacts,
+    )
+
+    assert report["baseline"]["eligible_cases"] == 2
+    assert report["baseline"]["acceptable_hit_at_1"] == 1.0
+    assert report["baseline"]["acceptable_hit_at_10"] == 1.0
+    assert report["baseline"]["parent_equiv_acceptable_hit_at_1"] == 1.0
+    assert report["baseline"]["parent_equiv_acceptable_hit_at_10"] == 1.0
+
 
 def test_comparison_reports_narrow_parent_equivalent_metrics() -> None:
     review, private_mapping = prepared_review()

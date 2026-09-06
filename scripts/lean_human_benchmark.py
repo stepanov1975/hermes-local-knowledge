@@ -635,6 +635,8 @@ def _benchmark_cases(benchmark: JsonDict) -> dict[str, JsonDict]:
     source = _dict(benchmark.get("source"), "benchmark.source")
     _sha(source.get("index_sha256"), "benchmark.source.index_sha256")
     cases = _unique_map(benchmark.get("cases"), "case_id", "benchmark.cases")
+    if not cases:
+        raise ValidationError("benchmark.cases must not be empty")
     for case_id, case in cases.items():
         _str(case.get("search_query"), f"benchmark case {case_id}.search_query")
         artifact_type = case.get("artifact_type")
@@ -937,10 +939,11 @@ def _score(
             result["canonical_current_at_1"] += 1
         if top_label.get("harmful_if_primary") is True:
             result["harmful_at_1"] += 1
-    eligible_cases = result["eligible_cases"]
-    if eligible_cases:
-        result["acceptable_mrr_at_10"] /= eligible_cases
-        result["parent_equiv_acceptable_mrr_at_10"] /= eligible_cases
+    denominator = result["eligible_cases"] or 1
+    for prefix in ("", "parent_equiv_"):
+        for cutoff in (1, 3, 5, 10):
+            result[f"{prefix}acceptable_hit_at_{cutoff}"] /= denominator
+        result[f"{prefix}acceptable_mrr_at_10"] /= denominator
     return result
 
 
