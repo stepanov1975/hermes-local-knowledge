@@ -518,7 +518,8 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
         assert artifact_type is None
         return ["doc:noise"]
 
-    baseline = replay_benchmark(benchmark, search)
+    valid_artifacts = index_artifacts()
+    baseline = replay_benchmark(benchmark, search, valid_artifacts=valid_artifacts)
     _verify_baseline_replay(baseline, copy.deepcopy(baseline))
     altered_baseline = copy.deepcopy(baseline)
     altered_baseline["cases"][0]["ids"].reverse()
@@ -539,7 +540,9 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
         ]
     }
     candidate = build_candidate_rankings(baseline, authority)
-    report = compare_rankings(benchmark, baseline, authority)
+    report = compare_rankings(
+        benchmark, baseline, authority, valid_artifacts=valid_artifacts
+    )
 
     assert report["baseline"]["acceptable_hit_at_1"] == 0
     assert report["candidate"]["acceptable_hit_at_1"] == 1
@@ -559,34 +562,37 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
     tampered["cases"][0]["ids"].append("doc:new")
     tampered["limit"] = 2
     with pytest.raises(ValidationError, match="limit"):
-        compare_rankings(benchmark, tampered, authority)
+        compare_rankings(
+            benchmark, tampered, authority, valid_artifacts=valid_artifacts
+        )
 
     with pytest.raises(ValidationError, match="at least 10"):
-        replay_benchmark(benchmark, search, limit=2)
+        replay_benchmark(benchmark, search, valid_artifacts=valid_artifacts, limit=2)
 
     malformed_benchmark = copy.deepcopy(benchmark)
     malformed_benchmark["cases"][0]["items"][0]["relevance"] = "3"
     with pytest.raises(ValidationError, match="relevance"):
-        replay_benchmark(malformed_benchmark, search)
+        replay_benchmark(malformed_benchmark, search, valid_artifacts=valid_artifacts)
 
     malformed_benchmark = copy.deepcopy(benchmark)
     malformed_benchmark["cases"][0]["items"][0]["canonical_current"] = 1
     with pytest.raises(ValidationError, match="canonical_current"):
-        replay_benchmark(malformed_benchmark, search)
+        replay_benchmark(malformed_benchmark, search, valid_artifacts=valid_artifacts)
 
     malformed_benchmark = copy.deepcopy(benchmark)
     malformed_benchmark["cases"][0]["artifact_type"] = ["skill"]
     with pytest.raises(ValidationError, match="artifact_type"):
-        replay_benchmark(malformed_benchmark, search)
+        replay_benchmark(malformed_benchmark, search, valid_artifacts=valid_artifacts)
+
+    nonexistent_label = copy.deepcopy(benchmark)
+    nonexistent_label["cases"][0]["items"][0]["artifact_id"] = "skill:missing"
+    with pytest.raises(ValidationError, match="not present in the frozen index"):
+        replay_benchmark(nonexistent_label, search, valid_artifacts=valid_artifacts)
 
 
 def test_comparison_reports_narrow_parent_equivalent_metrics() -> None:
     review, private_mapping = prepared_review()
     benchmark = finalize_for_test(review, accepted_decisions(review), private_mapping)
-    baseline = replay_benchmark(
-        benchmark,
-        lambda _query, _artifact_type, _limit: ["skill_support_doc:owner-reference"],
-    )
     artifacts = {
         **index_artifacts(),
         "skill_support_doc:owner-reference": {
@@ -614,12 +620,18 @@ def test_comparison_reports_narrow_parent_equivalent_metrics() -> None:
             "related": ["skill:owner"],
         },
     }
+    baseline = replay_benchmark(
+        benchmark,
+        lambda _query, _artifact_type, _limit: ["skill_support_doc:owner-reference"],
+        valid_artifacts=artifacts,
+    )
     equivalents = _parent_equivalence_map(artifacts)
 
     report = compare_rankings(
         benchmark,
         baseline,
         {"records": []},
+        valid_artifacts=artifacts,
         parent_equivalents=equivalents,
     )
 
@@ -639,11 +651,13 @@ def test_comparison_reports_narrow_parent_equivalent_metrics() -> None:
 def test_comparison_reports_exact_mrr_when_top_one_is_unchanged() -> None:
     review, private_mapping = prepared_review()
     benchmark = finalize_for_test(review, accepted_decisions(review), private_mapping)
+    valid_artifacts = index_artifacts()
     baseline = replay_benchmark(
         benchmark,
         lambda query, _artifact_type, _limit: (
             ["doc:noise", "doc:old", "skill:owner"] if query == "current owner" else []
         ),
+        valid_artifacts=valid_artifacts,
     )
     authority = {
         "records": [
@@ -659,7 +673,9 @@ def test_comparison_reports_exact_mrr_when_top_one_is_unchanged() -> None:
         ]
     }
 
-    report = compare_rankings(benchmark, baseline, authority)
+    report = compare_rankings(
+        benchmark, baseline, authority, valid_artifacts=valid_artifacts
+    )
 
     assert report["changed_top_1"] == []
     assert report["baseline"]["acceptable_hit_at_3"] == 1

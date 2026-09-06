@@ -658,10 +658,29 @@ def _benchmark_cases(benchmark: JsonDict) -> dict[str, JsonDict]:
     return cases
 
 
-def replay_benchmark(benchmark: JsonDict, search: SearchFn, *, limit: int = 10) -> JsonDict:
+def _validate_benchmark_artifacts(
+    benchmark_cases: dict[str, JsonDict], valid_artifacts: dict[str, JsonDict]
+) -> None:
+    for case_id, case in benchmark_cases.items():
+        for item in case["items"]:
+            artifact_id = item["artifact_id"]
+            if artifact_id not in valid_artifacts:
+                raise ValidationError(
+                    f"benchmark artifact {artifact_id!r} for {case_id} is not present in the frozen index"
+                )
+
+
+def replay_benchmark(
+    benchmark: JsonDict,
+    search: SearchFn,
+    *,
+    valid_artifacts: dict[str, JsonDict],
+    limit: int = 10,
+) -> JsonDict:
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 10:
         raise ValidationError("replay limit must be an integer of at least 10")
     cases = _benchmark_cases(benchmark)
+    _validate_benchmark_artifacts(cases, valid_artifacts)
     output: list[JsonDict] = []
     for case_id, case in cases.items():
         artifact_type = case.get("artifact_type")
@@ -930,11 +949,13 @@ def compare_rankings(
     baseline: JsonDict,
     authority: JsonDict,
     *,
+    valid_artifacts: dict[str, JsonDict],
     parent_equivalents: dict[str, set[str]] | None = None,
 ) -> JsonDict:
     """Generate the sole allowed candidate internally and compare it with the incumbent."""
 
     benchmark_cases = _benchmark_cases(benchmark)
+    _validate_benchmark_artifacts(benchmark_cases, valid_artifacts)
     baseline_cases = _ranking_cases(baseline, benchmark, "baseline")
     candidate = build_candidate_rankings(baseline, authority)
     candidate_cases = _ranking_cases(candidate, benchmark, "candidate")
@@ -1035,7 +1056,13 @@ def _checkout_index_module() -> Any:
     return index_module
 
 
-def _replay_frozen_index(benchmark: JsonDict, snapshot: Path, *, limit: int) -> JsonDict:
+def _replay_frozen_index(
+    benchmark: JsonDict,
+    snapshot: Path,
+    *,
+    limit: int,
+    valid_artifacts: dict[str, JsonDict],
+) -> JsonDict:
     index_module = _checkout_index_module()
 
     def search(query: str, artifact_type: str | None, search_limit: int) -> list[str]:
@@ -1046,7 +1073,12 @@ def _replay_frozen_index(benchmark: JsonDict, snapshot: Path, *, limit: int) -> 
             )
         ]
 
-    return replay_benchmark(benchmark, search, limit=limit)
+    return replay_benchmark(
+        benchmark,
+        search,
+        valid_artifacts=valid_artifacts,
+        limit=limit,
+    )
 
 
 def _verify_baseline_replay(baseline: JsonDict, replayed: JsonDict) -> None:
@@ -1110,7 +1142,13 @@ def _cli_replay(args: argparse.Namespace) -> JsonDict:
     with _frozen_index_snapshot(index) as snapshot:
         if file_sha256(snapshot) != benchmark["source"]["index_sha256"]:
             raise ValidationError("frozen index hash does not match benchmark")
-        rankings = _replay_frozen_index(benchmark, snapshot, limit=args.limit)
+        valid_artifacts = _index_artifacts(snapshot)
+        rankings = _replay_frozen_index(
+            benchmark,
+            snapshot,
+            limit=args.limit,
+            valid_artifacts=valid_artifacts,
+        )
     write_private_json(output, rankings)
     return {"output": str(Path(args.output)), "cases": len(rankings["cases"])}
 
@@ -1129,13 +1167,20 @@ def _cli_compare(args: argparse.Namespace) -> JsonDict:
     with _frozen_index_snapshot(index) as snapshot:
         if file_sha256(snapshot) != benchmark["source"]["index_sha256"]:
             raise ValidationError("frozen index hash does not match benchmark")
-        replayed = _replay_frozen_index(benchmark, snapshot, limit=baseline["limit"])
-        parent_equivalents = _parent_equivalence_map(_index_artifacts(snapshot))
+        valid_artifacts = _index_artifacts(snapshot)
+        replayed = _replay_frozen_index(
+            benchmark,
+            snapshot,
+            limit=baseline["limit"],
+            valid_artifacts=valid_artifacts,
+        )
+        parent_equivalents = _parent_equivalence_map(valid_artifacts)
     _verify_baseline_replay(baseline, replayed)
     report = compare_rankings(
         benchmark,
         baseline,
         authority,
+        valid_artifacts=valid_artifacts,
         parent_equivalents=parent_equivalents,
     )
     write_private_json(output, report)
