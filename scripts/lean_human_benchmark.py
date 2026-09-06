@@ -493,7 +493,6 @@ def _review_template(
                 "items": [
                     {
                         "item_id": item_id,
-                        "card": copy.deepcopy(item),
                         "relevance": None,
                         "canonical_current": None,
                         "harmful_if_primary": None,
@@ -575,7 +574,6 @@ def _validate_labeled_review(
     }
     item_fields = {
         "item_id",
-        "card",
         "relevance",
         "canonical_current",
         "harmful_if_primary",
@@ -599,11 +597,9 @@ def _validate_labeled_review(
         items = _unique_rows(case.get("items"), "item_id", f"review case {case_id}.items")
         if set(items) != set(expected_items):
             raise ValidationError(f"review item coverage does not match packet for {case_id}")
-        for item_id, expected_item in expected_items.items():
+        for item_id in expected_items:
             item = items[item_id]
             _require_exact_fields(item, item_fields, f"review item {item_id}")
-            if not _same_json(item.get("card"), expected_item["card"]):
-                raise ValidationError(f"review item {item_id} static fields do not match packet")
             relevance = item.get("relevance")
             if type(relevance) is not int or relevance not in VALID_RELEVANCE:
                 raise ValidationError(f"review item {item_id}.relevance must be 0..3")

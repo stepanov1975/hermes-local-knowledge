@@ -27,16 +27,16 @@ The script fails before reading or copying private inputs on Windows because thi
 
 ## Human-label contract
 
-`prepare` validates exact packet/mapping case and item coverage, verifies mapped artifact metadata against the frozen index, copies the packet's nonempty labeling instructions into the review, and emits no artifact IDs. It leaves these fields unset for every case and item:
+`prepare` validates exact packet/mapping case and item coverage, verifies mapped artifact metadata against the frozen index, copies the packet's nonempty labeling instructions into the review, and emits neither artifact IDs nor item-card text. It leaves these fields unset for every case and item:
 
 - case `none_needed` and nonempty `rationale`;
 - item `relevance` (`0` through `3`);
 - item `canonical_current` (`true` or `false`);
 - item `harmful_if_primary` (`true` or `false`).
 
-Packet authors must provide only deliberately redacted or synthetic `user_request` and `search_query` inputs. `preceding_context` is accepted as source-only input so an existing packet remains hash-bound, but its message text is never copied into a generated review or benchmark. Put any context a reviewer actually needs into a redacted or synthetic `user_request` instead.
+Packet authors must provide only deliberately redacted or synthetic `user_request` and `search_query` inputs. `preceding_context` and the full item cards are accepted as source-only inputs so the packet remains hash-bound and can be consulted privately during review, but none of their message, summary, description, locator, citation, or excerpt text is copied into a generated review or benchmark. Enter decisions by opaque `item_id`; put any source context that must appear in the review into a deliberately redacted or synthetic `user_request` instead.
 
-Set a nonempty top-level `reviewer` and fill every field. Do not remove or edit the copied instructions, task, query, or item-card fields.
+Set a nonempty top-level `reviewer` and fill every field. Do not remove or edit the copied instructions, task, query, or opaque item handles.
 
 `finalize` reloads the original packet, mapping, and frozen index; reconstructs all static review content; requires exact case/item coverage and explicit labels; and rejects source, identity, metadata, or static-field drift. The benchmark records canonical JSON content hashes for the packet, mapping, and completed review, plus the exact byte SHA-256 of the frozen index snapshot.
 

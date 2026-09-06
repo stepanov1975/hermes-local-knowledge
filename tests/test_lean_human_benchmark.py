@@ -179,6 +179,7 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
     assert first["reviewer"] is None
     assert first["instructions"] == source_packet["instructions"]
     assert "preceding_context" not in first["cases"][0]
+    assert "card" not in first["cases"][0]["items"][0]
     assert first["cases"][0]["none_needed"] is None
     assert first["cases"][0]["items"][0]["relevance"] is None
     assert "skill:owner" not in json.dumps(first, sort_keys=True)
@@ -191,31 +192,51 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
     }
 
 
-def test_prepare_and_finalize_omit_source_only_preceding_context() -> None:
+def test_prepare_and_finalize_omit_source_only_context_and_item_cards() -> None:
     source_packet = packet()
-    private_text = "synthetic transcript-shaped context that must not be copied"
+    private_context = "synthetic transcript-shaped context that must not be copied"
+    private_summary = "synthetic private document summary that must not be copied"
+    private_excerpt = "synthetic private authority excerpt that must not be copied"
     source_packet["cases"][0]["preceding_context"] = [
-        {"role": "user", "content": private_text}
+        {"role": "user", "content": private_context}
+    ]
+    source_packet["cases"][0]["items"][0]["summary"] = private_summary
+    source_packet["cases"][0]["items"][0]["authority_evidence"] = [
+        {"citation": "synthetic:private", "excerpt": private_excerpt}
     ]
     private_mapping = mapping(source_packet)
+    valid_artifacts = index_artifacts()
+    valid_artifacts["skill:owner"]["summary"] = private_summary
 
     review = prepare_review(
         source_packet,
         private_mapping,
         index_sha256=INDEX_SHA,
-        valid_artifacts=index_artifacts(),
+        valid_artifacts=valid_artifacts,
     )
-    assert private_text not in json.dumps(review, sort_keys=True)
+    serialized_review = json.dumps(review, sort_keys=True)
+    assert private_context not in serialized_review
+    assert private_summary not in serialized_review
+    assert private_excerpt not in serialized_review
     assert "preceding_context" not in review["cases"][0]
+    assert set(review["cases"][0]["items"][0]) == {
+        "canonical_current",
+        "harmful_if_primary",
+        "item_id",
+        "relevance",
+    }
 
     benchmark = finalize_benchmark(
         label_review(review),
         source_packet,
         private_mapping,
         index_sha256=INDEX_SHA,
-        valid_artifacts=index_artifacts(),
+        valid_artifacts=valid_artifacts,
     )
-    assert private_text not in json.dumps(benchmark, sort_keys=True)
+    serialized_benchmark = json.dumps(benchmark, sort_keys=True)
+    assert private_context not in serialized_benchmark
+    assert private_summary not in serialized_benchmark
+    assert private_excerpt not in serialized_benchmark
     assert "preceding_context" not in benchmark["cases"][0]
 
 
