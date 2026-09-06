@@ -13,6 +13,7 @@ import pytest
 from scripts.lean_human_benchmark import (
     _frozen_index_snapshot,
     _index_artifacts,
+    _parent_equivalence_map,
     _reject_output_alias,
     _verify_baseline_replay,
     REPOSITORY_ROOT,
@@ -201,9 +202,14 @@ def accepted_decisions(review: dict[str, Any]) -> dict[str, Any]:
 
 def index_artifacts() -> dict[str, dict[str, Any]]:
     return {
-        "skill:owner": {"type": "skill", "title": "Current owner", "path": "skills/current"},
-        "doc:old": {"type": "doc", "title": "Old plan", "path": "plans/old"},
-        "doc:noise": {"type": "doc", "title": "Unrelated", "path": "docs/noise"},
+        "skill:owner": {
+            "type": "skill",
+            "title": "Current owner",
+            "path": "skills/current",
+            "related": [],
+        },
+        "doc:old": {"type": "doc", "title": "Old plan", "path": "plans/old", "related": []},
+        "doc:noise": {"type": "doc", "title": "Unrelated", "path": "docs/noise", "related": []},
     }
 
 
@@ -555,7 +561,7 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
     with pytest.raises(ValidationError, match="limit"):
         compare_rankings(benchmark, tampered, authority)
 
-    with pytest.raises(ValidationError, match="at least 3"):
+    with pytest.raises(ValidationError, match="at least 10"):
         replay_benchmark(benchmark, search, limit=2)
 
     malformed_benchmark = copy.deepcopy(benchmark)
@@ -574,13 +580,130 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
         replay_benchmark(malformed_benchmark, search)
 
 
+def test_comparison_reports_narrow_parent_equivalent_metrics() -> None:
+    review, private_mapping = prepared_review()
+    benchmark = finalize_for_test(review, accepted_decisions(review), private_mapping)
+    baseline = replay_benchmark(
+        benchmark,
+        lambda _query, _artifact_type, _limit: ["skill_support_doc:owner-reference"],
+    )
+    artifacts = {
+        **index_artifacts(),
+        "skill_support_doc:owner-reference": {
+            "type": "skill_support_doc",
+            "title": "Owner reference",
+            "path": "skills/current/references/owner.md",
+            "related": ["skill:owner"],
+        },
+        "skill_support_doc:ambiguous": {
+            "type": "skill_support_doc",
+            "title": "Ambiguous reference",
+            "path": "skills/current/references/ambiguous.md",
+            "related": ["skill:owner", "skill:other"],
+        },
+        "skill:other": {
+            "type": "skill",
+            "title": "Other skill",
+            "path": "skills/other",
+            "related": [],
+        },
+        "doc:neighbor": {
+            "type": "doc",
+            "title": "Graph neighbor",
+            "path": "docs/neighbor.md",
+            "related": ["skill:owner"],
+        },
+    }
+    equivalents = _parent_equivalence_map(artifacts)
+
+    report = compare_rankings(
+        benchmark,
+        baseline,
+        {"records": []},
+        parent_equivalents=equivalents,
+    )
+
+    assert equivalents["skill:owner"] == {"skill_support_doc:owner-reference"}
+    assert "skill_support_doc:ambiguous" not in equivalents
+    assert "doc:neighbor" not in equivalents
+    assert report["baseline"]["acceptable_hit_at_1"] == 0
+    assert report["baseline"]["unjudged_at_1"] == 1
+    assert report["baseline"]["parent_equiv_acceptable_hit_at_1"] == 1
+    assert report["baseline"]["parent_equiv_acceptable_hit_at_3"] == 1
+    assert report["baseline"]["parent_equiv_acceptable_hit_at_5"] == 1
+    assert report["baseline"]["parent_equiv_acceptable_hit_at_10"] == 1
+    assert report["baseline"]["parent_equiv_acceptable_mrr_at_10"] == 1.0
+    assert report["baseline"]["parent_equiv_unjudged_at_1"] == 0
+
+
+def test_comparison_reports_exact_mrr_when_top_one_is_unchanged() -> None:
+    review, private_mapping = prepared_review()
+    benchmark = finalize_for_test(review, accepted_decisions(review), private_mapping)
+    baseline = replay_benchmark(
+        benchmark,
+        lambda query, _artifact_type, _limit: (
+            ["doc:noise", "doc:old", "skill:owner"] if query == "current owner" else []
+        ),
+    )
+    authority = {
+        "records": [
+            {
+                "artifact_id": "doc:old",
+                "status": "historical",
+                "confidence": "high",
+                "policy_eligible": True,
+                "relationships": [
+                    {"kind": "superseded_by", "target_artifact_id": "skill:owner"}
+                ],
+            }
+        ]
+    }
+
+    report = compare_rankings(benchmark, baseline, authority)
+
+    assert report["changed_top_1"] == []
+    assert report["baseline"]["acceptable_hit_at_3"] == 1
+    assert report["candidate"]["acceptable_hit_at_3"] == 1
+    assert report["baseline"]["acceptable_mrr_at_10"] == pytest.approx(1 / 3)
+    assert report["candidate"]["acceptable_mrr_at_10"] == 0.5
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("policy_eligible", "true", "policy_eligible"),
+        ("confidence", "hgh", "confidence"),
+        ("status", "historcal", "status"),
+    ],
+)
+def test_authority_eligibility_fields_are_validated(
+    field: str, value: object, message: str
+) -> None:
+    record: dict[str, Any] = {
+        "artifact_id": "doc:old",
+        "status": "historical",
+        "confidence": "high",
+        "policy_eligible": True,
+        "relationships": [],
+    }
+    record[field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        apply_explicit_supersession(["doc:old"], [record])
+
+
 def test_private_writer_uses_restrictive_modes(tmp_path: Path) -> None:
     destination = tmp_path / "private" / "result.json"
+    if os.name == "nt":
+        with pytest.raises(ValidationError, match="unsupported on Windows"):
+            write_private_json(destination, {"ok": True})
+        assert not destination.exists()
+        return
+
     write_private_json(destination, {"ok": True})
 
-    if os.name != "nt":
-        assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
-        assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX directory modes")
@@ -621,15 +744,21 @@ def test_index_reader_handles_sqlite_uri_characters(tmp_path: Path) -> None:
     index = tmp_path / "frozen?#index.sqlite"
     with sqlite3.connect(index) as connection:
         connection.execute(
-            "CREATE TABLE artifacts (id TEXT PRIMARY KEY, type TEXT, title TEXT, path TEXT)"
+            "CREATE TABLE artifacts ("
+            "id TEXT PRIMARY KEY, type TEXT, title TEXT, path TEXT, related_json TEXT)"
         )
         connection.execute(
-            "INSERT INTO artifacts (id, type, title, path) VALUES (?, ?, ?, ?)",
-            ("skill:owner", "skill", "Current owner", "skills/current"),
+            "INSERT INTO artifacts (id, type, title, path, related_json) VALUES (?, ?, ?, ?, ?)",
+            ("skill:owner", "skill", "Current owner", "skills/current", "[]"),
         )
 
     assert _index_artifacts(index) == {
-        "skill:owner": {"type": "skill", "title": "Current owner", "path": "skills/current"}
+        "skill:owner": {
+            "type": "skill",
+            "title": "Current owner",
+            "path": "skills/current",
+            "related": [],
+        }
     }
 
 
@@ -648,6 +777,7 @@ def test_output_must_not_alias_an_input(tmp_path: Path) -> None:
 
 def test_private_writer_rejects_public_repository_paths() -> None:
     repository_path = Path(__file__).resolve().parents[1] / "PRIVATE" / "result.json"
-    with pytest.raises(ValidationError, match="outside the public repository"):
+    expected_error = "unsupported on Windows" if os.name == "nt" else "outside the public repository"
+    with pytest.raises(ValidationError, match=expected_error):
         write_private_json(repository_path, {"private": True})
     assert not repository_path.exists()

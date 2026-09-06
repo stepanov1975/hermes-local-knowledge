@@ -77,6 +77,11 @@ def load_json(path: Path) -> JsonDict:
 
 
 def write_private_json(path: Path, value: object) -> None:
+    if os.name == "nt":
+        raise ValidationError(
+            "private benchmark output is unsupported on Windows because restrictive ACLs "
+            "cannot be guaranteed"
+        )
     resolved = path.expanduser().resolve(strict=False)
     if resolved.is_relative_to(REPOSITORY_ROOT):
         raise ValidationError(
@@ -654,8 +659,8 @@ def _benchmark_cases(benchmark: JsonDict) -> dict[str, JsonDict]:
 
 
 def replay_benchmark(benchmark: JsonDict, search: SearchFn, *, limit: int = 10) -> JsonDict:
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 3:
-        raise ValidationError("replay limit must be an integer of at least 3")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 10:
+        raise ValidationError("replay limit must be an integer of at least 10")
     cases = _benchmark_cases(benchmark)
     output: list[JsonDict] = []
     for case_id, case in cases.items():
@@ -682,9 +687,18 @@ def _eligible_supersession_edges(records: object) -> list[tuple[str, str]]:
     for index, raw in enumerate(_list(records, "authority.records")):
         record = _dict(raw, f"authority.records[{index}]")
         source = _str(record.get("artifact_id"), f"authority.records[{index}].artifact_id")
-        if record.get("policy_eligible") is not True or record.get("confidence") != "high":
+        policy_eligible = _bool(
+            record.get("policy_eligible"), f"authority record {source}.policy_eligible"
+        )
+        confidence = _str(record.get("confidence"), f"authority record {source}.confidence")
+        if confidence not in {"low", "medium", "high"}:
+            raise ValidationError(f"authority record {source}.confidence is invalid")
+        status = _str(record.get("status"), f"authority record {source}.status")
+        if status not in VALID_LIFECYCLES:
+            raise ValidationError(f"authority record {source}.status is invalid")
+        if not policy_eligible or confidence != "high":
             continue
-        if record.get("status") not in {"historical", "plan", "retired"}:
+        if status not in {"historical", "plan", "retired"}:
             continue
         for rel_index, raw_relationship in enumerate(
             _list(record.get("relationships", []), f"authority record {source}.relationships")
@@ -775,8 +789,8 @@ def _ranking_cases(rankings: JsonDict, benchmark: JsonDict, label: str) -> dict[
     if rankings.get("index_sha256") != benchmark["source"]["index_sha256"]:
         raise ValidationError(f"{label} index hash does not match benchmark")
     limit = rankings.get("limit")
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 3:
-        raise ValidationError(f"{label} limit must be an integer of at least 3")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 10:
+        raise ValidationError(f"{label} limit must be an integer of at least 10")
     cases = _unique_map(rankings.get("cases"), "case_id", f"{label}.cases")
     benchmark_cases = _benchmark_cases(benchmark)
     if set(cases) != set(benchmark_cases):
@@ -811,16 +825,30 @@ def build_candidate_rankings(baseline: JsonDict, authority: JsonDict) -> JsonDic
     }
 
 
-def _score(benchmark_cases: dict[str, JsonDict], ranking_cases: dict[str, JsonDict]) -> JsonDict:
+def _score(
+    benchmark_cases: dict[str, JsonDict],
+    ranking_cases: dict[str, JsonDict],
+    parent_equivalents: dict[str, set[str]] | None = None,
+) -> JsonDict:
+    equivalents = parent_equivalents or {}
     result: JsonDict = {
         "eligible_cases": 0,
         "none_needed_cases": 0,
         "none_needed_with_results": 0,
         "acceptable_hit_at_1": 0,
         "acceptable_hit_at_3": 0,
+        "acceptable_hit_at_5": 0,
+        "acceptable_hit_at_10": 0,
+        "acceptable_mrr_at_10": 0.0,
+        "parent_equiv_acceptable_hit_at_1": 0,
+        "parent_equiv_acceptable_hit_at_3": 0,
+        "parent_equiv_acceptable_hit_at_5": 0,
+        "parent_equiv_acceptable_hit_at_10": 0,
+        "parent_equiv_acceptable_mrr_at_10": 0.0,
         "canonical_current_at_1": 0,
         "harmful_at_1": 0,
         "unjudged_at_1": 0,
+        "parent_equiv_unjudged_at_1": 0,
         "graded_relevance_at_1_sum": 0,
     }
     for case_id, case in benchmark_cases.items():
@@ -833,8 +861,26 @@ def _score(benchmark_cases: dict[str, JsonDict], ranking_cases: dict[str, JsonDi
             continue
         result["eligible_cases"] += 1
         top = ids[0] if ids else None
+        judged_ids = set(labels)
+        acceptable_ids = {
+            artifact_id
+            for artifact_id, label_item in labels.items()
+            if label_item.get("relevance", 0) >= 2
+        }
+        parent_judged_ids = judged_ids | {
+            equivalent
+            for artifact_id in judged_ids
+            for equivalent in equivalents.get(artifact_id, set())
+        }
+        parent_acceptable_ids = acceptable_ids | {
+            equivalent
+            for artifact_id in acceptable_ids
+            for equivalent in equivalents.get(artifact_id, set())
+        }
         if top is not None and top not in labels:
             result["unjudged_at_1"] += 1
+        if top is not None and top not in parent_judged_ids:
+            result["parent_equiv_unjudged_at_1"] += 1
         top_label = labels.get(top, {})
         relevance = top_label.get("relevance", 0)
         result["graded_relevance_at_1_sum"] += relevance
@@ -842,14 +888,50 @@ def _score(benchmark_cases: dict[str, JsonDict], ranking_cases: dict[str, JsonDi
             result["acceptable_hit_at_1"] += 1
         if any(labels.get(artifact_id, {}).get("relevance", 0) >= 2 for artifact_id in ids[:3]):
             result["acceptable_hit_at_3"] += 1
+        if any(labels.get(artifact_id, {}).get("relevance", 0) >= 2 for artifact_id in ids[:5]):
+            result["acceptable_hit_at_5"] += 1
+        exact_acceptable_rank = next(
+            (rank for rank, artifact_id in enumerate(ids[:10], start=1) if artifact_id in acceptable_ids),
+            None,
+        )
+        if exact_acceptable_rank is not None:
+            result["acceptable_hit_at_10"] += 1
+            result["acceptable_mrr_at_10"] += 1.0 / exact_acceptable_rank
+        if top in parent_acceptable_ids:
+            result["parent_equiv_acceptable_hit_at_1"] += 1
+        if any(artifact_id in parent_acceptable_ids for artifact_id in ids[:3]):
+            result["parent_equiv_acceptable_hit_at_3"] += 1
+        if any(artifact_id in parent_acceptable_ids for artifact_id in ids[:5]):
+            result["parent_equiv_acceptable_hit_at_5"] += 1
+        parent_acceptable_rank = next(
+            (
+                rank
+                for rank, artifact_id in enumerate(ids[:10], start=1)
+                if artifact_id in parent_acceptable_ids
+            ),
+            None,
+        )
+        if parent_acceptable_rank is not None:
+            result["parent_equiv_acceptable_hit_at_10"] += 1
+            result["parent_equiv_acceptable_mrr_at_10"] += 1.0 / parent_acceptable_rank
         if top_label.get("canonical_current") is True:
             result["canonical_current_at_1"] += 1
         if top_label.get("harmful_if_primary") is True:
             result["harmful_at_1"] += 1
+    eligible_cases = result["eligible_cases"]
+    if eligible_cases:
+        result["acceptable_mrr_at_10"] /= eligible_cases
+        result["parent_equiv_acceptable_mrr_at_10"] /= eligible_cases
     return result
 
 
-def compare_rankings(benchmark: JsonDict, baseline: JsonDict, authority: JsonDict) -> JsonDict:
+def compare_rankings(
+    benchmark: JsonDict,
+    baseline: JsonDict,
+    authority: JsonDict,
+    *,
+    parent_equivalents: dict[str, set[str]] | None = None,
+) -> JsonDict:
     """Generate the sole allowed candidate internally and compare it with the incumbent."""
 
     benchmark_cases = _benchmark_cases(benchmark)
@@ -875,8 +957,8 @@ def compare_rankings(benchmark: JsonDict, baseline: JsonDict, authority: JsonDic
         "authority_sha256": canonical_sha256(authority),
         "candidate_sha256": canonical_sha256(candidate),
         "candidate_policy": candidate["candidate_policy"],
-        "baseline": _score(benchmark_cases, baseline_cases),
-        "candidate": _score(benchmark_cases, candidate_cases),
+        "baseline": _score(benchmark_cases, baseline_cases, parent_equivalents),
+        "candidate": _score(benchmark_cases, candidate_cases, parent_equivalents),
         "changed_top_1": changed,
         "manual_review_required": bool(changed),
         "automatic_release_verdict": None,
@@ -888,7 +970,9 @@ def _index_artifacts(path: Path) -> dict[str, JsonDict]:
         uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
         connection = sqlite3.connect(uri, uri=True)
         try:
-            rows = connection.execute("SELECT id, type, title, path FROM artifacts").fetchall()
+            rows = connection.execute(
+                "SELECT id, type, title, path, related_json FROM artifacts"
+            ).fetchall()
         finally:
             connection.close()
     except sqlite3.Error as exc:
@@ -898,12 +982,45 @@ def _index_artifacts(path: Path) -> dict[str, JsonDict]:
         artifact_id = _str(row[0], "frozen index artifact id")
         if artifact_id in artifacts:
             raise ValidationError(f"duplicate artifact {artifact_id!r} in frozen index")
+        try:
+            related = json.loads(str(row[4]))
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"frozen index artifact {artifact_id}.related_json is invalid"
+            ) from exc
+        related_values = _list(related, f"frozen index artifact {artifact_id}.related")
         artifacts[artifact_id] = {
             "type": _str(row[1], f"frozen index artifact {artifact_id}.type"),
             "title": _str(row[2], f"frozen index artifact {artifact_id}.title"),
             "path": _str(row[3], f"frozen index artifact {artifact_id}.path"),
+            "related": [
+                _str(value, f"frozen index artifact {artifact_id}.related")
+                for value in related_values
+            ],
         }
     return artifacts
+
+
+def _parent_equivalence_map(artifacts: dict[str, JsonDict]) -> dict[str, set[str]]:
+    """Relate each support document only to its one unambiguous owning skill."""
+
+    equivalents: dict[str, set[str]] = {}
+    for artifact_id, artifact in artifacts.items():
+        if artifact.get("type") != "skill_support_doc":
+            continue
+        parents = {
+            related_id
+            for related_id in artifact.get("related", [])
+            if related_id.startswith("skill:")
+            and related_id in artifacts
+            and artifacts[related_id].get("type") == "skill"
+        }
+        if len(parents) != 1:
+            continue
+        parent = next(iter(parents))
+        equivalents.setdefault(artifact_id, set()).add(parent)
+        equivalents.setdefault(parent, set()).add(artifact_id)
+    return equivalents
 
 
 def _checkout_index_module() -> Any:
@@ -1013,8 +1130,14 @@ def _cli_compare(args: argparse.Namespace) -> JsonDict:
         if file_sha256(snapshot) != benchmark["source"]["index_sha256"]:
             raise ValidationError("frozen index hash does not match benchmark")
         replayed = _replay_frozen_index(benchmark, snapshot, limit=baseline["limit"])
+        parent_equivalents = _parent_equivalence_map(_index_artifacts(snapshot))
     _verify_baseline_replay(baseline, replayed)
-    report = compare_rankings(benchmark, baseline, authority)
+    report = compare_rankings(
+        benchmark,
+        baseline,
+        authority,
+        parent_equivalents=parent_equivalents,
+    )
     write_private_json(output, report)
     return {"output": str(Path(args.output)), "changed_top_1": len(report["changed_top_1"])}
 
