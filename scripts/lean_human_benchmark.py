@@ -8,14 +8,18 @@ not publish private cases and it never mutates an index or telemetry database.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import copy
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
+import stat
+import sys
 import tempfile
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 
 JsonDict = dict[str, Any]
@@ -32,6 +36,8 @@ VALID_ROLES = {
 }
 VALID_LIFECYCLES = {"current", "historical", "draft", "plan", "retired", "unknown"}
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 
 class ValidationError(ValueError):
@@ -66,8 +72,15 @@ def write_private_json(path: Path, value: object) -> None:
             f"private output must be outside the public repository {REPOSITORY_ROOT}"
         )
     path = resolved
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=False, mode=0o700)
+    except FileExistsError:
+        if not path.parent.is_dir():
+            raise ValidationError(f"private output parent is not a directory: {path.parent}")
+    else:
+        os.chmod(path.parent, 0o700)
+    if os.name != "nt" and stat.S_IMODE(path.parent.stat().st_mode) != 0o700:
+        raise ValidationError(f"private output directory must have mode 0700: {path.parent}")
     payload = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
@@ -82,6 +95,21 @@ def write_private_json(path: Path, value: object) -> None:
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+
+
+@contextmanager
+def _frozen_index_snapshot(path: Path) -> Iterator[Path]:
+    source_path = path.expanduser().resolve()
+    with tempfile.TemporaryDirectory(prefix="hermes-local-knowledge-index-") as directory:
+        snapshot = Path(directory) / "index.sqlite"
+        try:
+            with source_path.open("rb") as source, snapshot.open("xb") as target:
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+        except OSError as exc:
+            raise ValidationError(f"cannot snapshot frozen index {source_path}: {exc}") from exc
+        yield snapshot
 
 
 def _dict(value: object, label: str) -> JsonDict:
@@ -561,6 +589,8 @@ def _benchmark_cases(benchmark: JsonDict) -> dict[str, JsonDict]:
 
 
 def replay_benchmark(benchmark: JsonDict, search: SearchFn, *, limit: int = 10) -> JsonDict:
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 3:
+        raise ValidationError("replay limit must be an integer of at least 3")
     cases = _benchmark_cases(benchmark)
     output: list[JsonDict] = []
     for case_id, case in cases.items():
@@ -675,8 +705,8 @@ def _ranking_cases(rankings: JsonDict, benchmark: JsonDict, label: str) -> dict[
     if rankings.get("index_sha256") != benchmark["source"]["index_sha256"]:
         raise ValidationError(f"{label} index hash does not match benchmark")
     limit = rankings.get("limit")
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-        raise ValidationError(f"{label} limit must be a positive integer")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 3:
+        raise ValidationError(f"{label} limit must be an integer of at least 3")
     cases = _unique_map(rankings.get("cases"), "case_id", f"{label}.cases")
     benchmark_cases = _benchmark_cases(benchmark)
     if set(cases) != set(benchmark_cases):
@@ -811,35 +841,46 @@ def _cli_prepare(args: argparse.Namespace) -> JsonDict:
 
 def _cli_finalize(args: argparse.Namespace) -> JsonDict:
     index = Path(args.index)
-    benchmark = finalize_benchmark(
-        load_json(Path(args.review)),
-        load_json(Path(args.decisions)),
-        load_json(Path(args.packet)),
-        load_json(Path(args.mapping)),
-        load_json(Path(args.rater_a)),
-        load_json(Path(args.rater_b)),
-        index_sha256=file_sha256(index),
-        valid_artifact_ids=_index_artifact_ids(index),
-    )
+    with _frozen_index_snapshot(index) as snapshot:
+        benchmark = finalize_benchmark(
+            load_json(Path(args.review)),
+            load_json(Path(args.decisions)),
+            load_json(Path(args.packet)),
+            load_json(Path(args.mapping)),
+            load_json(Path(args.rater_a)),
+            load_json(Path(args.rater_b)),
+            index_sha256=file_sha256(snapshot),
+            valid_artifact_ids=_index_artifact_ids(snapshot),
+        )
     write_private_json(Path(args.output), benchmark)
     return {"output": str(Path(args.output)), "cases": len(benchmark["cases"]), "human_gold": True}
 
 
 def _cli_replay(args: argparse.Namespace) -> JsonDict:
-    from hermes_local_knowledge.index import search_index
+    from hermes_local_knowledge import index as index_module
+
+    expected_module = (REPOSITORY_ROOT / "hermes_local_knowledge" / "index.py").resolve()
+    loaded_module = Path(index_module.__file__ or "").resolve()
+    if loaded_module != expected_module:
+        raise ValidationError(
+            f"replay must load index code from reviewed checkout {expected_module}, got {loaded_module}"
+        )
 
     benchmark = load_json(Path(args.benchmark))
     index = Path(args.index)
-    if file_sha256(index) != benchmark["source"]["index_sha256"]:
-        raise ValidationError("frozen index hash does not match benchmark")
+    with _frozen_index_snapshot(index) as snapshot:
+        if file_sha256(snapshot) != benchmark["source"]["index_sha256"]:
+            raise ValidationError("frozen index hash does not match benchmark")
 
-    def search(query: str, artifact_type: str | None, limit: int) -> list[str]:
-        return [
-            str(row["id"])
-            for row in search_index(index, query, limit=limit, artifact_type=artifact_type)
-        ]
+        def search(query: str, artifact_type: str | None, limit: int) -> list[str]:
+            return [
+                str(row["id"])
+                for row in index_module.search_index(
+                    snapshot, query, limit=limit, artifact_type=artifact_type
+                )
+            ]
 
-    rankings = replay_benchmark(benchmark, search, limit=args.limit)
+        rankings = replay_benchmark(benchmark, search, limit=args.limit)
     write_private_json(Path(args.output), rankings)
     return {"output": str(Path(args.output)), "cases": len(rankings["cases"])}
 

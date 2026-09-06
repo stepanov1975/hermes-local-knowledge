@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from scripts.lean_human_benchmark import (
+    _frozen_index_snapshot,
     ValidationError,
     apply_explicit_supersession,
     build_candidate_rankings,
@@ -437,6 +438,9 @@ def test_replay_candidate_and_comparison_are_same_membership_and_decision_focuse
     with pytest.raises(ValidationError, match="limit"):
         compare_rankings(benchmark, tampered, authority)
 
+    with pytest.raises(ValidationError, match="at least 3"):
+        replay_benchmark(benchmark, search, limit=2)
+
 
 def test_private_writer_uses_restrictive_modes(tmp_path: Path) -> None:
     destination = tmp_path / "private" / "result.json"
@@ -445,6 +449,27 @@ def test_private_writer_uses_restrictive_modes(tmp_path: Path) -> None:
     if os.name != "nt":
         assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
         assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not expose POSIX directory modes")
+def test_private_writer_rejects_insecure_existing_directory(tmp_path: Path) -> None:
+    destination = tmp_path / "shared" / "result.json"
+    destination.parent.mkdir(mode=0o755)
+    destination.parent.chmod(0o755)
+
+    with pytest.raises(ValidationError, match="mode 0700"):
+        write_private_json(destination, {"private": True})
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o755
+    assert not destination.exists()
+
+
+def test_frozen_index_snapshot_survives_source_replacement(tmp_path: Path) -> None:
+    source = tmp_path / "index.sqlite"
+    source.write_bytes(b"frozen")
+
+    with _frozen_index_snapshot(source) as snapshot:
+        source.write_bytes(b"replacement")
+        assert snapshot.read_bytes() == b"frozen"
 
 
 def test_private_writer_rejects_public_repository_paths() -> None:

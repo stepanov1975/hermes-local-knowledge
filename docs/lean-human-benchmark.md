@@ -3,6 +3,7 @@
 Use `scripts/lean_human_benchmark.py` to make a bounded local deployment decision about one deterministic ranking change. It is intentionally not a population-level retrieval study.
 
 Private task text, annotations, mappings, indexes, decisions, rankings, and reports must remain outside this public repository. Generated JSON is written with mode `0600` under mode-`0700` directories, and the writer rejects output paths inside this repository.
+On POSIX systems, an existing output directory must already have mode `0700`; the evaluator never changes permissions on caller-owned directories.
 
 ## Contract
 
@@ -13,6 +14,8 @@ The script is the single authoritative validator. It binds a finalized benchmark
 - both draft annotation inputs;
 - the frozen index;
 - the exact human-review packet.
+
+Finalization and replay use one private snapshot of the supplied frozen index for hashing and every subsequent read, so an atomic index rebuild cannot mix snapshots under one recorded hash. Replay always loads ranking code from the reviewed checkout and requires a result limit of at least three because the report includes Hit@3.
 
 Every case must have an explicit human decision. `accepted_proposal` accepts the deterministic draft proposal for that case; `edited` accepts the proposal except for explicit `none_needed` or item-field overrides. Finalization rejects missing or extra cases, unknown item handles, mapping drift, index drift, unresolved decisions, and mapped artifacts absent from the frozen index.
 
