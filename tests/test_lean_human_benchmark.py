@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 import stat
 from typing import Any
@@ -441,8 +442,9 @@ def test_private_writer_uses_restrictive_modes(tmp_path: Path) -> None:
     destination = tmp_path / "private" / "result.json"
     write_private_json(destination, {"ok": True})
 
-    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
-    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o600
 
 
 def test_private_writer_rejects_public_repository_paths() -> None:

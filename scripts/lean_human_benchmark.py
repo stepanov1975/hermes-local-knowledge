@@ -72,11 +72,11 @@ def write_private_json(path: Path, value: object) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
         temporary.replace(path)
         os.chmod(path, 0o600)
     except Exception:
