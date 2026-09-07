@@ -1343,7 +1343,7 @@ def test_registered_post_tool_hook_classifies_canonical_outcomes(
     assert "private timeout detail" not in db_text(state_dir)
 
 
-def test_current_candidate_schema_without_worker_lease_is_upgraded(tmp_path: Path) -> None:
+def test_prelease_queue_is_discovered_and_upgraded_without_candidate_loss(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     db_path = okf.okf_queue_db_path(state_dir)
@@ -1353,9 +1353,25 @@ def test_current_candidate_schema_without_worker_lease_is_upgraded(tmp_path: Pat
         )
         conn.execute(f"CREATE TABLE okf_candidates ({columns_sql})")
         conn.execute(
-            "INSERT INTO okf_candidates (tool_name, first_seen, last_seen) VALUES (?, ?, ?)",
-            ("historical_tool", "2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z"),
+            "INSERT INTO okf_candidates "
+            "(tool_name, generator_version, first_seen, last_seen, use_count) VALUES (?, ?, ?, ?, ?)",
+            (
+                "historical_tool",
+                okf.LEGACY_OKF_GENERATOR_VERSION,
+                "2026-07-01T00:00:00Z",
+                "2026-07-01T00:00:00Z",
+                1,
+            ),
         )
+
+    assert okf.has_generation_work(
+        state_dir,
+        min_use_count=1,
+        stale_after_seconds=60,
+        now="2026-09-07T00:00:00Z",
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA table_info(okf_worker_leases)").fetchall() == []
 
     okf.upsert_tool_candidate(
         state_dir,
