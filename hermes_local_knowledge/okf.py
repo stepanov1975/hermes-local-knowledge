@@ -699,6 +699,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         missing = set(_CANDIDATE_COLUMNS) - existing
         if missing:
             raise RuntimeError(f"okf_candidates is missing required current columns: {sorted(missing)}")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS okf_worker_leases (
+              name TEXT PRIMARY KEY,
+              owner TEXT NOT NULL,
+              expires_at REAL NOT NULL
+            )
+            """
+        )
         _validate_lease_table(conn)
         return
 

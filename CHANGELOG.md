@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.19] - 2026-09-07
+
+### Fixed
+
+- Created the OKF worker lease table when opening a pre-lease queue database, restoring tool-candidate recording after upgrades while preserving existing candidates.
+
+[0.4.19]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.18...v0.4.19
+
 ## [0.4.18] - 2026-08-31
 
 ### Changed
