@@ -699,6 +699,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         missing = set(_CANDIDATE_COLUMNS) - existing
         if missing:
             raise RuntimeError(f"okf_candidates is missing required current columns: {sorted(missing)}")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS okf_worker_leases (
+              name TEXT PRIMARY KEY,
+              owner TEXT NOT NULL,
+              expires_at REAL NOT NULL
+            )
+            """
+        )
         _validate_lease_table(conn)
         return
 
@@ -954,8 +963,21 @@ def has_generation_work(
         return False
     try:
         conn.execute("PRAGMA query_only=ON")
-        row = conn.execute(
+        lease_table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'okf_worker_leases'"
+        ).fetchone()
+        lease_guard = ""
+        lease_parameters: tuple[object, ...] = ()
+        if lease_table_exists is not None:
+            lease_guard = """
+              AND NOT EXISTS (
+                SELECT 1 FROM okf_worker_leases
+                WHERE name = ? AND expires_at > ?
+              )
             """
+            lease_parameters = (GENERATION_LEASE_NAME, current_dt.timestamp())
+        row = conn.execute(
+            f"""
             SELECT CASE WHEN
               EXISTS (
                 SELECT 1 FROM okf_candidates
@@ -973,10 +995,7 @@ def has_generation_work(
                       )
                 LIMIT 1
               )
-              AND NOT EXISTS (
-                SELECT 1 FROM okf_worker_leases
-                WHERE name = ? AND expires_at > ?
-              )
+              {lease_guard}
             THEN 1 ELSE 0 END
             """,
             (
@@ -988,8 +1007,7 @@ def has_generation_work(
                 OKF_GENERATOR_VERSION,
                 LEGACY_OKF_GENERATOR_VERSION,
                 cutoff,
-                GENERATION_LEASE_NAME,
-                current_dt.timestamp(),
+                *lease_parameters,
             ),
         ).fetchone()
         return row is not None and row[0] == 1

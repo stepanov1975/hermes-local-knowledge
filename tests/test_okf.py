@@ -1343,6 +1343,70 @@ def test_registered_post_tool_hook_classifies_canonical_outcomes(
     assert "private timeout detail" not in db_text(state_dir)
 
 
+def test_prelease_queue_is_discovered_and_upgraded_without_candidate_loss(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    db_path = okf.okf_queue_db_path(state_dir)
+    with sqlite3.connect(db_path) as conn:
+        columns_sql = ",\n".join(
+            f"{name} {definition}" for name, definition in okf._COLUMN_DEFINITIONS.items()
+        )
+        conn.execute(f"CREATE TABLE okf_candidates ({columns_sql})")
+        conn.execute(
+            "INSERT INTO okf_candidates "
+            "(tool_name, generator_version, first_seen, last_seen, use_count) VALUES (?, ?, ?, ?, ?)",
+            (
+                "historical_tool",
+                okf.LEGACY_OKF_GENERATOR_VERSION,
+                "2026-07-01T00:00:00Z",
+                "2026-07-01T00:00:00Z",
+                1,
+            ),
+        )
+
+    assert okf.has_generation_work(
+        state_dir,
+        min_use_count=1,
+        stale_after_seconds=60,
+        now="2026-09-07T00:00:00Z",
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA table_info(okf_worker_leases)").fetchall() == []
+
+    okf.upsert_tool_candidate(
+        state_dir,
+        tool_name="new_tool",
+        toolset="demo",
+        schema={"type": "object"},
+        args={},
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT tool_name FROM okf_candidates ORDER BY tool_name").fetchall() == [
+            ("historical_tool",),
+            ("new_tool",),
+        ]
+        table_info = conn.execute("PRAGMA table_info(okf_worker_leases)").fetchall()
+    assert [row[1] for row in table_info] == ["name", "owner", "expires_at"]
+    assert [row[1] for row in table_info if row[5]] == ["name"]
+
+
+def test_schema_check_preserves_a_caller_owned_transaction(tmp_path: Path) -> None:
+    okf.upsert_tool_candidate(
+        tmp_path,
+        tool_name="transaction_tool",
+        toolset="demo",
+        schema={"type": "object"},
+        args={},
+    )
+
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        okf._ensure_schema(conn)
+        assert conn.in_transaction
+        conn.rollback()
+
+
 def test_current_schema_accepts_historical_order_nullable_fields_and_unknown_extras(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
