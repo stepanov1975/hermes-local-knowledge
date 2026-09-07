@@ -221,6 +221,38 @@ def artifact(
     )
 
 
+def test_mixed_quote_script_to_write_keeps_isolated_guidance_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Synthetic task: inspect isolated-development guidance before writing a
+    # transfer test script. The existing live-environment script is not that guide.
+    guide = artifact(
+        "doc:orchid-isolated-development",
+        "doc",
+        "Orchid 2.0 isolated development",
+        path="docs/orchid-isolated-development.md",
+        summary="Isolated development guidance for writing an upload download test script.",
+    )
+    live_script = artifact(
+        "script:orchid-transfer-check",
+        "script",
+        "Orchid 2.0 transfer check",
+        path="scripts/orchid-transfer-check.py",
+        summary="Upload download script checking existing live-environment storage.",
+    )
+    db = build_fixture_index(tmp_path, monkeypatch, [guide, live_script])
+
+    results = index_owner.search_index(
+        db, '"Orchid 2.0" isolated development upload download script', limit=10
+    )
+
+    assert results[0]["id"] == guide.id
+    # Keep the distractor retrievable: otherwise this would not catch a later
+    # post-retrieval rule that blindly promotes the first script in the page.
+    assert live_script.id in {row["id"] for row in results[1:]}
+
+
 ALIASES = (
     "runbook runbooks skill skills doc docs document documents documentation "
     "reference references memory memories"

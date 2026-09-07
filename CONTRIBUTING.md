@@ -52,6 +52,13 @@ Generated or local-only files must stay out of commits, including:
 - `knowledge/`, `state/`, `logs/`, `tmp/`;
 - caches, build outputs, mutation-test workspaces, and virtualenvs.
 
+## Evaluating search changes
+
+Use the [bounded search-change evaluation guide](docs/search-evaluation.md) to
+freeze expectations, distinguish judgment provenance, inspect changed first
+results, and decide whether to accept or shelve a candidate. Synthetic regression
+tests belong in the existing test suite; private experiment data does not.
+
 ## Scope guidelines
 
 Prefer behavior-level fixes over speculative abstractions. If a change expands what the index scans by default, explain the privacy impact and add tests for private/local-state exclusion.
