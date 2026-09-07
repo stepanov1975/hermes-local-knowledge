@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,15 +23,50 @@ from scripts.lean_human_benchmark import (
     _reject_output_alias,
     canonical_sha256,
     file_sha256,
-    finalize_benchmark,
+    finalize_benchmark as _finalize_benchmark,
     load_json,
     main,
-    prepare_review,
+    prepare_review as _prepare_review,
     write_private_json,
 )
 
 
 INDEX_SHA = "1" * 64
+BLINDING_KEY = bytes(range(32))
+
+
+def prepare_review(
+    source_packet: dict[str, Any],
+    private_mapping: dict[str, Any],
+    *,
+    index_sha256: str,
+    valid_artifacts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return _prepare_review(
+        source_packet,
+        private_mapping,
+        index_sha256=index_sha256,
+        valid_artifacts=valid_artifacts,
+        blinding_key=BLINDING_KEY,
+    )
+
+
+def finalize_benchmark(
+    review: dict[str, Any],
+    source_packet: dict[str, Any],
+    private_mapping: dict[str, Any],
+    *,
+    index_sha256: str,
+    valid_artifacts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return _finalize_benchmark(
+        review,
+        source_packet,
+        private_mapping,
+        index_sha256=index_sha256,
+        valid_artifacts=valid_artifacts,
+        blinding_key=BLINDING_KEY,
+    )
 
 
 def packet() -> dict[str, Any]:
@@ -193,16 +229,29 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
         [1, 2],
         [1],
     ]
-    public_mapping_digest = bytes.fromhex(first["source"]["mapping_sha256"])
-    private_mapping_key = benchmark_module._review_mapping_key(private_mapping)
+    private_mapping_key = benchmark_module._review_handle_key(
+        BLINDING_KEY,
+        source_packet,
+        private_mapping,
+        INDEX_SHA,
+    )
+    mapping_guess_keys = (
+        benchmark_module._canonical_json_bytes(private_mapping),
+        bytes.fromhex(canonical_sha256(private_mapping)),
+        hashlib.sha256(
+            benchmark_module.REVIEW_HANDLE_KEY_DOMAIN
+            + benchmark_module._canonical_json_bytes(private_mapping)
+        ).digest(),
+    )
     for packet_case, review_case in zip(source_packet["cases"], first["cases"], strict=True):
         assert (
             benchmark_module._review_case_id(private_mapping_key, packet_case["case_id"])
             == review_case["case_id"]
         )
-        assert (
-            benchmark_module._review_case_id(public_mapping_digest, packet_case["case_id"])
+        assert all(
+            benchmark_module._review_case_id(guess_key, packet_case["case_id"])
             != review_case["case_id"]
+            for guess_key in mapping_guess_keys
         )
         for packet_item, review_item in zip(
             packet_case["items"], review_case["items"], strict=True
@@ -215,23 +264,47 @@ def test_prepare_is_deterministic_explicit_and_blinded() -> None:
                 )
                 == review_item["item_id"]
             )
-            assert (
+            assert all(
                 benchmark_module._review_item_id(
-                    public_mapping_digest,
-                    packet_case["case_id"],
-                    packet_item["item_id"],
+                    guess_key, packet_case["case_id"], packet_item["item_id"]
                 )
                 != review_item["item_id"]
+                for guess_key in mapping_guess_keys
             )
     assert first["cases"][0]["none_needed"] is None
     assert first["cases"][0]["items"][0]["relevance"] is None
     assert "skill:owner" not in json.dumps(first, sort_keys=True)
-    assert first["source"] == {
-        "index_sha256": INDEX_SHA,
-        "mapping_sha256": canonical_sha256(private_mapping),
-        "packet_sha256": canonical_sha256(source_packet),
-        "rubric_sha256": "2" * 64,
-    }
+    assert "source" not in first
+
+    independently_keyed = _prepare_review(
+        source_packet,
+        private_mapping,
+        index_sha256=INDEX_SHA,
+        valid_artifacts=index_artifacts(),
+        blinding_key=b"x" * 32,
+    )
+    assert independently_keyed["review_id"] != first["review_id"]
+    assert [case["case_id"] for case in independently_keyed["cases"]] != review_case_ids
+    assert [
+        item["item_id"] for case in independently_keyed["cases"] for item in case["items"]
+    ] != review_item_ids
+    with pytest.raises(ValidationError, match="exactly 32 bytes"):
+        _prepare_review(
+            source_packet,
+            private_mapping,
+            index_sha256=INDEX_SHA,
+            valid_artifacts=index_artifacts(),
+            blinding_key=b"short",
+        )
+    with pytest.raises(ValidationError, match="review identity does not match"):
+        _finalize_benchmark(
+            label_review(first),
+            source_packet,
+            private_mapping,
+            index_sha256=INDEX_SHA,
+            valid_artifacts=index_artifacts(),
+            blinding_key=b"x" * 32,
+        )
 
 
 def test_prepare_reblinds_identity_bearing_source_identifiers() -> None:
@@ -339,7 +412,14 @@ def test_finalize_requires_explicit_human_labels_and_maps_private_ids() -> None:
     assert benchmark["reviewer"] == "Alex"
     assert benchmark["instructions"] == source_packet["instructions"]
     assert "preceding_context" not in benchmark["cases"][0]
-    assert benchmark["source"]["review_sha256"] == canonical_sha256(labeled)
+    assert benchmark["source"] == {
+        "packet_id": source_packet["packet_id"],
+        "packet_sha256": canonical_sha256(source_packet),
+        "mapping_sha256": canonical_sha256(private_mapping),
+        "index_sha256": INDEX_SHA,
+        "rubric_sha256": source_packet["rubric_sha256"],
+        "review_sha256": canonical_sha256(labeled),
+    }
     assert "human_rationale" not in benchmark["cases"][0]
     assert benchmark["cases"][0]["items"][0] == {
         "artifact_id": "skill:owner",
@@ -523,8 +603,8 @@ def test_finalize_rejects_unresolved_case_and_source_identity() -> None:
         )
 
     wrong_source = label_review(review)
-    wrong_source["source"]["index_sha256"] = "4" * 64
-    with pytest.raises(ValidationError, match="source"):
+    wrong_source["source"] = {"index_sha256": "4" * 64}
+    with pytest.raises(ValidationError, match="invalid fields"):
         finalize_benchmark(
             wrong_source,
             source_packet,
@@ -720,6 +800,11 @@ def test_strict_json_rejects_duplicate_keys_and_nonfinite_numbers(tmp_path: Path
         load_json(invalid_utf8)
     with pytest.raises(ValidationError, match="JSON-serializable"):
         canonical_sha256({"value": float("nan")})
+    if os.name != "nt":
+        surrogate_output = tmp_path / "surrogate.json"
+        with pytest.raises(ValidationError, match="unpaired Unicode surrogates"):
+            write_private_json(surrogate_output, {"value": "\ud800"})
+        assert not surrogate_output.exists()
 
 
 def test_private_writer_uses_restrictive_modes_and_rejects_repository_paths(
@@ -886,6 +971,30 @@ def test_index_reader_rejects_wrong_format_version(tmp_path: Path) -> None:
         _index_artifacts(index_path)
 
 
+def test_cli_keygen_creates_private_key_without_overwrite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX private-file contract")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    workspace.chmod(0o700)
+    key_path = workspace / "blinding-key.json"
+
+    assert main(["keygen", "--output", str(key_path)]) == 0
+    key_document = load_json(key_path)
+    assert key_document["schema_version"] == 1
+    assert re.fullmatch(r"[0-9a-f]{64}", key_document["key_hex"])
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["keygen", "--output", str(key_path)])
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out.count('"output"') == 1
+    assert "refusing to replace existing blinding key" in captured.err
+
+
 def test_cli_prepare_and_finalize_real_private_index(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     if os.name == "nt":
         pytest.skip("POSIX private-file contract")
@@ -899,11 +1008,13 @@ def test_cli_prepare_and_finalize_real_private_index(tmp_path: Path, capsys: pyt
     private_mapping = mapping(source_packet, index_sha256=file_sha256(index_path))
     packet_path = workspace / "packet.json"
     mapping_path = workspace / "mapping.json"
+    key_path = workspace / "blinding-key.json"
     review_path = workspace / "review.json"
     labeled_path = workspace / "review-labeled.json"
     benchmark_path = workspace / "benchmark.json"
     write_secure_json(packet_path, source_packet)
     write_secure_json(mapping_path, private_mapping)
+    write_secure_json(key_path, {"schema_version": 1, "key_hex": BLINDING_KEY.hex()})
 
     assert main(
         [
@@ -912,6 +1023,8 @@ def test_cli_prepare_and_finalize_real_private_index(tmp_path: Path, capsys: pyt
             str(packet_path),
             "--mapping",
             str(mapping_path),
+            "--blinding-key",
+            str(key_path),
             "--index",
             str(index_path),
             "--output",
@@ -930,6 +1043,8 @@ def test_cli_prepare_and_finalize_real_private_index(tmp_path: Path, capsys: pyt
             str(packet_path),
             "--mapping",
             str(mapping_path),
+            "--blinding-key",
+            str(key_path),
             "--index",
             str(index_path),
             "--output",
@@ -970,9 +1085,11 @@ def test_cli_rejects_unpaired_unicode_surrogates_without_traceback(
 
     packet_path = workspace / "packet.json"
     mapping_path = workspace / "mapping.json"
+    key_path = workspace / "blinding-key.json"
     review_path = workspace / "review.json"
     write_secure_json(packet_path, source_packet)
     write_secure_json(mapping_path, private_mapping)
+    write_secure_json(key_path, {"schema_version": 1, "key_hex": BLINDING_KEY.hex()})
     write_secure_json(review_path, review)
 
     commands = (
@@ -982,6 +1099,8 @@ def test_cli_rejects_unpaired_unicode_surrogates_without_traceback(
             str(packet_path),
             "--mapping",
             str(mapping_path),
+            "--blinding-key",
+            str(key_path),
             "--index",
             str(index_path),
             "--output",
@@ -995,6 +1114,8 @@ def test_cli_rejects_unpaired_unicode_surrogates_without_traceback(
             str(packet_path),
             "--mapping",
             str(mapping_path),
+            "--blinding-key",
+            str(key_path),
             "--index",
             str(index_path),
             "--output",

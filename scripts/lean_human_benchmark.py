@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import copy
 import hashlib
 import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
@@ -38,6 +38,7 @@ VALID_ARTIFACT_TYPES = {
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REVIEWER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}")
 REVIEW_HANDLE_KEY_DOMAIN = b"hermes-local-knowledge/lean-review-handle-key/v1\0"
+BLINDING_KEY_BYTES = 32
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
@@ -143,25 +144,46 @@ def canonical_sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
-def _review_mapping_key(mapping: JsonDict) -> bytes:
-    return hashlib.sha256(REVIEW_HANDLE_KEY_DOMAIN + _canonical_json_bytes(mapping)).digest()
+def _validated_blinding_key(value: object) -> bytes:
+    if not isinstance(value, bytes) or len(value) != BLINDING_KEY_BYTES:
+        raise ValidationError(f"blinding key must contain exactly {BLINDING_KEY_BYTES} bytes")
+    return value
 
 
-def _review_case_id(mapping_key: bytes, case_id: str) -> str:
+def _review_handle_key(
+    blinding_key: bytes,
+    packet: JsonDict,
+    mapping: JsonDict,
+    index_sha256: str,
+) -> bytes:
+    key = _validated_blinding_key(blinding_key)
+    context = {
+        "packet_sha256": canonical_sha256(packet),
+        "mapping_sha256": canonical_sha256(mapping),
+        "index_sha256": index_sha256,
+    }
+    return hmac.new(
+        key,
+        REVIEW_HANDLE_KEY_DOMAIN + _canonical_json_bytes(context),
+        hashlib.sha256,
+    ).digest()
+
+
+def _review_case_id(handle_key: bytes, case_id: str) -> str:
     message = f"case\0{case_id}".encode("utf-8")
-    digest = hmac.new(mapping_key, message, hashlib.sha256).hexdigest()
+    digest = hmac.new(handle_key, message, hashlib.sha256).hexdigest()
     return f"case-{digest[:32]}"
 
 
-def _review_item_id(mapping_key: bytes, case_id: str, item_id: str) -> str:
+def _review_item_id(handle_key: bytes, case_id: str, item_id: str) -> str:
     message = f"item\0{case_id}\0{item_id}".encode("utf-8")
-    digest = hmac.new(mapping_key, message, hashlib.sha256).hexdigest()
+    digest = hmac.new(handle_key, message, hashlib.sha256).hexdigest()
     return f"item-{digest[:32]}"
 
 
-def _review_id(mapping_key: bytes, packet: JsonDict, index_sha256: str) -> str:
+def _review_id(handle_key: bytes, packet: JsonDict, index_sha256: str) -> str:
     message = f"review\0{canonical_sha256(packet)}\0{index_sha256}".encode("ascii")
-    digest = hmac.new(mapping_key, message, hashlib.sha256).hexdigest()
+    digest = hmac.new(handle_key, message, hashlib.sha256).hexdigest()
     return f"review-{digest[:32]}"
 
 
@@ -205,6 +227,21 @@ def load_json(path: Path) -> JsonDict:
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValidationError(f"cannot read JSON {path}: {exc}") from exc
     return _object(value, str(path))
+
+
+def _blinding_key_document(blinding_key: bytes) -> JsonDict:
+    key = _validated_blinding_key(blinding_key)
+    return {"schema_version": 1, "key_hex": key.hex()}
+
+
+def _load_blinding_key(path: Path) -> bytes:
+    data = load_json(path)
+    _require_exact_fields(data, {"schema_version", "key_hex"}, "blinding key")
+    _require_schema_version_one(data.get("schema_version"), "blinding key.schema_version")
+    key_hex = _text(data.get("key_hex"), "blinding key.key_hex")
+    if len(key_hex) != BLINDING_KEY_BYTES * 2 or any(char not in HEX_CHARS for char in key_hex):
+        raise ValidationError("blinding key.key_hex must contain exactly 64 lowercase hex characters")
+    return _validated_blinding_key(bytes.fromhex(key_hex))
 
 
 def _repository_roots() -> tuple[Path, ...]:
@@ -306,13 +343,18 @@ def write_private_json(path: Path, value: object) -> None:
     resolved = _resolved_private_path(path, "private output")
     _ensure_private_output_directory(resolved.parent)
     try:
-        payload = json.dumps(
-            value,
-            indent=2,
-            sort_keys=True,
-            ensure_ascii=False,
-            allow_nan=False,
-        ) + "\n"
+        payload = (
+            json.dumps(
+                value,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValidationError("private output must not contain unpaired Unicode surrogates") from exc
     except (TypeError, ValueError) as exc:
         raise ValidationError(f"private output must be JSON-serializable: {exc}") from exc
 
@@ -320,7 +362,7 @@ def write_private_json(path: Path, value: object) -> None:
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -333,6 +375,41 @@ def write_private_json(path: Path, value: object) -> None:
             pass
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _write_new_blinding_key(path: Path, blinding_key: bytes) -> None:
+    _require_private_filesystem_support()
+    resolved = _resolved_private_path(path, "private blinding-key output")
+    _ensure_private_output_directory(resolved.parent)
+    payload = (
+        json.dumps(
+            _blinding_key_document(blinding_key),
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("ascii")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{resolved.name}.", dir=resolved.parent)
+    temporary = Path(temporary_name)
+    descriptor_open = True
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor_open = False
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, resolved)
+    except FileExistsError as exc:
+        raise ValidationError(f"refusing to replace existing blinding key: {resolved}") from exc
+    except OSError as exc:
+        raise ValidationError(f"cannot create private blinding key {resolved}: {exc}") from exc
+    finally:
+        if descriptor_open:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -537,31 +614,23 @@ def _validated_inputs(
     return index_hash, packet_cases, mapping_ids
 
 
-def _review_source(packet: JsonDict, mapping: JsonDict, index_sha256: str) -> JsonDict:
-    return {
-        "packet_sha256": canonical_sha256(packet),
-        "mapping_sha256": canonical_sha256(mapping),
-        "index_sha256": index_sha256,
-        "rubric_sha256": packet["rubric_sha256"],
-    }
-
-
 def _review_template(
     packet: JsonDict,
     mapping: JsonDict,
     packet_cases: dict[str, JsonDict],
     *,
     index_sha256: str,
+    blinding_key: bytes,
 ) -> JsonDict:
     cases: list[JsonDict] = []
-    mapping_key = _review_mapping_key(mapping)
+    handle_key = _review_handle_key(blinding_key, packet, mapping, index_sha256)
     for case_number, (case_id, case) in enumerate(packet_cases.items(), start=1):
         packet_items = _unique_rows(
             case.get("items"), "item_id", f"packet case {case_id}.items"
         )
         cases.append(
             {
-                "case_id": _review_case_id(mapping_key, case_id),
+                "case_id": _review_case_id(handle_key, case_id),
                 "case_number": case_number,
                 "user_request": case["user_request"],
                 "search_query": case["search_query"],
@@ -570,7 +639,7 @@ def _review_template(
                 "none_needed": None,
                 "items": [
                     {
-                        "item_id": _review_item_id(mapping_key, case_id, item_id),
+                        "item_id": _review_item_id(handle_key, case_id, item_id),
                         "item_number": item_number,
                         "relevance": None,
                         "canonical_current": None,
@@ -582,11 +651,10 @@ def _review_template(
         )
     return {
         "schema_version": 1,
-        "review_id": _review_id(mapping_key, packet, index_sha256),
+        "review_id": _review_id(handle_key, packet, index_sha256),
         "human_gold_created": False,
         "reviewer": None,
         "instructions": packet["instructions"],
-        "source": _review_source(packet, mapping, index_sha256),
         "cases": cases,
     }
 
@@ -597,6 +665,7 @@ def prepare_review(
     *,
     index_sha256: str,
     valid_artifacts: dict[str, JsonDict],
+    blinding_key: bytes,
 ) -> JsonDict:
     """Build a blinded template whose labels must all be supplied by a human."""
 
@@ -606,7 +675,13 @@ def prepare_review(
         index_sha256=index_sha256,
         valid_artifacts=valid_artifacts,
     )
-    return _review_template(packet, mapping, packet_cases, index_sha256=index_hash)
+    return _review_template(
+        packet,
+        mapping,
+        packet_cases,
+        index_sha256=index_hash,
+        blinding_key=blinding_key,
+    )
 
 
 def _validate_labeled_review(
@@ -621,7 +696,6 @@ def _validate_labeled_review(
             "human_gold_created",
             "reviewer",
             "instructions",
-            "source",
             "cases",
         },
         "review",
@@ -634,8 +708,6 @@ def _validate_labeled_review(
     reviewer = _reviewer_identifier(review.get("reviewer"))
     if review.get("instructions") != template["instructions"]:
         raise ValidationError("review instructions do not match reconstructed template")
-    if not _same_json(_object(review.get("source"), "review.source"), template["source"]):
-        raise ValidationError("review source does not match reconstructed template")
 
     expected_cases = _unique_rows(template["cases"], "case_id", "template.cases")
     review_cases = _unique_rows(review.get("cases"), "case_id", "review.cases")
@@ -703,6 +775,7 @@ def finalize_benchmark(
     *,
     index_sha256: str,
     valid_artifacts: dict[str, JsonDict],
+    blinding_key: bytes,
 ) -> JsonDict:
     """Reconstruct all static inputs and materialize only explicit human labels."""
 
@@ -712,13 +785,19 @@ def finalize_benchmark(
         index_sha256=index_sha256,
         valid_artifacts=valid_artifacts,
     )
-    template = _review_template(packet, mapping, packet_cases, index_sha256=index_hash)
+    template = _review_template(
+        packet,
+        mapping,
+        packet_cases,
+        index_sha256=index_hash,
+        blinding_key=blinding_key,
+    )
     reviewer, review_cases = _validate_labeled_review(review, template)
-    mapping_key = _review_mapping_key(mapping)
+    handle_key = _review_handle_key(blinding_key, packet, mapping, index_hash)
 
     finalized_cases: list[JsonDict] = []
     for case_id, packet_case in packet_cases.items():
-        review_case_id = _review_case_id(mapping_key, case_id)
+        review_case_id = _review_case_id(handle_key, case_id)
         review_case = review_cases[review_case_id]
         review_items = _unique_rows(
             review_case["items"], "item_id", f"review case {case_id}.items"
@@ -728,7 +807,7 @@ def finalize_benchmark(
         )
         finalized_items: list[JsonDict] = []
         for item_id in packet_items:
-            review_item_id = _review_item_id(mapping_key, case_id, item_id)
+            review_item_id = _review_item_id(handle_key, case_id, item_id)
             item = review_items[review_item_id]
             finalized_items.append(
                 {
@@ -757,8 +836,11 @@ def finalize_benchmark(
         "reviewer": reviewer,
         "instructions": packet["instructions"],
         "source": {
-            **copy.deepcopy(template["source"]),
             "packet_id": packet["packet_id"],
+            "packet_sha256": canonical_sha256(packet),
+            "mapping_sha256": canonical_sha256(mapping),
+            "index_sha256": index_hash,
+            "rubric_sha256": packet["rubric_sha256"],
             "review_sha256": canonical_sha256(review),
         },
         "cases": finalized_cases,
@@ -819,12 +901,27 @@ def _preflight_private_cli(output: Path, inputs: Iterable[tuple[Path, str]]) -> 
     return resolved_inputs
 
 
+def _cli_keygen(args: argparse.Namespace) -> JsonDict:
+    key = secrets.token_bytes(BLINDING_KEY_BYTES)
+    _write_new_blinding_key(args.output, key)
+    key_path = _validate_private_input(args.output, "blinding key")
+    if not hmac.compare_digest(_load_blinding_key(key_path), key):
+        raise ValidationError("created blinding key failed read-back verification")
+    return {"output": str(args.output), "created": True}
+
+
 def _cli_prepare(args: argparse.Namespace) -> JsonDict:
     inputs = _preflight_private_cli(
         args.output,
-        ((args.packet, "packet"), (args.mapping, "mapping"), (args.index, "index")),
+        (
+            (args.blinding_key, "blinding key"),
+            (args.packet, "packet"),
+            (args.mapping, "mapping"),
+            (args.index, "index"),
+        ),
     )
-    packet_path, mapping_path, index_path = inputs
+    blinding_key_path, packet_path, mapping_path, index_path = inputs
+    blinding_key = _load_blinding_key(blinding_key_path)
     packet = load_json(packet_path)
     mapping = load_json(mapping_path)
     with _frozen_index_snapshot(index_path) as snapshot:
@@ -833,6 +930,7 @@ def _cli_prepare(args: argparse.Namespace) -> JsonDict:
             mapping,
             index_sha256=file_sha256(snapshot),
             valid_artifacts=_index_artifacts(snapshot),
+            blinding_key=blinding_key,
         )
     write_private_json(args.output, review)
     return {"output": str(args.output), "cases": len(review["cases"]), "human_gold": False}
@@ -843,12 +941,14 @@ def _cli_finalize(args: argparse.Namespace) -> JsonDict:
         args.output,
         (
             (args.review, "review"),
+            (args.blinding_key, "blinding key"),
             (args.packet, "packet"),
             (args.mapping, "mapping"),
             (args.index, "index"),
         ),
     )
-    review_path, packet_path, mapping_path, index_path = inputs
+    review_path, blinding_key_path, packet_path, mapping_path, index_path = inputs
+    blinding_key = _load_blinding_key(blinding_key_path)
     review = load_json(review_path)
     packet = load_json(packet_path)
     mapping = load_json(mapping_path)
@@ -859,6 +959,7 @@ def _cli_finalize(args: argparse.Namespace) -> JsonDict:
             mapping,
             index_sha256=file_sha256(snapshot),
             valid_artifacts=_index_artifacts(snapshot),
+            blinding_key=blinding_key,
         )
     write_private_json(args.output, benchmark)
     return {"output": str(args.output), "cases": len(benchmark["cases"]), "human_gold": True}
@@ -868,14 +969,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    keygen = subparsers.add_parser("keygen", help="create a private high-entropy blinding key")
+    keygen.add_argument("--output", type=Path, required=True)
+    keygen.set_defaults(handler=_cli_keygen)
+
     prepare = subparsers.add_parser("prepare", help="build an explicit human-review template")
     for name in ("packet", "mapping", "index", "output"):
         prepare.add_argument(f"--{name}", type=Path, required=True)
+    prepare.add_argument("--blinding-key", type=Path, required=True)
     prepare.set_defaults(handler=_cli_prepare)
 
     finalize = subparsers.add_parser("finalize", help="materialize explicit human labels")
     for name in ("review", "packet", "mapping", "index", "output"):
         finalize.add_argument(f"--{name}", type=Path, required=True)
+    finalize.add_argument("--blinding-key", type=Path, required=True)
     finalize.set_defaults(handler=_cli_finalize)
     return parser
 

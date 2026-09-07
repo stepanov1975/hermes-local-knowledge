@@ -4,16 +4,17 @@ Use `scripts/lean_human_benchmark.py` to turn a blinded case packet into one com
 
 ## Scope
 
-The finalizer does two things:
+The finalizer does three things:
 
-1. `prepare` creates a blinded review template.
-2. `finalize` reconstructs that template from the original inputs and materializes labels only when every case and item has an explicit human decision.
+1. `keygen` creates a one-benchmark 256-bit blinding key.
+2. `prepare` creates a blinded review template using that key.
+3. `finalize` reconstructs that template from the original inputs and key, then materializes labels only when every case and item has an explicit human decision.
 
 It deliberately does **not** merge LLM draft annotations, generate a reranker, replay search, calculate metrics, or make a release decision. Candidate evaluation belongs in the existing evaluation path and should be added only for a candidate that can fix a named retrieval failure.
 
 ## Private-file boundary
 
-Packets, mappings, review files, frozen indexes, and benchmarks can contain private task text or local artifact identities. Every CLI input and output must therefore resolve outside every Git-registered worktree of this public repository.
+Packets, mappings, blinding keys, review files, frozen indexes, and benchmarks can contain private task text, secrets, or local artifact identities. Every CLI input and output must therefore resolve outside every Git-registered worktree of this public repository. Keep the private mapping and blinding key inaccessible to the reviewer; retain the key through finalization and do not reuse it for another benchmark.
 
 On POSIX systems:
 
@@ -34,7 +35,7 @@ The script fails before reading or copying private inputs on Windows because thi
 - item `canonical_current` (`true` or `false`);
 - item `harmful_if_primary` (`true` or `false`).
 
-Packet authors must provide only deliberately redacted or synthetic `user_request` and `search_query` inputs. `preceding_context` and the full item cards are accepted as source-only inputs so the packet remains hash-bound and can be consulted privately during review, but none of their message, summary, description, locator, citation, or excerpt text is copied into a generated review or benchmark. `prepare` replaces the packet, case, and item identifiers with HMAC-derived opaque review handles keyed by a domain-separated secret derived from the private mapping—not by the mapping hash exposed for provenance—and adds 1-based `case_number` and `item_number` fields; correlate review rows with the original private packet only by these numbers. Source identifiers are restored only in the finalized benchmark, after labeling. Put any source context that must appear in the review into a deliberately redacted or synthetic `user_request` instead.
+Packet authors must provide only deliberately redacted or synthetic `user_request` and `search_query` inputs. `preceding_context` and the full item cards are accepted as source-only inputs so the packet remains hash-bound and can be consulted privately during review, but none of their message, summary, description, locator, citation, or excerpt text is copied into a generated review or benchmark. `prepare` replaces the packet, case, and item identifiers with HMAC-derived opaque review handles keyed by the independently generated private blinding key and adds 1-based `case_number` and `item_number` fields; correlate review rows with the original private packet only by these numbers. The review contains no source-provenance hash or key material: a reviewer who guesses the small mapping cannot use public provenance as an oracle or recreate the handles. Exact packet, mapping, index, and review provenance plus source identifiers are reconstructed only in the finalized benchmark, after labeling. Put any source context that must appear in the review into a deliberately redacted or synthetic `user_request` instead.
 
 Set a top-level `reviewer` identifier using 1–64 ASCII letters, digits, `.`, `_`, `@`, or `-`, then fill every decision field. The review accepts no free-form human text. Do not remove or edit the copied instructions, task, query, case/item numbers, or opaque handles.
 
@@ -45,9 +46,13 @@ Set a top-level `reviewer` identifier using 1–64 ASCII letters, digits, `.`, `
 ```bash
 PRIVATE="${XDG_STATE_HOME:-$HOME/.local/state}/hermes-local-knowledge/lean-benchmark"
 
+python scripts/lean_human_benchmark.py keygen \
+  --output "$PRIVATE/blinding-key.json"
+
 python scripts/lean_human_benchmark.py prepare \
   --packet "$PRIVATE/packet.json" \
   --mapping "$PRIVATE/mapping.json" \
+  --blinding-key "$PRIVATE/blinding-key.json" \
   --index "$PRIVATE/index.sqlite" \
   --output "$PRIVATE/review.json"
 
@@ -57,6 +62,7 @@ python scripts/lean_human_benchmark.py finalize \
   --review "$PRIVATE/review.json" \
   --packet "$PRIVATE/packet.json" \
   --mapping "$PRIVATE/mapping.json" \
+  --blinding-key "$PRIVATE/blinding-key.json" \
   --index "$PRIVATE/index.sqlite" \
   --output "$PRIVATE/benchmark.json"
 ```
