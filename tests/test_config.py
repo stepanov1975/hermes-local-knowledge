@@ -370,6 +370,43 @@ def test_inline_section_preserves_paths_lists_and_unspecified_defaults(tmp_path:
     assert resolved.implicit_feedback == ImplicitFeedbackSettings(min_confirmations=3)
 
 
+@pytest.mark.parametrize("inline_section", [False, True])
+def test_flow_lists_preserve_plain_apostrophes_and_disable_flags(
+    tmp_path: Path, inline_section: bool,
+) -> None:
+    entry = "known_entities: [O'Brien, Hermes], okf_enabled: false"
+    text = (
+        "local_knowledge: {" + entry + "}\n"
+        if inline_section else "local_knowledge:\n  known_entities: [O'Brien, Hermes]\n  okf_enabled: false\n"
+    )
+    write_config(tmp_path, text)
+    resolved = resolve_config(tmp_path)
+    assert resolved.index_settings.known_entities == ("O'Brien", "Hermes")
+    assert resolved.okf.enabled is False
+
+
+@pytest.mark.parametrize("explicit_home", [False, True])
+@pytest.mark.parametrize("inline_section", [False, True])
+def test_flow_lists_preserve_quoted_commas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    explicit_home: bool, inline_section: bool,
+) -> None:
+    hermes_home = tmp_path / "hermes"
+    block_hermes_host(monkeypatch)
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entry = "known_entities: ['Washington, D.C.', \"Paris, France\", 'O''Brien, Inc.', Hermes]"
+    text = (
+        "local_knowledge: {" + entry + "}\n"
+        if inline_section else "local_knowledge:\n  " + entry + "\n"
+    )
+    write_config(hermes_home, text)
+    resolved = resolve_config(hermes_home if explicit_home else None)
+    assert resolved.index_settings.known_entities == (
+        "Washington, D.C.", "Paris, France", "O'Brien, Inc.", "Hermes",
+    )
+
+
 def test_implicit_feedback_settings_are_nested_and_bounded(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes-home"
     write_config(
