@@ -66,8 +66,11 @@ def test_assigned_multiline_strings_do_not_supply_script_summary(tmp_path: Path)
 @pytest.mark.parametrize("root_layout", ["same", "ancestor", "separate"])
 @pytest.mark.parametrize("include_markdown_docs", [False, True])
 def test_runtime_support_scanner_does_not_skip_source_root_descendants(
-    tmp_path: Path, root_layout: str, include_markdown_docs: bool
+    tmp_path: Path, root_layout: str, include_markdown_docs: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Exercise home-shortened display paths on every platform, as Windows CI does.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     root = tmp_path / "source"
     home = root if root_layout == "same" else (
         root / "runtime" if root_layout == "ancestor" else tmp_path / "hermes"
@@ -83,7 +86,7 @@ def test_runtime_support_scanner_does_not_skip_source_root_descendants(
         "skill:backup", "skill_support_doc:runtime-skills-backup-references-restore"
     ]
     assert artifacts[1].related == ["skill:backup"]
-    assert artifacts[1].path == str(support)
+    assert Path(artifacts[1].path).expanduser().resolve() == support.resolve()
     assert artifacts[1].source == "runtime_skill_support_doc"
     state = tmp_path / "state"
     built, _ = build_index(root, state, home, settings)
