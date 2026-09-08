@@ -203,6 +203,39 @@ def test_exact_file_backed_consumer_records_implicit_feedback(
         ).fetchall() == [(event_id, artifact_id, consumer)]
 
 
+@pytest.mark.parametrize("same_process_cwd", [False, True])
+def test_relative_read_file_does_not_guess_source_root_attribution(
+    tmp_path: Path, monkeypatch, same_process_cwd: bool,
+) -> None:
+    config = _config(tmp_path)
+    _skill_id, _skill_path, runbook_id, runbook_path, metadata = _consumer_index(config)
+    _search(config, session="s1", task="t1", top_ids=[runbook_id], metadata=metadata)
+    monkeypatch.setattr("hermes_local_knowledge.implicit.resolve_config", lambda: config)
+    # Hermes resolves relative paths against the task's terminal cwd, which is
+    # not necessarily the plugin's process cwd (even if it equals source_root).
+    task_cwd = tmp_path / "other-workspace"
+    other_path = task_cwd / "docs" / runbook_path.name
+    other_path.parent.mkdir(parents=True)
+    other_path.write_text("# A different runbook\n", encoding="utf-8")
+    monkeypatch.chdir(config.source_root if same_process_cwd else task_cwd)
+
+    on_post_tool_call(
+        tool_name="read_file",
+        args={"path": "docs/test-update.md"},
+        # tools.file_tools.read_file_tool / ReadResult.to_dict return content
+        # and size/pagination metadata, but no resolved source path.
+        result=json.dumps({
+            "content": "1|# A different runbook", "total_lines": 1,
+            "file_size": other_path.stat().st_size, "truncated": False,
+        }),
+        session_id="s1", task_id="t1", turn_id="turn-1",
+        api_request_id="consumer-request",
+    )
+
+    with sqlite3.connect(config.state_dir / "usage.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM implicit_feedback").fetchone() == (0,)
+
+
 @pytest.mark.parametrize("api_request_id", ["search-request", ""])
 def test_file_backed_consumer_requires_a_later_model_request(
     tmp_path: Path,

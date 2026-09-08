@@ -150,22 +150,85 @@ def _resolve_profile_path(value: Any, *, hermes_home: Path, default: Path) -> Pa
 def _strip_yaml_comment(value: str) -> str:
     quote: str | None = None
     escaped = False
+    scalar_start = 0
     for index, char in enumerate(value):
         if escaped:
             escaped = False
         elif quote == '"' and char == "\\":
             escaped = True
-        elif char in {"'", '"'}:
-            quote = char if quote is None else None if quote == char else quote
-        elif char == "#" and quote is None and (index == 0 or value[index - 1].isspace()):
+        elif quote is not None:
+            if char == quote:
+                if quote == "'" and value[index + 1:index + 2] == "'":
+                    escaped = True
+                else:
+                    quote = None
+        elif char in {"'", '"'} and not value[scalar_start:index].strip():
+            quote = char
+        elif char == "#" and (index == 0 or value[index - 1].isspace()):
             return value[:index].rstrip()
+        elif char in "[{,:" or (
+            char == "-" and not value[:index].strip()
+            and value[index + 1:index + 2].isspace()
+        ):
+            # Flow delimiters and a block-list marker begin the next scalar.
+            scalar_start = index + 1
     return value.rstrip()
+
+
+def _split_yaml_flow_entries(text: str) -> list[str]:
+    """Split an inline collection without splitting quoted or nested commas."""
+    entries: list[str] = []
+    start = 1
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    scalar_start = 1
+    for index in range(1, len(text) - 1):
+        char = text[index]
+        if escaped:
+            escaped = False
+        elif quote == '"' and char == "\\":
+            escaped = True
+        elif quote is not None:
+            if char == quote:
+                if quote == "'" and text[index + 1] == "'":
+                    escaped = True
+                else:
+                    quote = None
+        elif char in {"'", '"'} and not text[scalar_start:index].strip():
+            quote = char
+        else:
+            if char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                entries.append(text[start:index])
+                start = index + 1
+            if char in "[{,:":
+                scalar_start = index + 1
+    if quote is not None or depth != 0:
+        raise ValueError("unclosed inline collection in local_knowledge config")
+    entries.append(text[start:-1])
+    return [entry for entry in entries if entry.strip()]
+
+
+def _parse_yaml_flow_mapping(text: str) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for entry in _split_yaml_flow_entries(text):
+        key, value = _mapping_entry(entry)
+        result[key] = _parse_yaml_scalar(value)
+    return result
 
 
 def _parse_yaml_scalar(value: str) -> Any:
     text = value.strip()
     if not text:
         return None
+    if text.startswith("{") and text.endswith("}"):
+        return _parse_yaml_flow_mapping(text)
+    if text.startswith("[") and text.endswith("]"):
+        return [_parse_yaml_scalar(entry) for entry in _split_yaml_flow_entries(text)]
     if text.startswith('"') and text.endswith('"'):
         try:
             return json.loads(text)
@@ -209,7 +272,8 @@ def _parse_local_section(text: str) -> dict[str, Any]:
         if key != _CONFIG_SECTION:
             continue
         if inline_value:
-            return {}
+            parsed = _parse_yaml_scalar(inline_value)
+            return parsed if isinstance(parsed, dict) else {}
         section_start = index + 1
         break
     if section_start is None:

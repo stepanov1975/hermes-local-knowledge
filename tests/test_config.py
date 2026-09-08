@@ -321,6 +321,134 @@ def test_okf_nested_flat_legacy_fallback_and_coercion(
     assert resolved.okf.max_worker_seconds == expected.max_generation_seconds
 
 
+@pytest.mark.parametrize("explicit_home", [False, True])
+@pytest.mark.parametrize("inline_section", [False, True])
+@pytest.mark.parametrize("disabled", ["false", "off", "'false'"])
+def test_explicit_profile_inline_maps_honor_disable_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    explicit_home: bool, inline_section: bool, disabled: str,
+) -> None:
+    hermes_home = tmp_path / "explicit-home"
+    block_hermes_host(monkeypatch)
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entries = [
+        f"okf: {{enabled: {disabled}, auto_generate: {disabled}}}",
+        f"implicit_feedback: {{enabled: {disabled}}}",
+    ]
+    body = (
+        "local_knowledge: {" + ", ".join(entries) + "} # inline section\n"
+        if inline_section
+        else "local_knowledge:\n  " + "\n  ".join(entries) + "\n"
+    )
+    write_config(hermes_home, body)
+
+    resolved = resolve_config(hermes_home if explicit_home else None)
+
+    assert resolved.okf == OKFSettings(enabled=False, auto_generate=False)
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings(enabled=False)
+    assert resolved.source_root == hermes_home.resolve()
+    assert resolved.index_settings == IndexSettings(include_markdown_docs=False)
+
+
+def test_inline_section_preserves_paths_lists_and_unspecified_defaults(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "explicit-home"
+    source_root = tmp_path / "source, with # punctuation"
+    write_config(
+        hermes_home,
+        'local_knowledge: {source_root: "' + str(source_root) + '", '
+        "known_entities: [Hermes, GitHub], okf: {auto_generate: false}, "
+        "implicit_feedback: {min_confirmations: 3},}\n",
+    )
+
+    resolved = resolve_config(hermes_home)
+
+    assert resolved.source_root == source_root.resolve()
+    assert resolved.index_settings.known_entities == ("Hermes", "GitHub")
+    assert resolved.index_settings.include_markdown_docs is True
+    assert resolved.okf == OKFSettings(auto_generate=False)
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings(min_confirmations=3)
+
+
+@pytest.mark.parametrize("inline_section", [False, True])
+def test_flow_lists_preserve_plain_apostrophes_and_disable_flags(
+    tmp_path: Path, inline_section: bool,
+) -> None:
+    entry = "known_entities: [O'Brien, Hermes], okf_enabled: false"
+    text = (
+        "local_knowledge: {" + entry + "}\n"
+        if inline_section else "local_knowledge:\n  known_entities: [O'Brien, Hermes]\n  okf_enabled: false\n"
+    )
+    write_config(tmp_path, text)
+    resolved = resolve_config(tmp_path)
+    assert resolved.index_settings.known_entities == ("O'Brien", "Hermes")
+    assert resolved.okf.enabled is False
+
+
+@pytest.mark.parametrize("layout", ["inline", "flow_list", "block_list"])
+@pytest.mark.parametrize(
+    ("entity", "expected"),
+    [
+        ("O'Brien", "O'Brien"),
+        ('Acme"Cloud', 'Acme"Cloud'),
+        ("'O''Brien # Cloud'", "O'Brien # Cloud"),
+        ('"Acme \\"Cloud\\" # West"', 'Acme "Cloud" # West'),
+        ("'Acme # Cloud'", "Acme # Cloud"),
+        ('"Acme # Cloud"', "Acme # Cloud"),
+        ("O'Brien#Cloud", "O'Brien#Cloud"),
+    ],
+)
+def test_commented_entities_preserve_quotes_and_disable_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    layout: str, entity: str, expected: str,
+) -> None:
+    block_hermes_host(monkeypatch)
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    flags = [
+        "okf: {enabled: false, auto_generate: false}",
+        "implicit_feedback: {enabled: false}",
+    ]
+    if layout == "inline":
+        entries = [f"known_entities: [{entity}, Acme]", *flags]
+        text = "local_knowledge: {" + ", ".join(entries) + "} # profile\n"
+    else:
+        entities = (
+            f"  known_entities: [{entity}, Acme] # profile\n"
+            if layout == "flow_list"
+            else f"  known_entities:\n    - {entity} # profile\n    - Acme\n"
+        )
+        text = "local_knowledge:\n" + entities + "  " + "\n  ".join(flags) + "\n"
+    write_config(tmp_path, text)
+
+    resolved = resolve_config(tmp_path)
+
+    assert resolved.index_settings.known_entities == (expected, "Acme")
+    assert resolved.okf == OKFSettings(enabled=False, auto_generate=False)
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings(enabled=False)
+
+
+@pytest.mark.parametrize("explicit_home", [False, True])
+@pytest.mark.parametrize("inline_section", [False, True])
+def test_flow_lists_preserve_quoted_commas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    explicit_home: bool, inline_section: bool,
+) -> None:
+    hermes_home = tmp_path / "hermes"
+    block_hermes_host(monkeypatch)
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entry = "known_entities: ['Washington, D.C.', \"Paris, France\", 'O''Brien, Inc.', Hermes]"
+    text = (
+        "local_knowledge: {" + entry + "}\n"
+        if inline_section else "local_knowledge:\n  " + entry + "\n"
+    )
+    write_config(hermes_home, text)
+    resolved = resolve_config(hermes_home if explicit_home else None)
+    assert resolved.index_settings.known_entities == (
+        "Washington, D.C.", "Paris, France", "O'Brien, Inc.", "Hermes",
+    )
+
+
 def test_implicit_feedback_settings_are_nested_and_bounded(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes-home"
     write_config(

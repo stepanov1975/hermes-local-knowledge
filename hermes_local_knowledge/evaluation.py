@@ -193,7 +193,9 @@ def _column(alias: str, columns: set[str], name: str, default: str = "NULL") -> 
     return f'{alias}."{name}"' if name in columns else default
 
 
-def _valid_event_link(row: Any, *, expected_root: str) -> bool:
+def _valid_event_link(
+    row: Any, *, expected_root: str, allow_query_level: bool = False,
+) -> bool:
     try:
         top_ids = json.loads(str(row["event_top_ids_json"] or "[]"))
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -207,7 +209,10 @@ def _valid_event_link(row: Any, *, expected_root: str) -> bool:
         and str(row["event_root"] or "") == expected_root
         and _clean_label_value(row["feedback_query"]) == _clean_label_value(row["event_query"])
         and isinstance(top_ids, list)
-        and _clean_label_value(row["artifact_id"]) in {str(value) for value in top_ids}
+        and (
+            (allow_query_level and not _clean_label_value(row["artifact_id"]))
+            or _clean_label_value(row["artifact_id"]) in {str(value) for value in top_ids}
+        )
     )
 
 
@@ -346,7 +351,7 @@ def load_quality_tiered_feedback_labels(
                     and _clean_label_value(parent["expected_artifact_id"]) in {"", artifact_id}
                     and _valid_event_link(row, expected_root=row_root)
                     and parent_linkage == "verified_event"
-                    and _valid_event_link(parent, expected_root=row_root)
+                    and _valid_event_link(parent, expected_root=row_root, allow_query_level=True)
                 )
                 trigger_query = _clean_label_value(parent["event_query"])
                 if not parent_valid or not trigger_query:

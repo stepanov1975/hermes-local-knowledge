@@ -1109,7 +1109,9 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                     resolution_counts.get(resolved_parent_id, 0) + 1
                 )
 
-        def valid_event_link(row: sqlite3.Row, expected_root: str) -> bool:
+        def valid_event_link(
+            row: sqlite3.Row, expected_root: str, *, allow_query_level: bool = False,
+        ) -> bool:
             top_ids, valid_top_ids = _decode_json_list(row["event_top_ids_json"])
             feedback_event_id = _persisted_id(row["event_id"])
             linked_event_id = _persisted_id(row["linked_event_id"])
@@ -1124,7 +1126,10 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                 and str(row["event_root"] or "") == expected_root
                 and _clean_label_text(row["feedback_query"]) == _clean_label_text(row["event_query"])
                 and valid_top_ids
-                and _clean_label_text(row["artifact_id"]) in top_ids
+                and (
+                    (allow_query_level and not _clean_label_text(row["artifact_id"]))
+                    or _clean_label_text(row["artifact_id"]) in top_ids
+                )
             )
 
         for row in valid_feedback_rows:
@@ -1178,7 +1183,7 @@ def read_usage_corpus(path: Path, live_root: Path) -> RawUsageCorpus:
                         and _clean_label_text(parent["expected_artifact_id"]) in {"", artifact_id}
                         and resolution_counts.get(resolved_parent_id) == 1
                         and parent_linkage == "verified_event"
-                        and valid_event_link(parent, root_text)
+                        and valid_event_link(parent, root_text, allow_query_level=True)
                     )
                     if valid_event_link(row, root_text) and parent_valid and trigger_query:
                         tier = "explicit_resolution"
