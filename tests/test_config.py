@@ -385,6 +385,48 @@ def test_flow_lists_preserve_plain_apostrophes_and_disable_flags(
     assert resolved.okf.enabled is False
 
 
+@pytest.mark.parametrize("layout", ["inline", "flow_list", "block_list"])
+@pytest.mark.parametrize(
+    ("entity", "expected"),
+    [
+        ("O'Brien", "O'Brien"),
+        ('Acme"Cloud', 'Acme"Cloud'),
+        ("'O''Brien # Cloud'", "O'Brien # Cloud"),
+        ('"Acme \\"Cloud\\" # West"', 'Acme "Cloud" # West'),
+        ("'Acme # Cloud'", "Acme # Cloud"),
+        ('"Acme # Cloud"', "Acme # Cloud"),
+        ("O'Brien#Cloud", "O'Brien#Cloud"),
+    ],
+)
+def test_commented_entities_preserve_quotes_and_disable_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    layout: str, entity: str, expected: str,
+) -> None:
+    block_hermes_host(monkeypatch)
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    flags = [
+        "okf: {enabled: false, auto_generate: false}",
+        "implicit_feedback: {enabled: false}",
+    ]
+    if layout == "inline":
+        entries = [f"known_entities: [{entity}, Acme]", *flags]
+        text = "local_knowledge: {" + ", ".join(entries) + "} # profile\n"
+    else:
+        entities = (
+            f"  known_entities: [{entity}, Acme] # profile\n"
+            if layout == "flow_list"
+            else f"  known_entities:\n    - {entity} # profile\n    - Acme\n"
+        )
+        text = "local_knowledge:\n" + entities + "  " + "\n  ".join(flags) + "\n"
+    write_config(tmp_path, text)
+
+    resolved = resolve_config(tmp_path)
+
+    assert resolved.index_settings.known_entities == (expected, "Acme")
+    assert resolved.okf == OKFSettings(enabled=False, auto_generate=False)
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings(enabled=False)
+
+
 @pytest.mark.parametrize("explicit_home", [False, True])
 @pytest.mark.parametrize("inline_section", [False, True])
 def test_flow_lists_preserve_quoted_commas(

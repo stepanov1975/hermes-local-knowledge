@@ -150,15 +150,28 @@ def _resolve_profile_path(value: Any, *, hermes_home: Path, default: Path) -> Pa
 def _strip_yaml_comment(value: str) -> str:
     quote: str | None = None
     escaped = False
+    scalar_start = 0
     for index, char in enumerate(value):
         if escaped:
             escaped = False
         elif quote == '"' and char == "\\":
             escaped = True
-        elif char in {"'", '"'}:
-            quote = char if quote is None else None if quote == char else quote
-        elif char == "#" and quote is None and (index == 0 or value[index - 1].isspace()):
+        elif quote is not None:
+            if char == quote:
+                if quote == "'" and value[index + 1:index + 2] == "'":
+                    escaped = True
+                else:
+                    quote = None
+        elif char in {"'", '"'} and not value[scalar_start:index].strip():
+            quote = char
+        elif char == "#" and (index == 0 or value[index - 1].isspace()):
             return value[:index].rstrip()
+        elif char in "[{,:" or (
+            char == "-" and not value[:index].strip()
+            and value[index + 1:index + 2].isspace()
+        ):
+            # Flow delimiters and a block-list marker begin the next scalar.
+            scalar_start = index + 1
     return value.rstrip()
 
 

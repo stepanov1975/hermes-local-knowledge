@@ -23,6 +23,10 @@ def write(path: Path, text: str) -> None:
         ('#!/usr/bin/env python3\n# coding: utf-8\nu"Module summary."\n', "Module summary."),
         ('r"""Module summary."""\n', "Module summary."),
         ('("Module " "summary.")\n', "Module summary."),
+        ('# Header comment.\n(\n    "Module "\n    "summary."\n)\n', "Module summary."),
+        ('"Module summary."; value = 1\n', "Module summary."),
+        ('("Not a docstring", "tuple")\n', "Local script example.py"),
+        ('"Not " + "a docstring"\n', "Local script example.py"),
         ('value = 1\n"""Not a module docstring."""\n', "Local script example.py"),
         ('b"""Not a text docstring."""\n', "Local script example.py"),
         ('f"""Not a constant docstring."""\n', "Local script example.py"),
@@ -33,6 +37,30 @@ def write(path: Path, text: str) -> None:
 )
 def test_python_script_summary_uses_only_module_docstring(text: str, expected: str) -> None:
     assert _script_summary(Path("example.py"), text) == expected
+
+
+@pytest.mark.parametrize("separator", ["\n", "; "])
+def test_python_docstring_survives_later_invalid_syntax(separator: str) -> None:
+    text = '"Module summary."' + separator + 'value = )\n'
+    assert _script_summary(Path("example.py"), text) == "Module summary."
+
+
+def test_python_docstring_survives_truncated_script_body(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    state = tmp_path / "state"
+    write(
+        root / "scripts" / "export.py",
+        '"""Export quasar checkpoints."""\n'
+        'payload = """' + "body text\n" * 6_000 + '"""\n',
+    )
+    artifacts, _ = build_index(
+        root, state, tmp_path / "hermes", IndexSettings(include_markdown_docs=False)
+    )
+    assert len(artifacts) == 1
+    assert artifacts[0].summary == "Export quasar checkpoints."
+    results = search_index(state / "index.sqlite", '"quasar checkpoints"', artifact_type="script")
+    assert [row["id"] for row in results] == ["script:scripts-export-py"]
+    assert results[0]["summary"] == "Export quasar checkpoints."
 
 
 def test_non_python_summary_does_not_interpret_python_quotes() -> None:

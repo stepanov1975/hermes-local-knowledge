@@ -8,9 +8,11 @@ The configuration module owns how those settings are resolved.
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 import re
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator, Protocol, Sequence
@@ -704,8 +706,23 @@ def scan_skills_and_support_docs(
 def _script_summary(path: Path, text: str) -> str:
     if path.suffix == ".py":
         try:
-            docstring = ast.get_docstring(ast.parse(text))
-        except (SyntaxError, ValueError):
+            # Stop at the first statement: later code may be invalid or cut off
+            # by the scanner's read limit, without invalidating the docstring.
+            tokens: list[tokenize.TokenInfo] = []
+            depth = 0
+            for token in tokenize.generate_tokens(io.StringIO(text).readline):
+                if token.type == tokenize.OP:
+                    if token.string == ";" and depth == 0:
+                        break
+                    if token.string in "([{":
+                        depth += 1
+                    elif token.string in ")]}":
+                        depth -= 1
+                tokens.append(token)
+                if token.type == tokenize.NEWLINE:
+                    break
+            docstring = ast.get_docstring(ast.parse(tokenize.untokenize(tokens)))
+        except (SyntaxError, ValueError, tokenize.TokenError):
             # Invalid or truncated source can still provide a header comment.
             docstring = None
         if docstring is not None:
