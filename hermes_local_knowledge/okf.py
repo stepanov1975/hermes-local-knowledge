@@ -712,7 +712,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         return
 
     columns_sql = ",\n      ".join(f"{name} {definition}" for name, definition in _COLUMN_DEFINITIONS.items())
-    conn.execute(f"CREATE TABLE okf_candidates (\n      {columns_sql}\n    )")
+    conn.execute(f"CREATE TABLE IF NOT EXISTS okf_candidates (\n      {columns_sql}\n    )")
+    # Another first-use writer may have created the table after our empty check.
+    missing = set(_CANDIDATE_COLUMNS) - _candidate_table_columns(conn)
+    if missing:
+        raise RuntimeError(f"okf_candidates is missing required current columns: {sorted(missing)}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_okf_candidates_status_seen ON okf_candidates(status, use_count, last_seen)")
     conn.execute(
         """
@@ -1109,12 +1113,15 @@ def _recover_stale_claims_on_connection(
         tool_name = str(row.get("tool_name") or "")
         claim_token = str(row.get("claim_token") or "")
         path = okf_file_path(state_dir, tool_name)
-        if path.is_file() and validate_okf_file(
+        if not path.is_file():
+            continue
+        validation = validate_okf_file(
             state_dir,
             claim_token=claim_token,
             path=path,
             _conn=conn,
-        )["valid"]:
+        )
+        if validation["valid"] and validation["tool"] == tool_name:
             completed += int(
                 _mark_candidate_done_on_connection(
                     conn,

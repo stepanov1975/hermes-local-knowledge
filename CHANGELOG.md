@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.20] - 2026-09-08
+
+### Fixed
+
+- Extract Python script summaries from the module docstring rather than unrelated multiline string boundaries.
+- Honor inline YAML mappings for standalone/profile configuration, including explicit feature disable flags.
+- Avoid attributing relative file reads to an indexed artifact without a confirmed absolute path.
+- Include runtime skill support documents when the source root is the Hermes home.
+- Preserve single-quoted phrase semantics in feedback-assisted routing.
+- Validate recovered OKF files against the exact claimed tool and schema, and tolerate concurrent first-use queue initialization.
+- Include verified query-level and zero-result search corrections in both evaluation loaders.
+
+[0.4.20]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.19...v0.4.20
+
 ## [0.4.19] - 2026-09-07
 
 ### Fixed

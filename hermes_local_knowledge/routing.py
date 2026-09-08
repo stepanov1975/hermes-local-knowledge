@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from .index import _query_terms, sqlite_readonly_uri
+from .index import _has_quoted_phrase, _query_terms, sqlite_readonly_uri
 
 POSITIVE_FEEDBACK_RATINGS = frozenset({"great", "useful"})
 NEGATIVE_FEEDBACK_RATINGS = frozenset(
@@ -212,7 +212,7 @@ def _query_token_count(query: str) -> int:
 
 
 def _feedback_query_key(query: str, terms: frozenset[str]) -> str:
-    if '"' in query:
+    if _has_quoted_phrase(query):
         return f"quoted:{_normalized_query(query)}"
     return f"terms:{' '.join(sorted(terms))}"
 
@@ -224,7 +224,7 @@ def _match_score(
 ) -> tuple[int, int, int, int] | None:
     if _normalized_query(route.query) == _normalized_query(query):
         return (2, len(route.terms), len(route.terms), route.feedback_id or 0)
-    if '"' in route.query or '"' in query:
+    if _has_quoted_phrase(route.query) or _has_quoted_phrase(query):
         return None
     if len(route.terms) < MIN_ROUTE_TERMS:
         return None

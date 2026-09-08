@@ -132,7 +132,13 @@ def _file_consumer_path(tool_name: str, args: Mapping[str, Any], result: Any) ->
         return str(source_path).strip() if payload.get("success") is True and source_path else ""
     if tool_name == "read_file":
         path = args.get("path")
-        return str(path).strip() if isinstance(payload.get("content"), str) and path else ""
+        if not isinstance(payload.get("content"), str) or not isinstance(path, str) or not path:
+            return ""
+        # Hermes read_file returns no canonical source path. Relative arguments
+        # use the task's terminal cwd, not source_root or this process's cwd.
+        # Without that result provenance, abstain rather than credit another file.
+        candidate = Path(path).expanduser()
+        return str(candidate) if candidate.is_absolute() else ""
     return ""
 
 

@@ -321,6 +321,55 @@ def test_okf_nested_flat_legacy_fallback_and_coercion(
     assert resolved.okf.max_worker_seconds == expected.max_generation_seconds
 
 
+@pytest.mark.parametrize("explicit_home", [False, True])
+@pytest.mark.parametrize("inline_section", [False, True])
+@pytest.mark.parametrize("disabled", ["false", "off", "'false'"])
+def test_explicit_profile_inline_maps_honor_disable_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    explicit_home: bool, inline_section: bool, disabled: str,
+) -> None:
+    hermes_home = tmp_path / "explicit-home"
+    block_hermes_host(monkeypatch)
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entries = [
+        f"okf: {{enabled: {disabled}, auto_generate: {disabled}}}",
+        f"implicit_feedback: {{enabled: {disabled}}}",
+    ]
+    body = (
+        "local_knowledge: {" + ", ".join(entries) + "} # inline section\n"
+        if inline_section
+        else "local_knowledge:\n  " + "\n  ".join(entries) + "\n"
+    )
+    write_config(hermes_home, body)
+
+    resolved = resolve_config(hermes_home if explicit_home else None)
+
+    assert resolved.okf == OKFSettings(enabled=False, auto_generate=False)
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings(enabled=False)
+    assert resolved.source_root == hermes_home.resolve()
+    assert resolved.index_settings == IndexSettings(include_markdown_docs=False)
+
+
+def test_inline_section_preserves_paths_lists_and_unspecified_defaults(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "explicit-home"
+    source_root = tmp_path / "source, with # punctuation"
+    write_config(
+        hermes_home,
+        'local_knowledge: {source_root: "' + str(source_root) + '", '
+        "known_entities: [Hermes, GitHub], okf: {auto_generate: false}, "
+        "implicit_feedback: {min_confirmations: 3},}\n",
+    )
+
+    resolved = resolve_config(hermes_home)
+
+    assert resolved.source_root == source_root.resolve()
+    assert resolved.index_settings.known_entities == ("Hermes", "GitHub")
+    assert resolved.index_settings.include_markdown_docs is True
+    assert resolved.okf == OKFSettings(auto_generate=False)
+    assert resolved.implicit_feedback == ImplicitFeedbackSettings(min_confirmations=3)
+
+
 def test_implicit_feedback_settings_are_nested_and_bounded(tmp_path: Path) -> None:
     hermes_home = tmp_path / "hermes-home"
     write_config(

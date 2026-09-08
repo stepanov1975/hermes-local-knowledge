@@ -153,6 +153,44 @@ def test_schema_view_redacts_defaults_examples_and_secret_like_descriptions(tmp_
         assert value not in persisted
 
 
+def test_concurrent_first_use_preserves_both_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked = threading.Barrier(2)
+    original_columns = okf._candidate_table_columns
+    errors: list[Exception] = []
+
+    def synchronized_columns(conn: sqlite3.Connection) -> set[str]:
+        columns = original_columns(conn)
+        if not columns:
+            checked.wait(timeout=5)
+        return columns
+
+    monkeypatch.setattr(okf, "_candidate_table_columns", synchronized_columns)
+
+    def observe(tool_name: str) -> None:
+        try:
+            okf.upsert_tool_candidate(
+                tmp_path, tool_name=tool_name, toolset="demo",
+                schema={"type": "object"}, args={},
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=observe, args=(name,)) for name in ("first", "second")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        rows = conn.execute(
+            "SELECT tool_name, use_count, status FROM okf_candidates ORDER BY tool_name"
+        ).fetchall()
+    assert rows == [("first", 1, "pending"), ("second", 1, "pending")]
+
+
 def test_upsert_candidate_counts_success_and_error(tmp_path: Path) -> None:
     schema = {"type": "object", "properties": {"query": {"type": "string"}}}
     okf.upsert_tool_candidate(
@@ -440,6 +478,43 @@ def test_recover_stale_claim_returns_retryable_candidate_to_pending(tmp_path: Pa
     assert rows[0]["status"] == "pending"
     assert rows[0]["claim_token"] is None
     assert rows[0]["claimed_at"] is None
+
+
+@pytest.mark.parametrize("max_attempts, unmatched_status", [(3, "pending"), (1, "error")])
+def test_stale_recovery_requires_exact_tool_despite_shared_slug_and_claim(
+    tmp_path: Path, max_attempts: int, unmatched_status: str,
+) -> None:
+    for tool_name in ("a-b", "a_b"):
+        okf.upsert_tool_candidate(
+            tmp_path, tool_name=tool_name, toolset="demo",
+            schema={"type": "object"}, args={},
+        )
+    claims = okf.claim_candidates(
+        tmp_path, limit=2, claim_token="shared-batch", now="2000-01-01T00:00:00Z",
+    )
+    assert len(claims) == 2
+    published = next(row for row in claims if row["tool_name"] == "a_b")
+    path = okf.okf_file_path(tmp_path, "a_b")
+    assert path == okf.okf_file_path(tmp_path, "a-b")
+    content = valid_claimed_okf(published)
+    write(path, content)
+    assert okf.validate_okf_file(tmp_path, claim_token="shared-batch", path=path)["valid"]
+
+    assert okf.recover_stale_claims(
+        tmp_path, stale_after_seconds=60, max_attempts=max_attempts,
+        now="2000-01-01T01:00:00Z",
+    ) == 2
+
+    with sqlite3.connect(okf.okf_queue_db_path(tmp_path)) as conn:
+        rows = conn.execute(
+            "SELECT tool_name, status, okf_path, claim_token FROM okf_candidates ORDER BY tool_name"
+        ).fetchall()
+    assert rows == [("a-b", unmatched_status, None, None), ("a_b", "done", str(path), None)]
+    assert path.read_text(encoding="utf-8") == content
+    assert len(okf.index_dirty_tokens(tmp_path)) == 1
+    if unmatched_status == "pending":
+        retried = okf.claim_candidates(tmp_path, limit=2, claim_token="retry")
+        assert [row["tool_name"] for row in retried] == ["a-b"]
 
 
 def test_recover_stale_claim_stops_after_attempt_limit(tmp_path: Path) -> None:

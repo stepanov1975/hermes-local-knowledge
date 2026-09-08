@@ -7,6 +7,7 @@ The configuration module owns how those settings are resolved.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -642,18 +643,14 @@ def _custom_support_candidates(root: Path, settings: ScannerSettings) -> list[_C
 def _runtime_support_candidates(root: Path, hermes_home: Path, settings: ScannerSettings) -> list[_Candidate]:
     candidates: list[_Candidate] = []
     skill_root = hermes_home / "skills"
-    resolved_root = root.resolve()
     for skill_md in _iter_files(
         skill_root,
         filename="SKILL.md",
         allowed_roots=(root, hermes_home),
         excluded_dir_names=settings.exclude_dir_names,
     ):
-        try:
-            if _path_is_relative_to(skill_md.resolve(strict=True), resolved_root):
-                continue
-        except OSError:
-            continue
+        # Source containment does not imply another enabled scanner collected
+        # the support files. Let candidate source identities deduplicate them.
         text = _safe_read_text(skill_md)
         frontmatter = _parse_frontmatter(text)
         skill_name = str(frontmatter.get("name") or skill_md.parent.name).strip()
@@ -705,9 +702,14 @@ def scan_skills_and_support_docs(
 
 
 def _script_summary(path: Path, text: str) -> str:
-    docstring = re.search(r'^[ruRUfbFB]*(["\']{3})(.*?)\1', text, re.DOTALL | re.MULTILINE)
-    if docstring:
-        return re.sub(r"\s+", " ", docstring.group(2).strip())[:500]
+    if path.suffix == ".py":
+        try:
+            docstring = ast.get_docstring(ast.parse(text))
+        except (SyntaxError, ValueError):
+            # Invalid or truncated source can still provide a header comment.
+            docstring = None
+        if docstring is not None:
+            return re.sub(r"\s+", " ", docstring.strip())[:500]
     comments: list[str] = []
     for raw_line in text.splitlines()[:30]:
         line = raw_line.strip()
@@ -814,7 +816,9 @@ def _source_markdown_candidates(
         relative = path.relative_to(root)
         if relative.name == "SKILL.md" or _relpath_matches_config_dir(relative, settings.custom_skill_dirs):
             continue
-        candidates.append(_markdown_candidate(root, path, _doc_type(relative, settings), settings))
+        # Prefer a skill support candidate when both scanners cover this file,
+        # preserving its owning-skill relationship rather than a generic doc.
+        candidates.append(_markdown_candidate(root, path, _doc_type(relative, settings), settings, priority=20))
     return candidates
 
 
