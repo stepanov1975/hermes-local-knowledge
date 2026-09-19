@@ -11,6 +11,16 @@ Durable product, ranking, privacy, and state rationale for `hermes-local-knowled
 - Stable boundaries are the `hermes_local_knowledge.plugin` entry point and `register`, the five documented tools/four hooks, the documented CLI/config behavior, and the eight names in `indexer.__all__`.
 - Model-facing native tool payloads are deliberately thinner than service/CLI data: routine calls expose only actionable routing and improvement evidence, while rich diagnostics stay in local telemetry and operator surfaces.
 
+## Verified-routing shadow boundary
+
+- Shadow capture/investigation is separate, explicitly opt-in and off by default. It never alters ranking, tool responses, feedback or publication. Contract 2 binds the original host user request separately from optional bounded assistant-supplied `lookup` intent/target/operation/context, with no history window. The complete baseline page and indexed-metadata fingerprint must preserve useful evidence (including trackers); unknown coverage vetoes acceptance.
+- Exact reuse requires current context/baseline/contract and existing source/age freshness. One detached applicability call over at most three candidates from 100 recent verified cases can accept same-source paraphrases/quantity changes. Lexical overlap only generates candidates. Semantic outcomes are `would_reuse`/`ai_applicable`, not new verification or savings; they inherit age and do not seed semantic chains. Rejected candidate reads have a separate evidence budget from acquisition. Legacy packets cannot bypass the contract.
+- Unlike structural OKF packets, shadow work retains bounded task text and sends selected operational Markdown evidence to the configured host model provider. Generated state stays private; independent AI verification is not a human label or execution permission.
+- Hook context propagation must match the actual host: pre-LLM hooks can run in copied worker-thread contexts. Exact profile/session/task/turn joins use a bounded locked map plus post-tool telemetry receipts, not a ContextVar written by a preceding hook.
+- Shadow state includes profile and source-root identity even with shared telemetry state. Model calls are recorded before dispatch; interrupted calls are ambiguous and not automatically replayed. Hash/locator/age checks govern private reuse observations, never operational safety.
+- Worker configuration must round-trip the host's serialized YAML, including indentless block lists. Request timeout is not a hard process deadline when the host retries or falls back.
+- Turn-end readiness wakes a finite detached shadow supervisor, with teardown fallback. Its separate namespace-local SQLite lock coalesces duplicate wakes without holding queue transactions; its 900-second/16-child allowance never replenishes. Child budgets/fencing and ambiguous-call closure remain unchanged. Only a surviving supervisor recovers child interruptions; supervisor death, reboot, or exhaustion requires a later external wake. No permanent scheduler or recursive chain is installed.
+
 ## Ownership
 
 - `config.py` resolves all configuration and aliases.

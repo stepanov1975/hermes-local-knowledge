@@ -180,6 +180,14 @@ Each invocation follows Hermes' context-local active profile, including hosts th
 
 When `source_root` is omitted, runtime skills, cron jobs, and MCP configuration are still indexed from `$HERMES_HOME`, but arbitrary root-level Markdown is not included by default. Generated state belongs outside a source repository and must not be committed.
 
+## Verified-routing shadow mode (off by default)
+
+An optional shadow lane captures task-linked searches with separate immediate lookup intent, investigates current Markdown sources, and verifies useful evidence coverage against the complete baseline. **Search results never change.** Exact recurrence has a cheap freshness/contract gate; a bounded detached-worker applicability check can label paraphrases or changed answer quantities as asynchronous **would-reuse** when the same sources cover them. Lexical shortlisting is not the semantic verdict, and neither path demonstrates savings.
+
+Eligible turn-end hooks wake a finite detached supervisor (teardown remains a fallback), so ready shadow work can progress across batches without another message. Each supervisor is limited to 15 minutes and 16 child batches; this can spend more tokens than one batch. Child interruptions are recovered only while the supervisor survives, using existing lease expiry and ambiguous-call closure. No permanent scheduler is installed.
+
+Native `knowledge_search` accepts optional bounded `lookup` fields (`intent`, `target`, `operation`, `context`), explicitly assistant-supplied rather than authority or execution permission. No transcript window is captured. Enabling shadow mode retains bounded private task/lookup text and sends task/source evidence to the configured model provider; it incurs additional model calls. It is independent of OKF and implicit feedback. See [configuration, lifecycle, cost, limitations and operator commands](docs/verified-routing-shadow.md) before opting in. Neither installation nor upgrade enables it.
+
 ## CLI
 
 The primary standalone entry point is:

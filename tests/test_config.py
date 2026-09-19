@@ -15,6 +15,7 @@ from hermes_local_knowledge.config import (
     ImplicitFeedbackSettings,
     IndexSettings,
     OKFSettings,
+    VerifiedRoutingSettings,
     resolve_config,
 )
 
@@ -22,6 +23,41 @@ from hermes_local_knowledge.config import (
 def write_config(hermes_home: Path, body: str) -> None:
     hermes_home.mkdir(parents=True, exist_ok=True)
     (hermes_home / "config.yaml").write_text(body, encoding="utf-8")
+
+
+def test_verified_routing_defaults_are_off_and_immutable(tmp_path: Path) -> None:
+    cfg = resolve_config(tmp_path / "fresh")
+    assert cfg.verified_routing == VerifiedRoutingSettings(
+        mode="off", max_cases_per_worker=1, max_model_calls_per_case=12,
+        max_worker_seconds=300, max_age_days=30,
+    )
+    with pytest.raises(FrozenInstanceError):
+        setattr(cfg.verified_routing, "mode", "shadow")
+    assert not cfg.state_dir.exists()
+
+
+@pytest.mark.parametrize("mode", ["off", "promote", "Shadow", "true", "[]", "null"])
+def test_verified_routing_invalid_mode_fails_off(tmp_path: Path, mode: str) -> None:
+    write_config(tmp_path, f"local_knowledge:\n  verified_routing:\n    mode: {mode}\n")
+    assert resolve_config(tmp_path).verified_routing.mode == "off"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("-100", (1, 4, 30, 1)), ("9999", (2, 24, 1200, 90)), ("bad", (1, 12, 300, 30))],
+)
+def test_verified_routing_nested_bounds(
+    tmp_path: Path, value: str, expected: tuple[int, int, int, int],
+) -> None:
+    write_config(tmp_path, "local_knowledge:\n  verified_routing:\n    mode: shadow\n" + "".join(
+        f"    {name}: {value}\n" for name in (
+            "max_cases_per_worker", "max_model_calls_per_case", "max_worker_seconds", "max_age_days",
+        )
+    ))
+    settings = resolve_config(tmp_path).verified_routing
+    assert settings.mode == "shadow"
+    assert (settings.max_cases_per_worker, settings.max_model_calls_per_case,
+            settings.max_worker_seconds, settings.max_age_days) == expected
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +88,7 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
         "ImplicitFeedbackSettings",
         "IndexSettings",
         "OKFSettings",
+        "VerifiedRoutingSettings",
         "resolve_config",
     ]
     assert not hasattr(config_module, "RuntimeConfig")
@@ -70,6 +107,7 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
         "warnings",
         "router_skill_path",
         "router_skill_path_source",
+        "verified_routing",
     ]
     assert resolved == Config(
         source_root=hermes_home.resolve(),

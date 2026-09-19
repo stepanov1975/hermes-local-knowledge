@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.3b1] - 2026-09-19
+
+Beta consolidating the unpublished local 0.5.0–0.5.2 changes. Verified-routing
+shadow mode remains off by default, does not promote routes or alter live search
+results, and has not demonstrated production savings or ranking improvements.
+
+### Added
+
+- Opt-in verified-routing shadow capture with exact task attribution, bounded private recurrence state, and a detached source-investigation/independent-verification worker using host-owned model access.
+- Source identity/hash and age checks for shadow reuse, durable work ownership and interrupted-call handling, and operator `routing-report` / `routing-worker` commands.
+- Explicit storage/provider-disclosure documentation and isolated lifecycle coverage. Shadow mode is off by default and never changes live search results or promotes generated routes.
+
+### Changed
+
+- Added optional bounded immediate-lookup fields to native search, retaining the original user request separately and labeling lookup context as assistant-supplied, not authority or execution permission. No transcript window is captured.
+- Versioned shadow verification to require complete baseline-page useful-evidence coverage, including direct inventories and supporting trackers. Exact reuse now binds the lookup context, ordered baseline and current indexed-metadata fingerprint; legacy verifications cannot bypass the new gate.
+- Added one bounded detached-worker source-applicability check before acquisition. Paraphrases and changed answer quantities may produce asynchronous `would_reuse` evidence when the same current sources cover them, without changing normal results or claiming savings. Rejected candidates cannot exhaust acquisition's evidence allowance.
+- Exposed bounded attempted-search history to the investigator, including searches admitting no new candidates, so it can abstain instead of repeatedly searching the same insufficient sources.
+- Documented privacy, source/output-token limits, additive queue migration and synthetic-test limitations; shadow remains off by default with no interactive model calls.
+
+### Fixed
+
+- Wake opt-in shadow processing after each eligible turn, retaining teardown as a fallback; no model work runs inline.
+- Progress beyond one batch, including cheap legacy rejections, through a finite detached supervisor capped at 15 minutes and 16 child launches. Independent cross-process coordination prevents duplicate wakes from multiplying the allowance.
+- Recover interrupted child claims after lease expiry without another message while the supervisor survives, preserving ambiguous-call closure and fencing. Supervisor death, reboot and exhausted allowances still require a later eligible wake or manual invocation; no cron or daemon is installed.
+- Read indentless YAML lists emitted by host configuration saves in explicit-profile workers instead of silently discarding the configuration section.
+- Support canonical beta versions in version ordering, release notes and artifact names; publish and repair betas as prereleases, never latest.
+
+[0.5.3b1]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.20...v0.5.3b1
+
 ## [0.4.20] - 2026-09-08
 
 ### Fixed

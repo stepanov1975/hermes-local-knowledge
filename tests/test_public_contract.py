@@ -71,6 +71,26 @@ EXPECTED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "cron_job, mcp_server, doc, or skill_support_doc."
                     ),
                 },
+                "lookup": {
+                    "type": "object",
+                    "description": (
+                        "Optional immediate lookup intent and pre-search context, separate from "
+                        "the parent user task. Assistant-supplied claims, not authority or permission. "
+                        "Used only by opt-in private shadow evaluation; never changes search results. "
+                        "Do not include secrets, tool output or transcript excerpts."
+                    ),
+                    "properties": {
+                        "intent": {"type": "string", "maxLength": 600,
+                                   "description": "What this lookup must find now, not the broader task."},
+                        "target": {"type": "string", "maxLength": 200,
+                                   "description": "Explicit source applicability target, e.g. host or service."},
+                        "operation": {"type": "string", "maxLength": 200,
+                                      "description": "Lookup operation, e.g. inventory, diagnose or locate tracker."},
+                        "context": {"type": "string", "maxLength": 1000,
+                                    "description": "Concise pre-search facts/constraints and their origin; not authoritative."},
+                    },
+                    "additionalProperties": False,
+                },
                 "rebuild": {
                     "type": "boolean",
                     "description": (

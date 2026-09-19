@@ -15,6 +15,7 @@ __all__ = [
     "ImplicitFeedbackSettings",
     "IndexSettings",
     "OKFSettings",
+    "VerifiedRoutingSettings",
     "resolve_config",
 ]
 
@@ -65,6 +66,17 @@ class ImplicitFeedbackSettings:
 
 
 @dataclass(frozen=True)
+class VerifiedRoutingSettings:
+    """Opt-in, bounded private routing investigations; never live promotion."""
+
+    mode: str = "off"
+    max_cases_per_worker: int = 1
+    max_model_calls_per_case: int = 12
+    max_worker_seconds: int = 300
+    max_age_days: int = 30
+
+
+@dataclass(frozen=True)
 class Config:
     """Fully resolved local-knowledge configuration."""
 
@@ -80,6 +92,7 @@ class Config:
     warnings: tuple[str, ...] = ()
     router_skill_path: Path | None = None
     router_skill_path_source: str = "default"
+    verified_routing: VerifiedRoutingSettings = field(default_factory=VerifiedRoutingSettings)
 
 
 def _present(value: Any) -> bool:
@@ -293,7 +306,10 @@ def _parse_local_section(text: str) -> dict[str, Any]:
             continue
         if section_indent is None:
             section_indent = indent
-        if indent == section_indent:
+        # YAML permits sequence items at the same indentation as their key;
+        # PyYAML/Hermes emit this form when saving configuration.
+        is_sequence_item = content == "-" or content.startswith("- ")
+        if indent == section_indent and not is_sequence_item:
             key, raw_value = _mapping_entry(content)
             if raw_value:
                 section[key] = _parse_yaml_scalar(raw_value)
@@ -427,6 +443,28 @@ def _resolve_implicit_feedback_settings(
     )
 
 
+def _resolve_verified_routing_settings(section: Mapping[str, Any]) -> VerifiedRoutingSettings:
+    nested = section.get("verified_routing", {})
+    values = nested if isinstance(nested, Mapping) else {}
+    # Unknown values (including YAML booleans) cannot enable private capture.
+    mode = values.get("mode")
+    return VerifiedRoutingSettings(
+        mode="shadow" if mode == "shadow" else "off",
+        max_cases_per_worker=_coerce_int(
+            values.get("max_cases_per_worker"), default=1, minimum=1, maximum=2,
+        ),
+        max_model_calls_per_case=_coerce_int(
+            values.get("max_model_calls_per_case"), default=12, minimum=4, maximum=24,
+        ),
+        max_worker_seconds=_coerce_int(
+            values.get("max_worker_seconds"), default=300, minimum=30, maximum=1200,
+        ),
+        max_age_days=_coerce_int(
+            values.get("max_age_days"), default=30, minimum=1, maximum=90,
+        ),
+    )
+
+
 def _warnings(source_root_source: str, hermes_home: Path) -> tuple[str, ...]:
     if source_root_source != "default" or not (hermes_home / "hermes-agent").exists():
         return ()
@@ -535,6 +573,7 @@ def resolve_config(hermes_home: Path | str | None = None) -> Config:
         router_skill_path_source=router_skill_path_source,
         okf=_resolve_okf_settings(section),
         implicit_feedback=_resolve_implicit_feedback_settings(section),
+        verified_routing=_resolve_verified_routing_settings(section),
         source_root_source=source_root_source,
         state_dir_source=state_dir_source,
         include_markdown_docs_source=include_markdown_docs_source,

@@ -1,3 +1,3 @@
 """Reusable local capability index for Hermes Agent."""
 
-__version__ = "0.4.20"
+__version__ = "0.5.3b1"

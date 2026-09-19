@@ -17,6 +17,12 @@ import re
 import subprocess
 import sys
 import tomllib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING or __package__:
+    from .render_release_notes import ReleaseNotesError, release_version_key
+else:
+    from render_release_notes import ReleaseNotesError, release_version_key
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VERSION_FILES = (
@@ -36,7 +42,6 @@ RELEASE_RELEVANT_PREFIXES = (
     "skills/",
 )
 _VERSION_RE = re.compile(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
-_SIMPLE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _ZERO_SHA_RE = re.compile(r"^0+$")
 
 
@@ -138,14 +143,11 @@ def require_metadata_in_sync(metadata: VersionMetadata, *, context: str = "Curre
     raise PolicyError(f"{context} plugin version metadata is not synchronized: {rendered}")
 
 
-def simple_version_key(version: str) -> tuple[int, int, int]:
-    match = _SIMPLE_VERSION_RE.fullmatch(version)
-    if match is None:
-        raise PolicyError(
-            f"Unsupported version {version!r}; version policy expects simple MAJOR.MINOR.PATCH numbers"
-        )
-    major, minor, patch = match.groups()
-    return int(major), int(minor), int(patch)
+def simple_version_key(version: str) -> tuple[int, int, int, int, int]:
+    try:
+        return release_version_key(version)
+    except ReleaseNotesError as exc:
+        raise PolicyError(str(exc)) from exc
 
 
 def is_version_bumped(*, current: str, base: str) -> bool:
@@ -211,6 +213,7 @@ def check_version_policy(root: Path, *, base_ref: str | None, head_ref: str = "H
 
     current_metadata = read_current_metadata(root)
     current_version = require_metadata_in_sync(current_metadata)
+    simple_version_key(current_version)
     messages.append(f"Version metadata in sync: {current_version}")
 
     if base_ref is None:

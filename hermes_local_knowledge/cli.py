@@ -310,6 +310,12 @@ def _add_install_router_skill_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="emit JSON")
 
 
+def _add_routing_report_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("routing-report", help="report private routing shadow counters (no task text)")
+    parser.add_argument("--hermes-home", type=Path, default=None, help="Hermes home directory")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+
+
 def setup_hermes_cli(parser: argparse.ArgumentParser) -> None:
     """Register the small setup/diagnostic surface under ``hermes local-knowledge``."""
     subparsers = parser.add_subparsers(dest="local_knowledge_command", required=True)
@@ -328,11 +334,35 @@ def setup_hermes_cli(parser: argparse.ArgumentParser) -> None:
         help="run one bounded automatic OKF generation batch",
     )
     worker_parser.add_argument("--hermes-home", type=Path, default=None, help="Hermes home directory")
+    routing_worker = subparsers.add_parser(
+        "routing-worker", help="run one bounded private routing shadow batch (host LLM required)",
+    )
+    routing_worker.add_argument("--hermes-home", type=Path, default=None, help="Hermes home directory")
+    supervisor = subparsers.add_parser(
+        "routing-supervisor", help="host-internal finite shadow batch supervisor",
+    )
+    supervisor.add_argument("--hermes-home", type=Path, default=None)
+    supervisor.add_argument("--wake-ns", type=int, default=None, help=argparse.SUPPRESS)
+    _add_routing_report_parser(subparsers)
 
 
 def handle_hermes_cli(args: argparse.Namespace, *, llm: Any = None) -> int:
     """Dispatch the Hermes-native CLI adapter through the standalone CLI."""
     command = str(args.local_knowledge_command)
+    if command == "routing-supervisor":
+        from .shadow_supervisor import run_supervisor
+
+        status = run_supervisor(hermes_home=args.hermes_home, wake_ns=args.wake_ns)
+        if status:
+            raise SystemExit(status)
+        return status
+    if command == "routing-worker":
+        from . import shadow
+
+        status = shadow.run_worker(llm=llm, hermes_home=args.hermes_home)
+        if status:
+            raise SystemExit(status)
+        return status
     if command == "okf-worker":
         status = okf.run_worker(llm=llm, hermes_home=args.hermes_home)
         if status:
@@ -446,6 +476,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     _add_install_router_skill_args(install_skill_parser)
 
     _add_okf_parser(subparsers)
+    _add_routing_report_parser(subparsers)
     return parser.parse_args(argv)
 
 
@@ -948,6 +979,12 @@ def main(
     get_neighbors_fn=get_neighbors,
 ) -> int:
     args = parse_args(argv)
+    if args.command == "routing-report":
+        from . import shadow
+
+        payload = shadow.report(resolve_config(args.hermes_home))
+        _emit_payload(payload, json_output=bool(args.json))
+        return 0
     if args.command == "install-router-skill":
         cfg = resolve_config(args.hermes_home)
         payload, status = _install_router_skill_payload(cfg, force=bool(args.force))

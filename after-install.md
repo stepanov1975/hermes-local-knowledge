@@ -116,3 +116,7 @@ No cron job is required. If an operator needs a fixed freshness interval, that e
 - Configuration edits and index rebuilds do not by themselves require a gateway restart.
 
 The plugin provides `knowledge_search`, `knowledge_get`, `knowledge_neighbors`, `knowledge_feedback`, and `knowledge_usage_report`.
+
+## Optional: verified-routing shadow mode
+
+Keep `local_knowledge.verified_routing.mode` at its default `off` unless the operator separately opts in. Unlike structural OKF generation, shadow investigation retains bounded task text and sends selected task/source evidence to the configured model provider. It never changes search results. Read [the shadow-mode guide](docs/verified-routing-shadow.md) before enabling; installing or upgrading the plugin is not consent to enable it.
