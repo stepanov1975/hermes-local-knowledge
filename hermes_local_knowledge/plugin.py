@@ -10,13 +10,13 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from . import index
+from . import index, shadow_hooks
 from .config import resolve_config
 from .implicit import on_post_tool_call as _on_implicit_post_tool_call
 from .implicit import on_pre_llm_call as _on_implicit_pre_llm_call
 from .implicit import on_session_end as _on_implicit_session_end
 from .okf import _on_post_tool_call as _on_okf_post_tool_call
-from .okf import _on_session_finalize
+from .okf import _on_session_finalize as _on_okf_session_finalize
 from .routing import ROUTING_TRACE_METADATA_KEY, SearchRoutingTrace
 from .service import LocalKnowledgeService
 from .telemetry import FEEDBACK_RATINGS, FeedbackDatabaseLockedError, _usage_context
@@ -36,9 +36,10 @@ def _render_search_hint(_session_info: Mapping[str, Any]) -> str:
 
 
 def _bind_implicit_pre_llm_context(**kwargs: Any) -> None:
-    """Bind implicit-feedback state without injecting static prompt text."""
+    """Bind optional per-turn state without injecting static prompt text."""
 
     _on_implicit_pre_llm_call(**kwargs)
+    shadow_hooks.on_pre_llm_call(**kwargs)
 
 
 def _history_contains_search_hint(conversation_history: Any) -> bool:
@@ -70,6 +71,18 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
 def _on_post_tool_call(**kwargs: Any) -> None:
     _on_okf_post_tool_call(**kwargs)
     _on_implicit_post_tool_call(**kwargs)
+    shadow_hooks.on_post_tool_call(**kwargs)
+
+
+def _on_session_end(**kwargs: Any) -> None:
+    _on_implicit_session_end(**kwargs)
+    shadow_hooks.on_session_end(**kwargs)
+
+
+def _on_session_finalize(**kwargs: Any) -> bool:
+    okf_launched = _on_okf_session_finalize(**kwargs)
+    shadow_launched = shadow_hooks.on_session_finalize(**kwargs)
+    return okf_launched or shadow_launched
 
 
 def _service() -> LocalKnowledgeService:
@@ -980,6 +993,26 @@ def register(ctx: Any) -> None:
                                 "skill_support_doc."
                             ),
                         },
+                        "lookup": {
+                            "type": "object",
+                            "description": (
+                                "Optional immediate lookup intent and pre-search context, separate from "
+                                "the parent user task. Assistant-supplied claims, not authority or permission. "
+                                "Used only by opt-in private shadow evaluation; never changes search results. "
+                                "Do not include secrets, tool output or transcript excerpts."
+                            ),
+                            "properties": {
+                                "intent": {"type": "string", "maxLength": 600,
+                                           "description": "What this lookup must find now, not the broader task."},
+                                "target": {"type": "string", "maxLength": 200,
+                                           "description": "Explicit source applicability target, e.g. host or service."},
+                                "operation": {"type": "string", "maxLength": 200,
+                                              "description": "Lookup operation, e.g. inventory, diagnose or locate tracker."},
+                                "context": {"type": "string", "maxLength": 1000,
+                                            "description": "Concise pre-search facts/constraints and their origin; not authoritative."},
+                            },
+                            "additionalProperties": False,
+                        },
                         "rebuild": {
                             "type": "boolean",
                             "description": (
@@ -1212,5 +1245,5 @@ def register(ctx: Any) -> None:
     if register_hook is not None:
         register_hook("pre_llm_call", pre_llm_callback)
         register_hook("post_tool_call", _on_post_tool_call)
-        register_hook("on_session_end", _on_implicit_session_end)
+        register_hook("on_session_end", _on_session_end)
         register_hook("on_session_finalize", _on_session_finalize)

@@ -29,6 +29,12 @@ Release-relevant changes must bump the synchronized version metadata described b
 
 Release notes are rendered from the exact `CHANGELOG.md` section and compare link for the package version. Re-running CI for an already released version is safe: the release workflow verifies the published status, exact notes body, and both expected artifacts before skipping it. A notes-only mismatch is repaired without rebuilding complete assets; a draft or artifact-incomplete release is repaired from its existing tag. If a matching tag exists without a release, the workflow only uses it when it points to the exact commit that passed CI.
 
+Release versions use canonical `MAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCHbN`
+syntax (for example, `0.5.3b1`). Beta numbers sort numerically before the final
+release of the same version. Other prerelease/local/postrelease spellings are not
+supported. Betas are published as GitHub prereleases with `--latest=false`;
+repair and final verification enforce the version's expected release status.
+
 ## Pull request expectations
 
 A good pull request includes:

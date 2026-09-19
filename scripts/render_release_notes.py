@@ -9,14 +9,38 @@ import re
 import sys
 from pathlib import Path
 
-VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+VERSION_PATTERN = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:b(0|[1-9][0-9]*))?"
+VERSION_RE = re.compile(VERSION_PATTERN)
 RELEASE_HEADING_RE = re.compile(r"^## \[(?P<version>[^]]+)] - \d{4}-\d{2}-\d{2}$")
 ANY_RELEASE_HEADING_RE = re.compile(r"^## \[[^]]+](?:\s|$)")
-ANY_VERSION_LINK_RE = re.compile(r"^\[\d+\.\d+\.\d+]:\s*\S+\s*$")
+ANY_VERSION_LINK_RE = re.compile(rf"^\[{VERSION_PATTERN}]:\s*\S+\s*$")
 
 
 class ReleaseNotesError(ValueError):
     """The changelog cannot produce one unambiguous release body."""
+
+
+def release_version_key(version: str) -> tuple[int, int, int, int, int]:
+    """Order canonical MAJOR.MINOR.PATCH[bN] releases (beta before final).
+
+    Deliberately not a general PEP 440 parser: other suffixes are unsupported.
+    Keep this helper self-contained: release repair copies this script from tags.
+    """
+    match = VERSION_RE.fullmatch(version)
+    if match is None:
+        raise ReleaseNotesError(f"invalid release version: {version!r}")
+    major, minor, patch, beta = match.groups()
+    return int(major), int(minor), int(patch), int(beta is None), int(beta or 0)
+
+
+def release_metadata(version: str) -> dict[str, str]:
+    key = release_version_key(version)
+    return {
+        "tag": f"v{version}",
+        "wheel": f"hermes_local_knowledge-{version}-py3-none-any.whl",
+        "sdist": f"hermes_local_knowledge-{version}.tar.gz",
+        "prerelease": str(key[3] == 0).lower(),
+    }
 
 
 def render_release_notes(changelog_path: Path, version: str) -> str:
@@ -109,6 +133,7 @@ def inspect_release(
     *,
     expected_wheel: str,
     expected_sdist: str,
+    expected_prerelease: bool = False,
 ) -> dict[str, bool]:
     """Classify release repair work while preserving unrelated assets."""
 
@@ -132,7 +157,8 @@ def inspect_release(
 
     assets_complete = all(asset_complete(name) for name in (expected_wheel, expected_sdist))
     release_shape_complete = (
-        release.get("isDraft") is False and release.get("isPrerelease") is False
+        release.get("isDraft") is False
+        and release.get("isPrerelease") is expected_prerelease
     )
     notes_match = release.get("body") == expected_notes
     return {
@@ -151,6 +177,7 @@ def verify_release_complete(
     *,
     expected_wheel: str,
     expected_sdist: str,
+    expected_prerelease: bool = False,
 ) -> None:
     """Require a published release with both expected artifacts and exact notes."""
 
@@ -159,6 +186,7 @@ def verify_release_complete(
         expected_notes,
         expected_wheel=expected_wheel,
         expected_sdist=expected_sdist,
+        expected_prerelease=expected_prerelease,
     )
     missing = [
         name
@@ -203,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
                 expected,
                 expected_wheel=args.expected_wheel,
                 expected_sdist=args.expected_sdist,
+                expected_prerelease=release_metadata(args.version)["prerelease"] == "true",
             )
             if args.inspect_release:
                 print(json.dumps(state, sort_keys=True))
@@ -212,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                     expected,
                     expected_wheel=args.expected_wheel,
                     expected_sdist=args.expected_sdist,
+                    expected_prerelease=release_metadata(args.version)["prerelease"] == "true",
                 )
         elif args.release_json is not None:
             verify_release_body(args.release_json, expected)

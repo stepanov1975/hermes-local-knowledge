@@ -94,3 +94,21 @@ For ranking/index changes, also run a configured build, read-only evaluation, an
 ## Repository safety
 
 Keep `.env*`, databases, JSONL indexes, logs, caches, builds, virtualenvs, mutation workspaces, and local state out of commits. This is a public repository: never add credentials, private document contents, raw session transcripts, or identifying telemetry rows.
+
+## Agent skills
+
+### Issue tracker
+
+Track issues and specs in GitHub Issues for
+`stepanov1975/hermes-local-knowledge`.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default five triage-state labels.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use a single root context with root-level ADRs.
+See `docs/agents/domain.md`.

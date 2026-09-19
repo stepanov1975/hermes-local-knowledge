@@ -93,10 +93,18 @@ jobs:
           print(project_version)
           PY
           )
-          tag="v${version}"
-          wheel="hermes_local_knowledge-${version}-py3-none-any.whl"
-          sdist="hermes_local_knowledge-${version}.tar.gz"
-          output "tag=${tag}" "wheel=${wheel}" "sdist=${sdist}"
+          metadata=$(python - "$version" <<'PY'
+          import json
+          import sys
+          from scripts.render_release_notes import release_metadata
+          print(json.dumps(release_metadata(sys.argv[1])))
+          PY
+          )
+          tag=$(jq -r '.tag' <<<"$metadata")
+          wheel=$(jq -r '.wheel' <<<"$metadata")
+          sdist=$(jq -r '.sdist' <<<"$metadata")
+          prerelease=$(jq -r '.prerelease' <<<"$metadata")
+          output "tag=${tag}" "wheel=${wheel}" "sdist=${sdist}" "prerelease=${prerelease}"
 
           tag_exists=false
           expected_sha="$HEAD_SHA"
@@ -312,12 +320,18 @@ jobs:
       - name: Repair prerelease status
         if: >-
           steps.release.outputs.needed == 'true' &&
-          steps.release.outputs.release_exists == 'true' &&
-          steps.release.outputs.release_is_prerelease == 'true'
+          steps.release.outputs.release_exists == 'true'
         env:
+          EXPECTED_PRERELEASE: ${{ steps.release.outputs.prerelease }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false
+        run: |
+          set -euo pipefail
+          latest_args=()
+          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+            latest_args=(--latest=false)
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease="$EXPECTED_PRERELEASE" "${latest_args[@]}"
 
       - name: Create GitHub release from existing tag
         if: >-
@@ -325,14 +339,20 @@ jobs:
           steps.release.outputs.release_exists == 'false' &&
           steps.release.outputs.tag_exists == 'true'
         env:
+          EXPECTED_PRERELEASE: ${{ steps.release.outputs.prerelease }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_NOTES_FILE: ${{ runner.temp }}/release-notes.md
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
+          latest_args=()
+          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+            latest_args=(--latest=false)
+          fi
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
+            --prerelease="$EXPECTED_PRERELEASE" "${latest_args[@]}" \
             --verify-tag \
             --title "$RELEASE_TAG" \
             --notes-file "$RELEASE_NOTES_FILE"
@@ -343,15 +363,21 @@ jobs:
           steps.release.outputs.release_exists == 'false' &&
           steps.release.outputs.tag_exists == 'false'
         env:
+          EXPECTED_PRERELEASE: ${{ steps.release.outputs.prerelease }}
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.sha }}
           RELEASE_NOTES_FILE: ${{ runner.temp }}/release-notes.md
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
+          latest_args=()
+          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+            latest_args=(--latest=false)
+          fi
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
+            --prerelease="$EXPECTED_PRERELEASE" "${latest_args[@]}" \
             --target "$HEAD_SHA" \
             --title "$RELEASE_TAG" \
             --notes-file "$RELEASE_NOTES_FILE"
@@ -401,6 +427,7 @@ jobs:
           (steps.release.outputs.release_exists == 'false' ||
           steps.release.outputs.release_is_draft == 'true')
         env:
+          EXPECTED_PRERELEASE: ${{ steps.release.outputs.prerelease }}
           EXPECTED_SDIST: ${{ steps.release.outputs.sdist }}
           EXPECTED_WHEEL: ${{ steps.release.outputs.wheel }}
           GH_TOKEN: ${{ github.token }}
@@ -413,7 +440,7 @@ jobs:
           set -euo pipefail
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json isDraft,isPrerelease,assets,body > "$RELEASE_JSON_FILE"
-          jq -e '.isDraft == true and .isPrerelease == false' "$RELEASE_JSON_FILE" >/dev/null
+          jq -e --argjson prerelease "$EXPECTED_PRERELEASE" '.isDraft == true and .isPrerelease == $prerelease' "$RELEASE_JSON_FILE" >/dev/null
           release_state=$(python "$RELEASE_NOTES_SCRIPT" \
             --version "${RELEASE_TAG#v}" \
             --changelog "$TAG_CHANGELOG_FILE" \
@@ -430,12 +457,20 @@ jobs:
           (steps.release.outputs.release_exists == 'false' ||
           steps.release.outputs.release_is_draft == 'true')
         env:
+          EXPECTED_PRERELEASE: ${{ steps.release.outputs.prerelease }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false
+        run: |
+          set -euo pipefail
+          latest_args=()
+          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+            latest_args=(--latest=false)
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease="$EXPECTED_PRERELEASE" "${latest_args[@]}"
 
       - name: Verify published release
         env:
+          EXPECTED_PRERELEASE: ${{ steps.release.outputs.prerelease }}
           EXPECTED_SHA: ${{ steps.release.outputs.expected_sha }}
           EXPECTED_SDIST: ${{ steps.release.outputs.sdist }}
           EXPECTED_WHEEL: ${{ steps.release.outputs.wheel }}
@@ -457,6 +492,19 @@ jobs:
             --expected-wheel "$EXPECTED_WHEEL" \
             --expected-sdist "$EXPECTED_SDIST" \
             --verify-complete
+
+          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+            # No stable release yet is valid; other API failures are not.
+            if ! latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest"); then
+              if [[ "$(jq -r '.status // empty' <<<"$latest")" != 404 ]]; then
+                exit 1
+              fi
+            fi
+            if [[ "$(jq -r '.tag_name // empty' <<<"$latest")" == "$RELEASE_TAG" ]]; then
+              echo "Beta release must not be latest." >&2
+              exit 1
+            fi
+          fi
 
           git fetch --force --no-tags origin \
             "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"

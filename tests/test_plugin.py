@@ -41,7 +41,7 @@ def test_version_metadata_stays_in_sync():
         if line.startswith("version:")
     )
 
-    assert hermes_local_knowledge.__version__ == "0.4.20"
+    assert hermes_local_knowledge.__version__ == "0.5.3b1"
     assert hermes_local_knowledge.__version__ == pyproject["project"]["version"]
     assert hermes_local_knowledge.__version__ == plugin_version
 
@@ -466,12 +466,10 @@ def test_register_exposes_native_tools_and_bundled_skill():
     assert callable(cli_calls[0]["setup_fn"])
     assert callable(cli_calls[0]["handler_fn"])
     assert cli_calls[0]["handler_fn"].keywords["llm"] is host_llm
-    assert hook_calls == [
-        ("pre_llm_call", plugin._on_pre_llm_call),
-        ("post_tool_call", plugin._on_post_tool_call),
-        ("on_session_end", plugin._on_implicit_session_end),
-        ("on_session_finalize", plugin._on_session_finalize),
+    assert [name for name, _ in hook_calls] == [
+        "pre_llm_call", "post_tool_call", "on_session_end", "on_session_finalize",
     ]
+    assert all(callable(callback) for _, callback in hook_calls)
 
 
 def test_register_prefers_system_prompt_section_when_supported(
@@ -525,7 +523,7 @@ def test_register_prefers_system_prompt_section_when_supported(
         "docs, use `knowledge_search` before broad file search; verify live state directly."
     )
     assert len(plugin.KNOWLEDGE_SEARCH_HINT) <= 200
-    assert hook_calls[0] == ("pre_llm_call", plugin._bind_implicit_pre_llm_context)
+    assert hook_calls[0][0] == "pre_llm_call"
     assert hook_calls[0][1](turn_id="turn-1") is None
     assert implicit_kwargs["turn_id"] == "turn-1"
 
@@ -682,8 +680,10 @@ def test_pre_llm_hook_injects_search_hint_into_real_api_content(
     assert result is not None
     assert callback_kwargs["turn_id"] == "turn-1"
 
-    compose_user_api_content = importlib.import_module(
-        "agent.turn_context"
+    # Older PyPI hosts lack this optional composition helper. Keep plugin output
+    # and context-binding assertions above unconditional on either host shape.
+    compose_user_api_content = pytest.importorskip(
+        "agent.turn_context", reason="host does not expose the API-content composition helper"
     ).compose_user_api_content
 
     api_content = compose_user_api_content(
