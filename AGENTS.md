@@ -9,6 +9,13 @@ These instructions apply to the whole repository.
 3. Keep changes focused. Runtime dependencies remain Python standard library only unless a documented product need justifies otherwise.
 4. Never commit generated/local state or secrets.
 
+## Official Hermes compatibility
+
+- This is a public, independently distributed plugin. It must work with unmodified official Hermes releases within its documented supported version range.
+- Do not require local Hermes core patches, forks, monkey-patching host internals, or deployment-specific behavior for plugin functionality or correctness. Use supported public extension APIs; document and verify any minimum Hermes version.
+- When a host limitation prevents an optional feature, use a plugin-owned alternative or explicit, observable degradation. Do not claim complete event capture when the host may omit callbacks, or make a host modification the required solution.
+- Verify compatibility on an unmodified official Hermes version, not only the maintainer's customized installation.
+
 ## Documented public boundaries
 
 - Package version is synchronized in `plugin.yaml`, `pyproject.toml`, and `hermes_local_knowledge/__init__.py`.
