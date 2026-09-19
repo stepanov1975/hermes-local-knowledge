@@ -136,4 +136,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
-    uses: ./.github/workflows/release.yml
+    # actionlint 1.7.12 does not yet accept $/ workflow references. This job-level
+    # call resolves from the caller's commit, not mutable runner workspace files.
+    # Migrate to $/ when the pinned actionlint supports it.
+    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository]
