@@ -343,7 +343,6 @@ def setup_hermes_cli(parser: argparse.ArgumentParser) -> None:
     )
     supervisor.add_argument("--hermes-home", type=Path, default=None)
     supervisor.add_argument("--wake-ns", type=int, default=None, help=argparse.SUPPRESS)
-    _add_routing_report_parser(subparsers)
 
 
 def handle_hermes_cli(args: argparse.Namespace, *, llm: Any = None) -> int:

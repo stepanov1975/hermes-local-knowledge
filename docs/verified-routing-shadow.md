@@ -192,13 +192,13 @@ daemon, startup recovery, or recursive supervisor chain is installed.
 ## Operator commands
 
 ```bash
-hermes local-knowledge routing-report --hermes-home /path/to/profile --json
+python -m hermes_local_knowledge.cli routing-report --hermes-home /path/to/profile --json
 hermes local-knowledge routing-worker --hermes-home /path/to/profile
 ```
 
 The worker uses host-owned model access and only operates in shadow mode; it is not
-a standalone inference client. The standalone Python CLI also supports
-`routing-report`. Reports expose counters/statuses, not request/source prose by
+a standalone inference client. `routing-report` is available only through the
+standalone Python CLI. Reports expose counters/statuses, not request/source prose by
 default. Disabling the mode stops new capture/launches but does not delete evidence
 or kill an existing worker. The supervisor rereads configuration between children
 and while waiting on leases, stopping further launches when shadow is off or the

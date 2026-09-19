@@ -241,6 +241,72 @@ def test_hard_interruption_recovered_without_replaying_provider_call(cfg: Config
     assert rows(cfg)[0]["reason"] == "interrupted_ambiguous"
 
 
+@pytest.mark.parametrize("stop", ["interruption", "deadline"])
+def test_two_case_batch_preserves_unstarted_case(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch, stop: str,
+) -> None:
+    cfg = replace(cfg, verified_routing=replace(cfg.verified_routing, max_cases_per_worker=2))
+    first = capture(cfg)["case_id"]
+    second = capture(cfg, user_request="Locate the Quartz service restart runbook.")["case_id"]
+    mutate(cfg, "UPDATE cases SET created=CASE WHEN id=? THEN 1 ELSE 2 END", (first,))
+    shadow.finish_session(cfg, "session-1")
+    clock = [100.0]
+    monkeypatch.setattr(shadow.time, "monotonic", lambda: clock[0])
+
+    class Stopped(Model):
+        def complete_structured(self, **kwargs: Any) -> Any:
+            response = super().complete_structured(**kwargs)
+            if stop == "interruption":
+                raise KeyboardInterrupt()
+            clock[0] += cfg.verified_routing.max_worker_seconds + 1
+            return response
+
+    model = Stopped()
+    if stop == "interruption":
+        with pytest.raises(KeyboardInterrupt):
+            shadow.run_batch(cfg, llm=model)
+        # Fresh claims are not recoverable merely because the worker exited.
+        assert not shadow.has_work(cfg)
+        assert shadow.run_batch(cfg, llm=Model())["claimed"] == 0
+        mutate(cfg, "UPDATE cases SET lease_until=0")
+    else:
+        assert shadow.run_batch(cfg, llm=model) == {"claimed": 2, "verified": 0, "unresolved": 1}
+        saved = {row["id"]: row for row in rows(cfg)}
+        assert saved[second]["status"] == "pending"
+        assert saved[second]["owner"] == ""
+        assert saved[second]["lease_until"] == 0
+        assert saved[second]["calls"] == 0
+    assert len(model.calls) == 1
+    assert shadow.has_work(cfg)
+    resumed = Model()
+    assert shadow.run_batch(cfg, llm=resumed) == {"claimed": 1, "verified": 1, "unresolved": 0}
+    saved = {row["id"]: row for row in rows(cfg)}
+    assert saved[first]["status"] == "unresolved"
+    assert saved[first]["reason"] == ("interrupted_ambiguous" if stop == "interruption" else "time_budget")
+    assert saved[first]["total_calls"] == 1
+    assert saved[second]["status"] == "ai_verified"
+    assert saved[second]["total_calls"] == len(resumed.calls) == 3
+
+
+@pytest.mark.parametrize("loss", ["case_owner", "lease_owner", "case_expiry", "lease_expiry"])
+def test_unstarted_deadline_release_requires_case_and_lease_fences(cfg: Config, loss: str) -> None:
+    capture(cfg)
+    shadow.finish_session(cfg, "session-1")
+    claimed = shadow._claim(cfg, "original", time.time() + 300)
+    assert len(claimed) == 1
+    sql = {
+        "case_owner": "UPDATE cases SET owner='successor'",
+        "lease_owner": "UPDATE lease SET owner='successor'",
+        "case_expiry": "UPDATE cases SET lease_until=0",
+        "lease_expiry": "UPDATE lease SET until=0",
+    }[loss]
+    mutate(cfg, sql)
+    before = rows(cfg)
+    with pytest.raises(ValueError, match="^ownership_lost$"):
+        shadow._complete(cfg, claimed[0], "original", {}, "time_budget")
+    assert rows(cfg) == before
+
+
 def test_foreign_live_lease_and_stale_owner_cannot_publish(cfg: Config) -> None:
     capture(cfg)
     shadow.finish_session(cfg, "session-1")

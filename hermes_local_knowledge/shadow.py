@@ -306,7 +306,10 @@ def _claim(cfg: Config, owner: str, lease_until: float) -> list[dict[str, Any]]:
         now = time.time()
         if conn.execute("SELECT 1 FROM lease WHERE until>?", (now,)).fetchone():
             return []
-        # An expired claim may have spent tokens even without a response receipt.
+        # Calls are committed before dispatch: only zero-call claims are safe to retry.
+        conn.execute("UPDATE cases SET status='pending',reason='',owner='',lease_until=0 "
+                     "WHERE status='running' AND lease_until<=? AND calls=0", (now,))
+        # An expired started claim may have spent tokens without a response receipt.
         conn.execute("UPDATE cases SET status='unresolved',reason='interrupted_ambiguous',owner='',"
                      "lease_until=0 WHERE status='running' AND lease_until<=?", (now,))
         rows = conn.execute("SELECT * FROM cases WHERE status='pending' AND ready=1 "
@@ -674,19 +677,24 @@ def _investigate(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
             "investigator_citations": proposal["citations"], "near_miss_id": near_miss, "sources": receipts}
 
 
-def _complete(cfg: Config, row: dict[str, Any], owner: str, result: dict[str, Any], reason: str) -> None:
+def _complete(cfg: Config, row: dict[str, Any], owner: str, result: dict[str, Any], reason: str) -> str:
     with closing(_connect(cfg, create=True)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         _fenced(conn, row["id"], owner)
         now = time.time()
         reused = result.get("provenance") == "ai_applicable"
         status = "would_reuse" if reused else "ai_verified" if result else "unresolved"
+        if not result and reason == "time_budget":
+            calls = conn.execute("SELECT calls FROM cases WHERE id=?", (row["id"],)).fetchone()[0]
+            if calls == 0:
+                status, reason = "pending", ""
         if reused:
             _count(conn, "would_reuse_semantic")
         conn.execute("UPDATE cases SET status=?,result=CASE WHEN ? THEN ? ELSE result END,reason=?,updated=?,verified_at=?,owner='',"
                      "lease_until=0 WHERE id=?",
                      (status, bool(result), json.dumps(result), reason,
                       now, result.get("source_verified_at", now) if result else 0, row["id"]))
+        return status
 
 
 def run_batch(cfg: Config, *, llm: Any) -> dict[str, Any]:
@@ -704,6 +712,8 @@ def run_batch(cfg: Config, *, llm: Any) -> dict[str, Any]:
         output["claimed"] = len(rows)
         for row in rows:
             try:
+                if time.monotonic() >= deadline:
+                    raise ValueError("time_budget")
                 result = _investigate(cfg, llm=llm, row=row, owner=owner, deadline=deadline)
                 _complete(cfg, row, owner, result, "")
                 if result.get("provenance") == "ai_applicable":
@@ -717,8 +727,8 @@ def run_batch(cfg: Config, *, llm: Any) -> dict[str, Any]:
                     stage = conn.execute("SELECT stage FROM cases WHERE id=?", (row["id"],)).fetchone()[0]
                 if stage.endswith("_inflight"):
                     reason = "interrupted_ambiguous"
-                _complete(cfg, row, owner, {}, reason)
-                output["unresolved"] += 1
+                if _complete(cfg, row, owner, {}, reason) == "unresolved":
+                    output["unresolved"] += 1
     except Exception:
         output["error"] = "worker_error"
     finally:

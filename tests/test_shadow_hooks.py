@@ -419,9 +419,11 @@ def test_cli_report_and_native_worker_bridge(
     assert exc.value.code == 1
     assert cli.main(["routing-report", "--hermes-home", str(cfg.hermes_home), "--json"]) == 0
     standalone = json.loads(capsys.readouterr().out)
-    args = parser.parse_args(["routing-report", "--hermes-home", str(cfg.hermes_home), "--json"])
-    assert cli.handle_hermes_cli(args) == 0
-    assert json.loads(capsys.readouterr().out) == standalone == shadow.report(cfg)
+    assert standalone == shadow.report(cfg)
+    assert "routing-report" not in parser.format_help()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["routing-report", "--hermes-home", str(cfg.hermes_home), "--json"])
+    assert exc.value.code == 2
     assert not cfg.state_dir.exists()
     with pytest.raises(SystemExit) as exc:
         cli.main(["routing-worker"])

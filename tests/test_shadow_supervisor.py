@@ -186,16 +186,19 @@ def test_turn_end_alone_drains_eight_cases_including_legacy_and_changed_baseline
 
 
 @pytest.mark.skipif(os.name == "nt", reason="SIGKILL interruption proof is POSIX-specific")
+@pytest.mark.parametrize("batch_size,expected_launches", [(1, 3), (2, 2)])
 def test_killed_child_is_closed_after_lease_and_remaining_cases_progress_without_wake(
-    cfg: Config, processes: list[subprocess.Popen[Any]],
+    cfg: Config, processes: list[subprocess.Popen[Any]], batch_size: int, expected_launches: int,
 ) -> None:
+    config_file = cfg.hermes_home / "config.yaml"
+    config_file.write_text(config_file.read_text() + f"    max_cases_per_worker: {batch_size}\n")
     capture(cfg, 3)
     shadow.finish_session(cfg, "test")
     scenario(cfg, kill_first=True, short_lease=True)
     process = start(cfg, processes)
     wait_for(lambda: (cfg.hermes_home / "killed").exists())
     with shadow._connect(cfg) as conn:
-        running = dict(conn.execute("SELECT * FROM cases WHERE status='running'").fetchone())
+        running = dict(conn.execute("SELECT * FROM cases WHERE status='running' AND calls>0").fetchone())
     assert running["calls"] == 1 and running["stage"].endswith("_inflight")
     assert running["lease_until"] > time.time()
     assert shadow_supervisor.work_delay(cfg) is not None
@@ -208,7 +211,7 @@ def test_killed_child_is_closed_after_lease_and_remaining_cases_progress_without
     assert interrupted["calls"] == interrupted["total_calls"] == 1  # No replay.
     assert shadow.report(cfg)["cases"] == {"unresolved": 3}
     assert shadow.report(cfg)["model_calls"] == 3
-    assert launches(cfg) == 3
+    assert launches(cfg) == expected_launches
 
 
 def test_duplicate_wakes_cannot_multiply_or_replenish_exhausted_allowance(
@@ -356,17 +359,24 @@ def test_disable_during_child_stops_subsequent_launches(
     assert shadow._path(cfg).with_name("supervisor.log").read_text() == "disabled_or_changed\n"
 
 
-def test_expired_running_only_is_closed_without_model_call(
-    cfg: Config, processes: list[subprocess.Popen[Any]],
+@pytest.mark.parametrize("started", [False, True])
+def test_expired_running_retries_only_unstarted_cases(
+    cfg: Config, processes: list[subprocess.Popen[Any]], started: bool,
 ) -> None:
     capture(cfg, 1)
     shadow.finish_session(cfg, "test")
     claimed = shadow._claim(cfg, "interrupted", time.time() - 1)
     assert len(claimed) == 1
+    if started:
+        with shadow._connect(cfg, create=True) as conn:
+            conn.execute("UPDATE cases SET calls=1,total_calls=1,stage='investigator_inflight'")
     assert start(cfg, processes).wait(timeout=10) == 0
     assert shadow.report(cfg)["cases"] == {"unresolved": 1}
-    assert shadow.report(cfg)["model_calls"] == 0
-    assert not (cfg.hermes_home / "model-started").exists()
+    assert shadow.report(cfg)["model_calls"] == 1
+    assert (cfg.hermes_home / "model-started").exists() is not started
+    with shadow._connect(cfg) as conn:
+        reason = conn.execute("SELECT reason FROM cases").fetchone()[0]
+    assert (reason == "interrupted_ambiguous") is started
     assert launches(cfg) == 1
 
 
