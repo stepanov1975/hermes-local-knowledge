@@ -60,6 +60,13 @@ Receipts disappear after consumption; existing consumer databases keep their own
 already-documented projections. Asynchronous bookkeeping can lag the next lookup;
 this is not a synchronous feedback-visibility guarantee.
 
+Synchronous argument-shape capture reads at most eight children per container,
+with a shared 256-node traversal budget (including repeated references). Tool
+result strings over 65,536 characters are rejected before JSON classification or
+evidence parsing. These limits discard the observation with `projection_error`,
+not the tool call or its original result; large file/skill results therefore do
+not supply implicit-consumption evidence.
+
 ## Deduplication, overload and failure
 
 Complete profile/root/state + tool + session/task/turn/API-request/tool-call
@@ -73,7 +80,10 @@ that could duplicate earlier effects.
 
 Full or closed queues reject new observations, never tool execution. Oversized or
 unprojectable receipts are discarded. Lifecycle reservations can also be rejected
-when full; a later lifecycle notification or manual worker invocation may be
+if observer thread construction/start fails (`enqueue_error`), without failing
+the host hook or leaving an occupied slot; later submissions can retry startup.
+Full queues can also reject lifecycle work; a later lifecycle notification or
+manual worker invocation may be
 needed to wake durable work. Accepted work is never evicted to make room. A hung
 producer/consumer can prevent draining; interpreter termination can lose pending
 work. There is **no lossless, crash-recovery, durable or exactly-once guarantee**.

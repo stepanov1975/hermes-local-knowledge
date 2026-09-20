@@ -23,6 +23,7 @@ from .config import _OBSERVER_CONFIG, resolve_config
 logger = logging.getLogger(__name__)
 IDENTITY = ("session_id", "task_id", "turn_id", "api_request_id", "tool_call_id")
 MAX_RECEIPT_BYTES = 65536
+MAX_RESULT_CHARS = 65536
 
 
 def _text(value: Any, limit: int) -> str:
@@ -105,6 +106,10 @@ def project_call(args: Any, metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def project_result(payload: dict[str, Any], result: Any, failed: bool) -> None:
+    # Bound both classification and selected-tool parsing before either decoder
+    # can allocate a tree. Oversized output still returns unchanged to the host.
+    if isinstance(result, str) and len(result) > MAX_RESULT_CHARS:
+        raise ValueError("result exceeds observer budget")
     success, error_type, _ = okf._classify_result(result)
     success = success and not failed
     payload["status"] = "success" if success else "error"
@@ -180,12 +185,13 @@ class Observer:
             slot = _Slot(context, kind)
             self._queue.append(slot)
             if self._thread is None:
-                thread = threading.Thread(target=self._run, name="local-knowledge-observer", daemon=True)
                 try:
+                    thread = threading.Thread(target=self._run, name="local-knowledge-observer", daemon=True)
                     thread.start()
                 except Exception:
                     self._queue.pop()
-                    raise
+                    self._notice("enqueue_error")
+                    return None
                 self._thread = thread
                 atexit.register(self.close, 1.0)
             self._counts["accepted"] += 1

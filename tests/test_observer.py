@@ -209,6 +209,147 @@ def test_schema_snapshot_preserves_shared_json_and_rejects_cycles() -> None:
         observer._schema_snapshot(schema)
 
 
+@pytest.mark.parametrize("kind", ["mapping", "sequence"])
+def test_arg_shape_reads_only_bounded_prefix(kind: str) -> None:
+    from collections.abc import Sequence
+
+    reads: list[int] = []
+
+    class WideMapping(UserDict):
+        def items(self) -> Any:
+            for index in range(10000):
+                reads.append(index)
+                yield str(index), "PRIVATE"
+
+    class WideSequence(Sequence):
+        def __len__(self) -> int:
+            return 10000
+
+        def __getitem__(self, index: Any) -> Any:
+            if index >= 10000:
+                raise IndexError
+            reads.append(index)
+            return "PRIVATE"
+
+    value = WideMapping(dict.fromkeys(range(10000))) if kind == "mapping" else WideSequence()
+    shape = okf.safe_arg_shape(value)
+    assert reads == list(range(okf.DEFAULT_MAX_ARG_ITEMS))
+    assert shape["truncated"] is True
+    assert shape["field_count" if kind == "mapping" else "length"] == 10000
+    assert "PRIVATE" not in json.dumps(shape)
+
+
+def test_arg_shape_global_budget_drops_observation(cfg: Config) -> None:
+    reads: list[int] = []
+
+    class SharedMapping(UserDict):
+        def items(self) -> Any:
+            for index, child in super().items():
+                reads.append(index)
+                yield index, child
+
+    tree: Any = "PRIVATE"
+    for _ in range(6):
+        tree = SharedMapping(dict.fromkeys(range(8), tree))
+    args = {"tree": tree}
+    received: list[Any] = []
+    queue = observer.Observer(lambda *a, **k: received.append(k))
+    calls: list[Any] = []
+    result = object()
+
+    def downstream(actual: Any) -> Any:
+        calls.append(actual)
+        return result
+
+    assert queue.middleware(args, downstream, tool_name="synthetic", **IDS) is result
+    assert queue.close(5)
+    assert len(reads) <= 256
+    assert len(calls) == 1 and calls[0] is args
+    assert received == []
+    assert queue.stats()["projection_error"] == 1
+    assert queue.stats()["discarded"] == 1
+
+
+@pytest.mark.parametrize("tool_name", ["synthetic", "knowledge_search", "knowledge_get", "skill_view", "read_file"])
+def test_large_result_is_not_parsed(cfg: Config, monkeypatch: pytest.MonkeyPatch, tool_name: str) -> None:
+    raw = json.dumps({"success": True, "content": "PRIVATE" * observer.MAX_RESULT_CHARS})
+    parsed_large: list[bool] = []
+    loads = json.loads
+
+    def spy(value: Any, *args: Any, **kwargs: Any) -> Any:
+        if value is raw:
+            parsed_large.append(True)
+        return loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", spy)
+    received: list[Any] = []
+    queue = observer.Observer(lambda *a, **k: received.append(k))
+    calls: list[Any] = []
+    args: dict[str, Any] = {}
+
+    def downstream(actual: Any) -> str:
+        calls.append(actual)
+        return raw
+
+    assert queue.middleware(args, downstream, tool_name=tool_name, **IDS) is raw
+    assert queue.close(5)
+    assert parsed_large == []
+    assert len(calls) == 1 and calls[0] is args
+    assert received == []
+    assert queue.stats()["projection_error"] == 1
+    assert queue.stats()["discarded"] == 1
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+def test_result_parse_budget_boundary(extra: int) -> None:
+    raw = '{"success": false, "error": "failure", "content": ""}'
+    raw = raw[:-2] + "x" * (observer.MAX_RESULT_CHARS - len(raw) + extra) + raw[-2:]
+    payload: dict[str, Any] = {"tool_name": "read_file"}
+    if extra:
+        with pytest.raises(ValueError, match="budget"):
+            observer.project_result(payload, raw, False)
+    else:
+        observer.project_result(payload, raw, False)
+        assert payload["status"] == "error"
+        assert payload["error_type"] == "tool_error"
+        assert json.loads(payload["result"]) == {"success": False, "content": ""}
+
+
+@pytest.mark.parametrize("failure", ["construction", "start"])
+def test_thread_startup_failure_is_fail_open_and_recovers(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str,
+) -> None:
+    ctx = Context()
+    plugin.register(ctx)
+    queue = ctx.middleware.__self__
+    monkeypatch.setattr(plugin, "check_knowledge_available", lambda: False)
+    received: list[str] = []
+    queue.consume = lambda kind, **p: received.append(kind)
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("PRIVATE startup failure")
+
+    with monkeypatch.context() as patch:
+        if failure == "construction":
+            patch.setattr(observer.threading, "Thread", broken)
+        else:
+            patch.setattr(observer.threading.Thread, "start", broken)
+        for name in ("pre_llm_call", "on_session_end", "on_session_finalize"):
+            assert ctx.hooks[name](**IDS) is None
+        result = object()
+        assert ctx.middleware({}, lambda args: result, tool_name="synthetic", **IDS) is result
+        assert queue.stats()["pending"] == 0
+        assert queue.stats().get("accepted", 0) == 0
+        assert queue.stats()["enqueue_error"] == 4
+        assert queue._thread is None
+    assert "enqueue_error" in caplog.text
+    assert "PRIVATE" not in caplog.text
+    queue.submit("pre", {})
+    assert queue.close(5)
+    assert received == ["pre"]
+    assert queue.stats()["accepted"] == queue.stats()["completed"] == 1
+
+
 class Context:
     def __init__(self) -> None:
         self.hooks: dict[str, Any] = {}

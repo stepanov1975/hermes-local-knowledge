@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -525,27 +526,34 @@ def safe_arg_shape(value: Any, *, max_items: int = DEFAULT_MAX_ARG_ITEMS, depth:
     Tool arguments can contain document text, chat contents, email bodies, paths,
     tokens, or other private data. The OKF queue needs routing shape only, so this
     function records coarse value types and bounded item counts without scalar
-    values or raw mapping keys.
+    values or raw mapping keys. A shared traversal budget also bounds branching
+    and repeated references; oversized shapes are rejected, not fully expanded.
     """
+    return _safe_arg_shape(value, max_items=max_items, depth=depth, budget=[256])
+
+
+def _safe_arg_shape(value: Any, *, max_items: int, depth: int, budget: list[int]) -> dict[str, Any]:
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ValueError("argument shape exceeds traversal budget")
     if depth >= 6:
         return {"type": type(value).__name__, "truncated": True}
     if isinstance(value, Mapping):
-        items = list(value.items())
         shaped: dict[str, Any] = {}
-        for index, (_raw_key, raw_child) in enumerate(items[:max_items]):
-            shaped[f"field_{index}"] = safe_arg_shape(raw_child, max_items=max_items, depth=depth + 1)
-        result: dict[str, Any] = {"type": "object", "field_count": len(items), "fields": shaped}
-        if len(items) > max_items:
+        for index, (_raw_key, raw_child) in enumerate(islice(value.items(), max_items)):
+            shaped[f"field_{index}"] = _safe_arg_shape(raw_child, max_items=max_items, depth=depth + 1, budget=budget)
+        result: dict[str, Any] = {"type": "object", "field_count": len(value), "fields": shaped}
+        if len(value) > max_items:
             result["truncated"] = True
         return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        values = list(value)
         result = {
             "type": "array",
-            "length": len(values),
-            "items": [safe_arg_shape(item, max_items=max_items, depth=depth + 1) for item in values[:max_items]],
+            "length": len(value),
+            "items": [_safe_arg_shape(item, max_items=max_items, depth=depth + 1, budget=budget)
+                      for item in islice(value, max_items)],
         }
-        if len(values) > max_items:
+        if len(value) > max_items:
             result["truncated"] = True
         return result
     if value is None:
