@@ -36,10 +36,51 @@ def context_fields(source: Mapping[str, Any]) -> dict[str, Any]:
             "worker_generated": bool(source.get("worker_generated"))}
 
 
+def _schema_snapshot(schema: Any) -> Any:
+    """Admit only a bounded JSON tree before either projection or raw hashing.
+
+    Count shared children on every occurrence, not once per object identity:
+    both the projector and JSON encoder expand them. Copying also prevents a
+    later registry mutation from invalidating the admission bounds. Reject the
+    receipt rather than hashing a truncated schema as if it were complete.
+    """
+    nodes_left = 4096
+    chars_left = MAX_RECEIPT_BYTES
+
+    def copy(value: Any, depth: int) -> Any:
+        nonlocal nodes_left, chars_left
+        nodes_left -= 1
+        if nodes_left < 0 or depth > 32:
+            raise ValueError("schema exceeds observer budget")
+        if type(value) is str:
+            chars_left -= len(value)
+            if chars_left < 0:
+                raise ValueError("schema exceeds observer budget")
+            return value
+        if type(value) is dict:
+            result = {}
+            for key, child in value.items():
+                if type(key) is not str:
+                    raise ValueError("schema is not a JSON tree")
+                result[copy(key, depth + 1)] = copy(child, depth + 1)
+            return result
+        if type(value) is list:
+            return [copy(child, depth + 1) for child in value]
+        if value is None or type(value) in (bool, float):
+            return value
+        if type(value) is int and value.bit_length() <= 256:
+            return value
+        # Do not invoke arbitrary iterators or schema_hash's default=str.
+        raise ValueError("schema is not a bounded JSON tree")
+
+    return copy(schema, 0)
+
+
 def project_call(args: Any, metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Copy only purpose-specific evidence, not arbitrary tool args/output."""
     name = _text(metadata.get("tool_name"), 240)
     toolset, schema = okf._tool_metadata(name)
+    schema = _schema_snapshot(schema)
     source = args if isinstance(args, dict) else {}
     selected: dict[str, Any] = {}
     if name == "knowledge_search":

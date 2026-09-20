@@ -138,15 +138,75 @@ def test_projection_privacy_schema_shape_and_oversize(cfg: Config, monkeypatch: 
     assert "untrusted-key" not in json.dumps(payload)
     assert payload["_okf_capture"]["arg_shape"] == okf.safe_arg_shape(args)
     assert payload["_okf_capture"]["schema_hash"] == okf.schema_hash(schema)
-    for name, args, raw in (("read_file", {"path": "/synthetic/path"}, {"content": "SECRET"}),
-                            ("skill_view", {}, {"success": True, "_source_path": "/synthetic/path", "content": "SECRET"})):
+    source_path = str((cfg.source_root / "docs" / "atlas.md").resolve())
+    for name, args, raw in (("read_file", {"path": source_path}, {"content": "SECRET"}),
+                            ("skill_view", {}, {"success": True, "_source_path": source_path, "content": "SECRET"})):
         p = observer.project_call(args, {"tool_name": name})
         observer.project_result(p, json.dumps(raw), False)
-        assert implicit._file_consumer_path(name, p["args"], p["result"]) == "/synthetic/path"
+        assert implicit._file_consumer_path(name, p["args"], p["result"]) == source_path
         assert "SECRET" not in json.dumps(p)
     queue = observer.Observer(lambda *a, **k: None)
     queue.submit("pre", {"oversized": "x" * observer.MAX_RECEIPT_BYTES})
     assert queue.close(5) and queue.stats()["oversize"] == 1
+
+
+@pytest.mark.parametrize("location", ["properties", "default"])
+def test_shared_schema_work_is_bounded(cfg: Config, monkeypatch: pytest.MonkeyPatch, location: str) -> None:
+    # Tiny shared input, exponentially large expanded tree. `default` also proves
+    # that fields ignored by projection cannot reach the raw-schema hash.
+    schema: dict[str, Any] = {"type": "string"}
+    for _ in range(12):
+        schema = {location: {f"field_{i}": schema for i in range(16)}}
+    monkeypatch.setattr(okf, "_tool_metadata", lambda name: ("synthetic", schema))
+
+    unbounded_calls: list[bool] = []
+
+    def unbounded(*args: Any, **kwargs: Any) -> Any:
+        unbounded_calls.append(True)
+        raise ValueError("oversized schema reached projection/hash")
+
+    monkeypatch.setattr(okf, "project_routing_schema", unbounded)
+    monkeypatch.setattr(okf, "schema_hash", unbounded)
+    received: list[Any] = []
+    queue = observer.Observer(lambda *a, **k: received.append(k))
+    calls: list[Any] = []
+    args = {"value": "PRIVATE"}
+    result = object()
+
+    def downstream(actual: Any) -> object:
+        calls.append(actual)
+        return result
+
+    try:
+        assert queue.middleware(args, downstream, tool_name="synthetic", **IDS) is result
+    finally:
+        assert queue.close(5)
+    assert len(calls) == 1 and calls[0] is args
+    assert unbounded_calls == []
+    assert received == []
+    assert queue.stats()["projection_error"] == 1
+
+
+@pytest.mark.parametrize("schema", [
+    {"enum": [None] * 4096},
+    {"description": "x" * observer.MAX_RECEIPT_BYTES},
+    {"default": 1 << 256},
+])
+def test_schema_snapshot_rejects_total_work(schema: Any) -> None:
+    with pytest.raises(ValueError):
+        observer._schema_snapshot(schema)
+
+
+def test_schema_snapshot_preserves_shared_json_and_rejects_cycles() -> None:
+    child: dict[str, Any] = {"type": "string", "default": "PRIVATE"}
+    schema = {"properties": {"first": child, "second": child}}
+    copied = observer._schema_snapshot(schema)
+    assert copied == schema
+    assert okf.schema_hash(copied) == okf.schema_hash(schema)
+    assert copied["properties"]["first"] is not copied["properties"]["second"]
+    child["items"] = child
+    with pytest.raises(ValueError, match="budget"):
+        observer._schema_snapshot(schema)
 
 
 class Context:
@@ -163,6 +223,34 @@ class Context:
     def register_middleware(self, name: str, callback: Any) -> None:
         assert name == "tool_execution"
         self.middleware = callback
+
+
+def test_pre_hook_config_failure_omits_shadow_capture(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    def malformed() -> Config:
+        raise ValueError("PRIVATE malformed config")
+
+    monkeypatch.setattr(plugin, "resolve_config", malformed)
+    monkeypatch.setattr(observer, "resolve_config", malformed)
+    ctx = Context()
+    plugin.register(ctx)
+    queue = ctx.middleware.__self__
+    submitted: list[dict[str, Any]] = []
+    submit = queue.submit
+
+    def record(kind: str, payload: dict[str, Any]) -> None:
+        submitted.append(payload)
+        submit(kind, payload)
+
+    monkeypatch.setattr(queue, "submit", record)
+    try:
+        assert ctx.hooks["pre_llm_call"](**IDS, user_message="PRIVATE request") is None
+    finally:
+        assert queue.close(5)
+    assert len(submitted) == 1
+    assert "user_message" not in submitted[0]
+    assert "PRIVATE" not in json.dumps(submitted)
+    assert queue.stats()["config_error"] == 1
+    assert not cfg.state_dir.exists()
 
 
 @pytest.mark.parametrize("consumer", ["knowledge_get", "read_file", "skill_view"])

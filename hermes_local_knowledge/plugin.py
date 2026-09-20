@@ -1257,7 +1257,12 @@ def register(ctx: Any) -> None:
             payload = context_fields(kwargs)
             # Shadow's only optional text input; never copy conversation history.
             request = kwargs.get("user_message")
-            if (resolve_config().verified_routing.mode == "shadow"
+            try:
+                shadow_enabled = resolve_config().verified_routing.mode == "shadow"
+            except Exception:
+                # Optional capture must not prevent the host's model request.
+                shadow_enabled = False
+            if (shadow_enabled
                     and isinstance(request, str) and len(request) <= shadow_hooks.MAX_USER_REQUEST_CHARS):
                 payload["user_message"] = request
             observer.submit("pre", payload)
