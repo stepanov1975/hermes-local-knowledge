@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from hermes_local_knowledge import cli, implicit, index, plugin, shadow, shadow_hooks
+from hermes_local_knowledge import cli, implicit, index, observer, plugin, shadow, shadow_hooks
 from hermes_local_knowledge.config import Config, VerifiedRoutingSettings, resolve_config
 
 IDENTITY = {"session_id": "session", "task_id": "task", "turn_id": "turn"}
@@ -295,27 +295,67 @@ def test_real_host_threaded_hooks_and_underlying_deferred_search_receipt(
     monkeypatch.setattr(shadow_hooks, "on_pre_llm_call", record_thread)
     monkeypatch.setattr(shadow, "observe", observe)
     monkeypatch.setattr(plugin, "_on_okf_post_tool_call", lambda **k: None)
-    plugin.register(host.PluginContext(manifest, manager))
+    queue: observer.Observer | None = None
+    if callable(getattr(host.PluginContext, "register_middleware", None)):
+        class Context(host.PluginContext):  # type: ignore[name-defined]
+            def register_middleware(self, kind: str, callback: Any) -> Any:
+                nonlocal queue
+                queue = callback.__self__
+                return super().register_middleware(kind, callback)
+
+        context = Context(manifest, manager)
+    else:
+        context = host.PluginContext(manifest, manager)
+    monkeypatch.setattr(observer, "resolve_config", lambda: cfg)
+    monkeypatch.setattr(host, "get_plugin_manager", lambda: manager)
+    plugin.register(context)
     try:
-        # PyPI hosts invoke inline; newer hosts may add their own executor.
-        # Dispatch in separate copied contexts so both exercise the real manager
-        # across threads, without propagating the pre-hook context back to search.
+        # Real host dispatch in copied thread contexts must not propagate the
+        # pre-hook's context back to the unwrapped deferred search handler.
         threaded(manager.invoke_hook, hook_name="pre_llm_call", **IDENTITY, user_message=REQUEST)
-        result = search()  # Same handler seam as the unwrapped deferred dispatch.
-        threaded(manager.invoke_hook, hook_name="post_tool_call", **IDENTITY,
-                 api_request_id="api", tool_name="knowledge_search",
-                 args={"query": QUERY}, status="success", result=result)
+        if queue is not None:
+            middleware = importlib.import_module("hermes_cli.middleware")
+            calls: list[dict[str, Any]] = []
+
+            def execute(args: dict[str, Any]) -> str:
+                calls.append(args)
+                return search()  # Deferred handler receives no turn/API IDs.
+
+            result = threaded(middleware.run_tool_execution_middleware, **IDENTITY,
+                              api_request_id="api", tool_call_id="call", tool_name="knowledge_search",
+                              args={"query": QUERY}, next_call=execute)
+            assert calls == [{"query": QUERY}]
+            assert queue.drain(5)
+            # The host may still emit this hook; it must not duplicate capture.
+            threaded(manager.invoke_hook, hook_name="post_tool_call", **IDENTITY,
+                     api_request_id="api", tool_call_id="call", tool_name="knowledge_search",
+                     args={"query": QUERY}, status="success", result=result)
+            assert queue.drain(5)
+        else:
+            result = search()
+            threaded(manager.invoke_hook, hook_name="post_tool_call", **IDENTITY,
+                     api_request_id="api", tool_name="knowledge_search",
+                     args={"query": QUERY}, status="success", result=result)
+        assert len(observed) == 1
         assert observed[0]["user_request"] == REQUEST
         assert len(hook_threads) == 2
-        # Retain Thread objects: operating systems may reuse exited thread IDs.
-        assert hook_threads[0] is not hook_threads[1]
+        # Modern bookkeeping is intentionally serial on one observer thread;
+        # legacy callbacks run in separate copied host thread contexts.
+        assert (hook_threads[0] is hook_threads[1]) == (queue is not None)
         assert all(thread is not threading.current_thread() for thread in hook_threads)
+        threaded(manager.invoke_hook, hook_name="on_session_end", **IDENTITY)
+        if queue is not None:
+            assert queue.drain(5)
+        assert not shadow_hooks._REQUESTS
+        # ContextVar cleanup must be checked in the context that was seeded,
+        # separately from the host's cross-thread lifecycle dispatch above.
         implicit.on_pre_llm_call(**IDENTITY)
-        # Existing implicit cleanup is retained in the composed hook.
+        assert implicit._resolved_turn_id(session_id="session", task_id="task", turn_id=None) == "turn"
         plugin._on_session_end(**IDENTITY)
         assert implicit._resolved_turn_id(session_id="session", task_id="task", turn_id=None) == ""
-        assert not shadow_hooks._REQUESTS
     finally:
+        if queue is not None:
+            assert queue.close(5)
         unload = getattr(manager, "unload", None)
         if callable(unload):
             unload()

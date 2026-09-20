@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -525,27 +526,34 @@ def safe_arg_shape(value: Any, *, max_items: int = DEFAULT_MAX_ARG_ITEMS, depth:
     Tool arguments can contain document text, chat contents, email bodies, paths,
     tokens, or other private data. The OKF queue needs routing shape only, so this
     function records coarse value types and bounded item counts without scalar
-    values or raw mapping keys.
+    values or raw mapping keys. A shared traversal budget also bounds branching
+    and repeated references; oversized shapes are rejected, not fully expanded.
     """
+    return _safe_arg_shape(value, max_items=max_items, depth=depth, budget=[256])
+
+
+def _safe_arg_shape(value: Any, *, max_items: int, depth: int, budget: list[int]) -> dict[str, Any]:
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ValueError("argument shape exceeds traversal budget")
     if depth >= 6:
         return {"type": type(value).__name__, "truncated": True}
     if isinstance(value, Mapping):
-        items = list(value.items())
         shaped: dict[str, Any] = {}
-        for index, (_raw_key, raw_child) in enumerate(items[:max_items]):
-            shaped[f"field_{index}"] = safe_arg_shape(raw_child, max_items=max_items, depth=depth + 1)
-        result: dict[str, Any] = {"type": "object", "field_count": len(items), "fields": shaped}
-        if len(items) > max_items:
+        for index, (_raw_key, raw_child) in enumerate(islice(value.items(), max_items)):
+            shaped[f"field_{index}"] = _safe_arg_shape(raw_child, max_items=max_items, depth=depth + 1, budget=budget)
+        result: dict[str, Any] = {"type": "object", "field_count": len(value), "fields": shaped}
+        if len(value) > max_items:
             result["truncated"] = True
         return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        values = list(value)
         result = {
             "type": "array",
-            "length": len(values),
-            "items": [safe_arg_shape(item, max_items=max_items, depth=depth + 1) for item in values[:max_items]],
+            "length": len(value),
+            "items": [_safe_arg_shape(item, max_items=max_items, depth=depth + 1, budget=budget)
+                      for item in islice(value, max_items)],
         }
-        if len(values) > max_items:
+        if len(value) > max_items:
             result["truncated"] = True
         return result
     if value is None:
@@ -784,14 +792,21 @@ def upsert_tool_candidate(
     error_type: str | None = None,
     error_message: str | None = None,
     now: str | None = None,
+    _capture: Mapping[str, Any] | None = None,
 ) -> None:
     if not tool_name:
         return
     del error_message
     timestamp = now or utc_now()
-    schema_json = canonical_schema_json(schema)
-    digest = schema_hash(schema)
-    arg_shape_json = json.dumps(safe_arg_shape(args), sort_keys=True, separators=(",", ":"))
+    if _capture is not None and not is_routing_schema_projection(schema):
+        raise ValueError("invalid captured schema")
+    schema_json = (canonical_schema_json(schema) if _capture is None
+                   else json.dumps(schema, sort_keys=True, separators=(",", ":")))
+    digest = schema_hash(schema) if _capture is None else str(_capture["schema_hash"])
+    shape = safe_arg_shape(args) if _capture is None else _capture["arg_shape"]
+    if not _is_canonical_arg_shape(shape):
+        raise ValueError("invalid captured argument shape")
+    arg_shape_json = json.dumps(shape, sort_keys=True, separators=(",", ":"))
     success_increment = 1 if success is not False else 0
     error_increment = 1 if success is False else 0
     clean_error_type = _safe_error_type(error_type)
@@ -1765,7 +1780,11 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         if not isinstance(args, dict):
             args = {}
         success, error_type, error_message = _classify_hook_outcome(kwargs)
-        toolset, schema = _tool_metadata(tool_name)
+        capture = kwargs.get("_okf_capture")
+        toolset, schema = (
+            (capture["toolset"], capture["schema"])
+            if isinstance(capture, dict) else _tool_metadata(tool_name)
+        )
         upsert_tool_candidate(
             cfg.state_dir,
             tool_name=tool_name,
@@ -1775,6 +1794,7 @@ def _on_post_tool_call(**kwargs: Any) -> None:
             success=success,
             error_type=error_type,
             error_message=error_message,
+            _capture=capture,
         )
     except Exception:
         logger.exception("Failed to record local-knowledge OKF tool candidate")

@@ -6,6 +6,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,9 @@ class Config:
     router_skill_path: Path | None = None
     router_skill_path_source: str = "default"
     verified_routing: VerifiedRoutingSettings = field(default_factory=VerifiedRoutingSettings)
+
+
+_OBSERVER_CONFIG: ContextVar[Config | None] = ContextVar("lk_observer_config", default=None)
 
 
 def _present(value: Any) -> bool:
@@ -480,6 +484,9 @@ def _warnings(source_root_source: str, hermes_home: Path) -> tuple[str, ...]:
 def resolve_config(hermes_home: Path | str | None = None) -> Config:
     """Resolve local-knowledge settings from one Hermes profile and the environment."""
 
+    captured = _OBSERVER_CONFIG.get()
+    if hermes_home is None and captured is not None:
+        return captured
     explicit_home = _present(hermes_home)
     base_hermes_home = _base_hermes_home(hermes_home)
     section = _load_section(base_hermes_home, explicit_home=explicit_home)
