@@ -797,6 +797,10 @@ def _doctor_payload(
         "warnings": list(cfg.warnings),
         "checks": [],
     }
+    from . import refresh
+
+    payload["index_refresh"] = {"max_age_seconds": cfg.index_max_age_seconds,
+                                **refresh.status(cfg)}
     errors: list[str] = []
 
     def check(name: str, ok: bool, detail: str, *, fatal: bool = False) -> None:
@@ -950,6 +954,7 @@ def _doctor_payload(
 
 def _print_doctor(payload: dict[str, Any]) -> None:
     print("local_knowledge doctor")
+    print(f"  Index refresh: {json.dumps(payload.get('index_refresh', {}), sort_keys=True)}")
     print(f"  Hermes home: {payload['hermes_home']}")
     print(f"  Source root: {payload['source_root']} ({payload['source_root_source']})")
     print(f"  State dir:   {payload['state_dir']} ({payload['state_dir_source']})")

@@ -108,7 +108,9 @@ def test_public_surface_models_and_implicit_defaults(tmp_path: Path) -> None:
         "router_skill_path",
         "router_skill_path_source",
         "verified_routing",
+        "index_max_age_seconds",
     ]
+    assert resolved.index_max_age_seconds == 3600
     assert resolved == Config(
         source_root=hermes_home.resolve(),
         hermes_home=hermes_home.resolve(),

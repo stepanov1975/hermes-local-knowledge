@@ -10,7 +10,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from . import index, shadow_hooks
+from . import index, refresh, shadow_hooks
 from .config import resolve_config
 from .implicit import on_post_tool_call as _on_implicit_post_tool_call
 from .implicit import on_pre_llm_call as _on_implicit_pre_llm_call
@@ -57,10 +57,22 @@ def _history_contains_search_hint(conversation_history: Any) -> bool:
     return False
 
 
+def _refresh_on_activity() -> None:
+    try:
+        refresh.maybe_refresh(resolve_config())
+    except Exception:
+        pass  # Optional maintenance must not prevent a model request.
+
+
+def _pre_llm_activity(**kwargs: Any) -> None:
+    _refresh_on_activity()
+    _bind_implicit_pre_llm_context(**kwargs)
+
+
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     """Bind implicit state and inject the hint on older Hermes hosts."""
 
-    _bind_implicit_pre_llm_context(**kwargs)
+    _pre_llm_activity(**kwargs)
     if not check_knowledge_available():
         return None
     if _history_contains_search_hint(kwargs.get("conversation_history")):
@@ -1240,7 +1252,7 @@ def register(ctx: Any) -> None:
             position="after_memory",
             max_chars=200,
         )
-        pre_llm_callback = _bind_implicit_pre_llm_context
+        pre_llm_callback = _pre_llm_activity
     register_hook = getattr(ctx, "register_hook", None)
     register_middleware = getattr(ctx, "register_middleware", None)
     if callable(register_middleware) and callable(register_hook):
@@ -1254,6 +1266,7 @@ def register(ctx: Any) -> None:
         observer = Observer(consume)
 
         def pre(**kwargs: Any) -> dict[str, str] | None:
+            _refresh_on_activity()
             payload = context_fields(kwargs)
             # Shadow's only optional text input; never copy conversation history.
             request = kwargs.get("user_message")

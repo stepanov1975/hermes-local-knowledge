@@ -94,6 +94,7 @@ class Config:
     router_skill_path: Path | None = None
     router_skill_path_source: str = "default"
     verified_routing: VerifiedRoutingSettings = field(default_factory=VerifiedRoutingSettings)
+    index_max_age_seconds: int = 3600
 
 
 _OBSERVER_CONFIG: ContextVar[Config | None] = ContextVar("lk_observer_config", default=None)
@@ -581,6 +582,9 @@ def resolve_config(hermes_home: Path | str | None = None) -> Config:
         okf=_resolve_okf_settings(section),
         implicit_feedback=_resolve_implicit_feedback_settings(section),
         verified_routing=_resolve_verified_routing_settings(section),
+        index_max_age_seconds=_coerce_int(
+            section.get("index_max_age_seconds"), default=3600, minimum=0, maximum=604800,
+        ),
         source_root_source=source_root_source,
         state_dir_source=state_dir_source,
         include_markdown_docs_source=include_markdown_docs_source,

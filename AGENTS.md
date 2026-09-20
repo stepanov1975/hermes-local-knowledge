@@ -60,9 +60,9 @@ These instructions apply to the whole repository.
 
 ## State and concurrency invariants
 
-Generated state includes `index.sqlite`, `index.jsonl`, `usage.sqlite`, `okf_queue.sqlite`, `okfs/tools/*.md`, `okf_worker.log`, the v0.3.12-compatible file gate `index_build.lock`, the SQLite transaction lock `index_build.sqlite`, and `okf_index_dirty/`. Do not commit it.
+Generated state includes `index_refresh.json`, `index.sqlite`, `index.jsonl`, `usage.sqlite`, `okf_queue.sqlite`, `okfs/tools/*.md`, `okf_worker.log`, the v0.3.12-compatible file gate `index_build.lock`, the SQLite transaction lock `index_build.sqlite`, and `okf_index_dirty/`. Do not commit it.
 
-- Managed lookups rebuild missing, corrupt, older-format, or OKF-dirty indexes. Ordinary source changes require `rebuild=true`, an explicit CLI build, or an optional operator schedule; no schedule is required.
+- Managed lookups rebuild missing, corrupt, older-format, or OKF-dirty indexes. Ordinary source changes are picked up by age-based background refresh during activity (one hour by default); idle profiles do not refresh. Preserve explicit `rebuild=true` and CLI builds for immediate freshness. No external schedule is required.
 - Reject newer index formats before publication. Build and validate temporary SQLite/JSONL outputs before publishing them as a recoverable, hash-bound pair under both build locks.
 - OKF automatic generation is enabled by default and must be disclosed as consuming additional model tokens. The finalizer only checks and launches; the detached worker uses one fixed lease, one structured batch call when claims exist, and claim/lease-fenced validation/publication.
 - Version 0.4.0 supports the current v0.3.12 queue shape through selected-claim normalization, not a general migration ladder.

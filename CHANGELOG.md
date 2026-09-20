@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.3b3] - 2026-09-20
+
+### Added
+
+- Default one-hour, activity-driven background index refresh using successful-build metadata, frozen profile configuration and existing cross-process publication locks. Set `index_max_age_seconds: 0` to disable. No model calls or idle timer.
+- Nonblocking healthy managed reads, lock-protected freshness rechecks, and a five-minute failure cooldown with doctor receipt/log diagnostics. Explicit rebuild and repair behavior remain synchronous.
+- Document daemon-thread/short-lived CLI limits; no Hermes core changes or scheduler required.
+
 ## [0.5.3b2] - 2026-09-20
 
 ### Changed
@@ -40,6 +48,7 @@ results, and has not demonstrated production savings or ranking improvements.
 - Read indentless YAML lists emitted by host configuration saves in explicit-profile workers instead of silently discarding the configuration section.
 - Support canonical beta versions in version ordering, release notes and artifact names; publish and repair betas as prereleases, never latest.
 
+[0.5.3b3]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b2...v0.5.3b3
 [0.5.3b2]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b1...v0.5.3b2
 [0.5.3b1]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.20...v0.5.3b1
 

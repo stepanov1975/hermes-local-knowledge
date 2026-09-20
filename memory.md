@@ -77,13 +77,13 @@ The authoritative derived index is format 4. `index.jsonl` is a validated compan
 
 - Classify persisted indexes as missing, corrupt, older, current, or newer.
 - Managed lookups rebuild missing, corrupt, older, and OKF-dirty state. A newer format is rejected so an older runtime cannot downgrade it.
-- Ordinary source-file, cron-registry, and MCP-config changes are not inferred from index age or source mtimes. They require `rebuild=true`, an explicit build, or an optional operator schedule.
+- Ordinary source-file, cron-registry, and MCP-config changes are picked up by activity-driven age refresh (default one hour, 0 disables). Age uses successful-build metadata, not filesystem mtimes. Pre-LLM and managed lookups schedule daemon maintenance outside the observer queue; frozen configuration preserves profile ownership. Healthy reads never wait on build locks; a transient split is readable only with a busy compatibility gate and full validation against the hash-matched rollback companion; builders recheck age inside both existing locks. A persisted error-class receipt supplies five-minute retry cooldown and doctor diagnostics. Short-lived CLI/shutdown may interrupt maintenance; immediate freshness still requires explicit rebuild.
 - Index construction, validation, and publication hold the v0.3.12-compatible regular-file gate at `<state_dir>/index_build.lock`, then the new-process SQLite transaction lock at `<state_dir>/index_build.sqlite`.
 - Build SQLite and JSONL in temporary files, validate corpus IDs/schema/edges/metadata, then publish a hash-bound recoverable pair. Restore the prior JSONL on a caught SQLite publication failure; classify a crash-split pair as corrupt so managed lookup rebuilds it.
 - Dirty markers are tokenized. A successful build removes only the tokens observed before that build; concurrently created tokens remain for the next managed lookup.
 - Explicit CLI `--db` paths are caller-owned and are never rebuilt implicitly or allowed to consume shared dirty markers.
 
-Generated/local state includes `index.sqlite`, `index.jsonl`, `usage.sqlite`, `okf_queue.sqlite`, `okfs/tools/*.md`, `okf_worker.log`, `index_build.lock`, `index_build.sqlite`, and `okf_index_dirty/`. None belongs in source control.
+Generated/local state includes `index.sqlite`, `index.jsonl`, `usage.sqlite`, `okf_queue.sqlite`, `okfs/tools/*.md`, `okf_worker.log`, `index_build.lock`, `index_build.sqlite`, `index_refresh.json`, and `okf_index_dirty/`. None belongs in source control.
 
 ## Tool-OKF lifecycle rationale
 
