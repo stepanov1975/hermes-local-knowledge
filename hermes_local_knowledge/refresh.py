@@ -17,9 +17,30 @@ from .config import Config
 _LOG = logging.getLogger(__name__)
 _MUTEX = threading.Lock()
 _RUNNING: set[Path] = set()
-_RETRY_UNTIL: dict[Path, float] = {}
+_RETRY_UNTIL: dict[Path, tuple[float, tuple[int, ...] | None]] = {}
 RETRY_SECONDS = 300
 _STATUS_NAME = "index_refresh.json"
+
+
+def _after_fork_in_child() -> None:
+    global _MUTEX
+    # Parent threads do not survive fork, nor may their locked mutex be reused.
+    _MUTEX = threading.Lock()
+    _RUNNING.clear()
+    _RETRY_UNTIL.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
+def _index_identity(config: Config) -> tuple[int, ...] | None:
+    try:
+        stat = (config.state_dir / "index.sqlite").stat()
+        # Publication replaces SQLite even when built_at has the same second.
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return None
 
 
 def status(config: Config) -> dict[str, Any]:
@@ -62,7 +83,11 @@ def _due(config: Config) -> bool:
         if built.tzinfo is None:
             return False
         age = time.time() - built.timestamp()
-        retry_at = float(status(config).get("retry_after", 0))
+        receipt = status(config)
+        identity = _index_identity(config)
+        retry_at = (float(receipt.get("retry_after", 0))
+                    if identity is not None and receipt.get("index_identity") == list(identity)
+                    else 0)
         return age >= config.index_max_age_seconds and time.time() >= retry_at
     except (OSError, sqlite3.Error, ValueError, TypeError, OverflowError):
         return False
@@ -74,11 +99,13 @@ def _refresh(config: Config) -> None:
     with index.index_build_lock(config.state_dir):
         if not _due(config):
             return
+        identity = _index_identity(config)
         try:
             index.build_index(config.source_root, config.state_dir, config.hermes_home,
                               config.index_settings, force=True)
         except Exception as exc:
             _write_status(config, {"state": "failed", "error_class": type(exc).__name__,
+                                   "index_identity": identity,
                                    "retry_after": time.time() + RETRY_SECONDS})
             raise
         _write_status(config, {"state": "succeeded", "completed_at": time.time(),
@@ -86,12 +113,13 @@ def _refresh(config: Config) -> None:
 
 
 def _run(config: Config, key: Path) -> None:
+    identity = _index_identity(config)
     try:
         _refresh(config)
     except Exception as exc:
         _LOG.warning("local_knowledge index refresh failed (%s)", type(exc).__name__)
         with _MUTEX:
-            _RETRY_UNTIL[key] = time.monotonic() + RETRY_SECONDS
+            _RETRY_UNTIL[key] = (time.monotonic() + RETRY_SECONDS, identity)
     finally:
         with _MUTEX:
             _RUNNING.discard(key)
@@ -108,8 +136,11 @@ def maybe_refresh(config: Config) -> bool:
     key = config.state_dir.resolve()
     with _MUTEX:
         for expired in list(_RETRY_UNTIL):
-            if _RETRY_UNTIL[expired] <= time.monotonic():
+            if _RETRY_UNTIL[expired][0] <= time.monotonic():
                 del _RETRY_UNTIL[expired]
+        identity = _index_identity(config)
+        if key in _RETRY_UNTIL and _RETRY_UNTIL[key][1] != identity:
+            del _RETRY_UNTIL[key]
         if key in _RUNNING or key in _RETRY_UNTIL or not _due(config):
             return False
         _RUNNING.add(key)
@@ -118,7 +149,7 @@ def maybe_refresh(config: Config) -> bool:
                              name="lk-index-refresh", daemon=True).start()
         except Exception as exc:
             _RUNNING.discard(key)
-            _RETRY_UNTIL[key] = time.monotonic() + RETRY_SECONDS
+            _RETRY_UNTIL[key] = (time.monotonic() + RETRY_SECONDS, identity)
             _LOG.warning("local_knowledge index refresh launch failed (%s)", type(exc).__name__)
             return False
     return True

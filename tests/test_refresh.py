@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import closing
 import dataclasses
 import json
 import os
@@ -26,7 +27,7 @@ def config(tmp_path: Path) -> Config:
 
 
 def stale(cfg: Config) -> None:
-    with sqlite3.connect(cfg.state_dir / "index.sqlite") as connection:
+    with closing(sqlite3.connect(cfg.state_dir / "index.sqlite")) as connection, connection:
         connection.execute("UPDATE metadata SET value='2000-01-01T00:00:00Z' WHERE key='built_at'")
 
 
@@ -144,11 +145,11 @@ def test_newer_and_invalid_age_do_not_refresh(tmp_path: Path) -> None:
     cfg = config(tmp_path)
     service = LocalKnowledgeService(cfg)
     service.rebuild()
-    with sqlite3.connect(service.db_path) as connection:
+    with closing(sqlite3.connect(service.db_path)) as connection, connection:
         connection.execute("UPDATE metadata SET value='not a timestamp' WHERE key='built_at'")
     os.utime(service.db_path, (0, 0))
     assert not refresh.maybe_refresh(cfg)
-    with sqlite3.connect(service.db_path) as connection:
+    with closing(sqlite3.connect(service.db_path)) as connection, connection:
         connection.execute(f"PRAGMA user_version={index.INDEX_FORMAT_VERSION + 1}")
     assert not refresh.maybe_refresh(cfg)
     with pytest.raises(index.NewerIndexFormatError):
@@ -283,7 +284,7 @@ def test_busy_gate_never_bypasses_invalid_state(tmp_path: Path, damage: str) -> 
     if damage == "sqlite":
         service.db_path.write_bytes(b"invalid sqlite")
     elif damage == "rows":
-        with sqlite3.connect(service.db_path) as connection:
+        with closing(sqlite3.connect(service.db_path)) as connection, connection:
             connection.execute("UPDATE artifacts SET triggers_json='[null]'")
     elif damage == "hash":
         backup.write_text("wrong companion")
@@ -291,7 +292,7 @@ def test_busy_gate_never_bypasses_invalid_state(tmp_path: Path, damage: str) -> 
         service.db_path.unlink()
     elif damage in {"older", "newer"}:
         version = index.INDEX_FORMAT_VERSION + (1 if damage == "newer" else -1)
-        with sqlite3.connect(service.db_path) as connection:
+        with closing(sqlite3.connect(service.db_path)) as connection, connection:
             connection.execute(f"PRAGMA user_version={version}")
     elif damage == "dirty":
         marker = cfg.state_dir / index.DIRTY_MARKER_NAME
@@ -325,3 +326,132 @@ def test_launch_failure_is_optional_and_backed_off(tmp_path: Path, monkeypatch) 
     assert service.search("alpha", limit=5)[0]
     assert not refresh.maybe_refresh(cfg)
     assert attempts == [1]
+
+
+@pytest.mark.parametrize("rebuild", ["service", "cli"])
+@pytest.mark.parametrize("failure", ["build", "receipt", "launch"])
+def test_successful_rebuild_supersedes_cooldown(tmp_path: Path, monkeypatch, rebuild, failure) -> None:
+    cfg = dataclasses.replace(config(tmp_path), index_max_age_seconds=60)
+    service = LocalKnowledgeService(cfg)
+    service.rebuild()
+    stale(cfg)
+
+    def fail(*args, **kwargs):
+        raise OSError("synthetic failure")
+
+    with monkeypatch.context() as failing:
+        if failure == "launch":
+            failing.setattr(refresh.threading.Thread, "start", fail)
+            assert not refresh.maybe_refresh(cfg)
+        else:
+            failing.setattr(index, "collect_artifacts", fail)
+            if failure == "receipt":
+                failing.setattr(refresh, "_write_status", fail)
+            assert refresh.maybe_refresh(cfg)
+            wait(cfg)
+        assert not refresh.maybe_refresh(cfg)
+    assert cfg.state_dir in refresh._RETRY_UNTIL
+    if failure == "build":
+        assert refresh.status(cfg)["state"] == "failed"
+    if rebuild == "service":
+        service.rebuild()
+    else:
+        subprocess.run([
+            sys.executable, "-m", "hermes_local_knowledge.cli", "build",
+            "--root", str(cfg.source_root), "--output-dir", str(cfg.state_dir),
+            "--hermes-home", str(cfg.hermes_home),
+        ], check=True, timeout=10, capture_output=True, text=True)
+    # Advance age past the configured interval, but not the five-minute retry.
+    now = time.time()
+    monkeypatch.setattr(refresh.time, "time", lambda: now + 61)
+    assert refresh._due(cfg)  # persisted receipt cannot block the replacement
+    assert refresh.maybe_refresh(cfg)  # neither can the process-local fallback
+    wait(cfg)
+    assert refresh.status(cfg)["state"] == "succeeded"
+
+
+def test_stale_helper_closes_sqlite_connection(tmp_path: Path, monkeypatch) -> None:
+    cfg = config(tmp_path)
+    LocalKnowledgeService(cfg).rebuild()
+    opened = []
+    connect = sqlite3.connect
+
+    def track(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        opened.append(connection)  # prevent GC from hiding an unclosed handle
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", track)
+    stale(cfg)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_resets_running_worker_and_locked_mutex(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    LocalKnowledgeService(cfg).rebuild()
+    stale(cfg)
+    code = """
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+from hermes_local_knowledge import index, refresh
+from hermes_local_knowledge.config import Config, IndexSettings
+p = Path(sys.argv[1])
+cfg = Config(p/'source', p/'home', p/'state', IndexSettings())
+entered, release = threading.Event(), threading.Event()
+original = index.collect_artifacts
+def slow(*args, **kwargs):
+    entered.set()
+    assert release.wait(10)
+    return original(*args, **kwargs)
+index.collect_artifacts = slow
+assert refresh.maybe_refresh(cfg)
+assert entered.wait(5)
+locked, unlock = threading.Event(), threading.Event()
+def hold_mutex():
+    with refresh._MUTEX:
+        locked.set()
+        assert unlock.wait(10)
+holder = threading.Thread(target=hold_mutex)
+holder.start()
+assert locked.wait(5)
+reader, writer = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(reader)
+    try:
+        index.collect_artifacts = original
+        assert not refresh._RUNNING
+        assert not refresh._RETRY_UNTIL
+        # Child must not inherit the mutex held by the vanished parent thread.
+        assert refresh._MUTEX.acquire(timeout=1)
+        refresh._MUTEX.release()
+        assert refresh.maybe_refresh(cfg)
+        os.write(writer, b'ready')
+        os.close(writer)
+        deadline = time.monotonic() + 10
+        while cfg.state_dir in refresh._RUNNING and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert cfg.state_dir not in refresh._RUNNING
+        assert refresh.status(cfg)['state'] == 'succeeded'
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        os._exit(1)
+    os._exit(0)
+os.close(writer)
+try:
+    assert os.read(reader, 5) == b'ready'
+finally:
+    os.close(reader)
+    unlock.set()
+    release.set()
+holder.join(timeout=5)
+assert os.waitpid(pid, 0)[1] == 0
+"""
+    subprocess.run([sys.executable, "-c", code, str(tmp_path)], check=True, timeout=20)
