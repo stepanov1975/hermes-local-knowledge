@@ -20,7 +20,7 @@ These instructions apply to the whole repository.
 
 - Package version is synchronized in `plugin.yaml`, `pyproject.toml`, and `hermes_local_knowledge/__init__.py`.
 - The Python plugin entry point is `local_knowledge = hermes_local_knowledge.plugin`; `plugin.register` is the registration boundary.
-- Registration provides exactly five native tools (`knowledge_search`, `knowledge_get`, `knowledge_neighbors`, `knowledge_feedback`, `knowledge_usage_report`) and four hooks (`pre_llm_call`, `post_tool_call`, `on_session_end`, `on_session_finalize`).
+- Registration provides exactly five native tools (`knowledge_search`, `knowledge_get`, `knowledge_neighbors`, `knowledge_feedback`, `knowledge_usage_report`) and three hooks (`pre_llm_call`, `on_session_end`, `on_session_finalize`) plus public `tool_execution` middleware on supported hosts. Older hosts without middleware use the explicitly best-effort fourth hook, `post_tool_call`, instead; do not register both capture paths.
 - `indexer.__all__` is exactly: `Artifact`, `Edge`, `IndexSettings`, `build_index`, `search_index`, `get_artifact`, `get_neighbors`, `main`.
 - `python -m hermes_local_knowledge.cli` is the primary standalone CLI. `python -m hermes_local_knowledge.indexer` is the preserved compatibility entry point. `hermes local-knowledge` is the smaller install/doctor surface; its worker command is host-internal.
 - Preserve documented configuration aliases and defaults. Do not preserve undocumented private call shapes merely because a test once patched them.

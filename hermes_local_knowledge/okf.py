@@ -784,14 +784,21 @@ def upsert_tool_candidate(
     error_type: str | None = None,
     error_message: str | None = None,
     now: str | None = None,
+    _capture: Mapping[str, Any] | None = None,
 ) -> None:
     if not tool_name:
         return
     del error_message
     timestamp = now or utc_now()
-    schema_json = canonical_schema_json(schema)
-    digest = schema_hash(schema)
-    arg_shape_json = json.dumps(safe_arg_shape(args), sort_keys=True, separators=(",", ":"))
+    if _capture is not None and not is_routing_schema_projection(schema):
+        raise ValueError("invalid captured schema")
+    schema_json = (canonical_schema_json(schema) if _capture is None
+                   else json.dumps(schema, sort_keys=True, separators=(",", ":")))
+    digest = schema_hash(schema) if _capture is None else str(_capture["schema_hash"])
+    shape = safe_arg_shape(args) if _capture is None else _capture["arg_shape"]
+    if not _is_canonical_arg_shape(shape):
+        raise ValueError("invalid captured argument shape")
+    arg_shape_json = json.dumps(shape, sort_keys=True, separators=(",", ":"))
     success_increment = 1 if success is not False else 0
     error_increment = 1 if success is False else 0
     clean_error_type = _safe_error_type(error_type)
@@ -1765,7 +1772,11 @@ def _on_post_tool_call(**kwargs: Any) -> None:
         if not isinstance(args, dict):
             args = {}
         success, error_type, error_message = _classify_hook_outcome(kwargs)
-        toolset, schema = _tool_metadata(tool_name)
+        capture = kwargs.get("_okf_capture")
+        toolset, schema = (
+            (capture["toolset"], capture["schema"])
+            if isinstance(capture, dict) else _tool_metadata(tool_name)
+        )
         upsert_tool_candidate(
             cfg.state_dir,
             tool_name=tool_name,
@@ -1775,6 +1786,7 @@ def _on_post_tool_call(**kwargs: Any) -> None:
             success=success,
             error_type=error_type,
             error_message=error_message,
+            _capture=capture,
         )
     except Exception:
         logger.exception("Failed to record local-knowledge OKF tool candidate")

@@ -1242,7 +1242,48 @@ def register(ctx: Any) -> None:
         )
         pre_llm_callback = _bind_implicit_pre_llm_context
     register_hook = getattr(ctx, "register_hook", None)
-    if register_hook is not None:
+    register_middleware = getattr(ctx, "register_middleware", None)
+    if callable(register_middleware) and callable(register_hook):
+        from .observer import Observer, context_fields
+
+        def consume(kind: str, **payload: Any) -> None:
+            callbacks = {"pre": _bind_implicit_pre_llm_context, "post": _on_post_tool_call,
+                         "end": _on_session_end, "finalize": _on_session_finalize}
+            callbacks[kind](**payload)
+
+        observer = Observer(consume)
+
+        def pre(**kwargs: Any) -> dict[str, str] | None:
+            payload = context_fields(kwargs)
+            # Shadow's only optional text input; never copy conversation history.
+            request = kwargs.get("user_message")
+            if (resolve_config().verified_routing.mode == "shadow"
+                    and isinstance(request, str) and len(request) <= shadow_hooks.MAX_USER_REQUEST_CHARS):
+                payload["user_message"] = request
+            observer.submit("pre", payload)
+            if (not callable(register_system_prompt_section) and check_knowledge_available()
+                    and not _history_contains_search_hint(kwargs.get("conversation_history"))):
+                return {"context": KNOWLEDGE_SEARCH_HINT}
+            return None
+
+        def end(**kwargs: Any) -> None:
+            observer.submit("end", context_fields(kwargs))
+
+        def finalize(**kwargs: Any) -> None:
+            observer.submit("finalize", context_fields(kwargs))
+
+        register_middleware("tool_execution", observer.middleware)
+        register_hook("pre_llm_call", pre)
+        # Exactly one transport: never also register the post-tool hook here.
+        register_hook("on_session_end", end)
+        register_hook("on_session_finalize", finalize)
+    elif register_hook is not None:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Local knowledge legacy inline observer: host hooks may omit concurrent calls; "
+            "no queue/finalization fence. Use official Hermes v2026.9.14 or newer."
+        )
         register_hook("pre_llm_call", pre_llm_callback)
         register_hook("post_tool_call", _on_post_tool_call)
         register_hook("on_session_end", _on_session_end)

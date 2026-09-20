@@ -8,7 +8,7 @@ Durable product, ranking, privacy, and state rationale for `hermes-local-knowled
 - It answers “which artifact should be inspected first?” It does not replace reading that artifact and is not chunk RAG.
 - Runtime dependencies remain standard-library-only. Generated state is local-only.
 - Runtime configuration follows Hermes' context-local active profile before process-wide environment fallbacks; profile state remains isolated by default, while an explicitly shared `state_dir` intentionally combines telemetry and learned feedback.
-- Stable boundaries are the `hermes_local_knowledge.plugin` entry point and `register`, the five documented tools/four hooks, the documented CLI/config behavior, and the eight names in `indexer.__all__`.
+- Stable boundaries are the `hermes_local_knowledge.plugin` entry point and `register`, the five documented tools, three lifecycle hooks and tool middleware (legacy post-tool hook fallback), the documented CLI/config behavior, and the eight names in `indexer.__all__`.
 - Model-facing native tool payloads are deliberately thinner than service/CLI data: routine calls expose only actionable routing and improvement evidence, while rich diagnostics stay in local telemetry and operator surfaces.
 
 ## Verified-routing shadow boundary
@@ -89,8 +89,9 @@ Generated/local state includes `index.sqlite`, `index.jsonl`, `usage.sqlite`, `o
 
 Automatic generation defaults on because generated routing notes materially improve future tool discovery. It spends additional model tokens, which installers and agents must disclose; users can disable it while retaining candidate capture, existing-artifact lookup, and manual OKF management.
 
-- `post_tool_call` records a safe structural candidate and never performs model work.
-- `on_session_finalize` only performs a read-only, tightly timeout-bounded work check and detached launch. Session closure must not wait for generation.
+- Middleware reserves bounded observer capacity before tool execution; ordered accepted lifecycle work cannot overtake in-flight admitted producers. Tool execution remains parallel. Legacy hosts use an explicitly lossy inline post-tool hook fallback.
+- The observer records safe structural candidates, preserves purpose-specific consumption evidence and never performs model work. Its bounded in-memory identity window suppresses replay counters only within one registration; this is not durable exactly-once delivery.
+- Accepted `on_session_finalize` work runs after earlier observer reservations and only performs a read-only, tightly timeout-bounded work check and detached launch. Full queues can reject lifecycle work; process-exit drain is bounded. Session closure must not wait for generation.
 - The worker takes one fixed lease of `max(300, 2 * max_generation_seconds + 120)`, claims a bounded batch, and makes exactly one structured call when claims exist.
 - The generation packet is a bounded schema/argument-shape projection with a claim-time same-toolset allowlist. Candidate batching is an execution optimization, not semantic evidence between candidates.
 - Each generated item must match the claimed tool, toolset, schema hash, generator version, output path, and allowlist. Temporary-file validation precedes a short lease/claim-fenced publication transaction; ownership loss makes the result non-publishable.

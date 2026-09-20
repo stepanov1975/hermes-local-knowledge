@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.3b2] - 2026-09-20
+
+### Changed
+
+- Capture tool observations through supported middleware on unmodified official Hermes, using bounded serial plugin bookkeeping without serializing tools or registering duplicate post-tool hooks.
+- Preserve implicit file/skill/get consumption, OKF structural schema/argument shape and opt-in shadow identity while discarding arbitrary raw tool bodies.
+- Order accepted lifecycle work behind admitted in-flight tools; freeze profile configuration and suppress same-identity replays within a bounded process-local window.
+- Document observable overload/error/shutdown losses and the legacy inline-hook fallback; no durable or exactly-once delivery claim.
+- Verify offline official-host AIAgent direct, deferred and parallel-batch execution in addition to consumer/lifecycle tests.
+
 ## [0.5.3b1] - 2026-09-19
 
 Beta consolidating the unpublished local 0.5.0–0.5.2 changes. Verified-routing
@@ -30,6 +40,7 @@ results, and has not demonstrated production savings or ranking improvements.
 - Read indentless YAML lists emitted by host configuration saves in explicit-profile workers instead of silently discarding the configuration section.
 - Support canonical beta versions in version ordering, release notes and artifact names; publish and repair betas as prereleases, never latest.
 
+[0.5.3b2]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b1...v0.5.3b2
 [0.5.3b1]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.20...v0.5.3b1
 
 ## [0.4.20] - 2026-09-08

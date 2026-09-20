@@ -1,0 +1,273 @@
+"""Bounded, process-local bookkeeping; never a durable delivery queue.
+
+Reservations are ordered at middleware entry, before downstream execution. A
+lifecycle reservation therefore cannot overtake an admitted in-flight producer.
+Only the observer waits for a slow tool; downstream tool execution stays parallel.
+"""
+from __future__ import annotations
+
+import atexit
+import json
+import logging
+import threading
+import time
+from collections import Counter, OrderedDict, deque
+from collections.abc import Callable, Mapping
+from contextvars import Context, copy_context
+from dataclasses import dataclass
+from typing import Any
+
+from . import okf, shadow
+from .config import _OBSERVER_CONFIG, resolve_config
+
+logger = logging.getLogger(__name__)
+IDENTITY = ("session_id", "task_id", "turn_id", "api_request_id", "tool_call_id")
+MAX_RECEIPT_BYTES = 65536
+
+
+def _text(value: Any, limit: int) -> str:
+    # Reject rather than truncate correlation identities and source locators.
+    return value if isinstance(value, str) and len(value) <= limit else ""
+
+
+def context_fields(source: Mapping[str, Any]) -> dict[str, Any]:
+    return {**{key: _text(source.get(key), 128) for key in IDENTITY},
+            "parent_session_id": bool(source.get("parent_session_id")),
+            "worker_generated": bool(source.get("worker_generated"))}
+
+
+def project_call(args: Any, metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy only purpose-specific evidence, not arbitrary tool args/output."""
+    name = _text(metadata.get("tool_name"), 240)
+    toolset, schema = okf._tool_metadata(name)
+    source = args if isinstance(args, dict) else {}
+    selected: dict[str, Any] = {}
+    if name == "knowledge_search":
+        selected = {key: _text(source.get(key), limit) for key, limit in
+                    (("query", 4000), ("artifact_type", 128))}
+        lookup = source.get("lookup")
+        if lookup is not None:
+            try:
+                selected["lookup"] = shadow._lookup_context(lookup)["lookup"]["fields"]
+            except ValueError:
+                # Preserve rejection without retaining invalid values or turning
+                # supplied invalid context into an absent (valid) lookup.
+                selected["lookup"] = False
+    elif name == "knowledge_get":
+        selected["artifact_id"] = _text(source.get("artifact_id"), 4096)
+    elif name == "read_file":
+        selected["path"] = _text(source.get("path"), 4096)
+    return {**context_fields(metadata), "tool_name": name, "args": selected,
+            "_okf_capture": {"toolset": _text(toolset, 240) or None, "schema": okf.project_routing_schema(schema),
+                             "schema_hash": okf.schema_hash(schema),
+                             "arg_shape": okf.safe_arg_shape(source)}}
+
+
+def project_result(payload: dict[str, Any], result: Any, failed: bool) -> None:
+    success, error_type, _ = okf._classify_result(result)
+    success = success and not failed
+    payload["status"] = "success" if success else "error"
+    payload["error_type"] = "execution_error" if failed else error_type
+    selected: dict[str, Any] = {"success": success}
+    if isinstance(result, str) and payload["tool_name"] in {
+        "knowledge_search", "knowledge_get", "skill_view", "read_file",
+    }:
+        try:
+            parsed = json.loads(result)
+        except (ValueError, RecursionError):
+            parsed = None
+        if isinstance(parsed, dict):
+            receipt = parsed.get("usage_event_id")
+            if isinstance(receipt, int) and not isinstance(receipt, bool) and receipt > 0:
+                selected["usage_event_id"] = receipt
+            if payload["tool_name"] == "skill_view" and parsed.get("success") is True:
+                selected["_source_path"] = _text(parsed.get("_source_path"), 4096)
+            if payload["tool_name"] == "read_file" and isinstance(parsed.get("content"), str):
+                # Content presence is evidence; its body is not retained.
+                selected["content"] = ""
+    payload["result"] = json.dumps(selected)
+
+
+@dataclass
+class _Slot:
+    context: Context
+    kind: str
+    ready: bool = False
+    payload: str | None = None
+
+
+class Observer:
+    """One serial consumer per registration, with bounded admission and dedup.
+
+    Capacity includes active producers and the currently executing consumer.
+    Replays with complete host identity are suppressed within a bounded in-memory
+    window. Failed consumers are not retried, since they may have partially written.
+    """
+
+    def __init__(self, consume: Callable[..., Any], *, capacity: int = 256,
+                 dedup_capacity: int = 4096) -> None:
+        if capacity < 1 or dedup_capacity < 1:
+            raise ValueError("observer limits must be positive")
+        self.consume = consume
+        self.capacity = capacity
+        self.dedup_capacity = dedup_capacity
+        self._condition = threading.Condition()
+        self._queue: deque[_Slot] = deque()
+        self._seen: OrderedDict[tuple[str, ...], None] = OrderedDict()
+        self._counts: Counter[str] = Counter()
+        self._closed = False
+        self._thread: threading.Thread | None = None
+
+    def stats(self) -> dict[str, int]:
+        with self._condition:
+            return {**self._counts, "pending": len(self._queue)}
+
+    def _notice(self, reason: str) -> None:
+        with self._condition:
+            self._counts[reason] += 1
+            count = self._counts[reason]
+        # Log first and powers of two: overload must not create unbounded logs.
+        if count & (count - 1) == 0:
+            logger.warning("Local knowledge observer %s (count=%d)", reason, count)
+
+    def reserve(self, kind: str) -> _Slot | None:
+        with self._condition:
+            if self._closed or len(self._queue) >= self.capacity:
+                self._notice("closed" if self._closed else "full")
+                return None
+            context = copy_context()
+            slot = _Slot(context, kind)
+            self._queue.append(slot)
+            if self._thread is None:
+                thread = threading.Thread(target=self._run, name="local-knowledge-observer", daemon=True)
+                try:
+                    thread.start()
+                except Exception:
+                    self._queue.pop()
+                    raise
+                self._thread = thread
+                atexit.register(self.close, 1.0)
+            self._counts["accepted"] += 1
+            self._condition.notify_all()
+        try:
+            # Freeze all custom settings, not just HERMES_HOME; no worker-time
+            # config reload or process-global environment mutation.
+            context.run(_OBSERVER_CONFIG.set, resolve_config())
+        except Exception:
+            self.finish(slot, None)
+            self._notice("config_error")
+            return None
+        return slot
+
+    def finish(self, slot: _Slot, payload: dict[str, Any] | None) -> None:
+        serialized = None
+        try:
+            if payload is not None:
+                serialized = json.dumps(payload, ensure_ascii=True)
+                if len(serialized) > MAX_RECEIPT_BYTES:
+                    serialized = None
+                    self._notice("oversize")
+        except Exception:
+            self._notice("projection_error")
+        finally:
+            with self._condition:
+                slot.payload = serialized
+                slot.ready = True
+                self._condition.notify_all()
+
+    def middleware(self, args: Any, next_call: Callable[..., Any], **metadata: Any) -> Any:
+        slot = None
+        payload = None
+        try:
+            slot = self.reserve("post")
+            if slot is not None:
+                payload = project_call(args, metadata)
+        except Exception:
+            self._notice("projection_error")
+        result: Any = None
+        failed = True
+        try:
+            result = next_call(args)  # single use, original object, no retries
+            failed = False
+            return result
+        finally:
+            if slot is not None:
+                try:
+                    if payload is not None:
+                        project_result(payload, result, failed)
+                except Exception:
+                    payload = None
+                    self._notice("projection_error")
+                try:
+                    self.finish(slot, payload)
+                except Exception:
+                    self._notice("enqueue_error")
+
+    def submit(self, kind: str, payload: dict[str, Any]) -> None:
+        slot = self.reserve(kind)
+        if slot is not None:
+            self.finish(slot, payload)
+
+    def _deliver(self, slot: _Slot) -> None:
+        if slot.payload is None:
+            with self._condition:
+                self._counts["discarded"] += 1
+            return
+        payload = json.loads(slot.payload)
+        if slot.kind == "post":
+            cfg = resolve_config()
+            ids = tuple(payload[key] for key in IDENTITY)
+            if all(ids):
+                key = (str(cfg.hermes_home), str(cfg.source_root), str(cfg.state_dir),
+                       payload["tool_name"], *ids)
+                if key in self._seen:
+                    with self._condition:
+                        self._counts["duplicate"] += 1
+                    return
+                self._seen[key] = None
+                if len(self._seen) > self.dedup_capacity:
+                    self._seen.popitem(last=False)
+            else:
+                self._notice("unkeyed")
+        self.consume(slot.kind, **payload)
+        with self._condition:
+            self._counts["delivered"] += 1
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: (self._queue and self._queue[0].ready)
+                                         or (self._closed and not self._queue))
+                if not self._queue:
+                    return
+                slot = self._queue[0]
+            try:
+                slot.context.run(self._deliver, slot)
+            except Exception:
+                # Never log private exception text or retry partial effects.
+                self._notice("consumer_error")
+            finally:
+                with self._condition:
+                    self._queue.popleft()
+                    self._counts["completed"] += 1
+                    self._condition.notify_all()
+
+    def drain(self, timeout: float = 2.0) -> bool:
+        """Wait for work admitted before this call, including active producers."""
+        with self._condition:
+            target = self._counts["accepted"]
+            done = self._condition.wait_for(lambda: self._counts["completed"] >= target,
+                                            timeout=max(0, timeout))
+        if not done:
+            self._notice("drain_timeout")
+        return done
+
+    def close(self, timeout: float = 2.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        done = self.drain(timeout)
+        if self._thread is not None:
+            self._thread.join(max(0, deadline - time.monotonic()))
+        return done
