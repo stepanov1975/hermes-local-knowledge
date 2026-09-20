@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import json
 import sqlite3
 import threading
+import weakref
 from collections import UserDict
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
@@ -31,6 +33,119 @@ def cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
     monkeypatch.setattr(plugin, "resolve_config", lambda: config)
     monkeypatch.setattr(shadow_hooks, "_wake_supervisor", lambda cfg: False)
     return config
+
+
+def test_idle_retirement_restart_and_collectability(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(observer, "IDLE_SECONDS", 0.02, raising=False)
+    seen: list[int] = []
+    queue = observer.Observer(lambda kind, **p: seen.append(p["number"]))
+    ref = weakref.ref(queue)
+    try:
+        for number in range(3):
+            queue.submit("pre", {"number": number})
+            thread = queue._thread
+            assert thread is not None
+            thread.join(2)
+            assert not thread.is_alive()
+            assert queue._thread is None
+        assert seen == [0, 1, 2]
+        assert queue.stats()["accepted"] == queue.stats()["completed"] == 3
+        del queue
+        gc.collect()
+        assert ref() is None  # Includes the real atexit registry, not a mock.
+    finally:
+        if (remaining := ref()) is not None:
+            remaining.close(2)
+
+
+@pytest.mark.parametrize("pending", ["producer", "consumer"])
+def test_idle_timeout_never_retires_pending_work(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch, pending: str,
+) -> None:
+    monkeypatch.setattr(observer, "IDLE_SECONDS", 0.02, raising=False)
+    entered, release = threading.Event(), threading.Event()
+    seen: list[str] = []
+
+    def consume(kind: str, **p: Any) -> None:
+        if pending == "consumer":
+            entered.set()
+            assert release.wait(5)
+        seen.append(kind)
+
+    queue = observer.Observer(consume)
+    slot = queue.reserve("pre")
+    assert slot is not None
+    thread = queue._thread
+    assert thread is not None
+    try:
+        if pending == "consumer":
+            queue.finish(slot, {})
+            assert entered.wait(2)
+        thread.join(0.1)
+        assert thread.is_alive() and queue._thread is thread
+        assert queue.stats()["pending"] == 1
+        queue.submit("finalize", {})
+        release.set()
+        if pending == "producer":
+            queue.finish(slot, {})
+        assert queue.drain(2)
+        thread.join(2)
+        assert not thread.is_alive()
+        assert seen == ["pre", "finalize"]
+    finally:
+        release.set()
+        queue.finish(slot, {})
+        queue.close(2)
+
+
+def test_submission_racing_idle_retirement_is_delivered(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(observer, "IDLE_SECONDS", 0.02, raising=False)
+    retiring, release, submitting = threading.Event(), threading.Event(), threading.Event()
+    unregister = observer.atexit.unregister
+    seen: list[int] = []
+    queue = observer.Observer(lambda kind, **p: seen.append(p["number"]))
+
+    def pause_unregister(callback: Any) -> None:
+        if callback == queue.close and not retiring.is_set():
+            retiring.set()
+            assert release.wait(5)
+        unregister(callback)
+
+    monkeypatch.setattr(observer.atexit, "unregister", pause_unregister)
+
+    def submit() -> None:
+        submitting.set()
+        queue.submit("pre", {"number": 2})
+
+    try:
+        queue.submit("pre", {"number": 1})
+        old_thread = queue._thread
+        assert retiring.wait(2)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(submit)
+            assert submitting.wait(2)
+            release.set()
+            future.result(2)
+        assert queue.drain(2)
+        assert old_thread is not None
+        old_thread.join(2)
+        assert seen == [1, 2]
+        assert queue.stats()["accepted"] == queue.stats()["completed"] == 2
+    finally:
+        release.set()
+        queue.close(2)
+
+
+def test_close_releases_real_atexit_reference(cfg: Config) -> None:
+    queue = observer.Observer(lambda *a, **k: None)
+    queue.submit("pre", {})
+    ref = weakref.ref(queue)
+    assert queue.close(2)
+    del queue
+    gc.collect()
+    assert ref() is None
 
 
 def test_parallel_original_objects_context_and_finalizer(cfg: Config) -> None:
@@ -364,6 +479,69 @@ class Context:
     def register_middleware(self, name: str, callback: Any) -> None:
         assert name == "tool_execution"
         self.middleware = callback
+
+
+def test_registered_unload_closes_and_releases_observer(cfg: Config) -> None:
+    callbacks: list[Any] = []
+
+    class UnloadContext(Context):
+        def on_unload(self, callback: Any) -> None:
+            callbacks.append(callback)
+
+    ctx = UnloadContext()
+    plugin.register(ctx)
+    queue = ctx.middleware.__self__
+    queue.submit("pre", {})
+    ref = weakref.ref(queue)
+    assert len(callbacks) == 1
+    callbacks.pop()()
+    assert queue._closed and queue._thread is None
+    assert queue.reserve("pre") is None
+    del queue, ctx
+    gc.collect()
+    assert ref() is None
+
+
+def test_close_timeout_preserves_pending_then_releases_reference(cfg: Config) -> None:
+    queue = observer.Observer(lambda *a, **k: None)
+    slot = queue.reserve("pre")
+    assert slot is not None
+    thread = queue._thread
+    assert thread is not None
+    assert not queue.close(0)
+    assert thread.is_alive()
+    queue.finish(slot, {})
+    thread.join(2)
+    assert not thread.is_alive()
+    assert queue.stats()["completed"] == 1
+    ref = weakref.ref(queue)
+    del queue
+    gc.collect()
+    assert ref() is None
+
+
+def test_reservation_wakes_idle_worker(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[int] = []
+    queue = observer.Observer(lambda kind, **p: seen.append(p["number"]))
+    waiting = threading.Event()
+    wait_for = queue._condition.wait_for
+
+    def idle_wait(predicate: Any, timeout: Any = None) -> Any:
+        if timeout == observer.IDLE_SECONDS:
+            waiting.set()
+        return wait_for(predicate, timeout)
+
+    monkeypatch.setattr(queue._condition, "wait_for", idle_wait)
+    try:
+        queue.submit("pre", {"number": 1})
+        thread = queue._thread
+        assert waiting.wait(2)
+        queue.submit("pre", {"number": 2})
+        assert queue.drain(2)
+        assert queue._thread is thread
+        assert seen == [1, 2]
+    finally:
+        queue.close(2)
 
 
 def test_pre_hook_config_failure_omits_shadow_capture(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1282,6 +1282,9 @@ def register(ctx: Any) -> None:
         # Exactly one transport: never also register the post-tool hook here.
         register_hook("on_session_end", end)
         register_hook("on_session_finalize", finalize)
+        on_unload = getattr(ctx, "on_unload", None)
+        if callable(on_unload):
+            on_unload(lambda: observer.close(1.0))
     elif register_hook is not None:
         import logging
 

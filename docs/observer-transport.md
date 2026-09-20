@@ -31,6 +31,15 @@ consumer delays observation for every session using that registration. It does
 not delay other tools. An accepted drain waits for the admission high-water mark
 at the time of the drain, including active producers, not for later submissions.
 A best-effort process-exit handler closes admission and waits at most one second.
+On hosts exposing public `ctx.on_unload` (including official v2026.9.14), plugin
+unload also closes admission and drains for at most one second. Pending work is
+not cancelled if that deadline expires; the worker exits after it completes.
+Independently, an empty queue retires its thread after 30 idle seconds and removes
+its bound exit handler, releasing unloaded registrations even without host
+teardown. The next admission starts a new worker; retirement and admission share
+one lock, and neither active producers nor consumers count as idle. Restart keeps
+the registration's counters and dedup window. A permanently hung producer or
+consumer can still retain its observer; safe retirement does not abandon work.
 Session hooks do not close the process queue. Work entering after a lifecycle
 reservation belongs after that boundary; unadmitted/full tools have no fence.
 

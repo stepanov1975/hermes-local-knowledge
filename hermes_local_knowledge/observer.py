@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 IDENTITY = ("session_id", "task_id", "turn_id", "api_request_id", "tool_call_id")
 MAX_RECEIPT_BYTES = 65536
 MAX_RESULT_CHARS = 65536
+IDLE_SECONDS = 30.0
 
 
 def _text(value: Any, limit: int) -> str:
@@ -283,10 +284,17 @@ class Observer:
     def _run(self) -> None:
         while True:
             with self._condition:
-                self._condition.wait_for(lambda: (self._queue and self._queue[0].ready)
-                                         or (self._closed and not self._queue))
                 if not self._queue:
-                    return
+                    self._condition.wait_for(lambda: self._queue or self._closed,
+                                             timeout=IDLE_SECONDS)
+                    if not self._queue:
+                        # Admission and retirement share this lock: a racing
+                        # reservation either wakes us or starts a new worker.
+                        atexit.unregister(self.close)
+                        self._thread = None
+                        return
+                # A reserved producer (or executing consumer) is not idle.
+                self._condition.wait_for(lambda: self._queue[0].ready)
                 slot = self._queue[0]
             try:
                 slot.context.run(self._deliver, slot)
@@ -313,8 +321,9 @@ class Observer:
         deadline = time.monotonic() + timeout
         with self._condition:
             self._closed = True
+            thread = self._thread
             self._condition.notify_all()
         done = self.drain(timeout)
-        if self._thread is not None:
-            self._thread.join(max(0, deadline - time.monotonic()))
+        if thread is not None:
+            thread.join(max(0, deadline - time.monotonic()))
         return done
