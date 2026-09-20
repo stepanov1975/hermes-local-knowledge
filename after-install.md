@@ -97,11 +97,11 @@ python -m hermes_local_knowledge.cli doctor \
   --query "backup runbook"
 ```
 
-## 6. Refresh explicitly when ordinary sources change
+## 6. Understand index freshness
 
-Managed lookups rebuild a missing, corrupt, older-format, or OKF-dirty index. They do not detect ordinary source-file, cron-registry, or MCP-config changes.
+Managed lookups rebuild a missing, corrupt, older-format, or OKF-dirty index. Ordinary source changes are picked up asynchronously on pre-LLM or managed-lookup activity after the last successful build reaches `local_knowledge.index_max_age_seconds` (default `3600`; `0` disables). This consumes no model tokens. Old valid results remain available while refreshing; idle installations do no work. A short-lived CLI may exit before refresh completes. Doctor JSON exposes `index_refresh.json` failure/cooldown status.
 
-After such a change, pass `rebuild=true` to a native lookup or run:
+For immediate freshness after a change, pass `rebuild=true` to a native lookup or run:
 
 ```bash
 python -m hermes_local_knowledge.cli build --from-hermes-config

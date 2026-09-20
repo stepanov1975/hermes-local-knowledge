@@ -85,6 +85,22 @@ def main() -> None:
         expected = [{"tool_name": "knowledge_search", **ids, "tool_call_id": call}
                     for call in ["call-0", "call-1", *[f"parallel-{i}" for i in range(6)]]]
         assert sorted(delivered, key=lambda item: item["tool_call_id"]) == sorted(expected, key=lambda item: item["tool_call_id"])
+        from hermes_local_knowledge import refresh
+        from hermes_local_knowledge.config import resolve_config
+        from hermes_local_knowledge.service import LocalKnowledgeService
+        import sqlite3
+        import time
+
+        cfg = resolve_config()
+        (source / "docs/new.md").write_text("# Zebracobalt repair\nNew source discovered by age refresh.\n")
+        with sqlite3.connect(cfg.state_dir / "index.sqlite") as connection:
+            connection.execute("UPDATE metadata SET value='2000-01-01T00:00:00Z' WHERE key='built_at'")
+        get_plugin_manager().invoke_hook("pre_llm_call", **ids, conversation_history=[])
+        deadline = time.monotonic() + 15
+        while refresh.status(cfg).get("state") != "succeeded" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert refresh.status(cfg).get("state") == "succeeded"
+        assert LocalKnowledgeService(cfg).search("zebracobalt", limit=3)[0]
         prefixes = ("hermes_cli", "agent", "tools", "model_tools", "hermes_constants", "run_agent", "hermes_local_knowledge")
         sources = {name: str(Path(filename).resolve()) for name, module in sys.modules.items()
                    if name.startswith(prefixes) and isinstance(filename := getattr(module, "__file__", None), str)}

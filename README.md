@@ -165,6 +165,7 @@ Canonical settings, aliases, and defaults:
 | `known_entities` | `entities` | `[Hermes, GitHub, MCP, Cron]` |
 | `include_markdown_docs` | — | `true` with an explicit source root; `false` when the root falls back to `$HERMES_HOME` |
 | `exclude_dir_names` | — | `[]`, merged with built-in exclusions |
+| `index_max_age_seconds` | — | `3600`; `0` disables activity-driven age refresh |
 | `okf.enabled` | flat `okf_enabled` | `true` |
 | `okf.auto_generate` | flat `okf_auto_generate` | `true` |
 | `okf.max_candidates_per_session` | flat `okf_max_candidates_per_session` | `2` |
@@ -219,7 +220,11 @@ The host also uses an internal bounded worker subcommand for automatic OKF gener
 
 Managed native lookups, and CLI `search`/`get`/`neighbors` with `--from-hermes-config` and no explicit `--db`, rebuild when the index is missing, corrupt, older than format 4, or marked dirty by completed OKF publication. A newer index format is rejected rather than overwritten.
 
-Ordinary source-file, cron-registry, or MCP-config changes are **not** detected automatically. After those changes, either:
+Ordinary source-file, cron-registry and MCP-config changes are picked up by **opportunistic age refresh**, enabled by default (`index_max_age_seconds: 3600`; `0` disables it; values clamp to 0–604800 seconds). Pre-LLM activity and managed lookups cheaply read successful-build metadata and schedule background maintenance when stale. No source scan or model call runs on the trigger path, and idle installations do no work. The initiating lookup can return the old valid index. This is not a fixed freshness deadline or a filesystem watcher.
+
+A daemon thread captures the resolved profile configuration, independently of the tool observer queue. One thread per process/index is admitted; both existing build locks serialize builders across processes, and freshness is checked again inside those locks. Healthy managed reads do not wait for build locks. During the JSONL-before-SQLite publication window, a busy compatibility gate plus full validation against the existing hash-matched rollback companion permits old-index reads; a busy gate alone never bypasses validation. Missing/corrupt/older-format and OKF-dirty repair remains synchronous. Failed builds retain the prior valid pair and write an error-class-only `index_refresh.json` receipt with a five-minute retry cooldown, shared across processes; doctor JSON exposes the receipt, and failures are logged. If launching or recording a receipt fails, logging and a process-local cooldown remain best-effort fallbacks. Existing atomic publication/recovery rules remain unchanged.
+
+Short-lived CLI processes or host shutdown may interrupt daemon maintenance: there is no exit drain or completion guarantee. Older hosts use the supported pre-LLM hook on a best-effort basis; managed lookups are an independent trigger. For immediate freshness, either:
 
 - pass `rebuild=true` to `knowledge_search`, `knowledge_get`, or `knowledge_neighbors`; or
 - run `python -m hermes_local_knowledge.cli build --from-hermes-config` (or `doctor --rebuild`).
@@ -239,6 +244,7 @@ okfs/tools/*.md
 okf_worker.log
 index_build.lock
 index_build.sqlite
+index_refresh.json
 okf_index_dirty/
 ```
 

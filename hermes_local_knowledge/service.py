@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import __version__, index
+from . import __version__, index, refresh
 from .artifacts import Artifact, Edge
 from .config import Config
 from .evaluation import SearchEvaluationReport, evaluate_index_against_feedback_report
@@ -123,6 +123,9 @@ class LocalKnowledgeService:
     def ensure_index(self) -> tuple[Path, dict[str, Any]]:
         """Ensure the managed index through the format-4 builder."""
 
+        if not index._dirty_tokens(self.config.state_dir) and not index._managed_index_needs_rebuild(self.db_path):
+            refresh.maybe_refresh(self.config)
+            return self.db_path, self._metadata(self.db_path)
         _build_result, metadata = self._build(force=False)
         return self.db_path, metadata
 

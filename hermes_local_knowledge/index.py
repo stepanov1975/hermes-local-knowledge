@@ -173,6 +173,36 @@ def index_needs_rebuild(db_path: Path) -> bool:
     return state in {"missing", "corrupt", "older"}
 
 
+def _managed_index_needs_rebuild(db_path: Path) -> bool:
+    """Accept a fully validated old pair while another publisher holds the gate.
+
+    Sequential JSONL/SQLite replacement temporarily splits the visible pair.
+    The existing rollback copy can prove the old SQLite's companion identity;
+    a busy lock alone is never evidence that a corrupt index is readable.
+    Stable crash splits still require repair, even if a rollback file survived.
+    """
+    if not index_needs_rebuild(db_path):
+        return False
+    if not db_path.is_file():
+        return True
+    fd = _open_legacy_index_build_lock(db_path.parent / INDEX_BUILD_LOCK_NAME)
+    try:
+        if _try_acquire_legacy_index_build_lock(fd):
+            _release_legacy_index_build_lock(fd)
+            # Publication may have completed since the first classification.
+            return index_needs_rebuild(db_path)
+        for companion in db_path.parent.glob(".index.jsonl.rollback.*.tmp"):
+            try:
+                _validate_sqlite(db_path, jsonl_path=companion)
+            except (OSError, sqlite3.Error, ValueError):
+                continue
+            return False
+        # A completed publisher may already have removed its rollback copy.
+        return index_needs_rebuild(db_path)
+    finally:
+        _close_legacy_index_build_lock(fd)
+
+
 def _refuse_newer_index(db_path: Path) -> None:
     version = index_format_version(db_path)
     if version is not None and version > INDEX_FORMAT_VERSION:

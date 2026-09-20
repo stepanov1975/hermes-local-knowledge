@@ -56,7 +56,7 @@ The plugin indexes whole artifacts. It identifies the first artifact to inspect;
    - `cron_job` → verify the live cron registry before mutating jobs.
    - `mcp_server` → inspect the live wrapper/config before troubleshooting.
 
-4. Check freshness when it matters. Managed lookups rebuild an index that is missing, corrupt, older-format, or marked dirty by completed tool-OKF publication. They do **not** detect ordinary source-file, cron-registry, or MCP-config changes. When those changed recently or results look stale, force a rebuild:
+4. Check freshness when it matters. Managed lookups rebuild an index that is missing, corrupt, older-format, or marked dirty by completed tool-OKF publication. Activity-driven background refresh picks up ordinary changes after the last successful build is one hour old by default (`index_max_age_seconds: 0` disables it). Old valid results may be returned while maintenance runs; this is not a freshness deadline. When those changed recently or results look stale, force a rebuild:
 
    ```text
    knowledge_search(query="new helper script", limit=8, rebuild=true)
