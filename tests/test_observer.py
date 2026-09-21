@@ -3,6 +3,8 @@ from __future__ import annotations
 import gc
 import json
 import sqlite3
+import subprocess
+import sys
 import threading
 import weakref
 from collections import UserDict
@@ -434,6 +436,48 @@ def test_large_content_validates_complete_envelope(body: str, error: str | None)
         observer.project_result(payload, malformed, False)
         assert payload["status"] == "unknown"
         assert json.loads(payload["result"]) == {"success": None}
+
+
+@pytest.mark.parametrize("consumer", ["read_file", "skill_view"])
+def test_malformed_escaped_quotes_return_promptly(tmp_path: Path, consumer: str) -> None:
+    # A thread timeout cannot stop a regex holding the GIL. Bound the whole
+    # middleware invocation in a killable child, including unchanged return.
+    code = r'''
+import json
+import sys
+from pathlib import Path
+from hermes_local_knowledge import observer, okf
+from hermes_local_knowledge.config import Config, IndexSettings
+
+root = Path(sys.argv[1])
+observer.resolve_config = lambda: Config(root, root, root, IndexSettings())
+okf._tool_metadata = lambda name: ("synthetic", {})
+raw = '{"content":"' + '\\"' * 33000 + '\\q"}'
+seen = []
+calls = []
+def downstream(args):
+    calls.append(args)
+    return raw
+queue = observer.Observer(lambda kind, **payload: seen.append(payload))
+try:
+    args = {"path": "synthetic"}
+    assert queue.middleware(args, downstream, tool_name=sys.argv[2]) is raw
+    assert calls == [args] and calls[0] is args
+    assert queue.drain(1)
+    assert len(seen) == 1 and seen[0]["status"] == "unknown"
+    assert json.loads(seen[0]["result"]) == {"success": None}
+    assert raw not in json.dumps(seen)
+    assert queue.stats()["result_unknown"] == 1
+finally:
+    assert queue.close(1)
+print("unchanged return; one downstream call; unknown observation")
+'''
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code, str(tmp_path), consumer],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+        timeout=5, check=True,
+    )
+    assert result.stdout.strip() == "unchanged return; one downstream call; unknown observation"
 
 
 @pytest.mark.parametrize("extra", [0, 1])

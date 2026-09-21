@@ -137,9 +137,18 @@ def _result_envelope(result: str, name: str) -> str:
     end = 0
     size = 0
     previous = None
-    for count, match in enumerate(_JSON_STRING.finditer(result)):
+    cursor = 0
+    count = 0
+    # Advance only past complete tokens. Never retry a failed string at an
+    # escaped quote inside it: overlapping suffix searches are quadratic.
+    while (start := result.find('"', cursor)) != -1:
         if count >= 4096:
             raise ValueError("result_budget")
+        match = _JSON_STRING.match(result, start)
+        if match is None:
+            raise ValueError("invalid result string")
+        cursor = match.end()
+        count += 1
         if (previous is not None and previous.end() - previous.start() == 9
                 and previous.group() == '"content"'
                 and result[previous.end():match.start()].strip() == ":"):
