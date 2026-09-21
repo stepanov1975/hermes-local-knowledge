@@ -181,8 +181,8 @@ def project_result(payload: dict[str, Any], result: Any, failed: bool) -> None:
     if isinstance(result, str):
         try:
             envelope = _result_envelope(result, payload["tool_name"])
-        except ValueError:
-            reason = "result_budget"
+        except ValueError as error:
+            reason = "result_budget" if str(error) == "result_budget" else "result_malformed"
         else:
             try:
                 parsed = json.loads(envelope, object_pairs_hook=_result_object,

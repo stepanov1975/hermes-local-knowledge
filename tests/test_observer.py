@@ -468,6 +468,8 @@ try:
     assert json.loads(seen[0]["result"]) == {"success": None}
     assert raw not in json.dumps(seen)
     assert queue.stats()["result_unknown"] == 1
+    assert queue.stats()["result_malformed"] == 1
+    assert queue.stats().get("result_budget", 0) == 0
 finally:
     assert queue.close(1)
 print("unchanged return; one downstream call; unknown observation")
@@ -478,6 +480,27 @@ print("unchanged return; one downstream call; unknown observation")
         timeout=5, check=True,
     )
     assert result.stdout.strip() == "unchanged return; one downstream call; unknown observation"
+
+
+@pytest.mark.parametrize("consumer", ["read_file", "skill_view"])
+@pytest.mark.parametrize("limit", ["scan", "tokens", "prefix", "envelope"])
+def test_large_result_budget_diagnostic(consumer: str, limit: str) -> None:
+    body = "x" * observer.MAX_RESULT_CHARS
+    if limit == "scan":
+        raw = json.dumps({"content": "x" * observer.MAX_CONTENT_SCAN_CHARS})
+    elif limit == "tokens":
+        raw = json.dumps({"content": body, "items": [""] * 4096})
+    elif limit == "prefix":
+        raw = json.dumps({"metadata": body, "content": body})
+    else:
+        raw = json.dumps({"content": body, "metadata": body})
+    payload: dict[str, Any] = {"tool_name": consumer}
+    observer.project_result(payload, raw, False)
+    assert payload["status"] == "unknown"
+    assert payload["error_type"] is None
+    assert payload["_result_diagnostic"] == "result_budget"
+    assert json.loads(payload["result"]) == {"success": None}
+    assert body not in json.dumps(payload)
 
 
 @pytest.mark.parametrize("extra", [0, 1])
