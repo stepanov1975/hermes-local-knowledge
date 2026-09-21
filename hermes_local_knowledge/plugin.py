@@ -82,6 +82,8 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
 
 def _on_post_tool_call(**kwargs: Any) -> None:
     _on_okf_post_tool_call(**kwargs)
+    if kwargs.get("_observer_attributed") is False:
+        return
     _on_implicit_post_tool_call(**kwargs)
     shadow_hooks.on_post_tool_call(**kwargs)
 
