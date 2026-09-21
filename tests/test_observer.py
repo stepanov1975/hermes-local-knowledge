@@ -419,10 +419,27 @@ def test_large_result_is_not_parsed(cfg: Config, monkeypatch: pytest.MonkeyPatch
     assert not queue.stats().get("discarded")
 
 
+def test_observer_case_ids_fit_windows_environment() -> None:
+    # Pytest exports each node ID as PYTEST_CURRENT_TEST during setup/call/teardown.
+    # Payload-sized IDs exceed Windows' 32767-character environment-value limit
+    # before the test body runs, and make failure reporting prohibitively large.
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "--collect-only", "-q",
+         "-o", "addopts=", "tests/test_observer.py"],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+        timeout=30, check=True,
+    )
+    node_ids = [line for line in result.stdout.splitlines() if line.startswith("tests/test_observer.py::")]
+    assert node_ids
+    # Keep a generous margin for checkout paths and pytest's phase suffix.
+    oversized = [(node_id[:100], len(node_id)) for node_id in node_ids if len(node_id) > 1024]
+    assert not oversized, oversized
+
+
 @pytest.mark.parametrize("body", [
     "Plain private text " * 6000,
     'Escapes \" \\ \n \t ☃ "success":false ' * 3000,
-])
+], ids=["plain-content", "escaped-content"])
 @pytest.mark.parametrize("error", [None, "failure"])
 def test_large_content_validates_complete_envelope(body: str, error: str | None) -> None:
     raw = json.dumps({"content": body, "success": True, "error": error, "_source_path": "/synthetic/SKILL.md"})
@@ -832,6 +849,9 @@ def test_ineligible_consumption_does_not_learn(cfg: Config, consumer: str, fault
     '{"content": "' + 'x' * 90000 + '\\q"}',
     json.dumps({"output": "x" * 90000}),
     json.dumps({"content": "x" * 1100000}),
+], ids=[
+    "not-json", "nonfinite-error", "duplicate-status", "truncated-content",
+    "invalid-content-escape", "oversized-output", "content-scan-budget",
 ])
 def test_unknown_result_keeps_structural_use_not_success_or_error(cfg: Config, raw: str) -> None:
     queue = observer.Observer(lambda kind, **p: okf._on_post_tool_call(**p))
