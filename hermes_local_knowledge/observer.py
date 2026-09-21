@@ -9,6 +9,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import re
 import threading
 import time
 from collections import Counter, OrderedDict, deque
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 IDENTITY = ("session_id", "task_id", "turn_id", "api_request_id", "tool_call_id")
 MAX_RECEIPT_BYTES = 65536
 MAX_RESULT_CHARS = 65536
+MAX_CONTENT_SCAN_CHARS = 1048576
+# Lex only complete JSON strings, with bounded input and no per-character
+# backtracking stack. The JSON decoder still validates the entire envelope.
+_JSON_STRING = re.compile(r'"(?:[^"\\\x00-\x1f]++|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*+"')
 IDLE_SECONDS = 30.0
 
 
@@ -78,12 +83,26 @@ def _schema_snapshot(schema: Any) -> Any:
     return copy(schema, 0)
 
 
+class _CallProjectionError(ValueError):
+    """Fixed category only; never retain schema/argument exception text."""
+
+
 def project_call(args: Any, metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Copy only purpose-specific evidence, not arbitrary tool args/output."""
     name = _text(metadata.get("tool_name"), 240)
-    toolset, schema = okf._tool_metadata(name)
-    schema = _schema_snapshot(schema)
+    try:
+        toolset, schema = okf._tool_metadata(name)
+        schema = _schema_snapshot(schema)
+        capture = {"toolset": _text(toolset, 240) or None,
+                   "schema": okf.project_routing_schema(schema),
+                   "schema_hash": okf.schema_hash(schema)}
+    except Exception:
+        raise _CallProjectionError("schema_projection_error") from None
     source = args if isinstance(args, dict) else {}
+    try:
+        capture["arg_shape"] = okf.safe_arg_shape(source)
+    except Exception:
+        raise _CallProjectionError("argument_projection_error") from None
     selected: dict[str, Any] = {}
     if name == "knowledge_search":
         selected = {key: _text(source.get(key), limit) for key, limit in
@@ -101,37 +120,87 @@ def project_call(args: Any, metadata: Mapping[str, Any]) -> dict[str, Any]:
     elif name == "read_file":
         selected["path"] = _text(source.get("path"), 4096)
     return {**context_fields(metadata), "tool_name": name, "args": selected,
-            "_okf_capture": {"toolset": _text(toolset, 240) or None, "schema": okf.project_routing_schema(schema),
-                             "schema_hash": okf.schema_hash(schema),
-                             "arg_shape": okf.safe_arg_shape(source)}}
+            "_okf_capture": capture}
+
+
+def _result_envelope(result: str, name: str) -> str:
+    """Elide only validated content strings; never parse an unbounded JSON tree.
+
+    This is not a prefix/suffix success heuristic: all other bytes must fit the
+    normal decoder budget, and the compacted envelope must parse in full.
+    """
+    if len(result) <= MAX_RESULT_CHARS:
+        return result
+    if name not in {"read_file", "skill_view"} or len(result) > MAX_CONTENT_SCAN_CHARS:
+        raise ValueError("result_budget")
+    parts: list[str] = []
+    end = 0
+    size = 0
+    previous = None
+    for count, match in enumerate(_JSON_STRING.finditer(result)):
+        if count >= 4096:
+            raise ValueError("result_budget")
+        if (previous is not None and previous.end() - previous.start() == 9
+                and previous.group() == '"content"'
+                and result[previous.end():match.start()].strip() == ":"):
+            size += match.start() - end + 2
+            if size > MAX_RESULT_CHARS:
+                raise ValueError("result_budget")
+            parts.extend((result[end:match.start()], '""'))
+            end = match.end()
+        previous = match
+    if size + len(result) - end > MAX_RESULT_CHARS:
+        raise ValueError("result_budget")
+    parts.append(result[end:])
+    return "".join(parts)
+
+
+def _result_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate result key")
+    return result
+
+
+def _invalid_constant(value: str) -> Any:
+    raise ValueError("non-JSON constant")
 
 
 def project_result(payload: dict[str, Any], result: Any, failed: bool) -> None:
-    # Bound both classification and selected-tool parsing before either decoder
-    # can allocate a tree. Oversized output still returns unchanged to the host.
-    if isinstance(result, str) and len(result) > MAX_RESULT_CHARS:
-        raise ValueError("result exceeds observer budget")
-    success, error_type, _ = okf._classify_result(result)
-    success = success and not failed
-    payload["status"] = "success" if success else "error"
-    payload["error_type"] = "execution_error" if failed else error_type
-    selected: dict[str, Any] = {"success": success}
-    if isinstance(result, str) and payload["tool_name"] in {
-        "knowledge_search", "knowledge_get", "skill_view", "read_file",
-    }:
+    parsed = None
+    reason = "result_type"
+    if isinstance(result, str):
         try:
-            parsed = json.loads(result)
-        except (ValueError, RecursionError):
-            parsed = None
-        if isinstance(parsed, dict):
-            receipt = parsed.get("usage_event_id")
-            if isinstance(receipt, int) and not isinstance(receipt, bool) and receipt > 0:
-                selected["usage_event_id"] = receipt
-            if payload["tool_name"] == "skill_view" and parsed.get("success") is True:
-                selected["_source_path"] = _text(parsed.get("_source_path"), 4096)
-            if payload["tool_name"] == "read_file" and isinstance(parsed.get("content"), str):
-                # Content presence is evidence; its body is not retained.
-                selected["content"] = ""
+            envelope = _result_envelope(result, payload["tool_name"])
+        except ValueError:
+            reason = "result_budget"
+        else:
+            try:
+                parsed = json.loads(envelope, object_pairs_hook=_result_object,
+                                    parse_constant=_invalid_constant)
+                reason = "result_shape"
+            except (ValueError, RecursionError):
+                reason = "result_malformed"
+    success: bool | None = None
+    error_type = None
+    if failed:
+        success, error_type = False, "execution_error"
+    elif isinstance(parsed, dict):
+        success = not (parsed.get("success") is False or bool(parsed.get("error")))
+        error_type = None if success else "tool_error"
+    payload["status"] = "unknown" if success is None else "success" if success else "error"
+    payload["error_type"] = error_type
+    if success is None:
+        payload["_result_diagnostic"] = reason
+    selected: dict[str, Any] = {"success": success}
+    if success is True and isinstance(parsed, dict):
+        receipt = parsed.get("usage_event_id")
+        if isinstance(receipt, int) and not isinstance(receipt, bool) and receipt > 0:
+            selected["usage_event_id"] = receipt
+        if payload["tool_name"] == "skill_view" and parsed.get("success") is True:
+            selected["_source_path"] = _text(parsed.get("_source_path"), 4096)
+        if payload["tool_name"] == "read_file" and isinstance(parsed.get("content"), str):
+            selected["content"] = ""
     payload["result"] = json.dumps(selected)
 
 
@@ -216,7 +285,7 @@ class Observer:
                     serialized = None
                     self._notice("oversize")
         except Exception:
-            self._notice("projection_error")
+            self._notice("receipt_serialization_error")
         finally:
             with self._condition:
                 slot.payload = serialized
@@ -230,8 +299,10 @@ class Observer:
             slot = self.reserve("post")
             if slot is not None:
                 payload = project_call(args, metadata)
+        except _CallProjectionError as error:
+            self._notice(str(error))
         except Exception:
-            self._notice("projection_error")
+            self._notice("call_projection_error")
         result: Any = None
         failed = True
         try:
@@ -243,9 +314,12 @@ class Observer:
                 try:
                     if payload is not None:
                         project_result(payload, result, failed)
+                        if payload["status"] == "unknown":
+                            self._notice("result_unknown")
+                            self._notice(payload.pop("_result_diagnostic"))
                 except Exception:
                     payload = None
-                    self._notice("projection_error")
+                    self._notice("result_projection_error")
                 try:
                     self.finish(slot, payload)
                 except Exception:
@@ -277,6 +351,14 @@ class Observer:
                     self._seen.popitem(last=False)
             else:
                 self._notice("unkeyed")
+                for field, value in zip(IDENTITY, ids):
+                    if not value:
+                        self._notice("missing_" + field)
+            # Tool-call ID is needed for replay suppression, not the downstream
+            # exact session/task/turn/request joins. Never infer those joins.
+            payload["_observer_attributed"] = all(ids[:4])
+            if not payload["_observer_attributed"]:
+                self._notice("attribution_skipped")
         self.consume(slot.kind, **payload)
         with self._condition:
             self._counts["delivered"] += 1

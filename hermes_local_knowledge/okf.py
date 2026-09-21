@@ -807,7 +807,7 @@ def upsert_tool_candidate(
     if not _is_canonical_arg_shape(shape):
         raise ValueError("invalid captured argument shape")
     arg_shape_json = json.dumps(shape, sort_keys=True, separators=(",", ":"))
-    success_increment = 1 if success is not False else 0
+    success_increment = 1 if success is True else 0
     error_increment = 1 if success is False else 0
     clean_error_type = _safe_error_type(error_type)
     with _connect(state_dir) as conn:
@@ -1754,10 +1754,12 @@ def _classify_result(result: Any) -> tuple[bool, str | None, str | None]:
     return True, None, None
 
 
-def _classify_hook_outcome(kwargs: Mapping[str, Any]) -> tuple[bool, str | None, str | None]:
+def _classify_hook_outcome(kwargs: Mapping[str, Any]) -> tuple[bool | None, str | None, str | None]:
     status = kwargs.get("status")
     if isinstance(status, str) and status.strip():
         normalized = status.strip().lower()
+        if normalized == "unknown":
+            return None, None, None
         if normalized in {"ok", "success"}:
             return True, None, None
         error_type = kwargs.get("error_type") or normalized

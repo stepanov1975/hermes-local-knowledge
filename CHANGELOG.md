@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.3b4] - 2026-09-21
+
+### Fixed
+
+- Preserve bounded structural observations for oversized, malformed or unclassified results without counting unknown outcomes as successes or errors.
+- Recover exact file/skill consumption from complete, validated large content envelopes within fixed scan/decoder budgets; never retain their bodies or infer success from a truncated prefix.
+- Diagnose missing host identity fields and skip unattributable implicit/shadow evidence without inventing IDs. Official execute-code nested dispatch remains explicitly degraded; no host patch is required.
+- Report privacy-safe projection categories while retaining complete schema hashing, queue/receipt bounds and original tool results/exceptions.
+
 ## [0.5.3b3] - 2026-09-20
 
 ### Added
@@ -48,6 +57,7 @@ results, and has not demonstrated production savings or ranking improvements.
 - Read indentless YAML lists emitted by host configuration saves in explicit-profile workers instead of silently discarding the configuration section.
 - Support canonical beta versions in version ordering, release notes and artifact names; publish and repair betas as prereleases, never latest.
 
+[0.5.3b4]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b3...v0.5.3b4
 [0.5.3b3]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b2...v0.5.3b3
 [0.5.3b2]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b1...v0.5.3b2
 [0.5.3b1]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.20...v0.5.3b1

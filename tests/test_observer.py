@@ -211,7 +211,7 @@ def test_failures_never_rerun_or_change_exception(cfg: Config, monkeypatch: pyte
     result = object()
     assert queue.middleware({}, lambda args: result, **IDS) is result
     assert queue.close(5)
-    assert queue.stats()["projection_error"] == 1
+    assert queue.stats()["call_projection_error"] == 1
 
 
 def test_full_drain_closed_replay_and_bounded_dedup(cfg: Config) -> None:
@@ -299,7 +299,7 @@ def test_shared_schema_work_is_bounded(cfg: Config, monkeypatch: pytest.MonkeyPa
     assert len(calls) == 1 and calls[0] is args
     assert unbounded_calls == []
     assert received == []
-    assert queue.stats()["projection_error"] == 1
+    assert queue.stats()["schema_projection_error"] == 1
 
 
 @pytest.mark.parametrize("schema", [
@@ -381,7 +381,7 @@ def test_arg_shape_global_budget_drops_observation(cfg: Config) -> None:
     assert len(reads) <= 256
     assert len(calls) == 1 and calls[0] is args
     assert received == []
-    assert queue.stats()["projection_error"] == 1
+    assert queue.stats()["argument_projection_error"] == 1
     assert queue.stats()["discarded"] == 1
 
 
@@ -392,7 +392,7 @@ def test_large_result_is_not_parsed(cfg: Config, monkeypatch: pytest.MonkeyPatch
     loads = json.loads
 
     def spy(value: Any, *args: Any, **kwargs: Any) -> Any:
-        if value is raw:
+        if isinstance(value, str) and len(value) > observer.MAX_RESULT_CHARS:
             parsed_large.append(True)
         return loads(value, *args, **kwargs)
 
@@ -410,9 +410,30 @@ def test_large_result_is_not_parsed(cfg: Config, monkeypatch: pytest.MonkeyPatch
     assert queue.close(5)
     assert parsed_large == []
     assert len(calls) == 1 and calls[0] is args
-    assert received == []
-    assert queue.stats()["projection_error"] == 1
-    assert queue.stats()["discarded"] == 1
+    assert len(received) == 1
+    assert "PRIVATE" not in json.dumps(received)
+    assert len(json.dumps(received[0])) <= observer.MAX_RECEIPT_BYTES
+    assert received[0]["status"] == ("success" if tool_name in {"read_file", "skill_view"} else "unknown")
+    assert not queue.stats().get("discarded")
+
+
+@pytest.mark.parametrize("body", [
+    "Plain private text " * 6000,
+    'Escapes \" \\ \n \t ☃ "success":false ' * 3000,
+])
+@pytest.mark.parametrize("error", [None, "failure"])
+def test_large_content_validates_complete_envelope(body: str, error: str | None) -> None:
+    raw = json.dumps({"content": body, "success": True, "error": error, "_source_path": "/synthetic/SKILL.md"})
+    assert len(raw) > observer.MAX_RESULT_CHARS
+    payload: dict[str, Any] = {"tool_name": "skill_view"}
+    observer.project_result(payload, raw, False)
+    assert payload["status"] == ("error" if error else "success")
+    assert ("_source_path" in json.loads(payload["result"])) == (error is None)
+    assert body not in json.dumps(payload)
+    for malformed in (raw[:-1], raw + " trailing", raw.replace('"content":', '"content"', 1)):
+        observer.project_result(payload, malformed, False)
+        assert payload["status"] == "unknown"
+        assert json.loads(payload["result"]) == {"success": None}
 
 
 @pytest.mark.parametrize("extra", [0, 1])
@@ -420,14 +441,10 @@ def test_result_parse_budget_boundary(extra: int) -> None:
     raw = '{"success": false, "error": "failure", "content": ""}'
     raw = raw[:-2] + "x" * (observer.MAX_RESULT_CHARS - len(raw) + extra) + raw[-2:]
     payload: dict[str, Any] = {"tool_name": "read_file"}
-    if extra:
-        with pytest.raises(ValueError, match="budget"):
-            observer.project_result(payload, raw, False)
-    else:
-        observer.project_result(payload, raw, False)
-        assert payload["status"] == "error"
-        assert payload["error_type"] == "tool_error"
-        assert json.loads(payload["result"]) == {"success": False, "content": ""}
+    observer.project_result(payload, raw, False)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "tool_error"
+    assert json.loads(payload["result"]) == {"success": False}
 
 
 @pytest.mark.parametrize("failure", ["construction", "start"])
@@ -573,7 +590,8 @@ def test_pre_hook_config_failure_omits_shadow_capture(cfg: Config, monkeypatch: 
 
 
 @pytest.mark.parametrize("consumer", ["knowledge_get", "read_file", "skill_view"])
-def test_registered_full_consumers_and_lifecycle(cfg: Config, consumer: str) -> None:
+@pytest.mark.parametrize("body_size", [12, 90000])
+def test_registered_full_consumers_and_lifecycle(cfg: Config, consumer: str, body_size: int) -> None:
     skill_path = cfg.source_root / "custom_skills/atlas/SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text("---\nname: atlas\ndescription: Atlas restore runbook\n---\n# Atlas restore runbook\nRestore Atlas backup.\n")
@@ -594,7 +612,7 @@ def test_registered_full_consumers_and_lifecycle(cfg: Config, consumer: str) -> 
     else:
         consume_args = {"path": str(skill_path if consumer == "skill_view" else cfg.source_root / "docs/atlas.md")}
         def downstream(a: dict[str, Any]) -> str:
-            return json.dumps({"success": True, "content": "PRIVATE BODY", "_source_path": a["path"]})
+            return json.dumps({"success": True, "content": "x" * body_size, "_source_path": a["path"]})
     call_ids = {**IDS, "api_request_id": "later-api", "tool_call_id": "consume"}
     ctx.middleware(consume_args, downstream, tool_name=consumer, **call_ids)
     # Replay receipt, not tool execution: all consumer counters must remain stable.
@@ -707,6 +725,69 @@ def test_immutable_receipt_and_failed_replay(cfg: Config) -> None:
     assert received[0]["status"] == "error"
     assert "PRIVATE ERROR" not in json.dumps(received)
     assert queue.stats()["duplicate"] == 1
+
+
+@pytest.mark.parametrize("consumer", ["read_file", "skill_view"])
+@pytest.mark.parametrize("fault", ["malformed", "budget", "missing_turn", "error"])
+def test_ineligible_consumption_does_not_learn(cfg: Config, consumer: str, fault: str) -> None:
+    path = cfg.source_root / ("custom_skills/atlas/SKILL.md" if consumer == "skill_view" else "docs/atlas.md")
+    if consumer == "skill_view":
+        path.parent.mkdir(parents=True)
+        path.write_text("---\nname: atlas\ndescription: Atlas restore runbook\n---\nAtlas restore backup.\n")
+    ctx = Context()
+    plugin.register(ctx)
+    queue = ctx.middleware.__self__
+    ctx.hooks["pre_llm_call"](**IDS, user_message="Locate Atlas restore runbook")
+    ctx.middleware({"query": "Atlas restore runbook"}, lambda a: plugin._handle_search(a, **IDS),
+                   tool_name="knowledge_search", **IDS)
+    raw = json.dumps({"success": fault != "error", "_source_path": str(path),
+                      "content": "PRIVATE" * (200000 if fault == "budget" else 15000)})
+    if fault == "malformed":
+        raw = raw[:-1]
+    ids = {**IDS, "api_request_id": "later", "tool_call_id": "consume"}
+    if fault == "missing_turn":
+        ids["turn_id"] = ""  # Pre-hook binding must not repair absent host evidence.
+    assert ctx.middleware({"path": str(path)}, lambda a: raw, tool_name=consumer, **ids) is raw
+    assert queue.close(10)
+    with sqlite3.connect(cfg.state_dir / "usage.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM implicit_feedback").fetchone()[0] == 0
+    with sqlite3.connect(cfg.state_dir / "okf_queue.sqlite") as conn:
+        row = conn.execute("SELECT use_count, success_count, error_count FROM okf_candidates WHERE tool_name=?",
+                           (consumer,)).fetchone()
+    assert row == (1, int(fault == "missing_turn"), int(fault == "error"))
+
+
+@pytest.mark.parametrize("raw", [
+    'not json',
+    '{"success": true, "error": NaN, "content": "body"}',
+    '{"success": false, "success": true, "content": "body"}',
+    '{"content": "' + 'x' * 90000 + '"',
+    '{"content": "' + 'x' * 90000 + '\\q"}',
+    json.dumps({"output": "x" * 90000}),
+    json.dumps({"content": "x" * 1100000}),
+])
+def test_unknown_result_keeps_structural_use_not_success_or_error(cfg: Config, raw: str) -> None:
+    queue = observer.Observer(lambda kind, **p: okf._on_post_tool_call(**p))
+    assert queue.middleware({}, lambda a: raw, tool_name="read_file", **IDS) is raw
+    assert queue.close(5)
+    with sqlite3.connect(cfg.state_dir / "okf_queue.sqlite") as conn:
+        row = conn.execute("SELECT use_count, success_count, error_count FROM okf_candidates").fetchone()
+    assert row == (1, 0, 0)
+    assert queue.stats().get("result_unknown") == 1
+
+
+@pytest.mark.parametrize("missing", list(IDS))
+def test_missing_identity_is_observable_without_inventing_ids(cfg: Config, missing: str) -> None:
+    received: list[Any] = []
+    queue = observer.Observer(lambda kind, **p: received.append(p))
+    ids = {key: value for key, value in IDS.items() if key != missing}
+    for _ in range(2):
+        queue.middleware({}, lambda a: '{}', tool_name="synthetic", **ids)
+    assert queue.close(5)
+    assert len(received) == 2 and not queue._seen
+    assert all(p[missing] == "" for p in received)
+    assert queue.stats()["missing_" + missing] == 2
+    assert all(p["_observer_attributed"] == (missing == "tool_call_id") for p in received)
 
 
 def test_okf_error_schema_parity_and_unkeyed_limit(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:

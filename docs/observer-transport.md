@@ -71,10 +71,20 @@ this is not a synchronous feedback-visibility guarantee.
 
 Synchronous argument-shape capture reads at most eight children per container,
 with a shared 256-node traversal budget (including repeated references). Tool
-result strings over 65,536 characters are rejected before JSON classification or
-evidence parsing. These limits discard the observation with `projection_error`,
-not the tool call or its original result; large file/skill results therefore do
-not supply implicit-consumption evidence.
+results are decoded only within a 65,536-character JSON envelope budget. For
+`read_file` and `skill_view`, strings up to 1,048,576 characters can additionally
+be scanned for complete, valid JSON `content` string values (at most 4096 string
+tokens). Those values are replaced with empty strings before decoding the entire
+remaining envelope within the normal budget. Invalid syntax, duplicate keys and
+non-JSON constants are rejected; no prefix/suffix success inference is used.
+Bodies are never retained in receipts. Large valid file/skill results can therefore
+supply exact consumption evidence without decoding their content into a tree.
+
+Malformed, unsupported-shape/type and over-budget results preserve a structural
+OKF use with **unknown** outcome: neither success nor error counters increase,
+and no successful implicit consumption is inferred. A raised tool exception
+remains an execution error. Schema/argument projection or receipt serialization
+failures can still discard the observation, never the original tool result.
 
 ## Deduplication, overload and failure
 
@@ -82,10 +92,21 @@ Complete profile/root/state + tool + session/task/turn/API-request/tool-call
 identity suppresses replay within the **latest 4096 distinct admitted identities**
 per registration. A suppressed receipt does not increment OKF counters or invoke
 implicit/shadow capture again. The window is bounded FIFO, not a durable ledger.
-Missing IDs are counted as `unkeyed` and are not deduplicated; eviction, reload,
-other processes and restarts can admit a replay again. The identity is recorded
-before consumer dispatch: partial failures are not retried automatically, because
-that could duplicate earlier effects.
+Missing IDs are counted as `unkeyed` and separately as `missing_<field>`; they
+are not deduplicated. Missing session/task/turn/API-request identity additionally
+increments `attribution_skipped`: structural OKF capture remains eligible, but
+implicit and shadow attribution are skipped. IDs are never invented from ambient
+state. Missing only tool-call ID prevents replay suppression, not an otherwise
+exact consumer join. Eviction, reload, other processes and restarts can admit a
+replay again.
+
+On official v2026.9.14, both execute-code host dispatch seams omit session, turn,
+API-request and tool-call IDs while retaining task ID. Their completions therefore
+have this explicit attribution degradation. This plugin cannot reconstruct those
+missing host identities or count callbacks never supplied by a host.
+
+Complete deduplication identity is recorded before consumer dispatch: partial
+failures are not retried automatically, because that could duplicate earlier effects.
 
 Full or closed queues reject new observations, never tool execution. Oversized or
 unprojectable receipts are discarded. Lifecycle reservations can also be rejected
@@ -98,9 +119,13 @@ producer/consumer can prevent draining; interpreter termination can lose pending
 work. There is **no lossless, crash-recovery, durable or exactly-once guarantee**.
 
 The `hermes_local_knowledge.observer` logger emits structural warnings for `full`,
-`closed`, `oversize`, `config_error`, `projection_error`, `enqueue_error`,
-`consumer_error`, `unkeyed` and `drain_timeout`. It logs the first occurrence and
-powers of two to avoid overload log storms, without raw arguments/results or
+`closed`, `oversize`, `config_error`, `enqueue_error`, `consumer_error`,
+`unkeyed`, `missing_<field>`, `attribution_skipped` and `drain_timeout`.
+Projection categories distinguish `schema_projection_error`,
+`argument_projection_error`, `call_projection_error`, `result_projection_error`
+and `receipt_serialization_error`. `result_unknown` is accompanied by one of
+`result_budget`, `result_malformed`, `result_type` or `result_shape`. It logs the
+first occurrence and powers of two to avoid overload log storms, without raw arguments/results or
 exception text. The registration's internal observer `stats()` reports accepted,
 completed, delivered, duplicate, discarded, pending and error/rejection counters;
 absent counter keys mean zero. `delivered` means the callback returned, not that
@@ -138,6 +163,9 @@ Use a clean environment without credentials. Verify the official Git commit and
 clean status before and after. The script blocks network and child-process calls,
 uses synthetic provider messages (no inference), exercises direct/deferred calls
 and a six-call direct batch, compares all five IDs, and checks imported module
-provenance. Reused dependency site-packages are not an independently locked clean
-host install. This does not cover paid provider conversations, connector batches,
+provenance. It also sends large real `read_file`/`skill_view` results through the
+registered plugin's real implicit and OKF database consumers, then exercises both
+execute-code dispatch seams to assert explicit missing attribution without false
+implicit feedback. These seam calls do not launch an execute-code sandbox. Reused
+dependency site-packages are not an independently locked clean host install. This does not cover paid provider conversations, connector batches,
 remote workers, delegated processes or native Windows execution.

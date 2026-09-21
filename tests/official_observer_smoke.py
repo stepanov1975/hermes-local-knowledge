@@ -23,7 +23,10 @@ def main() -> None:
                       TERMINAL_CWD=str(home), HERMES_TOOL_RESULT_STORAGE_DIR=str(home / "results"))
     source = home / "source"
     (source / "docs").mkdir(parents=True, exist_ok=True)
-    (source / "docs/atlas.md").write_text("# Atlas restore runbook\nRestore the Atlas backup.\n")
+    (source / "docs/atlas.md").write_text("# Atlas restore runbook\n" + ("Restore Atlas backup. " * 40 + "\n") * 100)
+    skill = home / "skills/atlas-proof/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: atlas-proof\ndescription: Atlas restore runbook\n---\n" + "Atlas restore. " * 6000)
     (home / "config.yaml").write_text(
         f"plugins:\n  enabled: []\nlocal_knowledge:\n  source_root: {source}\n"
         "  okf:\n    auto_generate: false\n  verified_routing:\n    mode: shadow\n"
@@ -59,7 +62,7 @@ def main() -> None:
     ctx.observer.consume = record
     agent = AIAgent(model="synthetic-offline", api_key="synthetic-not-a-key", provider="custom",
                     base_url="http://127.0.0.1:9/v1", api_mode="chat_completions",
-                    enabled_toolsets=["local_knowledge", "file"], session_id="offline-session",
+                    enabled_toolsets=["local_knowledge", "file", "skills"], session_id="offline-session",
                     skip_memory=True, skip_context_files=True, skip_background_review=True,
                     quiet_mode=True, tool_progress_mode="off", checkpoints_enabled=False)
     agent._current_turn_id = "offline-turn"
@@ -92,6 +95,56 @@ def main() -> None:
         import time
 
         cfg = resolve_config()
+
+        def execute(name: str, args: dict[str, Any], call_id: str) -> str:
+            call = SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(
+                name=name, arguments=json.dumps(args)))
+            messages: list[Any] = []
+            agent._execute_tool_calls(SimpleNamespace(tool_calls=[call], content=None), messages, ids["task_id"])
+            assert ctx.observer.drain(20)
+            return str(messages[-1]["content"])
+
+        # Real official file/skill handlers, real implicit/OKF database consumers.
+        for tool, tool_args, artifact_type in (
+            ("read_file", {"path": str(source / "docs/atlas.md")}, "runbook"),
+            ("skill_view", {"name": "atlas-proof"}, "skill"),
+        ):
+            agent._current_api_request_id = tool + "-search"
+            execute("knowledge_search", {"query": "Atlas restore runbook", "artifact_type": artifact_type}, tool + "-search")
+            agent._current_api_request_id = tool + "-consume"
+            raw = execute(tool, tool_args, tool + "-consume")
+            assert len(raw) > 65536 and isinstance(json.loads(raw)["content"], str)
+        with sqlite3.connect(cfg.state_dir / "usage.sqlite") as connection:
+            consumed = connection.execute("SELECT consumer_tool FROM implicit_feedback ORDER BY consumer_tool").fetchall()
+        assert consumed == [("read_file",), ("skill_view",)]
+        with sqlite3.connect(cfg.state_dir / "okf_queue.sqlite") as connection:
+            outcomes = connection.execute(
+                "SELECT tool_name, use_count, success_count, error_count FROM okf_candidates "
+                "WHERE tool_name IN ('read_file', 'skill_view') ORDER BY tool_name").fetchall()
+        assert outcomes == [("read_file", 1, 1, 0), ("skill_view", 1, 1, 0)]
+
+        # Exercise both actual execute_code host dispatch seams, without launching
+        # a sandbox or changing host internals. Neither seam supplies four IDs.
+        from tools.code_execution_rpc import _default_dispatch  # type: ignore[import-not-found,import-untyped]
+        from tools.code_kernel import CellAuthority  # type: ignore[import-not-found,import-untyped]
+
+        authority = CellAuthority(ids["task_id"])
+        for offset, dispatch in enumerate((_default_dispatch(ids["task_id"]), authority.dispatch), 2):
+            raw = dispatch("read_file", {"path": str(source / "docs/atlas.md"), "offset": offset})
+            result = json.loads(raw)
+            assert not result.get("error") and isinstance(result.get("content"), str)
+        authority.retire()
+        assert ctx.observer.drain(20)
+        assert ctx.observer.stats()["attribution_skipped"] == 2
+        for key in ("session_id", "turn_id", "api_request_id", "tool_call_id"):
+            assert ctx.observer.stats()["missing_" + key] == 2
+            assert all(not item[key] for item in delivered[-2:])
+        with sqlite3.connect(cfg.state_dir / "usage.sqlite") as connection:
+            assert connection.execute("SELECT count(*) FROM implicit_feedback").fetchone()[0] == 2
+        with sqlite3.connect(cfg.state_dir / "okf_queue.sqlite") as connection:
+            assert connection.execute(
+                "SELECT use_count, success_count, error_count FROM okf_candidates WHERE tool_name='read_file'"
+            ).fetchone() == (3, 3, 0)
         (source / "docs/new.md").write_text("# Zebracobalt repair\nNew source discovered by age refresh.\n")
         with sqlite3.connect(cfg.state_dir / "index.sqlite") as connection:
             connection.execute("UPDATE metadata SET value='2000-01-01T00:00:00Z' WHERE key='built_at'")
@@ -105,7 +158,9 @@ def main() -> None:
         sources = {name: str(Path(filename).resolve()) for name, module in sys.modules.items()
                    if name.startswith(prefixes) and isinstance(filename := getattr(module, "__file__", None), str)}
         assert all(path.startswith((str(official) + "/", str(repo) + "/")) for path in sources.values())
-        print(json.dumps({"deliveries": delivered, "queue": ctx.observer.stats(), "modules_checked": len(sources)}))
+        print(json.dumps({"deliveries": delivered, "queue": ctx.observer.stats(), "modules_checked": len(sources),
+                          "implicit_consumers": consumed, "attributed_okf_outcomes": outcomes,
+                          "unattributed_read_file_uses": 2}))
     finally:
         assert ctx.observer.close(20)
         agent.close()
