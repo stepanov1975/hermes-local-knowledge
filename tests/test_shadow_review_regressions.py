@@ -207,9 +207,10 @@ def test_failed_provider_elapsed_is_fenced_and_never_retried(cfg, monkeypatch, s
 
 
 @pytest.mark.parametrize("reject_first", [False, True])
-def test_full_baseline_can_reuse_and_rejected_candidate_cannot_poison(cfg, monkeypatch, reject_first):
-    baseline = [item(i) for i in range(30)]
+def test_eligible_baseline_can_reuse_and_rejected_candidate_cannot_poison(cfg, monkeypatch, reject_first):
+    baseline = [item(i) for i in range(5)]
     row = capture(cfg, baseline=baseline)
+    row["_diagnostics"] = shadow_sources.Diagnostics()
     good = prior(cfg, [item(35), item(36), item(37)], "good")
     shortlisted = [good]
     if reject_first:
@@ -243,7 +244,8 @@ def test_full_baseline_can_reuse_and_rejected_candidate_cannot_poison(cfg, monke
 
 
 def test_source_budget_rejection_preserves_prior_and_later_candidates(cfg, monkeypatch):
-    row = capture(cfg, baseline=[item(i) for i in range(30)])
+    row = capture(cfg, baseline=[item(i) for i in range(5)])
+    row["_diagnostics"] = shadow_sources.Diagnostics()
     shortlisted = [prior(cfg, [item(30)], "first"),
                    prior(cfg, [item(i) for i in range(31, 39)], "too_many"),
                    prior(cfg, [item(39)], "last")]
@@ -259,5 +261,5 @@ def test_source_budget_rejection_preserves_prior_and_later_candidates(cfg, monke
     packet = packets[0]
     assert [r["case_id"] for r in packet["stored_routes"]] == ["first", "last"]
     assert len(packet["sources"]) <= shadow_sources.MAX_SOURCES
-    assert len(packet["candidates"]) == 32
+    assert len(packet["candidates"]) == 7
     assert not set(item(i) for i in range(31, 39)) & {s["id"] for s in packet["sources"]}

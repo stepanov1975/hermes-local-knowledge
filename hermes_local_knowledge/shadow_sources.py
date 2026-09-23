@@ -185,10 +185,60 @@ def sources_current(cfg: Config, identities: list[dict[str, Any]]) -> bool:
         return False
 
 
+REFUSAL_CODES = frozenset({
+    "source_too_large", "empty_source", "missing_source", "unsupported_source",
+    "unregistered_source_path", "source_count_budget", "source_bytes_budget",
+    "source_unavailable", "unsearched_source", "source_identity_changed",
+    "artifact_type_mismatch", "candidate_budget", "source_error",
+})
+ABSTENTION_CATEGORIES = frozenset({
+    "unspecified", "insufficient_sources", "ambiguous_lookup", "conflicting_evidence",
+    "baseline_coverage", "no_applicable_route",
+})
+
+
+class Diagnostics:
+    """Bounded structural receipt, never model prose, search text or source content."""
+
+    def __init__(self) -> None:
+        self.eligibility = "not_checked"
+        self.reason = ""
+        self.attempts: list[dict[str, str]] = []
+        self.read_attempts = 0
+        self.actions: dict[str, int] = {}
+        self.abstention = "unspecified"
+
+    def read(self, artifact_id: str, phase: str, reason: str, *, known: bool) -> None:
+        self.read_attempts = min(9999, self.read_attempts + 1)
+        if len(self.attempts) < 64:
+            # Unknown model-supplied IDs may be arbitrary prose: never retain them.
+            self.attempts.append({"id": artifact_id[:600] if known else "",
+                                  "phase": phase, "reason": reason})
+
+    def action(self, stage: str, parsed: Any) -> None:
+        value = parsed.get("action" if stage == "investigator" else "verdict") if isinstance(parsed, dict) else None
+        allowed = ({"search", "read", "propose", "unresolved"} if stage == "investigator"
+                   else {"applicable", "verified", "unresolved"})
+        key = stage + ":" + (value if isinstance(value, str) and value in allowed else "invalid")
+        self.actions[key] = min(9999, self.actions.get(key, 0) + 1)
+        if stage == "investigator" and value == "unresolved":
+            category = parsed.get("category")
+            self.abstention = category if isinstance(category, str) and category in ABSTENTION_CATEGORIES else "unspecified"
+
+    def packet(self) -> dict[str, Any]:
+        return {"version": 1, "eligibility": self.eligibility, "eligibility_reason": self.reason,
+                "read_attempts": self.read_attempts, "attempts": self.attempts,
+                "attempts_truncated": self.read_attempts > len(self.attempts),
+                "actions": self.actions, "abstention_category": self.abstention}
+
+
 class Evidence:
     """A single case's in-memory search/read allowance; content is never persisted."""
 
-    def __init__(self, cfg: Config, artifact_type: str) -> None:
+    def __init__(self, cfg: Config, artifact_type: str, *,
+                 diagnostics: Diagnostics | None = None, phase: str = "acquisition") -> None:
+        self.diagnostics = diagnostics
+        self.phase = phase
         self.cfg = cfg
         self.artifact_type = artifact_type
         self.candidates: dict[str, dict[str, Any]] = {}
@@ -233,6 +283,20 @@ class Evidence:
                                             for key in ("id", "type", "title", "path", "summary")}
 
     def read(self, artifact_id: str, *, refresh: bool = False) -> dict[str, Any]:
+        reason = "read"
+        try:
+            return self._read(artifact_id, refresh=refresh)
+        except (OSError, UnicodeError):
+            reason = "source_unavailable"
+            raise
+        except Exception as exc:
+            reason = str(exc) if type(exc) is ValueError and str(exc) in REFUSAL_CODES else "source_error"
+            raise
+        finally:
+            if self.diagnostics is not None:
+                self.diagnostics.read(artifact_id, self.phase, reason, known=artifact_id in self.candidates)
+
+    def _read(self, artifact_id: str, *, refresh: bool = False) -> dict[str, Any]:
         if artifact_id not in self.candidates:
             raise ValueError("unsearched_source")
         if artifact_id in self.sources and not refresh:
