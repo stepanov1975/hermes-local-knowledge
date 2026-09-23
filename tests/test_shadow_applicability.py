@@ -194,12 +194,13 @@ def test_full_thirty_baseline_coverage_and_current_metadata_fingerprint(cfg: Con
     baseline = [WORKFLOW, ATLAS, *extra, TRACKER]
     observe(cfg, baseline=baseline)
     model = ScriptedModel()
-    assert run(cfg, model)["verified"] == 1
+    assert run(cfg, model)["unresolved"] == 1
     row = records(cfg)[0]
     assert json.loads(row["baseline_ids"]) == baseline
-    assert len(json.loads(row["result"])["baseline_review"]) == 30
-    assert all(json.loads(c["input"][0]["text"])["baseline_ids"] == baseline for c in model.calls)
-    assert observe(cfg, baseline=baseline)["observation"] == "would_reuse"
+    assert row["reason"] == "ineligible_baseline_source_count_budget"
+    assert model.calls == []
+    assert json.loads(row["result"]) == {}
+    assert observe(cfg, baseline=baseline)["observation"] == "fallback"
     # Same ID/order but newly useful metadata must trigger a new coverage decision.
     with sqlite3.connect(cfg.state_dir / "index.sqlite") as conn:
         conn.execute("UPDATE artifacts SET summary='Atlas current service changes' WHERE id=?", (extra[-1],))
@@ -235,8 +236,10 @@ def test_rejected_full_source_candidate_does_not_spend_acquisition_evidence_budg
     observe(cfg, lookup={**LOOKUP, "target": "Boreal", "intent": "Find Boreal host inventory"}, baseline=[BOREAL, WORKFLOW])
     model = ScriptedModel()
     assert run(cfg, model)["verified"] == 1
-    assert len(model.calls) == 4
-    acquisition = json.loads(model.calls[1]["input"][0]["text"])
+    # Stored receipts leave baseline unread: skip applicability without spending a call.
+    assert len(model.calls) == 3
+    assert not any(c["purpose"].endswith("applicability") for c in model.calls)
+    acquisition = json.loads(model.calls[0]["input"][0]["text"])
     assert acquisition["sources"] == [] and acquisition["read_refusals"] == {}
     assert json.loads(records(cfg)[1]["result"])["route_ids"] == [BOREAL]
 

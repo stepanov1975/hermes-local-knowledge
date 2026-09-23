@@ -58,7 +58,7 @@ def citation(source: dict[str, Any]) -> dict[str, Any]:
 
 
 class Model:
-    """Exercises the real action loop, not private worker helpers."""
+    """Synthetic provider exercises the real loop; not a model efficacy evaluation."""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []

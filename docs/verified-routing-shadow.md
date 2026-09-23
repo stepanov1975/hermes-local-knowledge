@@ -99,7 +99,10 @@ no later user clarification or tool evidence is added to a captured case.
    wakes a detached finite supervisor. Teardown retains the same wake as a fallback.
    Neither hook waits for model work or performs inference. The supervisor starts
    separate host workers, each retaining the configured batch/case limits.
-4. The worker considers at most three lexically/shared-source shortlisted routes
+4. Before any model call, the worker deterministically reads the **complete**
+   baseline through the existing bounded Markdown reader (see eligibility below).
+   Ineligible baselines close without applicability or acquisition inference.
+   For eligible cases, the worker considers at most three lexically/shared-source shortlisted routes
    from the latest 100 same-profile/root/filter `ai_verified` cases. Shortlisting
    is **candidate generation, never a semantic verdict**. Eligible candidates need
    contract 2, unexpired verification and unchanged readable source dependencies.
@@ -141,14 +144,77 @@ them without further candidate admission. Rejected routes restore tentative
 admissions instead of consuming the next route's allowance. Both evidence phases
 retain the limits of eight whole readable sources, 24 KB per source and 96 KB
 aggregate source text.
-The applicability phase may read baseline items only while they fit; unread items
-remain explicit metadata/refusals. Investigator responses request at most 1,800
+If the combined stored-route dependencies and complete baseline do not fit these
+limits, applicability is skipped without inference and acquisition retains its
+separate allowance. Investigator responses request at most 1,800
 output tokens; verifier/applicability responses request at most 4,000 to accommodate
 complete baseline reviews. These are output limits, not total token budgets.
 The per-case invocation and per-batch time limits include all stages, but
 host/provider retry and fallback policy can extend elapsed time and token use
 behind each host call. Late work cannot publish after losing its lease. Interrupted
 calls remain explicitly ambiguous rather than being automatically retried.
+
+### Conservative baseline eligibility (0.5.3b5)
+
+Before **any detached model call**, the complete captured baseline must be readable
+as registered operational Markdown within the existing eight-source, 24,000-byte
+per-source and 96,000-byte aggregate reader limits. Supported types remain `skill`,
+`skill_support_doc`, `runbook`, `memory_doc`, and `doc`; scripts and `tool_okf` are
+not newly readable. No new configuration or expanded model/source allowance is
+introduced. An empty baseline can still proceed to bounded acquisition/search.
+
+A refusal closes the case as `unresolved` with a stable reason such as
+`ineligible_baseline_unsupported_source`, `ineligible_baseline_missing_source`,
+`ineligible_baseline_source_unavailable`, `ineligible_baseline_source_too_large`,
+`ineligible_baseline_source_count_budget`, or `ineligible_baseline_source_bytes_budget`.
+The first refusal in baseline order determines the case reason; the bounded receipt
+retains attempted reads/refusals across the full baseline. Unregistered paths,
+empty sources and type mismatches likewise veto. Source or metadata changes and
+worker time/lease failures remain distinct from eligibility/model abstention.
+
+This is an **intentionally conservative scope restriction, not a semantic judgment**:
+even an irrelevant unsupported or oversized baseline item skips the whole case.
+The worker neither drops unknown entries nor pretends they are `not_useful`. It
+may skip cases that a future, separately designed evidence strategy could solve.
+Eligible model decisions still require the complete baseline coverage review and
+unknown coverage still vetoes acceptance. Preflight identities are rechecked before
+model dispatch and acceptance; this is not an atomic filesystem snapshot. Preflight
+content stays in memory and is not added to model packets or persisted. Existing
+cheap exact-reuse observations retain their contract/source/age checks and do not
+call a model; historical results are not bulk rewritten.
+
+### Structural diagnostics and abstention categories
+
+The additive `cases.diagnostics` JSON column defaults to `{}` and migrates on the
+next normal shadow write. It records a versioned structural receipt: eligibility
+and reason, at most 64 read attempts (known artifact IDs capped at 600 characters,
+stage and stable outcome/refusal code), truncation/count metadata, bounded
+stage/action counts and an investigator abstention category. Counters saturate at
+9,999. Unknown model-supplied read IDs are blanked, not stored as arbitrary prose.
+These are worker read attempts, including cached reads and verifier refreshes,
+not a transcript or an exhaustive trace of freshness-validation disk I/O.
+
+The optional unresolved category is one of `unspecified`, `insufficient_sources`,
+`ambiguous_lookup`, `conflicting_evidence`, `baseline_coverage`, or
+`no_applicable_route`. Missing, unknown or malformed categories become `unspecified`,
+so older model responses remain valid. Categories are **model-reported**, not proof
+of cause. A model abstention still has reason `insufficient_evidence`; deterministic
+ineligibility, provider failure, time/call limits and source changes remain separate.
+No raw response, rationale, query history or source content is added to diagnostics.
+The inherited private original request/lookup queue boundary is unchanged.
+
+Receipts are checkpointed before/after calls and on caught success/failure under
+the existing lease/claim fence. A lost lease cannot overwrite a newer owner;
+a hard-killed worker may leave only its last checkpoint, never a fabricated trace.
+`routing-report --json` exposes aggregate `reasons` and `diagnostics` (eligibility,
+fixed action counts, model abstention categories, retained refusal counts and
+truncated-case counts), not per-case source IDs or text. Refusal totals cover the
+retained prefix, not attempts beyond truncation. Old schemas/rows count as
+`unavailable`; read-only reporting does not migrate them or infer historical actions.
+
+Synthetic fake-provider tests exercise these contracts, including zero-call skips
+and eligible success/reuse. They do not establish real-model efficacy or historical
+refusal causes, production savings or improved live routing.
 
 ### Finite scheduling and recovery boundary
 

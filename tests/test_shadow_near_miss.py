@@ -1,4 +1,4 @@
-"""A mixed baseline must not spend near-miss read attempts on unsupported types."""
+"""A mixed baseline is outside the conservative Markdown-only shadow scope."""
 import json
 from types import SimpleNamespace
 
@@ -6,7 +6,7 @@ from hermes_local_knowledge import index, shadow
 from hermes_local_knowledge.config import Config, IndexSettings, VerifiedRoutingSettings
 
 
-def test_script_prefix_does_not_hide_readable_near_miss(tmp_path):
+def test_script_prefix_preflight_preserves_complete_baseline_without_model_calls(tmp_path):
     root, home, state = (tmp_path / name for name in ('root', 'home', 'state'))
     (root / 'scripts').mkdir(parents=True)
     (root / 'docs').mkdir()
@@ -24,23 +24,18 @@ def test_script_prefix_does_not_hide_readable_near_miss(tmp_path):
     shadow.observe(cfg, user_request='Find Quartz instructions', query='Quartz', artifact_type='',
                    session_id='session', task_id='task', turn_id='turn', baseline_ids=baseline)
     shadow.finish_session(cfg, 'session')
-    verified_packets = []
+    calls = []
 
     def complete_structured(**kwargs):
-        packet = json.loads(kwargs['input'][0]['text'])
-        if kwargs['purpose'].endswith('verifier'):
-            verified_packets.append(packet)
-            raise RuntimeError('intentional stop after reaching verifier')
-        if not packet['sources']:
-            answer = {'action': 'read', 'ids': [route]}
-        else:
-            source = next(s for s in packet['sources'] if s['id'] == route)
-            cite = {k: source[k] for k in ('id', 'locator', 'sha256')}
-            cite.update(start_line=1, end_line=2)
-            answer = {'action': 'propose', 'route_ids': [route], 'citations': [cite]}
-        return SimpleNamespace(parsed=answer, usage={})
+        calls.append(kwargs)
+        raise AssertionError('Mixed baseline must not call a model')
 
-    shadow.run_batch(cfg, llm=SimpleNamespace(complete_structured=complete_structured))
-    assert len(verified_packets) == 1
-    assert verified_packets[0]['near_miss_id'] == competitor
-    assert verified_packets[0]['baseline_ids'] == baseline
+    assert shadow.run_batch(cfg, llm=SimpleNamespace(complete_structured=complete_structured))['unresolved'] == 1
+    assert calls == []
+    with shadow._connect(cfg) as conn:
+        row = conn.execute('SELECT * FROM cases').fetchone()
+    assert row['reason'] == 'ineligible_baseline_unsupported_source'
+    assert json.loads(row['baseline_ids']) == baseline
+    attempts = json.loads(row['diagnostics'])['attempts']
+    assert [a['id'] for a in attempts] == baseline
+    assert [a['reason'] for a in attempts] == ['unsupported_source'] * 3 + ['read'] * 2

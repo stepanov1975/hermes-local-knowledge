@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.3b5] - 2026-09-23
+
+### Fixed
+
+- Preflight the complete baseline before detached shadow model work. Unsupported, missing, unreadable, oversized or over-budget evidence now closes with an explicit ineligible reason and no model calls, without dropping baseline entries or claiming irrelevance.
+- Retain bounded, lease-fenced structural eligibility/read/action receipts and optional enumerated model abstention categories in private queue state; summarize them in the read-only routing report, including legacy receipt unavailability.
+- Recheck preflight source identities and baseline metadata before model dispatch and source identities before acceptance. Normal search, model budgets and supported source types are unchanged.
+- Document the intentionally conservative Markdown-only shadow scope and synthetic-test limitations; no production quality or token-savings claim.
+
 ## [0.5.3b4] - 2026-09-21
 
 ### Fixed
@@ -57,6 +66,7 @@ results, and has not demonstrated production savings or ranking improvements.
 - Read indentless YAML lists emitted by host configuration saves in explicit-profile workers instead of silently discarding the configuration section.
 - Support canonical beta versions in version ordering, release notes and artifact names; publish and repair betas as prereleases, never latest.
 
+[0.5.3b5]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b4...v0.5.3b5
 [0.5.3b4]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b3...v0.5.3b4
 [0.5.3b3]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b2...v0.5.3b3
 [0.5.3b2]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b1...v0.5.3b2

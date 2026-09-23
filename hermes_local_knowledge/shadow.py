@@ -22,7 +22,10 @@ from typing import Any
 from ._lexical import COMMON_STOPWORDS
 from .config import Config, resolve_config
 from .index import _query_terms
-from .shadow_sources import MARKDOWN_TYPES, Evidence, checked_citations, identity, sources_current
+from .shadow_sources import (
+    ABSTENTION_CATEGORIES, MARKDOWN_TYPES, REFUSAL_CODES, Diagnostics, Evidence,
+    checked_citations, identity, sources_current,
+)
 
 __all__ = ["observe", "finish_session", "has_work", "report", "run_batch", "run_worker"]
 MAX_CASES = 500
@@ -43,7 +46,8 @@ CREATE TABLE IF NOT EXISTS cases (
  total_calls INTEGER NOT NULL DEFAULT 0, usage TEXT NOT NULL DEFAULT '{}',
  result TEXT NOT NULL DEFAULT '{}', reason TEXT NOT NULL DEFAULT '',
  verified_at REAL NOT NULL DEFAULT 0, elapsed_seconds REAL NOT NULL DEFAULT 0,
- models TEXT NOT NULL DEFAULT '[]', lookup_context TEXT NOT NULL DEFAULT '{}'
+ models TEXT NOT NULL DEFAULT '[]', lookup_context TEXT NOT NULL DEFAULT '{}',
+ diagnostics TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL,
@@ -114,6 +118,8 @@ def _connect(cfg: Config, *, create: bool = False) -> sqlite3.Connection:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(cases)")}
             if "lookup_context" not in columns:
                 conn.execute("ALTER TABLE cases ADD COLUMN lookup_context TEXT NOT NULL DEFAULT '{}'")
+            if "diagnostics" not in columns:
+                conn.execute("ALTER TABLE cases ADD COLUMN diagnostics TEXT NOT NULL DEFAULT '{}'")
     else:
         conn.execute("PRAGMA query_only=ON")
     return conn
@@ -226,7 +232,7 @@ def observe(cfg: Config, *, user_request: str, query: str, artifact_type: str,
                     else:
                         reason = "legacy_contract" if not current_contract else "expired" if not fresh else "changed_source"
                         conn.execute("UPDATE cases SET status='pending',ready=0,owner='',lease_until=0,"
-                                     "stage='',calls=0,result='{}',verified_at=0,reason=?,session_id=?,"
+                                     "stage='',calls=0,result='{}',diagnostics='{}',verified_at=0,reason=?,session_id=?,"
                                      "task_id=?,turn_id=?,sessions=? WHERE id=?",
                                      (reason, *context, json.dumps([session_id]), key))
                 sessions = json.loads(row["sessions"])
@@ -289,6 +295,40 @@ def report(cfg: Config) -> dict[str, Any]:
         with closing(_connect(cfg)) as conn:
             summary["cases"] = dict(conn.execute("SELECT status,COUNT(*) FROM cases GROUP BY status"))
             summary["counters"] = dict(conn.execute("SELECT name,value FROM counters"))
+            summary["reasons"] = dict(conn.execute(
+                "SELECT reason,COUNT(*) FROM cases WHERE reason!='' GROUP BY reason"))
+            diagnostics: dict[str, Any] = {"available": 0, "unavailable": 0, "eligibility": {},
+                                           "abstention_categories": {}, "refusals_retained": {},
+                                           "actions": {}, "truncated_cases": 0}
+            summary["diagnostics"] = diagnostics
+            columns = {item[1] for item in conn.execute("PRAGMA table_info(cases)")}
+            selection = "diagnostics" if "diagnostics" in columns else "'{}'"
+            for item in conn.execute(f"SELECT {selection} FROM cases LIMIT 500"):
+                receipt = json.loads(item[0])
+                if not isinstance(receipt, dict) or receipt.get("version") != 1:
+                    diagnostics["unavailable"] += 1
+                    continue
+                diagnostics["available"] += 1
+                eligibility = receipt.get("eligibility", "not_checked")
+                if eligibility in {"eligible", "ineligible", "not_checked"}:
+                    counts = diagnostics["eligibility"]
+                    counts[eligibility] = counts.get(eligibility, 0) + 1
+                for key, value in receipt.get("actions", {}).items():
+                    # Fixed structural keys only; never project arbitrary stored prose.
+                    if re.fullmatch(r"(investigator|applicability|verifier):(search|read|propose|unresolved|applicable|verified|invalid)", key):
+                        counts = diagnostics["actions"]
+                        counts[key] = counts.get(key, 0) + value
+                if receipt.get("actions", {}).get("investigator:unresolved"):
+                    category = receipt.get("abstention_category", "unspecified")
+                    if category in ABSTENTION_CATEGORIES:
+                        counts = diagnostics["abstention_categories"]
+                        counts[category] = counts.get(category, 0) + 1
+                diagnostics["truncated_cases"] += int(receipt.get("attempts_truncated") is True)
+                for attempt in receipt.get("attempts", [])[:64]:
+                    reason = attempt.get("reason")
+                    if reason in REFUSAL_CODES:
+                        counts = diagnostics["refusals_retained"]
+                        counts[reason] = counts.get(reason, 0) + 1
             for row in conn.execute("SELECT total_calls,usage,elapsed_seconds FROM cases LIMIT 500"):
                 summary["model_calls"] += row["total_calls"]
                 summary["elapsed_seconds"] += row["elapsed_seconds"]
@@ -341,8 +381,23 @@ def _usage(response: Any) -> dict[str, int | float]:
             and isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < 1e12}
 
 
+def _save_diagnostics(cfg: Config, row: dict[str, Any], owner: str) -> None:
+    with closing(_connect(cfg, create=True)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _fenced(conn, row["id"], owner)
+        conn.execute("UPDATE cases SET diagnostics=? WHERE id=?",
+                     (json.dumps(row["_diagnostics"].packet()), row["id"]))
+
+
 def _call(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadline: float,
           stage: str, instructions: str, packet: dict[str, Any]) -> Any:
+    _save_diagnostics(cfg, row, owner)
+    baseline = row.get("_baseline_sources", [])
+    if baseline and not sources_current(cfg, baseline):
+        raise ValueError("source_changed_during_verification")
+    task = _task_packet(row)
+    if task["lookup_context"]["baseline_fingerprint"] != _baseline_fingerprint(cfg, task["baseline_ids"]):
+        raise ValueError("baseline_changed")
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ValueError("time_budget")
@@ -385,9 +440,12 @@ def _call(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadline: f
         conn.execute("UPDATE cases SET stage=?,usage=?,models=?,elapsed_seconds=elapsed_seconds+? WHERE id=?",
                      (stage + "_received", json.dumps(usage), json.dumps(models),
                       max(0, time.monotonic() - started), row["id"]))
+    parsed = getattr(response, "parsed", None)
+    row["_diagnostics"].action(stage, parsed)
+    _save_diagnostics(cfg, row, owner)
     if time.monotonic() >= deadline:
         raise ValueError("time_budget")
-    return getattr(response, "parsed", None)
+    return parsed
 
 
 _CITATIONS = ("Every citation must have id, locator, sha256 copied exactly from a READ source, "
@@ -428,7 +486,10 @@ _INVESTIGATE = (
     "Return one JSON object per call: {action:'search',query:'...'} to search beyond the current candidates; "
     "{action:'read',ids:['exact candidate ID',...]} to inspect up to three whole sources; "
     "{action:'propose',route_ids:['ID'],citations:[...]} only when read sources establish precise "
-    "operation, target and scope; or {action:'unresolved'}. A route has one or two IDs. "
+    "operation, target and scope; or {action:'unresolved',category:'unspecified'}. "
+    "For unresolved, category is one of: unspecified, insufficient_sources, ambiguous_lookup, "
+    "conflicting_evidence, baseline_coverage, no_applicable_route. No free-text rationale. "
+    "A route has one or two IDs. "
     "Inspect plausible competing/near-miss artifacts; a lexical match alone is insufficient. " + _CITATIONS
 )
 _VERIFY = (
@@ -525,7 +586,7 @@ def _reuse_candidates(cfg: Config, row: dict[str, Any], task: dict[str, Any]) ->
 def _applicable(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadline: float,
                 task: dict[str, Any]) -> dict[str, Any] | None:
     # A rejected old route must not consume acquisition's source/search allowance.
-    evidence = Evidence(cfg, row["artifact_type"])
+    evidence = Evidence(cfg, row["artifact_type"], diagnostics=row["_diagnostics"], phase="applicability")
     # Keep the complete (at most 30) baseline metadata separate during receipt
     # admission. Receipts retain Evidence's candidate/source/byte limits.
     baseline = Evidence(cfg, row["artifact_type"])
@@ -565,6 +626,8 @@ def _applicable(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadl
     for artifact_id in task["baseline_ids"]:
         if artifact_id in evidence.candidates:
             evidence.try_read(artifact_id)
+    if any(i not in evidence.sources for i in task["baseline_ids"]):
+        return None  # Combined stored-route + baseline budget cannot cover this packet.
     parsed = _call(cfg, llm=llm, row=row, owner=owner, deadline=deadline, stage="applicability",
                    instructions=_APPLICABILITY,
                    packet={**task, "stored_routes": candidates, **evidence.packet()})
@@ -592,14 +655,52 @@ def _applicable(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadl
 
 def _investigate(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
                  deadline: float) -> dict[str, Any]:
+    row["_diagnostics"] = Diagnostics()
+    try:
+        result = _investigate_case(cfg, llm=llm, row=row, owner=owner, deadline=deadline)
+        baseline = row.get("_baseline_sources", [])
+        if baseline and not sources_current(cfg, baseline):
+            raise ValueError("source_changed_during_verification")
+        if time.monotonic() >= deadline:
+            raise ValueError("time_budget")
+        return result
+    finally:
+        _save_diagnostics(cfg, row, owner)
+
+
+def _preflight(cfg: Config, row: dict[str, Any], task: dict[str, Any], deadline: float) -> None:
+    diagnostics = row["_diagnostics"]
+    evidence = Evidence(cfg, row["artifact_type"], diagnostics=diagnostics, phase="preflight")
+    evidence.include(task["baseline_ids"])
+    for artifact_id in task["baseline_ids"]:
+        if time.monotonic() >= deadline:
+            raise ValueError("time_budget")
+        if artifact_id not in evidence.candidates:
+            reason = evidence.refusals.get(artifact_id, "missing_source")
+            diagnostics.read(artifact_id, "preflight", reason, known=True)
+        else:
+            evidence.try_read(artifact_id)
+    refused = [evidence.refusals[i] for i in task["baseline_ids"] if i in evidence.refusals]
+    if refused:
+        diagnostics.eligibility = "ineligible"
+        diagnostics.reason = "ineligible_baseline_" + refused[0]
+        raise ValueError(diagnostics.reason)
+    diagnostics.eligibility = "eligible"
+    row["_baseline_sources"] = [identity(source) for source in evidence.sources.values()]
+
+
+def _investigate_case(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
+                      deadline: float) -> dict[str, Any]:
     task = _task_packet(row)
     if task["lookup_context"].get("baseline_fingerprint") != _baseline_fingerprint(cfg, task["baseline_ids"]):
         raise ValueError("baseline_changed")
+    _preflight(cfg, row, task, deadline)
+    _save_diagnostics(cfg, row, owner)
     applicable = _applicable(cfg, llm=llm, row=row, owner=owner, deadline=deadline,
                              task=task)
     if applicable is not None:
         return applicable
-    evidence = Evidence(cfg, row["artifact_type"])
+    evidence = Evidence(cfg, row["artifact_type"], diagnostics=row["_diagnostics"])
     evidence.include(task["baseline_ids"])
     evidence.search(row["query"])
     # Expand on the immediate intent, not obligatorily back into the parent workflow.
@@ -652,6 +753,7 @@ def _investigate(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
     near_miss = next((candidate for candidate in readable_candidates[:3] if evidence.try_read(candidate)), "")
     if not near_miss:
         raise ValueError("missing_readable_near_miss")
+    evidence.phase = "verifier"
     # The verifier sees newly read evidence, never an investigator-authored source summary.
     for artifact_id in list(dict.fromkeys([*evidence.sources, near_miss])):
         old = evidence.sources.get(artifact_id)
