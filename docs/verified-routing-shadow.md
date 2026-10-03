@@ -169,7 +169,7 @@ Ordinary `read` inspects a complete UTF-8 source up to 24,000 bytes. The investi
 can request `{action:"read_excerpt", id:"exact ID", start_line:201, end_line:280}`
 for an exact inclusive range of at most 160 lines and 24,000 selected bytes from a
 file up to 1,000,000 bytes. Registered Markdown types and scripts with `.py`, `.sh`,
-`.bash`, `.ps1`, `.js`, or `.ts` suffixes are supported under the existing confined
+`.bash`, `.cjs`, `.mjs`, or `.js` suffixes are supported under the existing confined
 roots/exclusions and descriptor-pinned source opener. Scripts are never executed.
 Obvious credential assignments, private-key headers and credential URLs in scripts
 refuse the source rather than rewriting lines. This conservative guard may reject

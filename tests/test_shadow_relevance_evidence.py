@@ -53,14 +53,16 @@ def test_irrelevant_lead_does_not_veto_useful_route(cfg: Config, kind: str) -> N
     assert ident not in {s["id"] for s in result["sources"]}
 
 
-@pytest.mark.parametrize("script", [False, True])
-def test_selected_large_source_exact_excerpt_verified_and_reused(cfg: Config, script: bool) -> None:
+@pytest.mark.parametrize("script", ["", "py", "cjs", "mjs"])
+def test_selected_large_source_exact_excerpt_verified_and_reused(cfg: Config, script: str) -> None:
     padding = "# unrelated historical note " + "x" * 130 + "\n"
     if script:
         (cfg.source_root / "scripts").mkdir()
-        path = cfg.source_root / "scripts" / "atlas-inventory.py"
-        body = "def atlas_inventory():\n    return ['scheduler', 'tracker']\n"
-        ident = "script:scripts-atlas-inventory-py"
+        suffix = script
+        path = cfg.source_root / "scripts" / ("atlas-inventory." + suffix)
+        body = ("def atlas_inventory():\n    return ['scheduler', 'tracker']\n" if script == "py" else
+                "// Atlas inventory\nconst inventory = ['scheduler', 'tracker'];\n")
+        ident = "script:scripts-atlas-inventory-" + suffix
     else:
         path = cfg.source_root / "docs" / "atlas-inventory.md"
         body = "# Atlas inventory\nAtlas inventory lists scheduler and tracker.\n"
@@ -159,10 +161,11 @@ def test_excerpt_citations_and_baseline_scope_cannot_claim_unread_lines(cfg: Con
         evidence.read(ATLAS, start_line=1, end_line=161)
 
 
-def test_script_credential_refusal_preserves_exact_content_boundary(cfg: Config) -> None:
+@pytest.mark.parametrize("assignment", ["API_TOKEN", "AWS_ACCESS_KEY_ID", "AZURE_ACCESS_KEY"])
+def test_script_credential_refusal_preserves_exact_content_boundary(cfg: Config, assignment: str) -> None:
     (cfg.source_root / "scripts").mkdir()
     path = cfg.source_root / "scripts" / "atlas-secret.py"
-    path.write_text("# Atlas\nAPI_TOKEN = 'SYNTHETIC_TEST_ONLY'\nprint('inventory')\n")
+    path.write_text(f"# Atlas\n{assignment} = 'SYNTHETIC_TEST_ONLY'\nprint('inventory')\n")
     index.build_index(cfg.source_root, cfg.state_dir, cfg.hermes_home, cfg.index_settings)
     evidence = Evidence(cfg, "")
     ident = "script:scripts-atlas-secret-py"
@@ -397,3 +400,18 @@ def test_large_excerpt_near_miss_reaches_verifier(cfg: Config) -> None:
     model = ExcerptCompetitor()
     assert run(cfg, model)["verified"] == 1
     assert any(call["purpose"].endswith("verifier") for call in model.calls)
+
+
+def test_contiguous_multi_range_complete_source_needs_no_partial_scope(cfg: Config) -> None:
+    path = cfg.source_root / "docs" / "atlas-inventory.md"
+    path.write_text("# Atlas inventory\n" + "Fact.\n" * 160)
+    evidence = Evidence(cfg, "")
+    evidence.include([ATLAS])
+    assert not evidence.read(ATLAS, start_line=1, end_line=160)["complete"]
+    source = evidence.read(ATLAS, start_line=161, end_line=161)
+    assert source["complete"] and len(source["ranges"]) == 2
+    review = [{"id": ATLAS, "disposition": "retained", "covered_by": [ATLAS], "reason": "All evidence inspected."}]
+    citation = {**{k: source[k] for k in ("id", "locator", "sha256")}, "start_line": 1, "end_line": 1}
+    assert shadow._coverage({"baseline_review": review}, {"baseline_ids": [ATLAS]},
+                            evidence, [ATLAS], [citation])[0]["disposition"] == "retained"
+    assert shadow_sources.sources_current(cfg, [shadow_sources.identity(source)])

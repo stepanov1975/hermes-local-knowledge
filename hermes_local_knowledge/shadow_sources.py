@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import index
+from .artifacts import _SCRIPT_SUFFIXES as SCRIPT_SUFFIXES
 from .config import Config
 
 MAX_FILE_BYTES = 1_000_000
@@ -23,9 +24,8 @@ MAX_LOCATIONS = 32
 MAX_CANDIDATES = 32
 MARKDOWN_TYPES = frozenset({"skill", "skill_support_doc", "runbook", "doc", "memory_doc"})
 SOURCE_TYPES = MARKDOWN_TYPES | {"script"}
-SCRIPT_SUFFIXES = frozenset({".py", ".sh", ".bash", ".ps1", ".js", ".ts"})
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:[a-z0-9_]*(?:api[_-]?key|token|secret|password|passwd|authorization)[a-z0-9_]*)\b"
+    r"(?i)\b(?:[a-z0-9_]*(?:api[_-]?key|access[_-]?key|token|secret|password|passwd|authorization)[a-z0-9_]*)\b"
     r"[\"\']?\s*[:=]\s*\S+|-----BEGIN [A-Z ]*PRIVATE KEY-----|https?://[^/\s]+:[^/\s]+@"
 )
 
@@ -264,7 +264,8 @@ def merge_sources(previous: dict[str, Any], source: dict[str, Any]) -> dict[str,
         return {**source, **bounds[0], "text": "".join(lines[n] for n in sorted(lines)), "bytes": size,
                 "complete": len(lines) == source["total_lines"]}
     return {**source, "ranges": bounds, "line_text": lines, "text": "", "bytes": size,
-            "start_line": bounds[0]["start_line"], "end_line": bounds[-1]["end_line"], "complete": False}
+            "start_line": bounds[0]["start_line"], "end_line": bounds[-1]["end_line"],
+            "complete": len(lines) == source["total_lines"]}
 
 
 def locate_source(cfg: Config, artifact_id: str, query: str) -> dict[str, Any]:
