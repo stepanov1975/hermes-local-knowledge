@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.3b5] - 2026-10-03
+
+### Fixed
+
+- Treat shadow search candidates as leads, not a mandatory reading list: preserve every baseline ID and metadata-based irrelevant judgments while unknown or unread useful coverage still vetoes acceptance.
+- Inspect selected scripts and large Markdown files through exact bounded source-line excerpts, full-file hashes, and explicit partial useful-evidence scope; never execute sources or claim excerpt inspection is complete content coverage.
+- Expose source availability/type/size advice before selection and retain bounded structural read/action/abstention diagnostics without source or model prose.
+- Admit individually fitting current stored-route receipts before packing applicability evidence, so a costly shortlist union cannot starve a cheaper route; acquisition keeps its independent allowance.
+- Add write-time diagnostics migration and defensive read-only aggregation of malformed/legacy receipts. Shadow remains off by default and never changes live results or promotes a route.
+
 ## [0.5.3b4] - 2026-09-21
 
 ### Fixed
@@ -57,6 +67,7 @@ results, and has not demonstrated production savings or ranking improvements.
 - Read indentless YAML lists emitted by host configuration saves in explicit-profile workers instead of silently discarding the configuration section.
 - Support canonical beta versions in version ordering, release notes and artifact names; publish and repair betas as prereleases, never latest.
 
+[0.5.3b5]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b4...v0.5.3b5
 [0.5.3b4]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b3...v0.5.3b4
 [0.5.3b3]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b2...v0.5.3b3
 [0.5.3b2]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3b1...v0.5.3b2

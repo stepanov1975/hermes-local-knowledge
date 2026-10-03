@@ -36,7 +36,7 @@ here is indexed or published. Keep state outside version control.
 
 **Provider disclosure:** the detached worker sends this pre-search packet, a bounded
 shortlist of prior packets when checking reuse, and selected current operational
-Markdown source content to the profile's configured Hermes model provider. This
+Markdown/script source content to the profile's configured Hermes model provider. This
 consumes additional model tokens; it is not local-only inference unless that
 provider is local. Bounded text can still contain sensitive information: this is
 not a general-purpose secret redactor. Do not opt in for conversations or source
@@ -128,8 +128,8 @@ no later user clarification or tool evidence is added to a captured case.
    inline. Changed baselines/context or old contracts cannot bypass coverage checks.
    A changed baseline fingerprint during worker processing also blocks publication.
 
-Contract 2 adds one optional queue column (`lookup_context`, default `{}`), migrated
-on a normal shadow write. Reports are read-only and do not migrate. Older stored
+Contract 2 adds the optional queue column `lookup_context` (default `{}`). Version
+0.5.3b5 also adds `diagnostics` (default `{}`), migrated on a normal shadow write. Reports are read-only and do not migrate. Older stored
 `ai_verified` outcomes remain historical evidence but cannot be reused by this
 contract; legacy queued cases without the packet close unresolved without inference.
 New exact observations can acquire a contract-2 case. There is no bulk rewrite.
@@ -137,10 +137,16 @@ New exact observations can acquire a contract-2 case. There is no bulk rewrite.
 Acquisition remains capped at six searches and 32 candidate metadata records.
 Applicability reserves separate bounded metadata allowances for the complete
 baseline (at most 30 records) and stored-route receipts (at most 32), then unions
-them without further candidate admission. Rejected routes restore tentative
-admissions instead of consuming the next route's allowance. Both evidence phases
-retain the limits of eight whole readable sources, 24 KB per source and 96 KB
-aggregate source text.
+them without further candidate admission. Each stored route is checked against
+its complete current receipts independently, then fitting sets are packed by
+source count and selected byte cost (shortlist order breaks ties). A rejected or
+costly set cannot consume the next individually checked set's allowance. Common
+IDs with different excerpt bounds cannot overwrite an admitted receipt. This is
+bounded capacity selection, not a semantic relevance verdict; some viable routes
+can still be omitted when their union does not fit. Both model evidence phases
+retain limits of eight sources, 24 KB per selected source and 96 KB aggregate
+selected source text. Independent candidate checking does additional bounded
+local reads; it does not consume acquisition's separate evidence allowance.
 The applicability phase may read baseline items only while they fit; unread items
 remain explicit metadata/refusals. Investigator responses request at most 1,800
 output tokens; verifier/applicability responses request at most 4,000 to accommodate
@@ -149,6 +155,66 @@ The per-case invocation and per-batch time limits include all stages, but
 host/provider retry and fallback policy can extend elapsed time and token use
 behind each host call. Late work cannot publish after losing its lease. Interrupted
 calls remain explicitly ambiguous rather than being automatically retried.
+
+### Exact source inspection and coverage limits
+
+Candidate metadata includes `read_status` and, when available, `file_bytes`.
+Availability, unsupported types, confinement refusals, and size requirements are
+selection advice, **not an all-baseline readability gate**. Every baseline ID
+remains in the task and must receive a semantic review. A source that is clearly
+irrelevant by metadata need not be read, including scripts or large documents.
+Potentially useful unread evidence remains `unknown` and vetoes acceptance.
+
+Ordinary `read` inspects a complete UTF-8 source up to 24,000 bytes. The investigator
+can request `{action:"read_excerpt", id:"exact ID", start_line:201, end_line:280}`
+for an exact inclusive range of at most 160 lines and 24,000 selected bytes from a
+file up to 1,000,000 bytes. Registered Markdown types and scripts with `.py`, `.sh`,
+`.bash`, `.cjs`, `.mjs`, or `.js` suffixes are supported under the existing confined
+roots/exclusions and descriptor-pinned source opener. Scripts are never executed.
+Obvious credential assignments, private-key headers and credential URLs in scripts
+refuse the source rather than rewriting lines. This conservative guard may reject
+non-secret assignments and is not a comprehensive secret detector; other sensitive
+source text can still reach the configured provider under the opt-in disclosure.
+
+An excerpt carries its original line numbers, exact bounds, total line/file sizes,
+`complete` flag and SHA-256 of the **entire** bounded file. Citations must fall
+inside inspected lines. Verifier refresh, exact reuse and semantic applicability
+re-read the same bounds and check the whole-file hash, identity and age. Changes
+outside an excerpt invalidate its receipt too. No source body is stored in the
+queue or indexed, and these ranges are not retrieval chunks or chunk RAG.
+
+Use `{action:"locate_source", id:"exact ID", query:"literal text"}` to locate
+relevant sections in a selected file before choosing ranges. Navigation returns
+up to 32 exact match locations and total line/file sizes, not source prose or
+citable evidence. Matching is case-sensitive; query length is limited to 200
+characters and navigation to six requests per investigation. A changed file hash
+between navigation and inspection refuses the read.
+
+Up to eight exact ranges per source accumulate within the 24,000-byte selected
+source and 96,000-byte case limits. Overlaps are deduplicated; citations spanning
+unread gaps are refused. An ordinary read after an excerpt attempts the full
+source rather than silently returning partial evidence. Verifier refresh re-reads
+the selected ranges; it independently judges them but cannot navigate to new
+ranges during its single verdict call. To retain/equate a partially inspected
+useful baseline, the review must explicitly say
+`evidence_scope:"useful_evidence_only"`. This is a semantic judgment that the
+inspected lines preserve evidence useful to this lookup, **not complete content
+coverage**. The verifier must reject when omitted content could change the route
+or coverage. Files above the scan limit, long lines above the selected byte limit,
+unsupported types and unresolved coverage can still force abstention. Scripted
+tests prove provenance/contract mechanics, not the correctness of those judgments.
+
+### Bounded structural diagnostics
+
+Private case receipts retain up to 64 read attempts (known indexed ID, fixed phase
+and reason), capped stage/action counts, a fixed investigator abstention category,
+and an explicit truncation flag. Unknown model-supplied IDs are not retained.
+No free-text abstention rationale, source content, search text or model response is
+added to diagnostics. Reports aggregate fixed keys/reasons, reject malformed
+values and count legacy/malformed envelopes as unavailable; a bad receipt does
+not hide the remaining operational totals. Receipts are written with the existing
+claim/lease fence before calls and at case exit. An interrupted provider call
+remains ambiguous. Reports do not migrate or rewrite old state.
 
 ### Finite scheduling and recovery boundary
 

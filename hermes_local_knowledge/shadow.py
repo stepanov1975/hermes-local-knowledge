@@ -22,7 +22,11 @@ from typing import Any
 from ._lexical import COMMON_STOPWORDS
 from .config import Config, resolve_config
 from .index import _query_terms
-from .shadow_sources import MARKDOWN_TYPES, Evidence, checked_citations, identity, sources_current
+from .shadow_sources import (
+    ABSTENTION_CATEGORIES, MARKDOWN_TYPES, MAX_CANDIDATES, MAX_SOURCES, MAX_TOTAL_BYTES,
+    REFUSAL_CODES, SOURCE_TYPES, Diagnostics, Evidence,
+    checked_citations, identity, sources_current,
+)
 
 __all__ = ["observe", "finish_session", "has_work", "report", "run_batch", "run_worker"]
 MAX_CASES = 500
@@ -43,7 +47,8 @@ CREATE TABLE IF NOT EXISTS cases (
  total_calls INTEGER NOT NULL DEFAULT 0, usage TEXT NOT NULL DEFAULT '{}',
  result TEXT NOT NULL DEFAULT '{}', reason TEXT NOT NULL DEFAULT '',
  verified_at REAL NOT NULL DEFAULT 0, elapsed_seconds REAL NOT NULL DEFAULT 0,
- models TEXT NOT NULL DEFAULT '[]', lookup_context TEXT NOT NULL DEFAULT '{}'
+ models TEXT NOT NULL DEFAULT '[]', lookup_context TEXT NOT NULL DEFAULT '{}',
+ diagnostics TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL,
@@ -114,6 +119,8 @@ def _connect(cfg: Config, *, create: bool = False) -> sqlite3.Connection:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(cases)")}
             if "lookup_context" not in columns:
                 conn.execute("ALTER TABLE cases ADD COLUMN lookup_context TEXT NOT NULL DEFAULT '{}'")
+            if "diagnostics" not in columns:
+                conn.execute("ALTER TABLE cases ADD COLUMN diagnostics TEXT NOT NULL DEFAULT '{}'")
     else:
         conn.execute("PRAGMA query_only=ON")
     return conn
@@ -226,7 +233,7 @@ def observe(cfg: Config, *, user_request: str, query: str, artifact_type: str,
                     else:
                         reason = "legacy_contract" if not current_contract else "expired" if not fresh else "changed_source"
                         conn.execute("UPDATE cases SET status='pending',ready=0,owner='',lease_until=0,"
-                                     "stage='',calls=0,result='{}',verified_at=0,reason=?,session_id=?,"
+                                     "stage='',calls=0,result='{}',diagnostics='{}',verified_at=0,reason=?,session_id=?,"
                                      "task_id=?,turn_id=?,sessions=? WHERE id=?",
                                      (reason, *context, json.dumps([session_id]), key))
                 sessions = json.loads(row["sessions"])
@@ -289,6 +296,46 @@ def report(cfg: Config) -> dict[str, Any]:
         with closing(_connect(cfg)) as conn:
             summary["cases"] = dict(conn.execute("SELECT status,COUNT(*) FROM cases GROUP BY status"))
             summary["counters"] = dict(conn.execute("SELECT name,value FROM counters"))
+            summary["reasons"] = dict(conn.execute(
+                "SELECT reason,COUNT(*) FROM cases WHERE reason!='' GROUP BY reason"))
+            diagnostics: dict[str, Any] = {"available": 0, "unavailable": 0,
+                "actions": {}, "abstention_categories": {}, "refusals_retained": {}, "truncated_cases": 0}
+            summary["diagnostics"] = diagnostics
+            columns = {item[1] for item in conn.execute("PRAGMA table_info(cases)")}
+            selection = "diagnostics" if "diagnostics" in columns else "'{}'"
+            for item in conn.execute(f"SELECT {selection} FROM cases LIMIT 500"):
+                try:
+                    receipt = json.loads(item[0]) if len(item[0]) <= 64_000 else None
+                except (ValueError, TypeError):
+                    receipt = None
+                if (not isinstance(receipt, dict) or type(receipt.get("version")) is not int
+                        or receipt["version"] != 1 or not isinstance(receipt.get("actions"), dict)
+                        or not isinstance(receipt.get("attempts"), list)):
+                    diagnostics["unavailable"] += 1
+                    continue
+                diagnostics["available"] += 1
+                actions = receipt.get("actions")
+                if isinstance(actions, dict):
+                    for key, value in actions.items():
+                        if (isinstance(key, str) and re.fullmatch(
+                                r"(investigator|applicability|verifier):(search|read|read_excerpt|locate_source|propose|unresolved|applicable|verified|invalid)", key)
+                                and type(value) is int and 0 <= value <= 9999):
+                            counts = diagnostics["actions"]
+                            counts[key] = counts.get(key, 0) + value
+                    category = receipt.get("abstention_category")
+                    if (type(actions.get("investigator:unresolved")) is int
+                            and 0 < actions["investigator:unresolved"] <= 9999
+                            and isinstance(category, str) and category in ABSTENTION_CATEGORIES):
+                        counts = diagnostics["abstention_categories"]
+                        counts[category] = counts.get(category, 0) + 1
+                diagnostics["truncated_cases"] += int(receipt.get("attempts_truncated") is True)
+                attempts = receipt.get("attempts")
+                if isinstance(attempts, list):
+                    for attempt in attempts[:64]:
+                        reason = attempt.get("reason") if isinstance(attempt, dict) else None
+                        if isinstance(reason, str) and reason in REFUSAL_CODES:
+                            counts = diagnostics["refusals_retained"]
+                            counts[reason] = counts.get(reason, 0) + 1
             for row in conn.execute("SELECT total_calls,usage,elapsed_seconds FROM cases LIMIT 500"):
                 summary["model_calls"] += row["total_calls"]
                 summary["elapsed_seconds"] += row["elapsed_seconds"]
@@ -341,8 +388,20 @@ def _usage(response: Any) -> dict[str, int | float]:
             and isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < 1e12}
 
 
+def _save_diagnostics(cfg: Config, row: dict[str, Any], owner: str) -> None:
+    with closing(_connect(cfg, create=True)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _fenced(conn, row["id"], owner)
+        conn.execute("UPDATE cases SET diagnostics=? WHERE id=?",
+                     (json.dumps(row["_diagnostics"].packet()), row["id"]))
+
+
 def _call(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadline: float,
           stage: str, instructions: str, packet: dict[str, Any]) -> Any:
+    _save_diagnostics(cfg, row, owner)
+    task = _task_packet(row)
+    if task["lookup_context"]["baseline_fingerprint"] != _baseline_fingerprint(cfg, task["baseline_ids"]):
+        raise ValueError("baseline_changed")
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ValueError("time_budget")
@@ -385,9 +444,12 @@ def _call(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadline: f
         conn.execute("UPDATE cases SET stage=?,usage=?,models=?,elapsed_seconds=elapsed_seconds+? WHERE id=?",
                      (stage + "_received", json.dumps(usage), json.dumps(models),
                       max(0, time.monotonic() - started), row["id"]))
+    parsed = getattr(response, "parsed", None)
+    row["_diagnostics"].action(stage, parsed)
+    _save_diagnostics(cfg, row, owner)
     if time.monotonic() >= deadline:
         raise ValueError("time_budget")
-    return getattr(response, "parsed", None)
+    return parsed
 
 
 _CITATIONS = ("Every citation must have id, locator, sha256 copied exactly from a READ source, "
@@ -418,22 +480,36 @@ _COVERAGE = (
     "not_useful may use clearly irrelevant current metadata without a full read; covered_by must be empty. "
     "Potentially useful unread/unavailable evidence is unknown, never assumed irrelevant; unknown or lost "
     "useful coverage vetoes acceptance. Read meaningful baseline artifacts before proposing. "
+    "Excerpts are exact bounded lines, not complete content coverage. For a useful baseline with complete:false, "
+    "include evidence_scope:'useful_evidence_only' ONLY when the inspected lines establish all evidence useful "
+    "for this lookup; otherwise mark unknown and request another range. Never infer absent facts from excerpts. "
 )
 _INVESTIGATE = (
     _CONTEXT + _COVERAGE +
-    "Investigate which whole registered operational Markdown artifacts should be read first. "
+    "Investigate which whole registered operational Markdown or script artifacts should be read first. "
     "search_history records attempted queries and newly admitted candidates. Do not repeat tried "
     "searches. If a targeted search adds no candidates and available sources do not cover the lookup, "
     "return unresolved rather than repeatedly rephrasing that search. "
     "Return one JSON object per call: {action:'search',query:'...'} to search beyond the current candidates; "
     "{action:'read',ids:['exact candidate ID',...]} to inspect up to three whole sources; "
+    "{action:'read_excerpt',id:'exact candidate ID',start_line:1,end_line:80} for an exact inclusive "
+    "range of at most 160 lines from a file up to 1 MB, with at most 24 KB of selected text. "
+    "{action:'locate_source',id:'exact candidate ID',query:'literal substring'} scans one selected file "
+    "up to 1 MB and returns at most 32 exact matching line/column positions (heading/symbol/literal), "
+    "not a summary or citable body. Use returned positions to choose read_excerpt ranges, never guess "
+    "line numbers. At most six scans; literal case-sensitive matching can miss synonyms. "
+    "Multiple ranges remain available within the same source/selected byte budgets. "
+    "Candidate read_status/file_bytes are selection advice, not relevance decisions. "
     "{action:'propose',route_ids:['ID'],citations:[...]} only when read sources establish precise "
-    "operation, target and scope; or {action:'unresolved'}. A route has one or two IDs. "
+    "operation, target and scope; or {action:'unresolved',category:'unspecified'}. "
+    "Category is unspecified, insufficient_sources, ambiguous_lookup, conflicting_evidence, "
+    "baseline_coverage, or no_applicable_route; no free-text rationale. A route has one or two IDs. "
     "Inspect plausible competing/near-miss artifacts; a lexical match alone is insufficient. " + _CITATIONS
 )
 _VERIFY = (
     _CONTEXT + _COVERAGE +
-    "Independently verify the proposed route. Do not rubber-stamp the investigator. Read fresh whole "
+    "Independently verify the proposed route. You cannot request searches or new ranges: reject unresolved "
+    "navigation or omitted evidence; do not rubber-stamp the investigator. Inspect fresh exact "
     "sources yourself and compare near_miss_id as well as every meaningful baseline artifact. "
     "Reject ambiguity, different operation/scope, a better source, implausible near miss or insufficient "
     "coverage. Return JSON {verdict:'verified'|'unresolved',route_ids:[...],near_miss_id:'...',"
@@ -493,8 +569,13 @@ def _coverage(parsed: dict[str, Any], task: dict[str, Any], evidence: Evidence,
                 raise ValueError("baseline_coverage_lost")
         else:
             raise ValueError("baseline_coverage_unknown")
+        source = evidence.sources.get(artifact_id)
+        partial = disposition in {"retained", "equivalent"} and source is not None and source.get("complete") is False
+        if partial and item.get("evidence_scope") != "useful_evidence_only":
+            raise ValueError("baseline_coverage_unknown")
         checked.append({"id": artifact_id, "disposition": disposition,
-                        "covered_by": covered, "reason": reason})
+                        "covered_by": covered, "reason": reason,
+                        **({"evidence_scope": "useful_evidence_only"} if partial else {})})
     return checked
 
 
@@ -525,34 +606,45 @@ def _reuse_candidates(cfg: Config, row: dict[str, Any], task: dict[str, Any]) ->
 def _applicable(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadline: float,
                 task: dict[str, Any]) -> dict[str, Any] | None:
     # A rejected old route must not consume acquisition's source/search allowance.
-    evidence = Evidence(cfg, row["artifact_type"])
+    evidence = Evidence(cfg, row["artifact_type"], diagnostics=row.get("_diagnostics"), phase="applicability")
     # Keep the complete (at most 30) baseline metadata separate during receipt
     # admission. Receipts retain Evidence's candidate/source/byte limits.
     baseline = Evidence(cfg, row["artifact_type"])
     baseline.include(task["baseline_ids"])
     candidates = []
+    admitted: list[tuple[dict[str, Any], Evidence]] = []
     for candidate in _reuse_candidates(cfg, row, task):
         result = json.loads(candidate["result"])
         receipts = result.get("sources", [])
         if not sources_current(cfg, receipts):
             continue
-        # Restore admitted packet state on rejection, but do not reset any
-        # cumulative read-attempt accounting owned by Evidence.
-        saved_candidates = evidence.candidates.copy()
-        saved_sources = evidence.sources.copy()
-        saved_refusals = evidence.refusals.copy()
-        saved_bytes = evidence.bytes_read
+        # Check each complete receipt set in isolation before packing the one
+        # model call. A costly earlier union must not crowd out a cheaper route.
+        current = Evidence(cfg, row["artifact_type"], diagnostics=row.get("_diagnostics"),
+                           phase="applicability")
         try:
-            evidence.include([source["id"] for source in receipts])
+            current.include([source["id"] for source in receipts])
             for source in receipts:
-                if identity(evidence.read(source["id"])) != source:
+                if identity(current.read(source["id"], receipt=source)) != source:
                     raise ValueError("source_changed_during_verification")
         except (OSError, ValueError):
-            evidence.candidates = saved_candidates
-            evidence.sources = saved_sources
-            evidence.refusals = saved_refusals
-            evidence.bytes_read = saved_bytes
             continue
+        admitted.append((candidate, current))
+    admitted.sort(key=lambda item: (len(item[1].sources), item[1].bytes_read))
+    for candidate, current in admitted:
+        # Common IDs with different inspected ranges cannot silently overwrite
+        # another stored route's exact receipt.
+        if any(identity(evidence.sources[i]) != identity(source)
+               for i, source in current.sources.items() if i in evidence.sources):
+            continue
+        combined = {**evidence.sources, **current.sources}
+        combined_candidates = {**evidence.candidates, **current.candidates}
+        size = sum(source["bytes"] for source in combined.values())
+        if (len(combined) > MAX_SOURCES or size > MAX_TOTAL_BYTES
+                or len(combined_candidates) > MAX_CANDIDATES):
+            continue
+        evidence.sources, evidence.candidates, evidence.bytes_read = combined, combined_candidates, size
+        result = json.loads(candidate["result"])
         candidates.append({"case_id": candidate["id"], "task": _task_packet(candidate),
                            "route_ids": result["route_ids"], "verified_at": candidate["verified_at"]})
     if not candidates:
@@ -563,7 +655,7 @@ def _applicable(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadl
     evidence.refusals = {**baseline.refusals, **evidence.refusals}
     # Read the baseline when it fits; remaining metadata/refusals stay explicit. No silent prefix coverage.
     for artifact_id in task["baseline_ids"]:
-        if artifact_id in evidence.candidates:
+        if artifact_id in evidence.candidates and artifact_id not in evidence.sources:
             evidence.try_read(artifact_id)
     parsed = _call(cfg, llm=llm, row=row, owner=owner, deadline=deadline, stage="applicability",
                    instructions=_APPLICABILITY,
@@ -592,6 +684,15 @@ def _applicable(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str, deadl
 
 def _investigate(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
                  deadline: float) -> dict[str, Any]:
+    row["_diagnostics"] = Diagnostics()
+    try:
+        return _investigate_case(cfg, llm=llm, row=row, owner=owner, deadline=deadline)
+    finally:
+        _save_diagnostics(cfg, row, owner)
+
+
+def _investigate_case(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
+                      deadline: float) -> dict[str, Any]:
     task = _task_packet(row)
     if task["lookup_context"].get("baseline_fingerprint") != _baseline_fingerprint(cfg, task["baseline_ids"]):
         raise ValueError("baseline_changed")
@@ -599,7 +700,7 @@ def _investigate(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
                              task=task)
     if applicable is not None:
         return applicable
-    evidence = Evidence(cfg, row["artifact_type"])
+    evidence = Evidence(cfg, row["artifact_type"], diagnostics=row["_diagnostics"])
     evidence.include(task["baseline_ids"])
     evidence.search(row["query"])
     # Expand on the immediate intent, not obligatorily back into the parent workflow.
@@ -623,6 +724,18 @@ def _investigate(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
                 raise ValueError("invalid_read_request")
             for artifact_id in ids:
                 evidence.try_read(artifact_id)
+        elif action == "locate_source":
+            if not isinstance(parsed.get("id"), str) or not isinstance(parsed.get("query"), str):
+                raise ValueError("invalid_read_request")
+            evidence.locate(parsed["id"], parsed["query"])
+        elif action == "read_excerpt":
+            artifact_id = parsed.get("id")
+            if not isinstance(artifact_id, str):
+                raise ValueError("invalid_read_request")
+            start, end = parsed.get("start_line"), parsed.get("end_line")
+            if type(start) is not int or type(end) is not int:
+                raise ValueError("invalid_read_range")
+            evidence.try_read(artifact_id, start_line=start, end_line=end)
         elif action == "propose":
             ids = parsed.get("route_ids")
             if (not isinstance(ids, list) or not 1 <= len(ids) <= 2
@@ -648,10 +761,15 @@ def _investigate(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
     if not near_misses:
         raise ValueError("missing_near_miss")
     readable_candidates = [candidate for candidate in near_misses
-                           if evidence.candidates[candidate]["type"] in MARKDOWN_TYPES]
-    near_miss = next((candidate for candidate in readable_candidates[:3] if evidence.try_read(candidate)), "")
+                           if evidence.candidates[candidate]["type"] in SOURCE_TYPES]
+    readable_candidates.sort(key=lambda candidate: (
+        candidate not in evidence.sources,
+        evidence.candidates[candidate]["type"] not in MARKDOWN_TYPES))
+    near_miss = next((candidate for candidate in readable_candidates[:3]
+                      if candidate in evidence.sources or evidence.try_read(candidate)), "")
     if not near_miss:
         raise ValueError("missing_readable_near_miss")
+    evidence.phase = "verifier"
     # The verifier sees newly read evidence, never an investigator-authored source summary.
     for artifact_id in list(dict.fromkeys([*evidence.sources, near_miss])):
         old = evidence.sources.get(artifact_id)
