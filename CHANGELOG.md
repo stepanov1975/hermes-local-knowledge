@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.3] - 2026-10-03
+
+Stable release of the 0.5.3 beta series. Runtime behavior is unchanged from
+0.5.3b5; installation and upgrade do not enable verified-routing shadow mode.
+
+### Added
+
+- Opt-in verified-routing shadow capture, bounded source investigation and private applicability/reuse diagnostics. Shadow remains off by default, never changes search results or promotes routes, and has not demonstrated production savings or ranking improvements.
+- Default one-hour, activity-driven background index refresh with nonblocking healthy reads, existing cross-process publication locks and bounded failure cooldown. No model calls or idle scheduler; explicit rebuild remains available.
+
+### Changed
+
+- Use supported tool-execution middleware on unmodified official Hermes v2026.9.14 and newer, retaining the explicitly best-effort legacy hook fallback on older hosts.
+- Preserve bounded structural observations and exact supported file/skill/get consumption without retaining arbitrary tool bodies; expose incomplete identity and capture diagnostics rather than inventing attribution.
+- Investigate selected scripts and large Markdown through bounded, hash-bound source excerpts, preserving complete baseline useful-evidence requirements and explicit partial-coverage limits.
+- Retain the reviewed build and security-tool dependency maintenance after 0.5.3b5; runtime dependencies remain Python standard library only.
+
+### Operational notes
+
+- Existing automatic tool-OKF generation remains enabled by default and may consume additional model tokens. Shadow investigations require separate opt-in and also consume model tokens; upgrading does not opt users in.
+- Background maintenance and bounded observers retain documented overload, shutdown and short-lived-process limits; no exactly-once capture or fixed freshness deadline is promised.
+
+[0.5.3]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.4.20...v0.5.3
+
 ## [0.5.3b5] - 2026-10-03
 
 ### Fixed
