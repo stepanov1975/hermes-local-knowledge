@@ -37,8 +37,10 @@ def test_noncanonical_or_unsupported_versions_rejected(version: str) -> None:
         policy.simple_version_key(version)
 
 
-def test_repository_beta_versions_are_synchronized() -> None:
-    assert policy.require_metadata_in_sync(policy.read_current_metadata(ROOT)) == "0.5.3b5"
+def test_repository_release_version_is_synchronized() -> None:
+    version = policy.require_metadata_in_sync(policy.read_current_metadata(ROOT))
+    assert version == "0.5.3"
+    assert release_metadata(version)["prerelease"] == "false"
     mismatched = policy.VersionMetadata("0.5.3b1", "0.5.3", "0.5.3b1")
     with pytest.raises(policy.PolicyError, match="not synchronized"):
         policy.require_metadata_in_sync(mismatched)
