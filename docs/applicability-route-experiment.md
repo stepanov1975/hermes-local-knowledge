@@ -2,8 +2,11 @@
 
 ## Decision
 
-The prepared applicability veto showed a useful semantic signal but **did not pass
-acceptance**. Retain the private experiment; do not deploy this candidate.
+The prepared applicability veto showed a useful semantic signal. It failed the
+original assistant-chosen 2 ms overhead gate. The maintainer subsequently set a
+**1 second total query-response** limit: reassessment of the unchanged observations
+passes that revised gate and the existing relevance/control gates. This supports
+a bounded prepared-veto improvement, **not deployment approval**.
 
 The earlier [revision veto](revision-route-experiment.md) rejected endorsements
 on any byte change. That harmed harmless edits and historical requests. This
@@ -67,6 +70,8 @@ Original and corrected-context review receipts are retained privately.
 
 ## Performance gate and limits
 
+### Original policy, retained as historical evidence
+
 Both lanes ran 30 alternating warm rounds through real managed search, native
 projection/serialization and disposable telemetry, without concurrent parent
 tests or reviews. Three full-packet cases exceeded the frozen **2 ms**
@@ -79,6 +84,25 @@ Gate-only median times were below 0.2 ms, but that does not establish negligible
 end-to-end cost. Response timing includes harness instrumentation and ordinary
 local I/O, not provider investigation, host transport or scheduling. The observed
 differences are not proof that the applicability rule caused each slowdown.
+
+### User-authorized 1 second policy
+
+On 2026-10-04 the maintainer explicitly set acceptable total query time to
+**1 second for this and future evaluations**. A separate private assessment
+applied that absolute limit to each recorded candidate initial and warm request;
+no queries, labels, responses or timing samples were regenerated. The original
+packet, code, report and rejected assessment remain unchanged.
+
+All **341 recorded candidate requests** meet the new limit; the slowest was about
+**578.2 ms**. The two first-result gains, zero relevance regressions and existing
+control/preservation checks remain unchanged, with no failing candidate cases.
+One incumbent request took about **2272.1 ms**; it is disclosed as a baseline
+breach, not a reason to veto the faster candidate. This sample comparison does
+not establish a guaranteed live response time or a causal tail-latency gain.
+
+The private current-policy entrypoint uses the 1 second absolute gate for future
+runs while retaining the predecessor only for historical reproduction. Relevance,
+stability, provenance and preservation gates are not relaxed.
 
 This establishes feasibility of a prepared, narrowly scoped semantic veto,
 not unseen-task benefit, autonomous investigator reliability, discovery of new
