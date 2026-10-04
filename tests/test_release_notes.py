@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,15 @@ from scripts.render_release_notes import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_repository_changelog_renders_current_package_release() -> None:
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = project["project"]["version"]
+    notes = render_release_notes(REPO_ROOT / "CHANGELOG.md", version)
+    assert "**Full changelog:**" in notes
+    assert "](https://github.com/stepanov1975/hermes-local-knowledge/compare/" in notes
+    assert notes.rstrip().endswith(f"...v{version})")
 
 
 def test_render_release_notes_extracts_exact_version_section_and_compare_link(tmp_path: Path) -> None:

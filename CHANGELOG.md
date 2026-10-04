@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [0.5.4b1] - Local candidate
+## [0.5.4b1] - 2026-10-04
 
 ### Added
 
@@ -20,7 +20,9 @@ All notable changes to this project are documented in this file.
 ### Operational notes
 
 - Opt-in background preparation sends bounded private task/source evidence to the configured model provider and consumes additional tokens. No model/network call runs in search; this candidate makes no claim of real-world ranking gains or savings.
-- Installation/upgrade do not enable vetoes. Roll back to `off`, or `shadow` for diagnostics without result changes. This is a local candidate, not a deployment or release.
+- Installation/upgrade do not enable vetoes. Roll back to `off`, or `shadow` for diagnostics without result changes. Production veto enablement requires a separate opt-in.
+
+[0.5.4b1]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3...v0.5.4b1
 
 ## [0.5.3] - 2026-10-03
 
