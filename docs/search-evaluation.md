@@ -24,6 +24,20 @@ comparison. Development cases that informed the hypothesis remain development
 evidence, not an independent holdout. Keep selected failures; do not rewrite
 queries after seeing results to obtain a passing gate.
 
+For the maintainer's search/retrieval evaluations, the standing latency acceptance
+limit is **1 second (1000 ms) total response time per candidate query**, not an
+added-overhead limit against the incumbent. Check each recorded initial and warm
+candidate request; a passing median cannot hide a measured request over the limit.
+Report baseline breaches and median/tail timings separately. Include synchronous
+retrieval, routing, telemetry and serialization within the measured query path;
+identify unmeasured transport boundaries and keep asynchronous preparation outside
+query latency. An offline pass is not a live service guarantee.
+
+A user-authorized threshold revision must retain the original policy and report,
+then produce a clearly labeled successor assessment from the unchanged observations
+or a separately identified new run. It is not permission to rewrite history or
+weaken relevance, stability or preservation gates.
+
 ## 2. State where judgments came from
 
 Distinguish historical user tasks from constructed tasks, and human judgments

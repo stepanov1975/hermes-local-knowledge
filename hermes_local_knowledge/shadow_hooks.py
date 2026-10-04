@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,40 @@ class _Request:
 
 _REQUESTS: dict[_ContextKey, _Request] = {}
 _LOCK = threading.Lock()
+
+
+@dataclass
+class SearchScope:
+    key: _ContextKey
+    request: _Request
+    lookup: Any
+    promotion: dict[str, Any] | None = None
+
+
+_SEARCH_SCOPE: ContextVar[SearchScope | None] = ContextVar("local_knowledge_search_scope", default=None)
+
+
+def active_scope(cfg: Config) -> SearchScope | None:
+    scope = _SEARCH_SCOPE.get()
+    if scope is None or scope.key[:3] != (cfg.hermes_home, cfg.source_root, cfg.state_dir):
+        return None
+    with _LOCK:
+        if (_REQUESTS.get(scope.key) is not scope.request
+                or scope.request.expires <= time.monotonic()):
+            return None
+    return scope
+
+
+def search_scope(cfg: Config, args: Any, metadata: Mapping[str, Any]) -> SearchScope | None:
+    if (cfg.verified_routing.mode != "veto" or metadata.get("tool_name") != "knowledge_search"
+            or _excluded(metadata) or not _identity(metadata.get("api_request_id"))):
+        return None
+    key = _key(cfg, metadata)
+    with _LOCK:
+        bound = _REQUESTS.get(key) if key is not None else None
+        if bound is None or key is None or bound.expires <= time.monotonic():
+            return None
+        return SearchScope(key, bound, args.get("lookup") if isinstance(args, dict) else None)
 
 
 def _identity(value: Any) -> str:
@@ -84,7 +119,7 @@ def on_pre_llm_call(**kwargs: Any) -> None:
     """Bind only an exact bounded current message; never read history."""
     try:
         cfg = resolve_config()
-        if cfg.verified_routing.mode != "shadow":
+        if cfg.verified_routing.mode not in {"shadow", "veto"}:
             _clear_profile(cfg)
             return
         key = _key(cfg, kwargs)
@@ -113,7 +148,7 @@ def on_post_tool_call(**kwargs: Any) -> None:
         if kwargs.get("tool_name") != "knowledge_search" or _excluded(kwargs):
             return
         cfg = resolve_config()
-        if cfg.verified_routing.mode != "shadow":
+        if cfg.verified_routing.mode not in {"shadow", "veto"}:
             _clear_profile(cfg)
             return
         if not _hook_succeeded(kwargs) or not _identity(kwargs.get("api_request_id")):
@@ -123,6 +158,10 @@ def on_post_tool_call(**kwargs: Any) -> None:
             _prune(time.monotonic())
             bound = _REQUESTS.get(key) if key is not None else None
         if bound is None or key is None:
+            return
+        promotion = kwargs.get("_promotion")
+        if cfg.verified_routing.mode == "veto" and (
+                not isinstance(promotion, dict) or promotion.get("user_request") != bound.text):
             return
         event_id = _usage_event_id(kwargs.get("result"))
         if event_id is None:
@@ -172,6 +211,7 @@ def on_post_tool_call(**kwargs: Any) -> None:
             cfg, user_request=bound.text, query=query, artifact_type=artifact_type or "",
             session_id=key[3], task_id=key[4], turn_id=key[5], baseline_ids=baseline_ids,
             lookup=args.get("lookup"),
+            **({"promotion": promotion} if cfg.verified_routing.mode == "veto" else {}),
         )
     except Exception:
         # Exceptions may include private task/source text; never log their value.
@@ -187,7 +227,7 @@ def on_session_end(**kwargs: Any) -> None:
             _prune(time.monotonic())
             if key is not None:
                 _REQUESTS.pop(key, None)
-        if cfg.verified_routing.mode != "shadow":
+        if cfg.verified_routing.mode not in {"shadow", "veto"}:
             _clear_profile(cfg)
             return
         session_id = _identity(kwargs.get("session_id"))
@@ -237,7 +277,7 @@ def on_session_finalize(**kwargs: Any) -> bool:
         if _excluded(kwargs):
             return False
         cfg = resolve_config()
-        if cfg.verified_routing.mode != "shadow":
+        if cfg.verified_routing.mode not in {"shadow", "veto"}:
             _clear_profile(cfg)
             return False
         return _wake_supervisor(cfg)

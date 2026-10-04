@@ -1323,7 +1323,8 @@ def _usage_report(
                    COUNT(*) - COALESCE(SUM(success), 0) AS errors,
                    COALESCE(SUM(CASE WHEN success = 1 AND COALESCE(result_count, 0) = 0 THEN 1 ELSE 0 END), 0)
                        AS zero_results,
-                   COALESCE(SUM(CASE WHEN COALESCE(route_outcome, 'none') <> 'none' THEN 1 ELSE 0 END), 0)
+                   COALESCE(SUM(CASE WHEN COALESCE(route_outcome, 'none') NOT IN
+                        ('none', 'applicability_vetoed') THEN 1 ELSE 0 END), 0)
                        AS route_changes,
                    ROUND(AVG(latency_ms), 1) AS avg_latency_ms,
                    MAX(ts) AS last_seen

@@ -1,6 +1,6 @@
 """Opt-in private routing observations and bounded, independently verified cases.
 
-Nothing here changes index content, rankings, feedback, or native tool responses.
+Shadow does not change search results; veto consumes exact source-only promotion reviews.
 The interactive path never calls a model. An interrupted external call is ambiguous,
 not retryable: a later worker closes that claim without charging for it again.
 """
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT
 
 
 def _enabled(cfg: Config) -> bool:
-    return getattr(getattr(cfg, "verified_routing", None), "mode", "off") == "shadow"
+    return getattr(getattr(cfg, "verified_routing", None), "mode", "off") in {"shadow", "veto"}
 
 
 def _path(cfg: Config) -> Path:
@@ -181,7 +181,7 @@ def _baseline_fingerprint(cfg: Config, ids: list[str]) -> str:
 
 def observe(cfg: Config, *, user_request: str, query: str, artifact_type: str,
             session_id: str, task_id: str, turn_id: str, baseline_ids: list[str],
-            lookup: Any = None) -> dict[str, Any]:
+            lookup: Any = None, promotion: dict[str, Any] | None = None) -> dict[str, Any]:
     """Capture exact, bounded task context or record a private would-reuse/fallback."""
     if not _enabled(cfg):
         return {"status": "off"}
@@ -212,6 +212,11 @@ def observe(cfg: Config, *, user_request: str, query: str, artifact_type: str,
             key = hashlib.sha256(json.dumps(
                 [_normalize(request), _normalize(query), artifact_type, lookup_context, baseline_ids],
                 ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            if promotion is not None:
+                from .applicability import case_key
+
+                lookup_context["promotion"] = promotion
+                key = case_key(promotion)
             row = conn.execute("SELECT * FROM cases WHERE id=?", (key,)).fetchone()
             now = time.time()
             observation = "fallback"
@@ -225,10 +230,24 @@ def observe(cfg: Config, *, user_request: str, query: str, artifact_type: str,
                     observations = [*observations[-7:], context]
                 reason = row["status"]
                 if row["status"] in {"ai_verified", "would_reuse"}:
-                    result = json.loads(row["result"])
-                    fresh = 0 <= now - row["verified_at"] <= cfg.verified_routing.max_age_days * 86400
+                    try:
+                        result = json.loads(row["result"])
+                        if not isinstance(result, dict):
+                            raise ValueError("invalid_result")
+                    except (ValueError, TypeError):
+                        if promotion is None:
+                            raise
+                        result = {}
+                    fresh = (isinstance(row["verified_at"], (int, float))
+                             and 0 <= now - row["verified_at"] <= cfg.verified_routing.max_age_days * 86400)
                     current_contract = result.get("contract_version") == VERIFICATION_CONTRACT
-                    if current_contract and fresh and sources_current(cfg, result.get("sources", [])):
+                    if promotion is not None:
+                        from .applicability import valid_result
+
+                        reusable = valid_result(cfg, result, promotion, row["verified_at"])
+                    else:
+                        reusable = current_contract and fresh and sources_current(cfg, result.get("sources", []))
+                    if reusable:
                         observation, reason = "would_reuse", "current_exact_case"
                     else:
                         reason = "legacy_contract" if not current_contract else "expired" if not fresh else "changed_source"
@@ -288,7 +307,7 @@ def has_work(cfg: Config) -> bool:
 
 
 def report(cfg: Config) -> dict[str, Any]:
-    summary: dict[str, Any] = {"mode": "shadow" if _enabled(cfg) else "off", "cases": {},
+    summary: dict[str, Any] = {"mode": cfg.verified_routing.mode, "cases": {},
                                "counters": {}, "model_calls": 0, "usage": {}, "elapsed_seconds": 0.0}
     if not _path(cfg).is_file():
         return summary
@@ -585,7 +604,9 @@ def _reuse_candidates(cfg: Config, row: dict[str, Any], task: dict[str, Any]) ->
         text = packet["query"] + " " + " ".join(packet["lookup_context"]["lookup"]["fields"].values())
         return set(_query_terms(text)) - COMMON_STOPWORDS
     with closing(_connect(cfg)) as conn:
+        # Promotion reviews are not replacement routes and must not spend the scan allowance.
         rows = conn.execute("SELECT * FROM cases WHERE status='ai_verified' AND id!=? AND artifact_type=? "
+                            "AND json_type(lookup_context, '$.promotion') IS NULL "
                             "ORDER BY verified_at DESC,id LIMIT ?",
                             (row["id"], row["artifact_type"], MAX_REUSE_SCAN)).fetchall()
     ranked = []
@@ -696,6 +717,10 @@ def _investigate_case(cfg: Config, *, llm: Any, row: dict[str, Any], owner: str,
     task = _task_packet(row)
     if task["lookup_context"].get("baseline_fingerprint") != _baseline_fingerprint(cfg, task["baseline_ids"]):
         raise ValueError("baseline_changed")
+    if "promotion" in task["lookup_context"]:
+        from .applicability import review as promotion_review
+
+        return promotion_review(cfg, llm=llm, row=row, owner=owner, deadline=deadline, task=task)
     applicable = _applicable(cfg, llm=llm, row=row, owner=owner, deadline=deadline,
                              task=task)
     if applicable is not None:

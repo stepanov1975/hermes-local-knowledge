@@ -18,7 +18,7 @@ from contextvars import Context, copy_context
 from dataclasses import dataclass
 from typing import Any
 
-from . import okf, shadow
+from . import okf, shadow, shadow_hooks
 from .config import _OBSERVER_CONFIG, resolve_config
 
 logger = logging.getLogger(__name__)
@@ -312,6 +312,17 @@ class Observer:
             self._notice(str(error))
         except Exception:
             self._notice("call_projection_error")
+        scope = None
+        token = None
+        try:
+            # A hook may have run on a copied-context worker. Resolve only its
+            # locked exact map entry, then scope the actual downstream dispatch.
+            cfg = resolve_config()
+            if cfg.verified_routing.mode == "veto":
+                scope = shadow_hooks.search_scope(cfg, args, metadata)
+                token = shadow_hooks._SEARCH_SCOPE.set(scope)
+        except Exception:
+            self._notice("scope_error")
         result: Any = None
         failed = True
         try:
@@ -319,9 +330,13 @@ class Observer:
             failed = False
             return result
         finally:
+            if token is not None:
+                shadow_hooks._SEARCH_SCOPE.reset(token)
             if slot is not None:
                 try:
                     if payload is not None:
+                        if scope is not None and scope.promotion is not None:
+                            payload["_promotion"] = scope.promotion
                         project_result(payload, result, failed)
                         if payload["status"] == "unknown":
                             self._notice("result_unknown")

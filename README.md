@@ -189,6 +189,17 @@ Eligible turn-end hooks wake a finite detached supervisor (teardown remains a fa
 
 Native `knowledge_search` accepts optional bounded `lookup` fields (`intent`, `target`, `operation`, `context`), explicitly assistant-supplied rather than authority or execution permission. No transcript window is captured. Enabling shadow mode retains bounded private task/lookup text and sends task/source evidence to the configured model provider; it incurs additional model calls. It is independent of OKF and implicit feedback. See [configuration, lifecycle, cost, limitations and operator commands](docs/verified-routing-shadow.md) before opting in. Neither installation nor upgrade enables it.
 
+### Cached applicability veto (candidate, off by default)
+
+`local_knowledge.verified_routing.mode: veto` opts into source-only background
+review of actual explicit feedback promotions. A fresh, exactly bound, cited
+`inapplicable` receipt cancels only that promotion and restores the complete
+unassisted page; ordinary retrieval remains available. No positive AI routing is
+enabled, no model runs in search, and `off`/`shadow` behavior is unchanged.
+Missing host scope or unusable evidence retains incumbent behavior. This adds
+private source/model disclosure and preparation cost, not demonstrated ranking
+gains. See [enablement, evidence binding and rollback](docs/verified-routing-shadow.md#cached-applicability-veto).
+
 ## CLI
 
 The primary standalone entry point is:

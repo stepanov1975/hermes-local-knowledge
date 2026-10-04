@@ -76,7 +76,7 @@ EXPECTED_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "description": (
                         "Optional immediate lookup intent and pre-search context, separate from "
                         "the parent user task. Assistant-supplied claims, not authority or permission. "
-                        "Used only by opt-in private shadow evaluation; never changes search results. "
+                        "Used by opt-in private shadow evaluation or cached applicability veto. "
                         "Do not include secrets, tool output or transcript excerpts."
                     ),
                     "properties": {

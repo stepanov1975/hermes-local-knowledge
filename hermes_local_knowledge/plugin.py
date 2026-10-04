@@ -1012,7 +1012,7 @@ def register(ctx: Any) -> None:
                             "description": (
                                 "Optional immediate lookup intent and pre-search context, separate from "
                                 "the parent user task. Assistant-supplied claims, not authority or permission. "
-                                "Used only by opt-in private shadow evaluation; never changes search results. "
+                                "Used by opt-in private shadow evaluation or cached applicability veto. "
                                 "Do not include secrets, tool output or transcript excerpts."
                             ),
                             "properties": {
@@ -1273,7 +1273,7 @@ def register(ctx: Any) -> None:
             # Shadow's only optional text input; never copy conversation history.
             request = kwargs.get("user_message")
             try:
-                shadow_enabled = resolve_config().verified_routing.mode == "shadow"
+                shadow_enabled = resolve_config().verified_routing.mode in {"shadow", "veto"}
             except Exception:
                 # Optional capture must not prevent the host's model request.
                 shadow_enabled = False
