@@ -604,15 +604,14 @@ def _reuse_candidates(cfg: Config, row: dict[str, Any], task: dict[str, Any]) ->
         text = packet["query"] + " " + " ".join(packet["lookup_context"]["lookup"]["fields"].values())
         return set(_query_terms(text)) - COMMON_STOPWORDS
     with closing(_connect(cfg)) as conn:
+        # Promotion reviews are not replacement routes and must not spend the scan allowance.
         rows = conn.execute("SELECT * FROM cases WHERE status='ai_verified' AND id!=? AND artifact_type=? "
+                            "AND json_type(lookup_context, '$.promotion') IS NULL "
                             "ORDER BY verified_at DESC,id LIMIT ?",
                             (row["id"], row["artifact_type"], MAX_REUSE_SCAN)).fetchall()
     ranked = []
     now = time.time()
     for candidate in rows:
-        # Promotion receipts are not independently investigated replacement routes.
-        if "promotion" in json.loads(candidate["lookup_context"]):
-            continue
         result = json.loads(candidate["result"])
         if (result.get("contract_version") != VERIFICATION_CONTRACT
                 or not 0 <= now - candidate["verified_at"] <= cfg.verified_routing.max_age_days * 86400):

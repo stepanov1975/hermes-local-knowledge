@@ -430,12 +430,11 @@ def test_promotion_receipts_are_not_shadow_replacement_routes(cfg: Config) -> No
 
 
 def test_real_host_threaded_native_deferred_parallel_scope_and_reset(
-    cfg: Config, monkeypatch: pytest.MonkeyPatch,
+    cfg: Config, monkeypatch: pytest.MonkeyPatch, official_host_manager: Any,
 ) -> None:
     host = importlib.import_module("hermes_cli.plugins")
     middleware = importlib.import_module("hermes_cli.middleware")
-    manager = host.PluginManager(scope_key=str(cfg.hermes_home))
-    manager.discover_and_load()
+    manager = official_host_manager
     manifest = host.PluginManifest(name="local_knowledge", key="local_knowledge", source="test")
     q: observer.Observer | None = None
 
@@ -445,7 +444,6 @@ def test_real_host_threaded_native_deferred_parallel_scope_and_reset(
             q = callback.__self__
             return super().register_middleware(kind, callback)
 
-    monkeypatch.setattr(host, "get_plugin_manager", lambda: manager)
     monkeypatch.setattr(plugin, "_on_okf_post_tool_call", lambda **k: None)
     plugin.register(Context(manifest, manager))
     assert q is not None

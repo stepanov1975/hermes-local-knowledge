@@ -275,11 +275,10 @@ def test_worker_recursion_guard(cfg: Config, monkeypatch: pytest.MonkeyPatch, en
 
 
 def test_real_host_threaded_hooks_and_underlying_deferred_search_receipt(
-    cfg: Config, monkeypatch: pytest.MonkeyPatch,
+    cfg: Config, monkeypatch: pytest.MonkeyPatch, official_host_manager: Any,
 ) -> None:
     host = importlib.import_module("hermes_cli.plugins")
-    manager = host.PluginManager(scope_key=str(cfg.hermes_home))
-    manager.discover_and_load()
+    manager = official_host_manager
     manifest = host.PluginManifest(name="local_knowledge", key="local_knowledge", source="test")
     observed: list[Any] = []
     hook_threads: list[threading.Thread] = []
@@ -308,7 +307,6 @@ def test_real_host_threaded_hooks_and_underlying_deferred_search_receipt(
     else:
         context = host.PluginContext(manifest, manager)
     monkeypatch.setattr(observer, "resolve_config", lambda: cfg)
-    monkeypatch.setattr(host, "get_plugin_manager", lambda: manager)
     plugin.register(context)
     try:
         # Real host dispatch in copied thread contexts must not propagate the
@@ -357,9 +355,6 @@ def test_real_host_threaded_hooks_and_underlying_deferred_search_receipt(
     finally:
         if queue is not None:
             assert queue.close(5)
-        unload = getattr(manager, "unload", None)
-        if callable(unload):
-            unload()
 
 
 def test_lifecycle_detaches_real_fake_host_worker_and_passes_llm(

@@ -11,7 +11,7 @@ from typing import Any
 from . import shadow
 from .config import Config
 from .routing import RouteDecision, RouteOutcome
-from .shadow_sources import Evidence, checked_citations, identity, sources_current
+from .shadow_sources import MAX_SOURCES, Evidence, checked_citations, identity, sources_current
 
 PROMOTION_CONTRACT = 1
 
@@ -67,12 +67,14 @@ def _valid_result(cfg: Config, result: dict[str, Any], promotion: dict[str, Any]
     if result["verdict"] == "uncertain":
         return True
     receipts = result.get("sources", [])
-    if not sources_current(cfg, receipts):
+    if not receipts or len(receipts) > MAX_SOURCES:
         return False
     evidence = Evidence(cfg, promotion["artifact_type"])
     evidence.include([item["id"] for item in receipts])
     for receipt in receipts:
-        evidence.read(receipt["id"], receipt=receipt)
+        # Validate the exact identity and citations against the same current read.
+        if identity(evidence.read(receipt["id"], receipt=receipt)) != receipt:
+            return False
     checked_citations(result.get("citations"), evidence.sources, [promotion["artifact_id"]])
     return (result["verdict"] != "inapplicable"
             or result.get("basis") == "scope_target_incompatibility")
