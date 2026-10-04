@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.4b1] - Local candidate
+
+### Added
+
+- Off-by-default `verified_routing.mode: veto` (`off`/`shadow` unchanged): cancel only actual explicit feedback promotions using fresh, exact source-only applicability receipts, restoring the complete unassisted page without positive AI routing.
+- Bind original host scope through public middleware, selected feedback, effective query/filter/limit, lookup context, namespaces, metadata and source hashes/age; absent scope or unusable evidence retains incumbent behavior and stale receipts are requeued.
+- Persist truthful `applicability_vetoed` usage with attempted identities and routing high-waters. Already-first/implicit routes and direct caller-owned indexes remain unchanged.
+
+### Operational notes
+
+- Opt-in background preparation sends bounded private task/source evidence to the configured model provider and consumes additional tokens. No model/network call runs in search; this candidate makes no claim of real-world ranking gains or savings.
+- Installation/upgrade do not enable vetoes. Roll back to `off`, or `shadow` for diagnostics without result changes. This is a local candidate, not a deployment or release.
+
 ## [0.5.3] - 2026-10-03
 
 Stable release of the 0.5.3 beta series. Runtime behavior is unchanged from

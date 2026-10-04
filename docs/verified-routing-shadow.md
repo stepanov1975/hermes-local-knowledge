@@ -1,7 +1,9 @@
 # Verified routing: opt-in shadow mode
 
-This feature measures whether independently investigated routes are worth reusing.
-It never changes search ranking, tool results, feedback ratings, or indexed artifacts.
+Shadow mode measures whether independently investigated routes are worth reusing.
+Shadow never changes search ranking, tool results, feedback ratings, or indexed artifacts.
+The separate opt-in [cached applicability veto](#cached-applicability-veto) can cancel
+explicit promotions; the shadow contracts below do not authorize those vetoes.
 It is **disabled by default**, independently of tool-OKF generation and implicit feedback.
 
 ## Enablement and provider boundary
@@ -11,7 +13,7 @@ Review the storage and token-use notice before opting in:
 ```yaml
 local_knowledge:
   verified_routing:
-    mode: shadow  # default: off; no promotion mode exists
+    mode: shadow  # default: off; allowed: off, shadow, veto (see below)
     max_cases_per_worker: 1  # range 1–2
     max_model_calls_per_case: 12  # range 4–24, applicability + investigator + verifier combined
     max_worker_seconds: 300  # range 30–1200
@@ -40,8 +42,8 @@ Markdown/script source content to the profile's configured Hermes model provider
 consumes additional model tokens; it is not local-only inference unless that
 provider is local. Bounded text can still contain sensitive information: this is
 not a general-purpose secret redactor. Do not opt in for conversations or source
-trees that must not reach that provider. Search tool responses and ordering are
-unchanged; only the optional input schema has grown.
+trees that must not reach that provider. In shadow mode, search tool responses and
+ordering are unchanged; only the optional input schema has grown.
 
 ## Immediate lookup and context provenance
 
@@ -227,7 +229,7 @@ large or slow queue. Each child retains `max_cases_per_worker`,
 `max_model_calls_per_case`, `max_worker_seconds`, and its original fixed lease.
 Consequently one wake may spend more tokens than one batch: up to 16 batches,
 subject to the total time limit. Model-call limits do not bound provider retries
-or total tokens/billing. Normal search results still never change.
+or total tokens/billing. Shadow-mode search results still never change.
 
 A separate `supervisor.sqlite` transaction lock in the private profile/root queue
 namespace excludes other supervisors without holding a queue transaction. This
@@ -255,6 +257,66 @@ exhausted budgets, or a failed launch leave remaining work for a later eligible
 turn/teardown or manual worker invocation. No cron, system service, permanent
 daemon, startup recovery, or recursive supervisor chain is installed.
 
+## Cached applicability veto
+
+Candidate version 0.5.4b1 adds a separate opt-in behavior to the same private queue
+and fenced background workers. The shadow lifecycle above remains shadow-only;
+its route investigation, baseline coverage judgments and `would_reuse` outcomes
+cannot cancel a promotion. In particular, metadata-only `baseline_review.not_useful`
+is never rejection evidence. Neither installation nor upgrade enables vetoes.
+
+```yaml
+local_knowledge:
+  verified_routing:
+    mode: veto
+    max_age_days: 30
+```
+
+Only an **actual successful explicit feedback promotion**, including a filtered
+retry, is eligible. The private packet binds the exact original host task,
+immediate query, effective filter/limit, pre-search `lookup` fields, resolved
+profile/source/state namespace, selected feedback/artifact identity, and the
+complete unassisted baseline and promoted metadata fingerprints. New endorsements
+cannot inherit an old veto. Already-first and implicit routes are not cancelled.
+
+Public tool-execution middleware conveys exact host scope around the real native
+handler, including deferred dispatch, without serializing downstream tools. Its
+scope resets after success or failure. Missing/unsupported identity, observer
+races or unavailable original task mean abstention, not latest-task guessing.
+Older hosts without middleware, direct CLI searches and caller-owned indexes
+cannot borrow guessed host task authority. Caller-owned indexes remain unassisted.
+
+The worker reads only the selected promoted source through the existing bounded
+source reader, optionally using literal location and exact excerpts for larger
+supported sources. It returns `applicable`, `inapplicable` or `uncertain`, never a
+replacement route. A negative verdict requires checked read-source citations
+positively establishing incompatible target/scope; an excerpt cannot establish
+absence. Missing source/task information, recency alone, historical requests and
+harmless edits are not semantic rejection evidence.
+
+Search performs no model/network work: it consumes only the exact completed
+source-only promotion receipt. `max_age_days`, current metadata, all source
+locators/whole-file hashes and citation bounds must still validate. A valid
+`inapplicable` cancels the promotion and restores the **entire** unassisted page,
+not a truncated substitute. The rejected artifact remains ordinarily retrievable.
+Usage records the caller-visible final page and `applicability_vetoed`, retaining
+attempted feedback/artifact IDs and routing high-waters. Positive/uncertain,
+missing, expired, corrupt, legacy, mismatched or changed evidence keeps incumbent
+routing. Invalid completed evidence is captured/requeued asynchronously; changed
+bytes invalidate receipts but are not themselves a veto.
+
+Veto opt-in retains private task/lookup and promotion packets and sends selected
+source content to the configured provider under the same disclosure above. It
+uses the existing case/call/time/lease budgets and consumes additional preparation
+tokens; source checks also cost bounded local reads. No positive AI routes,
+semantic gains, token savings or correctness of AI judgments are established by
+scripted controls. The normal off default and shadow-only result parity remain.
+
+**Rollback:** set `local_knowledge.verified_routing.mode` to `off` to stop new
+capture/vetoes/launches, or `shadow` to retain shadow diagnostics without vetoes.
+Neither deletes private state nor kills already bounded work; allow it to finish
+before snapshotting. No live enablement or deployment is part of this candidate.
+
 ## Operator commands
 
 ```bash
@@ -262,12 +324,12 @@ python -m hermes_local_knowledge.cli routing-report --hermes-home /path/to/profi
 hermes local-knowledge routing-worker --hermes-home /path/to/profile
 ```
 
-The worker uses host-owned model access and only operates in shadow mode; it is not
+The worker uses host-owned model access in `shadow` or `veto` mode; it is not
 a standalone inference client. `routing-report` is available only through the
 standalone Python CLI. Reports expose counters/statuses, not request/source prose by
 default. Disabling the mode stops new capture/launches but does not delete evidence
 or kill an existing worker. The supervisor rereads configuration between children
-and while waiting on leases, stopping further launches when shadow is off or the
+and while waiting on leases, stopping further launches when the mode is off or the
 queue namespace changes. Wait for bounded work to exit before freezing a snapshot.
 
 ## What this does not prove

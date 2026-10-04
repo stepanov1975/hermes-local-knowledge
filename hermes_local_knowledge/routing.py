@@ -55,6 +55,7 @@ class RouteOutcome(str, Enum):
     PROMOTED_EXISTING = "promoted_existing"
     PROMOTED_RETRY = "promoted_retry"
     VERIFICATION_FAILED = "verification_failed"
+    APPLICABILITY_VETOED = "applicability_vetoed"
 
 
 @dataclass(frozen=True, slots=True)

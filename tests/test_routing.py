@@ -217,6 +217,7 @@ def test_route_outcome_values_match_the_persisted_contract() -> None:
         "promoted_existing",
         "promoted_retry",
         "verification_failed",
+        "applicability_vetoed",
     ]
 
 

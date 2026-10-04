@@ -278,7 +278,8 @@ def test_real_host_threaded_hooks_and_underlying_deferred_search_receipt(
     cfg: Config, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     host = importlib.import_module("hermes_cli.plugins")
-    manager = host.PluginManager()
+    manager = host.PluginManager(scope_key=str(cfg.hermes_home))
+    manager.discover_and_load()
     manifest = host.PluginManifest(name="local_knowledge", key="local_knowledge", source="test")
     observed: list[Any] = []
     hook_threads: list[threading.Thread] = []

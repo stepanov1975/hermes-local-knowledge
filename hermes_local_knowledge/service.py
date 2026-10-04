@@ -202,6 +202,11 @@ class LocalKnowledgeService:
                 limit=limit,
                 search_index_fn=self._search_index_fn,
             )
+        if db_path is None and self.config.verified_routing.mode == "veto":
+            from .applicability import apply
+
+            decision = apply(self.config, baseline_rows, decision, query=query,
+                             artifact_type=artifact_type or "", limit=limit)
         metadata[ROUTING_TRACE_METADATA_KEY] = SearchRoutingTrace(
             baseline_ids=tuple(str(row.get("id")) for row in baseline_rows),
             decision=decision,
