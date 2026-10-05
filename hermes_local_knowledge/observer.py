@@ -244,6 +244,7 @@ class Observer:
         self._counts: Counter[str] = Counter()
         self._diagnostics: dict[tuple[str, str, str], Counter[str]] = {}
         self._flushed_completed = 0
+        self._drain_targets: Counter[int] = Counter()
         self._closed = False
         self._thread: threading.Thread | None = None
 
@@ -422,6 +423,16 @@ class Observer:
     def _run(self) -> None:
         while True:
             with self._condition:
+                completed = self._counts["completed"]
+                drain_ready = (completed > self._flushed_completed
+                               and any(target <= completed for target in self._drain_targets))
+            if drain_ready:
+                self._flush_diagnostics()
+                with self._condition:
+                    self._flushed_completed = completed
+                    self._condition.notify_all()
+                continue
+            with self._condition:
                 if not self._queue:
                     self._condition.wait_for(lambda: self._queue or self._closed,
                                              timeout=IDLE_SECONDS)
@@ -442,18 +453,30 @@ class Observer:
             finally:
                 with self._condition:
                     self._queue.popleft()
-                    slot.context.run(self._count, "completed")
-                self._flush_diagnostics()
-                with self._condition:
-                    self._flushed_completed = self._counts["completed"]
-                    self._condition.notify_all()
+                    completed = slot.context.run(self._count, "completed")
+                    # Deliver admitted bursts before paying SQLite latency. Bound
+                    # a continuously busy batch by the existing queue capacity.
+                    flush = (not self._queue or not self._queue[0].ready
+                             or completed in self._drain_targets
+                             or completed - self._flushed_completed >= self.capacity)
+                if flush:
+                    self._flush_diagnostics()
+                    with self._condition:
+                        self._flushed_completed = completed
+                        self._condition.notify_all()
 
     def drain(self, timeout: float = 2.0) -> bool:
         """Wait for work admitted before this call, including active producers."""
         with self._condition:
             target = self._counts["accepted"]
-            done = self._condition.wait_for(lambda: self._flushed_completed >= target,
-                                            timeout=max(0, timeout))
+            self._drain_targets[target] += 1
+            try:
+                done = self._condition.wait_for(lambda: self._flushed_completed >= target,
+                                                timeout=max(0, timeout))
+            finally:
+                self._drain_targets[target] -= 1
+                if not self._drain_targets[target]:
+                    del self._drain_targets[target]
         if not done:
             self._notice("drain_timeout")
         return done

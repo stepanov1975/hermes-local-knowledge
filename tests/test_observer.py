@@ -425,11 +425,12 @@ def test_observer_case_ids_fit_windows_environment() -> None:
     # before the test body runs, and make failure reporting prohibitively large.
     result = subprocess.run(
         [sys.executable, "-B", "-m", "pytest", "--collect-only", "-q",
-         "-o", "addopts=", "tests/test_observer.py"],
+         "-o", "addopts=", "tests/test_observer.py", "tests/test_learning_telemetry.py"],
         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
         timeout=30, check=True,
     )
-    node_ids = [line for line in result.stdout.splitlines() if line.startswith("tests/test_observer.py::")]
+    node_ids = [line for line in result.stdout.splitlines()
+                if line.startswith(("tests/test_observer.py::", "tests/test_learning_telemetry.py::"))]
     assert node_ids
     # Keep a generous margin for checkout paths and pytest's phase suffix.
     oversized = [(node_id[:100], len(node_id)) for node_id in node_ids if len(node_id) > 1024]

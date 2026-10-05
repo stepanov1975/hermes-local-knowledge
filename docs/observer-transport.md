@@ -132,8 +132,8 @@ absent counter keys mean zero. `delivered` means the callback returned, not that
 all of its independently fail-open database writes succeeded. Existing consumer
 logs remain relevant.
 
-`knowledge_usage_report.observer_diagnostics` now exposes best-effort durable
-aggregate counters in `usage.sqlite`, scoped to the current source root, package
+The CLI/operator usage report exposes best-effort durable aggregate counters in
+`usage.sqlite`, scoped to the current source root, package
 version and report window (minute buckets; the first minute can be partial).
 `accepted`, `completed`, `delivered`, `discarded`, `duplicate` and rejection/error
 counters cover tool **and lifecycle** reservations. `tool_observed` counts distinct
@@ -146,8 +146,11 @@ never sum them as lost events. Counts are not inferred from sampled warning logs
 
 Only fixed counter names/counts, root namespace, package version and minute bucket
 are stored: no tool names, identifiers, queries, arguments, paths from results or
-bodies. A bounded in-memory accumulator flushes on the observer thread after
-processing; tool-return paths do no diagnostic database I/O. Config-resolution
+bodies. A bounded in-memory accumulator batches ready receipts before flushing
+on the observer thread: at a queue gap, a drain boundary, or after at most 256
+completions. This reduces per-receipt SQLite contention but does not isolate slow
+filesystem I/O; persistence can still delay later receipts and bounded drains.
+Tool-return paths do no diagnostic database I/O. Config-resolution
 failures cannot be safely assigned to a root. Startup failures/rejections with no
 subsequent processed work, in-flight work, process termination, lock/write failures
 and accumulator scope overflow can lose aggregates; write failures emit a fixed
@@ -155,6 +158,10 @@ warning and are not retried. Teardown remains bounded. The report explicitly say
 `coverage: observed_callbacks_only` and `persistence: best_effort`; it is neither a
 complete host-call denominator nor a lossless learning-capture guarantee. Empty
 counts on old/legacy hosts mean no recorded diagnostics, not perfect capture.
+The native `knowledge_usage_report` response projects only observed tool outcomes,
+attribution gaps and capture/rejection failures with the coverage caveat. Internal
+queue accounting, missing-ID detail, package version and persistence metadata stay
+in the operator report; an empty native projection is omitted.
 
 ## Older hosts
 

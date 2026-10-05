@@ -12,10 +12,14 @@ from hermes_local_knowledge.config import Config, IndexSettings
 
 
 @pytest.mark.parametrize("tool,marker", [("skill_view", "_source_path"), ("read_file", "path")])
-def test_large_content_metadata_only(tool: str, marker: str) -> None:
+@pytest.mark.parametrize("body_size", [1300000, 4194176], ids=["megabyte", "near-scan-limit"])
+def test_large_content_metadata_only(tool: str, marker: str, body_size: int) -> None:
     # skill_view is uncapped; read_file's character cap is host configurable.
     raw = json.dumps({"success": True, marker: "/synthetic/SKILL.md",
-                      "content": "private body " * 100000})
+                      "content": "private body " + "x" * (body_size - 13)})
+    assert len(raw) <= observer.MAX_CONTENT_SCAN_CHARS
+    if body_size == 4194176:
+        assert observer.MAX_CONTENT_SCAN_CHARS - len(raw) < 128
     payload = {"tool_name": tool}
     observer.project_result(payload, raw, False)
     assert payload["status"] == "success"
@@ -48,7 +52,10 @@ def test_durable_diagnostics_scope_and_event_counts(tmp_path: Path, monkeypatch:
     assert diagnostics["plugin_version"] == __version__
     assert diagnostics["coverage"] == "observed_callbacks_only"
     assert diagnostics["persistence"] == "best_effort"
-    assert plugin._agent_usage_report(report)["observer_diagnostics"] == diagnostics
+    assert plugin._agent_usage_report(report)["observer_diagnostics"] == {
+        "coverage": "observed_callbacks_only",
+        "counts": {"tool_observed": 1, "outcome_success": 1, "attribution_skipped": 1},
+    }
     with sqlite3.connect(cfg.state_dir / "usage.sqlite") as conn:
         assert "task" not in str(conn.execute("SELECT * FROM observer_counts").fetchall())
         conn.executemany(
@@ -91,6 +98,42 @@ def test_diagnostics_do_not_block_foreground_and_drain_covers_flush(
         assert all(thread is not threading.current_thread() for thread in threads)
         release.set()
         assert queue.drain(5)
+    finally:
+        release.set()
+        assert queue.close(5)
+
+
+def test_diagnostics_batch_receipts_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = Config(tmp_path / "source", tmp_path / "profile", tmp_path / "state", IndexSettings())
+    monkeypatch.setattr(observer, "resolve_config", lambda: cfg)
+    observed: list[str] = []
+    batches: list[dict[str, int]] = []
+
+    def writer(root, state_dir, bucket, counts):
+        # Persistence must not interrupt the already-admitted delivery batch.
+        assert observed == ["first", "second", "third"]
+        batches.append(counts)
+        return True
+
+    release = threading.Event()
+
+    def consume(kind, **payload):
+        assert release.wait(5)
+        observed.append(payload["label"])
+
+    monkeypatch.setattr(telemetry, "record_observer_counts", writer)
+    queue = observer.Observer(consume)
+    try:
+        slots = [queue.reserve("end") for _ in range(3)]
+        for slot, label in zip(slots, ("first", "second", "third")):
+            assert slot is not None
+            queue.finish(slot, {"label": label})
+        release.set()
+        assert queue.drain(5)
+        assert len(batches) == 1
+        assert batches[0]["accepted"] == batches[0]["completed"] == 3
     finally:
         release.set()
         assert queue.close(5)
@@ -143,7 +186,8 @@ def test_durable_event_partition_and_duplicate_suppression(tmp_path: Path, monke
         assert "private-" not in str(conn.execute("SELECT * FROM observer_counts").fetchall())
 
 
-@pytest.mark.parametrize("result", ["not JSON", json.dumps({"success": True, "padding": "x" * 70000})])
+@pytest.mark.parametrize("result", ["not JSON", json.dumps({"success": True, "padding": "x" * 70000})],
+                         ids=["malformed", "metadata-budget"])
 def test_receipt_diagnostics_keep_admission_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: str,
 ) -> None:
