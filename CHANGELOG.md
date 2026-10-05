@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.4b2] - 2026-10-05
+
+### Added
+
+- Concise usage-report observer diagnostics: privacy-safe durable aggregates by source root, report window and package version distinguish accepted/processed receipts, context skips, unknown results and overlapping failure reasons. Coverage remains explicitly best-effort and limited to callbacks supplied by the host.
+
+### Fixed
+
+- Admit legitimate multi-megabyte file/skill content to the existing bounded metadata-only projection, without retaining raw bodies or relaxing complete-envelope validation, same-turn attribution or search deduplication.
+
+[0.5.4b2]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.4b1...v0.5.4b2
+
+## [0.5.4b1] - 2026-10-04
+
+### Added
+
+- Off-by-default `verified_routing.mode: veto` (`off`/`shadow` unchanged): cancel only actual explicit feedback promotions using fresh, exact source-only applicability receipts, restoring the complete unassisted page without positive AI routing.
+- Bind original host scope through public middleware, selected feedback, effective query/filter/limit, lookup context, namespaces, metadata and source hashes/age; absent scope or unusable evidence retains incumbent behavior and stale receipts are requeued.
+- Persist truthful `applicability_vetoed` usage with attempted identities and routing high-waters. Already-first/implicit routes and direct caller-owned indexes remain unchanged.
+
+### Fixed
+
+- Keep promotion-review cases outside the legacy shadow-route reuse scan limit, so newer promotion receipts cannot hide eligible replacement routes.
+- Exclude baseline-restoring applicability vetoes from route-change totals while retaining their separate outcome telemetry.
+- Validate cached source identities and citations against one current read per receipt, preserving stale/invalid evidence rejection without duplicate synchronous file reads.
+- Exercise real native/deferred middleware fixtures on both the public PyPI Hermes host and newer profile-scoped official hosts without weakening concurrency or reset assertions.
+
+### Operational notes
+
+- Opt-in background preparation sends bounded private task/source evidence to the configured model provider and consumes additional tokens. No model/network call runs in search; this candidate makes no claim of real-world ranking gains or savings.
+- Installation/upgrade do not enable vetoes. Roll back to `off`, or `shadow` for diagnostics without result changes. Production veto enablement requires a separate opt-in.
+
+[0.5.4b1]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3...v0.5.4b1
+
 ## [0.5.3] - 2026-10-03
 
 Stable release of the 0.5.3 beta series. Runtime behavior is unchanged from

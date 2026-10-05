@@ -68,7 +68,7 @@ class ImplicitFeedbackSettings:
 
 @dataclass(frozen=True)
 class VerifiedRoutingSettings:
-    """Opt-in, bounded private routing investigations; never live promotion."""
+    """Off-by-default private shadow reviews or cached explicit-promotion vetoes."""
 
     mode: str = "off"
     max_cases_per_worker: int = 1
@@ -454,7 +454,7 @@ def _resolve_verified_routing_settings(section: Mapping[str, Any]) -> VerifiedRo
     # Unknown values (including YAML booleans) cannot enable private capture.
     mode = values.get("mode")
     return VerifiedRoutingSettings(
-        mode="shadow" if mode == "shadow" else "off",
+        mode=mode if mode in ("shadow", "veto") else "off",
         max_cases_per_worker=_coerce_int(
             values.get("max_cases_per_worker"), default=1, minimum=1, maximum=2,
         ),

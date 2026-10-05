@@ -40,7 +40,7 @@ The plugin registers these native tools in the `local_knowledge` toolset:
 | `knowledge_feedback` | Record local lookup feedback such as `useful`, `missing`, `stale`, or `wrong_artifact`. |
 | `knowledge_usage_report` | Summarize local usage, failures, zero-result queries, and feedback. |
 
-Native tool responses are intentionally model-facing and concise. Search, get, and neighbor calls return only routing metadata needed to choose or inspect the next artifact, plus actionable warnings or rebuild state when present. Internal trigger vocabularies, index/configuration diagnostics, hashes, counts, and local database paths remain available to the service, CLI doctor, and local telemetry but are not serialized into routine agent context. The usage-report tool similarly returns a compact improvement-oriented projection rather than the complete telemetry schema.
+Native tool responses are intentionally model-facing and concise. Search, get, and neighbor calls return only routing metadata needed to choose or inspect the next artifact, plus actionable warnings or rebuild state when present. Internal trigger vocabularies, index/configuration diagnostics, hashes, counts, and local database paths remain available to the service, CLI doctor, and local telemetry but are not serialized into routine agent context. The usage-report tool similarly returns a compact improvement-oriented projection rather than the complete telemetry schema. Its observer diagnostics are privacy-safe aggregates for the current root/version/window, explicitly limited to best-effort observed callbacks; overlapping skip reasons are not a complete learning-capture denominator.
 
 The plugin registers `pre_llm_call`, `on_session_end`, and `on_session_finalize` hooks. On official Hermes v2026.9.14 and newer, public `tool_execution` middleware captures tool completions into a bounded plugin-owned serial observer while tools remain parallel. Older hosts retain a warned, best-effort `post_tool_call` fallback; the two transports are never registered together. See [observer transport, lifecycle fences, privacy and loss limits](docs/observer-transport.md). When the configured source is available, Hermes hosts with cache-safe plugin prompt sections add one concise system-prompt hint for each new session: use `knowledge_search` before broad file search for local Hermes/homelab artifacts, then verify live state directly. Older hosts use the same hint through a deduplicated `pre_llm_call` compatibility fallback. In either case, `pre_llm_call` continues to bind optional same-turn implicit search-result feedback; the remaining lifecycle hooks support exact successful consumption through `knowledge_get`, `skill_view`, or `read_file` plus tool-OKF capture/generation while keeping correlation inside the plugin when Hermes dispatches local-knowledge tools through its deferred-tool bridge.
 
@@ -188,6 +188,17 @@ An optional shadow lane captures task-linked searches with separate immediate lo
 Eligible turn-end hooks wake a finite detached supervisor (teardown remains a fallback), so ready shadow work can progress across batches without another message. Each supervisor is limited to 15 minutes and 16 child batches; this can spend more tokens than one batch. Child interruptions are recovered only while the supervisor survives, using existing lease expiry and ambiguous-call closure. No permanent scheduler is installed.
 
 Native `knowledge_search` accepts optional bounded `lookup` fields (`intent`, `target`, `operation`, `context`), explicitly assistant-supplied rather than authority or execution permission. No transcript window is captured. Enabling shadow mode retains bounded private task/lookup text and sends task/source evidence to the configured model provider; it incurs additional model calls. It is independent of OKF and implicit feedback. See [configuration, lifecycle, cost, limitations and operator commands](docs/verified-routing-shadow.md) before opting in. Neither installation nor upgrade enables it.
+
+### Cached applicability veto (candidate, off by default)
+
+`local_knowledge.verified_routing.mode: veto` opts into source-only background
+review of actual explicit feedback promotions. A fresh, exactly bound, cited
+`inapplicable` receipt cancels only that promotion and restores the complete
+unassisted page; ordinary retrieval remains available. No positive AI routing is
+enabled, no model runs in search, and `off`/`shadow` behavior is unchanged.
+Missing host scope or unusable evidence retains incumbent behavior. This adds
+private source/model disclosure and preparation cost, not demonstrated ranking
+gains. See [enablement, evidence binding and rollback](docs/verified-routing-shadow.md#cached-applicability-veto).
 
 ## CLI
 

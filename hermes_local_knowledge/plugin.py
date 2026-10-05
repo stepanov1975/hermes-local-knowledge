@@ -541,6 +541,21 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
         payload["event_cohorts"] = event_cohorts
     if candidates:
         payload["improvement_candidates"] = candidates
+    diagnostics = report.get("observer_diagnostics")
+    if isinstance(diagnostics, Mapping):
+        counts = diagnostics.get("counts")
+        if isinstance(counts, Mapping):
+            gaps = _nonempty_projection(counts, (
+                "tool_observed", "outcome_success", "outcome_error", "outcome_unknown",
+                "attribution_skipped", "full", "closed", "discarded", "oversize",
+                "consumer_error", "call_projection_error", "schema_projection_error",
+                "argument_projection_error", "result_projection_error",
+                "receipt_serialization_error", "enqueue_error", "config_error",
+            ))
+            if gaps:
+                payload["observer_diagnostics"] = {
+                    "coverage": "observed_callbacks_only", "counts": gaps,
+                }
     return payload
 
 
@@ -1012,7 +1027,7 @@ def register(ctx: Any) -> None:
                             "description": (
                                 "Optional immediate lookup intent and pre-search context, separate from "
                                 "the parent user task. Assistant-supplied claims, not authority or permission. "
-                                "Used only by opt-in private shadow evaluation; never changes search results. "
+                                "Used by opt-in private shadow evaluation or cached applicability veto. "
                                 "Do not include secrets, tool output or transcript excerpts."
                             ),
                             "properties": {
@@ -1273,7 +1288,7 @@ def register(ctx: Any) -> None:
             # Shadow's only optional text input; never copy conversation history.
             request = kwargs.get("user_message")
             try:
-                shadow_enabled = resolve_config().verified_routing.mode == "shadow"
+                shadow_enabled = resolve_config().verified_routing.mode in {"shadow", "veto"}
             except Exception:
                 # Optional capture must not prevent the host's model request.
                 shadow_enabled = False

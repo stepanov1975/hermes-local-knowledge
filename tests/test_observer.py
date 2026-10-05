@@ -425,11 +425,12 @@ def test_observer_case_ids_fit_windows_environment() -> None:
     # before the test body runs, and make failure reporting prohibitively large.
     result = subprocess.run(
         [sys.executable, "-B", "-m", "pytest", "--collect-only", "-q",
-         "-o", "addopts=", "tests/test_observer.py"],
+         "-o", "addopts=", "tests/test_observer.py", "tests/test_learning_telemetry.py"],
         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
         timeout=30, check=True,
     )
-    node_ids = [line for line in result.stdout.splitlines() if line.startswith("tests/test_observer.py::")]
+    node_ids = [line for line in result.stdout.splitlines()
+                if line.startswith(("tests/test_observer.py::", "tests/test_learning_telemetry.py::"))]
     assert node_ids
     # Keep a generous margin for checkout paths and pytest's phase suffix.
     oversized = [(node_id[:100], len(node_id)) for node_id in node_ids if len(node_id) > 1024]
@@ -825,7 +826,7 @@ def test_ineligible_consumption_does_not_learn(cfg: Config, consumer: str, fault
     ctx.middleware({"query": "Atlas restore runbook"}, lambda a: plugin._handle_search(a, **IDS),
                    tool_name="knowledge_search", **IDS)
     raw = json.dumps({"success": fault != "error", "_source_path": str(path),
-                      "content": "PRIVATE" * (200000 if fault == "budget" else 15000)})
+                      "content": "PRIVATE" * (observer.MAX_CONTENT_SCAN_CHARS // 7 + 1 if fault == "budget" else 15000)})
     if fault == "malformed":
         raw = raw[:-1]
     ids = {**IDS, "api_request_id": "later", "tool_call_id": "consume"}
@@ -848,7 +849,7 @@ def test_ineligible_consumption_does_not_learn(cfg: Config, consumer: str, fault
     '{"content": "' + 'x' * 90000 + '"',
     '{"content": "' + 'x' * 90000 + '\\q"}',
     json.dumps({"output": "x" * 90000}),
-    json.dumps({"content": "x" * 1100000}),
+    json.dumps({"content": "x" * observer.MAX_CONTENT_SCAN_CHARS}),
 ], ids=[
     "not-json", "nonfinite-error", "duplicate-status", "truncated-content",
     "invalid-content-escape", "oversized-output", "content-scan-budget",

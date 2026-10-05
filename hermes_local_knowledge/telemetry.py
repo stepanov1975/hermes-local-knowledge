@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -1167,6 +1168,40 @@ def _implicit_consumed_rank_lower_bound(
     }
 
 
+def record_observer_counts(root: str, state_dir: str, bucket: str, counts: dict[str, int]) -> bool:
+    """Best-effort aggregate only; never retain callback identities or bodies."""
+    try:
+        database = Path(state_dir) / "usage.sqlite"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(database, timeout=0.05)) as conn, conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS observer_counts (
+                root TEXT NOT NULL, plugin_version TEXT NOT NULL, bucket TEXT NOT NULL,
+                counter TEXT NOT NULL, count INTEGER NOT NULL,
+                PRIMARY KEY (root, plugin_version, bucket, counter))""")
+            conn.executemany("""INSERT INTO observer_counts VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(root, plugin_version, bucket, counter)
+                DO UPDATE SET count = count + excluded.count""",
+                [(root, __version__, bucket, key, value) for key, value in counts.items()])
+        return True
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def _observer_diagnostics(conn: sqlite3.Connection | None, root: str, since: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "plugin_version": __version__, "coverage": "observed_callbacks_only",
+        "persistence": "best_effort", "counts": {},
+    }
+    if conn is not None:
+        try:
+            result["counts"] = dict(conn.execute("""SELECT counter, SUM(count)
+                FROM observer_counts WHERE root = ? AND plugin_version = ? AND bucket >= ?
+                GROUP BY counter ORDER BY counter""", (root, __version__, since[:16] + ":00Z")))
+        except sqlite3.Error:
+            pass  # Older databases have no observer history; zero is not complete coverage.
+    return result
+
+
 def _usage_report(
     root: Path,
     *,
@@ -1194,6 +1229,7 @@ def _usage_report(
         "implicit_feedback_count": 0,
         "live_implicit_feedback_count": 0,
         "implicit_feedback_by_consumer": [],
+        "observer_diagnostics": _observer_diagnostics(None, root_text, since),
         "current_native_search_quality": {
             "cohort": "current_live_native_search",
             "plugin_version": __version__,
@@ -1269,6 +1305,7 @@ def _usage_report(
 
     conn = _usage_connect(root, usage_db)
     try:
+        report["observer_diagnostics"] = _observer_diagnostics(conn, root_text, since)
         total_events = conn.execute(
             "SELECT COUNT(*) FROM usage_events WHERE ts >= ?",
             (since,),
@@ -1323,7 +1360,8 @@ def _usage_report(
                    COUNT(*) - COALESCE(SUM(success), 0) AS errors,
                    COALESCE(SUM(CASE WHEN success = 1 AND COALESCE(result_count, 0) = 0 THEN 1 ELSE 0 END), 0)
                        AS zero_results,
-                   COALESCE(SUM(CASE WHEN COALESCE(route_outcome, 'none') <> 'none' THEN 1 ELSE 0 END), 0)
+                   COALESCE(SUM(CASE WHEN COALESCE(route_outcome, 'none') NOT IN
+                        ('none', 'applicability_vetoed') THEN 1 ELSE 0 END), 0)
                        AS route_changes,
                    ROUND(AVG(latency_ms), 1) AS avg_latency_ms,
                    MAX(ts) AS last_seen
