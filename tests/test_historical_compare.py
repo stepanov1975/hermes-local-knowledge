@@ -2750,7 +2750,7 @@ def test_cli_returns_nonzero_when_acceptance_fails(tmp_path: Path, monkeypatch: 
     assert json.loads(capsys.readouterr().out)["accepted"] is False
 
 
-def test_temporary_cleanup_failure_does_not_mask_primary_error(
+def test_temporary_failure_evidence_is_retained_without_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -2772,7 +2772,10 @@ def test_temporary_cleanup_failure_does_not_mask_primary_error(
 
     assert status == 2
     assert json.loads(captured.out)["error_type"] == "RuntimeError"
-    assert "private evaluation cleanup failed" in captured.err
+    assert "Private failure evidence retained at:" in captured.err
+    assert "cleanup failure" not in captured.err
+    assert temporary.exists()
+    assert json.loads((temporary / "failure.json").read_text())["message"] == "primary failure"
 
 
 def test_self_comparison_is_zero_diff_and_public_outputs_redact_private_canary(
