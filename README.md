@@ -270,7 +270,7 @@ Tool OKFs are compact routing notes for tools Hermes has actually used. They are
 1. When `okf.enabled` is true, the observer (or legacy `post_tool_call` fallback) records only a bounded structural projection: tool identity/toolset, a sanitized schema shape, argument shape, counters, and a redacted error class. It does not persist raw argument values, tool output, transcripts, emails, OCR text, private documents, schema descriptions/examples/defaults, or secret values.
 2. When `okf.auto_generate` is true, accepted `on_session_finalize` work follows already-admitted observations, performs a read-only, tightly bounded durable-queue check and launches a detached worker only when work is available. Legacy hosts run this check inline without an observer fence.
 3. The worker acquires one fixed lease of `max(300, 2 * max_generation_seconds + 120)` seconds and claims at most `max_candidates_per_session` rows. Lease and claim ownership are checked again before publication.
-4. If rows were claimed, the worker makes exactly one `ctx.llm.complete_structured` batch call with the privacy-safe routing projection and a bounded same-toolset related-tool allowlist. The model receives no terminal or file tools.
+4. Claimed legacy notes that can be converted losslessly are updated without a model call. If any claimed rows still need model-authored content, the worker makes at most one `ctx.llm.complete_structured` batch call with the privacy-safe routing projection and a bounded same-toolset related-tool allowlist. The model receives no terminal or file tools.
 5. Each result is identity-checked, rendered to a worker-unique temporary file, prevalidated, and published inside a short token/lease-fenced transaction. A stale worker cannot publish. Successful publication marks the managed index dirty.
 
 Version 0.4.0 reads the current v0.3.12 queue shape by normalizing a selected claim's stored schema into the bounded routing projection. It does not promise a general migration ladder for arbitrary older private schemas.
@@ -343,7 +343,7 @@ This project benefits from people who contribute code, share ideas, or inspire f
 - `evaluation.py` — read-only feedback-label replay and exact/parent-equivalent metrics.
 - `service.py` — one resolved configuration's managed index and telemetry lifecycle.
 - `okf.py` — privacy-safe OKF queue, hooks, detached worker, validation, and fenced publication.
-- `plugin.py` — Hermes registration for five tools, four hooks, the bundled skill, and installed CLI adapter; `register` is its public export.
+- `plugin.py` — Hermes registration for five tools, three lifecycle hooks plus tool-execution middleware (a fourth, best-effort post-tool hook on older hosts instead of middleware), the bundled skill, and installed CLI adapter; `register` is its public export.
 - `cli.py` — primary standalone command surface and the smaller Hermes CLI adapter.
 - `indexer.py` — thin compatibility facade exporting exactly `Artifact`, `Edge`, `IndexSettings`, `build_index`, `search_index`, `get_artifact`, `get_neighbors`, and `main`.
 - `__init__.py` — package version.
