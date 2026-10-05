@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -77,12 +78,26 @@ def test_fatal_evaluator_emits_single_redacted_json_and_private_traceback(
     assert json.loads(status.read_text())["stage"] == "failed"
 
 
+@pytest.fixture(params=[False, True])
+def receipt_failure(request: Any, monkeypatch: pytest.MonkeyPatch) -> bool:
+    original = compare.write_private_json
+
+    def write(path: Path, payload: Any) -> None:
+        if request.param and path.name.endswith(".receipt.json"):
+            raise OSError("private receipt path detail")
+        original(path, payload)
+
+    monkeypatch.setattr(compare, "write_private_json", write)
+    return bool(request.param)
+
+
 @pytest.mark.parametrize("body", [
     "print('malformed private output')",
     "import sys; print('private crash detail', file=sys.stderr); sys.exit(9)",
 ])
 def test_child_protocol_failures_preserve_private_streams_and_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], body: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    receipt_failure: bool, body: str,
 ) -> None:
     child = tmp_path / "child.py"
     child.write_text(body)
@@ -91,20 +106,23 @@ def test_child_protocol_failures_preserve_private_streams_and_receipt(
     with pytest.raises(RuntimeError):
         compare._invoke_evaluator(tmp_path, {"action": "evaluate"}, request_dir,
                                   api_module="unused", home=tmp_path, hermes_home=tmp_path)
-    receipt = json.loads(next(request_dir.glob("*.receipt.json")).read_text())
-    assert receipt["returncode"] in (0, 9)
-    assert Path(receipt["stdout_file"]).exists()
-    assert Path(receipt["stderr_file"]).exists()
+    if not receipt_failure:
+        receipt = json.loads(next(request_dir.glob("*.receipt.json")).read_text())
+        assert receipt["returncode"] in (0, 9)
+        assert Path(receipt["stdout_file"]).exists()
+        assert Path(receipt["stderr_file"]).exists()
     for path in request_dir.iterdir():
         if os.name == "posix":
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
     streams = capsys.readouterr()
     assert streams.out == ""
     assert "private" not in streams.err
+    assert ("receipt_write_failed" in streams.err) is receipt_failure
 
 
 def test_live_child_status_visible_before_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    receipt_failure: bool,
 ) -> None:
     child = tmp_path / "child.py"
     child.write_text(
@@ -141,6 +159,7 @@ def test_live_child_status_visible_before_completion(
     assert '"completed":2' in streams.err
     assert '"stage":"labels"' in streams.err
     assert "private query" not in streams.err
+    assert ("receipt_write_failed" in streams.err) is receipt_failure
 
 
 @pytest.mark.parametrize("accepted", [False, True])
@@ -242,6 +261,7 @@ def test_interrupted_comparison_retains_private_evidence(
 
 def test_interrupted_child_is_reaped_and_receipted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    receipt_failure: bool,
 ) -> None:
     child_script = tmp_path / "child.py"
     child_script.write_text("import time; time.sleep(60)")
@@ -262,17 +282,19 @@ def test_interrupted_child_is_reaped_and_receipted(
                                   api_module="unused", home=tmp_path, hermes_home=tmp_path)
     assert len(children) == 1
     assert children[0].poll() is not None
-    receipt = json.loads(next(request_dir.glob("*.receipt.json")).read_text())
-    assert receipt["returncode"] == children[0].returncode
-    assert receipt["returncode"] != 0
-    for key in ("request_file", "stdout_file", "stderr_file", "failures_file"):
-        assert Path(receipt[key]).exists()
+    if not receipt_failure:
+        receipt = json.loads(next(request_dir.glob("*.receipt.json")).read_text())
+        assert receipt["returncode"] == children[0].returncode
+        assert receipt["returncode"] != 0
+        for key in ("request_file", "stdout_file", "stderr_file", "failures_file"):
+            assert Path(receipt[key]).exists()
     for path in request_dir.iterdir():
         if os.name == "posix":
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
     streams = capsys.readouterr()
     assert streams.out == ""
     assert "private interrupt detail" not in streams.err
+    assert ("receipt_write_failed" in streams.err) is receipt_failure
 
 
 def test_startup_failure_keeps_original_redacted_contract(
@@ -321,3 +343,133 @@ def test_diagnostics_work_without_posix_fchmod(
     monkeypatch.delattr(os, "fchmod", raising=False)
     evaluator._failure_evidence(ValueError("retained diagnosis"))
     assert json.loads(diagnostic.read_text())["message"] == "retained diagnosis"
+
+
+@pytest.fixture
+def printed_api(tmp_path: Path) -> tuple[Path, dict[str, Any], bytes]:
+    # Real evaluator import and callback path; no monkeypatched child dispatch.
+    printed = "private callback context –\r\npartial".encode("utf-8")
+    (tmp_path / "printed_api.py").write_text(
+        "import time\n"
+        "def search_index(db, query, **kwargs):\n"
+        f"    print({printed.decode('utf-8')!r}, end='')\n"
+        "    if query == 'stall': time.sleep(60)\n"
+        "    if query == 'fail': raise ValueError('private callback failure')\n"
+        "    return []\n"
+        "def build_index(*args): return [], []\n"
+        "def get_artifact(*args): return None\n"
+        "def get_neighbors(*args): return []\n"
+    )
+    cases = tmp_path / "cases.json"
+    request = {"action": "evaluate", "case_file": str(cases),
+               "full_db": str(tmp_path / "full.sqlite"),
+               "synthetic_db": str(tmp_path / "synthetic.sqlite")}
+    return cases, request, printed
+
+
+def _printed_case(cases: Path, query: str) -> None:
+    cases.write_text(json.dumps({"labels": {"positive": [{"query_id": "q", "query": query}]}}))
+
+
+@pytest.mark.parametrize("query", ["ok", "fail"])
+def test_real_evaluator_private_capture_keeps_json_and_nonfatal_contract(
+    tmp_path: Path, printed_api: tuple[Path, dict[str, Any], bytes], query: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cases, request, printed = printed_api
+    _printed_case(cases, query)
+    request_dir = tmp_path / "requests"
+    result = compare._invoke_evaluator(tmp_path, request, request_dir,
+                                       api_module="printed_api", home=tmp_path, hermes_home=tmp_path)
+    receipt = json.loads(next(request_dir.glob("*.receipt.json")).read_text())
+    capture = Path(receipt["captured_stdout_file"])
+    assert capture.read_bytes() == printed
+    assert result["captured_stdout_sha256"] == hashlib.sha256(printed).hexdigest()
+    assert result["captured_stdout_bytes"] == len(printed)
+    assert json.loads(Path(receipt["stdout_file"]).read_text()) == result
+    outcome = result["label_search"]["q"]
+    if query == "fail":
+        assert set(outcome) == {"status", "error_type", "error_sha256", "duration_ms"}
+        assert outcome["status"] == "error"
+        evidence = json.loads(Path(receipt["failures_file"]).read_text())
+        assert Path(evidence["captured_stdout_file"]) == capture
+        assert evidence["message"] == "private callback failure"
+    else:
+        assert outcome["status"] == "ok"
+    if os.name == "posix":
+        assert stat.S_IMODE(capture.stat().st_mode) == 0o600
+    public_json = json.dumps(result)
+    assert "private callback context" not in public_json
+    assert "private callback failure" not in public_json
+    assert "captured_stdout_file" not in public_json
+    streams = capsys.readouterr()
+    assert streams.out == ""
+    assert "private" not in streams.err
+
+
+def test_real_evaluator_printed_context_survives_parent_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    printed_api: tuple[Path, dict[str, Any], bytes], capsys: pytest.CaptureFixture[str],
+) -> None:
+    cases, request, printed = printed_api
+    _printed_case(cases, "stall")
+    request_dir = tmp_path / "requests"
+    original_wait = compare.subprocess.Popen.wait
+    children: list[Any] = []
+
+    def interrupt_after_print(child: Any, timeout: Any = None) -> Any:
+        if timeout == 5 and not children:
+            children.append(child)
+            deadline = compare.time.monotonic() + 10
+            while compare.time.monotonic() < deadline:
+                paths = list(request_dir.glob("*.failures.stdout.log"))
+                if paths and paths[0].read_bytes() == printed:
+                    assert child.poll() is None  # callback is still stalled
+                    raise KeyboardInterrupt("private interrupt detail")
+                try:
+                    original_wait(child, timeout=0.02)
+                except compare.subprocess.TimeoutExpired:
+                    continue
+                pytest.fail("evaluator exited before its stalled callback was interrupted")
+            raise AssertionError("live printed capture not observed")
+        return original_wait(child, timeout=timeout)
+
+    monkeypatch.setattr(compare.subprocess.Popen, "wait", interrupt_after_print)
+    with pytest.raises(KeyboardInterrupt):
+        compare._invoke_evaluator(tmp_path, request, request_dir,
+                                  api_module="printed_api", home=tmp_path, hermes_home=tmp_path)
+    assert children[0].poll() is not None
+    receipt = json.loads(next(request_dir.glob("*.receipt.json")).read_text())
+    assert receipt["returncode"] == children[0].returncode != 0
+    capture = Path(receipt["captured_stdout_file"])
+    assert capture.read_bytes() == printed
+    assert Path(receipt["stdout_file"]).read_bytes() == b""
+    assert printed not in Path(receipt["stderr_file"]).read_bytes()
+    if os.name == "posix":
+        assert stat.S_IMODE(capture.stat().st_mode) == 0o600
+    streams = capsys.readouterr()
+    assert streams.out == ""
+    assert "private" not in streams.err
+
+
+def test_direct_evaluator_without_diagnostics_preserves_capture_contract(
+    tmp_path: Path, printed_api: tuple[Path, dict[str, Any], bytes],
+) -> None:
+    cases, request, printed = printed_api
+    _printed_case(cases, "fail")
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request))
+    child = compare.subprocess.run(
+        [compare.sys.executable, str(compare.EVALUATOR), "--request", str(request_path),
+         "--ref-root", str(tmp_path), "--api-module", "printed_api"],
+        cwd=tmp_path, env=compare.build_child_env(tmp_path, home=tmp_path, hermes_home=tmp_path,
+                                                source_root=None, state_dir=None, explicit_root=True),
+        capture_output=True, check=True,
+    )
+    payload = json.loads(child.stdout)
+    assert payload["ok"] is True
+    assert payload["label_search"]["q"]["status"] == "error"
+    assert payload["captured_stdout_sha256"] == hashlib.sha256(printed).hexdigest()
+    assert payload["captured_stdout_bytes"] == len(printed)
+    assert b"private" not in child.stdout + child.stderr
+    assert not list(tmp_path.glob("*.stdout.log"))

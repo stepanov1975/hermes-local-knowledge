@@ -9,7 +9,7 @@ index API.
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import asdict, is_dataclass, replace
 import hashlib
 import importlib
@@ -180,9 +180,14 @@ def _safe_call(callback: Callable[[], Any]) -> dict[str, Any]:
     try:
         value = _lookup_json_value(callback())
     except Exception as exc:  # individual replay failures are evaluator data
-        _failure_evidence(
-            exc, captured_stdout=captured.getvalue()[output_start:] if captured is not None else "",
+        evidence = (
+            {"captured_stdout": captured.getvalue()[output_start:]}
+            if captured is not None
+            else {"captured_stdout_file": str(_DIAGNOSTICS.with_suffix(".stdout.log"))}
+            if _DIAGNOSTICS is not None
+            else {"captured_stdout": ""}
         )
+        _failure_evidence(exc, **evidence)
         rendered = f"{type(exc).__name__}: {exc}"
         return {
             "status": "error",
@@ -830,18 +835,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     _CONTEXT.update(stage="request", ref_root=str(args.ref_root), api_module=str(args.api_module))
     _progress("start")
     captured_stdout = io.StringIO()
+    capture_path: Path | None = None
     status = 0
     try:
-        with redirect_stdout(captured_stdout):
-            request = json.loads(args.request.read_text(encoding="utf-8"))
-            if not isinstance(request, dict):
-                raise TypeError("request must contain a JSON object")
-            _CONTEXT.update(stage="import", action=request.get("action"))
-            _progress("import")
-            module, module_path = _import_api(str(args.api_module), args.ref_root)
-            _CONTEXT["stage"] = "dispatch"
-            _progress("dispatch")
-            result = _dispatch(module, request, args.ref_root.resolve())
+        with ExitStack() as stack:
+            capture: Any = captured_stdout
+            if _DIAGNOSTICS is not None:
+                path = _DIAGNOSTICS.with_suffix(".stdout.log")
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                    raw = stack.enter_context(os.fdopen(fd, "wb", buffering=0))
+                    if hasattr(os, "fchmod"):
+                        os.fchmod(raw.fileno(), 0o600)
+                    else:
+                        os.chmod(path, 0o600)
+                    capture = stack.enter_context(io.TextIOWrapper(
+                        raw, encoding="utf-8", newline="", write_through=True,
+                    ))
+                    capture_path = path
+                except OSError:
+                    print("evaluator-progress capture_write_failed", file=sys.stderr, flush=True)
+            with redirect_stdout(capture):
+                request = json.loads(args.request.read_text(encoding="utf-8"))
+                if not isinstance(request, dict):
+                    raise TypeError("request must contain a JSON object")
+                _CONTEXT.update(stage="import", action=request.get("action"))
+                _progress("import")
+                module, module_path = _import_api(str(args.api_module), args.ref_root)
+                _CONTEXT["stage"] = "dispatch"
+                _progress("dispatch")
+                result = _dispatch(module, request, args.ref_root.resolve())
         payload: dict[str, Any] = {
             "ok": True,
             "api_module": str(args.api_module),
@@ -849,7 +873,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             **result,
         }
     except Exception as exc:
-        _failure_evidence(exc, captured_stdout=captured_stdout.getvalue())
+        if capture_path is not None:
+            _failure_evidence(exc, captured_stdout_file=str(capture_path))
+        else:
+            _failure_evidence(exc, captured_stdout=captured_stdout.getvalue())
         status = 1
         rendered = f"{type(exc).__name__}: {exc}"
         payload = {
@@ -857,10 +884,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "error_type": type(exc).__name__,
             "error_sha256": _sha256_text(rendered),
         }
-    captured = captured_stdout.getvalue()
-    if captured:
-        payload["captured_stdout_sha256"] = _sha256_text(captured)
-        payload["captured_stdout_bytes"] = len(captured.encode("utf-8"))
+    captured_bytes = (
+        capture_path.read_bytes() if capture_path is not None
+        else captured_stdout.getvalue().encode("utf-8")
+    )
+    if captured_bytes:
+        payload["captured_stdout_sha256"] = hashlib.sha256(captured_bytes).hexdigest()
+        payload["captured_stdout_bytes"] = len(captured_bytes)
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
     _progress("complete" if status == 0 else "failed")
     return status

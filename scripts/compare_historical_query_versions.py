@@ -436,13 +436,17 @@ def _invoke_evaluator(
                     last_status = json.loads(progress_path.read_text(encoding="utf-8"))
                 except (OSError, ValueError):
                     pass
-                write_private_json(request_path.with_suffix(".receipt.json"), {
-                    "action": request.get("action"), "api_module": api_module,
-                    "checkout": str(checkout), "returncode": child.returncode,
-                    "last_status": last_status, "stdout_file": str(stdout_path),
-                    "stderr_file": str(stderr_path), "failures_file": str(diagnostics_path),
-                    "request_file": str(request_path),
-                })
+                try:
+                    write_private_json(request_path.with_suffix(".receipt.json"), {
+                        "action": request.get("action"), "api_module": api_module,
+                        "checkout": str(checkout), "returncode": child.returncode,
+                        "last_status": last_status, "stdout_file": str(stdout_path),
+                        "stderr_file": str(stderr_path), "failures_file": str(diagnostics_path),
+                        "captured_stdout_file": str(diagnostics_path.with_suffix(".stdout.log")),
+                        "request_file": str(request_path),
+                    })
+                except OSError:
+                    print("historical-progress receipt_write_failed", file=sys.stderr, flush=True)
     stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
     stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
     result = subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
