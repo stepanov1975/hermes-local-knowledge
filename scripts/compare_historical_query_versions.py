@@ -445,7 +445,7 @@ def _invoke_evaluator(
                         "captured_stdout_file": str(diagnostics_path.with_suffix(".stdout.log")),
                         "request_file": str(request_path),
                     })
-                except OSError:
+                except Exception:
                     print("historical-progress receipt_write_failed", file=sys.stderr, flush=True)
     stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
     stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
@@ -3966,7 +3966,7 @@ def main(argv: list[str] | None = None) -> int:
                     "error_type": type(exc).__name__, "message": str(exc),
                     "traceback": traceback.format_exc(),
                 })
-            except OSError:
+            except Exception:
                 print("Private failure receipt could not be written", file=sys.stderr, flush=True)
             print(f"Private failure evidence retained at: {base_dir}", file=sys.stderr, flush=True)
         if isinstance(exc, KeyboardInterrupt):

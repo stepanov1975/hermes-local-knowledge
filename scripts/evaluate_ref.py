@@ -826,6 +826,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _close_capture(stream: io.IOBase) -> None:
+    try:
+        stream.close()
+    except (OSError, UnicodeError):
+        print("evaluator-progress capture_close_failed", file=sys.stderr, flush=True)
+
+
+class _PrivateCapture:
+    """Keep optional capture failures out of the evaluated callback."""
+
+    def __init__(self, stream: io.TextIOWrapper) -> None:
+        self.stream = stream
+        self.disabled = False
+
+    def _disable(self) -> None:
+        self.disabled = True
+        print("evaluator-progress capture_write_failed", file=sys.stderr, flush=True)
+
+    def write(self, text: str) -> int:
+        if not self.disabled:
+            try:
+                return self.stream.write(text)
+            except (OSError, UnicodeError):
+                self._disable()
+        return len(text)
+
+    def flush(self) -> None:
+        if not self.disabled:
+            try:
+                self.stream.flush()
+            except (OSError, UnicodeError):
+                self._disable()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     global _DIAGNOSTICS, _PROGRESS_FILE
     args = build_parser().parse_args(argv)
@@ -845,14 +879,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 try:
                     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
                                  | getattr(os, "O_NOFOLLOW", 0), 0o600)
-                    raw = stack.enter_context(os.fdopen(fd, "wb", buffering=0))
+                    raw = os.fdopen(fd, "wb", buffering=0)
+                    stack.callback(_close_capture, raw)
                     if hasattr(os, "fchmod"):
                         os.fchmod(raw.fileno(), 0o600)
                     else:
                         os.chmod(path, 0o600)
-                    capture = stack.enter_context(io.TextIOWrapper(
-                        raw, encoding="utf-8", newline="", write_through=True,
-                    ))
+                    text = io.TextIOWrapper(raw, encoding="utf-8", newline="", write_through=True)
+                    stack.callback(_close_capture, text)
+                    capture = _PrivateCapture(text)
                     capture_path = path
                 except OSError:
                     print("evaluator-progress capture_write_failed", file=sys.stderr, flush=True)
@@ -884,10 +919,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "error_type": type(exc).__name__,
             "error_sha256": _sha256_text(rendered),
         }
-    captured_bytes = (
-        capture_path.read_bytes() if capture_path is not None
-        else captured_stdout.getvalue().encode("utf-8")
-    )
+    try:
+        captured_bytes = (
+            capture_path.read_bytes() if capture_path is not None
+            else captured_stdout.getvalue().encode("utf-8")
+        )
+    except (OSError, UnicodeError):
+        print("evaluator-progress capture_read_failed", file=sys.stderr, flush=True)
+        captured_bytes = b""
     if captured_bytes:
         payload["captured_stdout_sha256"] = hashlib.sha256(captured_bytes).hexdigest()
         payload["captured_stdout_bytes"] = len(captured_bytes)

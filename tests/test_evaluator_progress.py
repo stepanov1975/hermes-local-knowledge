@@ -78,12 +78,14 @@ def test_fatal_evaluator_emits_single_redacted_json_and_private_traceback(
     assert json.loads(status.read_text())["stage"] == "failed"
 
 
-@pytest.fixture(params=[False, True])
+@pytest.fixture(params=[False, True, "unicode"])
 def receipt_failure(request: Any, monkeypatch: pytest.MonkeyPatch) -> bool:
     original = compare.write_private_json
 
     def write(path: Path, payload: Any) -> None:
         if request.param and path.name.endswith(".receipt.json"):
+            if request.param == "unicode":
+                raise UnicodeEncodeError("utf-8", "\udcff", 0, 1, "private receipt detail")
             raise OSError("private receipt path detail")
         original(path, payload)
 
@@ -358,7 +360,8 @@ def printed_api(tmp_path: Path) -> tuple[Path, dict[str, Any], bytes]:
         "    return []\n"
         "def build_index(*args): return [], []\n"
         "def get_artifact(*args): return None\n"
-        "def get_neighbors(*args): return []\n"
+        "def get_neighbors(*args): return []\n",
+        encoding="utf-8",
     )
     cases = tmp_path / "cases.json"
     request = {"action": "evaluate", "case_file": str(cases),
@@ -473,3 +476,124 @@ def test_direct_evaluator_without_diagnostics_preserves_capture_contract(
     assert payload["captured_stdout_bytes"] == len(printed)
     assert b"private" not in child.stdout + child.stderr
     assert not list(tmp_path.glob("*.stdout.log"))
+
+
+@pytest.mark.parametrize("failure", ["write", "flush", "unicode"])
+def test_capture_errors_do_not_change_successful_callback(
+    failure: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    class BrokenStream:
+        def write(self, text: str) -> int:
+            if failure == "write":
+                raise OSError("private disk quota detail")
+            if failure == "unicode":
+                raise UnicodeEncodeError("utf-8", "\udcff", 0, 1, "private encoding detail")
+            return len(text)
+
+        def flush(self) -> None:
+            raise OSError("private flush detail")
+
+    stream: Any = BrokenStream()
+    sink = evaluator._PrivateCapture(stream)
+
+    def callback() -> Any:
+        print("private callback output", flush=True)
+        print("more private output", flush=True)
+        return {"value": "successful lookup"}
+
+    with redirect_stdout(sink):
+        result = evaluator._safe_call(callback)
+    assert result == {"status": "ok", "value": {"value": "successful lookup"}}
+    assert sink.disabled
+    streams = capsys.readouterr()
+    assert streams.out == ""
+    assert streams.err == "evaluator-progress capture_write_failed\n"
+
+
+@pytest.mark.parametrize("primary", [RuntimeError, KeyboardInterrupt])
+def test_failure_receipt_encoding_preserves_primary_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    primary: type[BaseException],
+) -> None:
+    base = tmp_path / "private"
+    base.mkdir()
+    monkeypatch.setattr(compare, "_work_dir", lambda _args: (base, True))
+    original = compare.write_private_json
+
+    def bad_receipt(path: Path, payload: Any) -> None:
+        payload["traceback"] += "\udcff"
+        original(path, payload)
+
+    def fail(*_args: Any) -> Any:
+        raise primary("private primary detail")
+
+    monkeypatch.setattr(compare, "write_private_json", bad_receipt)
+    monkeypatch.setattr(compare, "compare_refs", fail)
+    if primary is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            compare.main(["HEAD", "--usage-db", "unused", "--json"])
+    else:
+        assert compare.main(["HEAD", "--usage-db", "unused", "--json"]) == 2
+    assert base.exists()
+    streams = capsys.readouterr()
+    if primary is RuntimeError:
+        assert json.loads(streams.out)["error_type"] == "RuntimeError"
+    else:
+        assert streams.out == ""
+    assert "receipt could not be written" in streams.err
+    assert "private primary detail" not in streams.out + streams.err
+
+
+@pytest.mark.parametrize("failure", ["close", "read"])
+@pytest.mark.parametrize("primary_failure", [False, True])
+def test_capture_teardown_and_read_keep_main_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    failure: str, primary_failure: bool,
+) -> None:
+    request = tmp_path / "request.json"
+    request.write_text("{}", encoding="utf-8")
+    diagnostic = tmp_path / "failure.jsonl"
+    capture_path = diagnostic.with_suffix(".stdout.log")
+    monkeypatch.setattr(evaluator, "_import_api", lambda *_args: (object(), tmp_path / "api.py"))
+
+    def dispatch(*_args: Any) -> Any:
+        print("private API output")
+        if primary_failure:
+            raise ValueError("private primary detail")
+        return {"result": "successful lookup"}
+
+    monkeypatch.setattr(evaluator, "_dispatch", dispatch)
+    if failure == "close":
+        original_fdopen = os.fdopen
+
+        class FlushFails(io.FileIO):
+            def flush(self) -> None:
+                raise OSError("private flush detail")
+
+        def fdopen(fd: int, mode: str, *args: Any, **kwargs: Any) -> Any:
+            if mode == "wb":
+                return FlushFails(fd, mode, closefd=True)
+            return original_fdopen(fd, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "fdopen", fdopen)
+    else:
+        original_read = Path.read_bytes
+
+        def read(path: Path) -> bytes:
+            if path == capture_path:
+                raise OSError("private read detail")
+            return original_read(path)
+
+        monkeypatch.setattr(Path, "read_bytes", read)
+    status = evaluator.main(["--request", str(request), "--ref-root", str(tmp_path),
+                             "--diagnostics", str(diagnostic)])
+    streams = capsys.readouterr()
+    payload = json.loads(streams.out)
+    assert status == int(primary_failure)
+    assert payload["ok"] is not primary_failure
+    if primary_failure:
+        assert payload["error_type"] == "ValueError"
+    else:
+        assert payload["result"] == "successful lookup"
+    assert f"capture_{failure}_failed" in streams.err
+    assert "private" not in streams.out + streams.err
