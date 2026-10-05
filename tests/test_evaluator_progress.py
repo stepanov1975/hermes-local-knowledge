@@ -479,9 +479,9 @@ def test_direct_evaluator_without_diagnostics_preserves_capture_contract(
 
 
 @pytest.mark.parametrize("failure", ["write", "flush", "unicode"])
-@pytest.mark.parametrize("warning_failure", [False, True])
+@pytest.mark.parametrize("warning_failure", [False, True, "closed"])
 def test_capture_errors_do_not_change_successful_callback(
-    failure: str, warning_failure: bool, monkeypatch: pytest.MonkeyPatch,
+    failure: str, warning_failure: bool | str, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     class BrokenStream:
@@ -504,7 +504,11 @@ def test_capture_errors_do_not_change_successful_callback(
         return {"value": "successful lookup"}
 
     with monkeypatch.context() as context:
-        if warning_failure:
+        if warning_failure == "closed":
+            closed = io.StringIO()
+            closed.close()
+            context.setattr(evaluator.sys, "stderr", closed)
+        elif warning_failure:
             context.setattr(evaluator.sys, "stderr", BrokenStream())
         with redirect_stdout(sink):
             result = evaluator._safe_call(callback)

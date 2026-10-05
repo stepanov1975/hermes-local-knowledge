@@ -355,7 +355,7 @@ def build_child_env(
 def _notice(message: str) -> None:
     try:
         print(message, file=sys.stderr, flush=True)
-    except (OSError, UnicodeError):
+    except Exception:
         pass  # Optional diagnostics must not change the evaluation result.
 
 
