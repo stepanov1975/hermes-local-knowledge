@@ -825,7 +825,7 @@ def test_ineligible_consumption_does_not_learn(cfg: Config, consumer: str, fault
     ctx.middleware({"query": "Atlas restore runbook"}, lambda a: plugin._handle_search(a, **IDS),
                    tool_name="knowledge_search", **IDS)
     raw = json.dumps({"success": fault != "error", "_source_path": str(path),
-                      "content": "PRIVATE" * (200000 if fault == "budget" else 15000)})
+                      "content": "PRIVATE" * (observer.MAX_CONTENT_SCAN_CHARS // 7 + 1 if fault == "budget" else 15000)})
     if fault == "malformed":
         raw = raw[:-1]
     ids = {**IDS, "api_request_id": "later", "tool_call_id": "consume"}
@@ -848,7 +848,7 @@ def test_ineligible_consumption_does_not_learn(cfg: Config, consumer: str, fault
     '{"content": "' + 'x' * 90000 + '"',
     '{"content": "' + 'x' * 90000 + '\\q"}',
     json.dumps({"output": "x" * 90000}),
-    json.dumps({"content": "x" * 1100000}),
+    json.dumps({"content": "x" * observer.MAX_CONTENT_SCAN_CHARS}),
 ], ids=[
     "not-json", "nonfinite-error", "duplicate-status", "truncated-content",
     "invalid-content-escape", "oversized-output", "content-scan-budget",

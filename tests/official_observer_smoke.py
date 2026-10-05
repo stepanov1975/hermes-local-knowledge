@@ -23,12 +23,12 @@ def main() -> None:
                       TERMINAL_CWD=str(home), HERMES_TOOL_RESULT_STORAGE_DIR=str(home / "results"))
     source = home / "source"
     (source / "docs").mkdir(parents=True, exist_ok=True)
-    (source / "docs/atlas.md").write_text("# Atlas restore runbook\n" + ("Restore Atlas backup. " * 40 + "\n") * 100)
+    (source / "docs/atlas.md").write_text("# Atlas restore runbook\n" + ("Restore Atlas backup. " * 40 + "\n") * 1500)
     skill = home / "skills/atlas-proof/SKILL.md"
     skill.parent.mkdir(parents=True)
-    skill.write_text("---\nname: atlas-proof\ndescription: Atlas restore runbook\n---\n" + "Atlas restore. " * 6000)
+    skill.write_text("---\nname: atlas-proof\ndescription: Atlas restore runbook\n---\n" + "Atlas restore. " * 90000)
     (home / "config.yaml").write_text(
-        f"plugins:\n  enabled: []\nlocal_knowledge:\n  source_root: {source}\n"
+        f"plugins:\n  enabled: []\nfile_read_max_chars: 2000000\nlocal_knowledge:\n  source_root: {source}\n"
         "  okf:\n    auto_generate: false\n  verified_routing:\n    mode: shadow\n"
     )
 
@@ -51,6 +51,18 @@ def main() -> None:
     ctx = Context(PluginManifest(name="local_knowledge", version=__version__, source="user", path=str(repo)), get_plugin_manager())
     plugin.register(ctx)
     delivered: list[dict[str, Any]] = []
+    projected_sizes: dict[str, int] = {}
+
+    def capture(args: Any, next_call: Any, **metadata: Any) -> Any:
+        def downstream(values: Any) -> Any:
+            result = next_call(values)
+            if metadata.get("tool_name") in {"read_file", "skill_view"}:
+                projected_sizes[metadata["tool_name"]] = len(result)
+            return result
+        return downstream(args)
+
+    # A second public middleware measures raw handler output before host spillover.
+    PluginContext.register_middleware(ctx, "tool_execution", capture)
     consume = ctx.observer.consume
 
     def record(kind: str, **payload: Any) -> None:
@@ -112,8 +124,8 @@ def main() -> None:
             agent._current_api_request_id = tool + "-search"
             execute("knowledge_search", {"query": "Atlas restore runbook", "artifact_type": artifact_type}, tool + "-search")
             agent._current_api_request_id = tool + "-consume"
-            raw = execute(tool, tool_args, tool + "-consume")
-            assert len(raw) > 65536 and isinstance(json.loads(raw)["content"], str)
+            execute(tool, tool_args, tool + "-consume")
+            assert projected_sizes[tool] > 1048576
         with sqlite3.connect(cfg.state_dir / "usage.sqlite") as connection:
             consumed = connection.execute("SELECT consumer_tool FROM implicit_feedback ORDER BY consumer_tool").fetchall()
         assert consumed == [("read_file",), ("skill_view",)]
@@ -136,6 +148,13 @@ def main() -> None:
         authority.retire()
         assert ctx.observer.drain(20)
         assert ctx.observer.stats()["attribution_skipped"] == 2
+        report = LocalKnowledgeService(cfg).usage_report(days=7, limit=5)
+        counts = report["observer_diagnostics"]["counts"]
+        assert counts["attribution_skipped"] == 2
+        assert counts["tool_observed"] == 14
+        assert counts["outcome_success"] == 14
+        assert counts["attributed"] == 12
+        assert report["observer_diagnostics"]["coverage"] == "observed_callbacks_only"
         for key in ("session_id", "turn_id", "api_request_id", "tool_call_id"):
             assert ctx.observer.stats()["missing_" + key] == 2
             assert all(not item[key] for item in delivered[-2:])
@@ -160,7 +179,8 @@ def main() -> None:
         assert all(path.startswith((str(official) + "/", str(repo) + "/")) for path in sources.values())
         print(json.dumps({"deliveries": delivered, "queue": ctx.observer.stats(), "modules_checked": len(sources),
                           "implicit_consumers": consumed, "attributed_okf_outcomes": outcomes,
-                          "unattributed_read_file_uses": 2}))
+                          "unattributed_read_file_uses": 2, "raw_result_sizes": projected_sizes,
+                          "observer_diagnostics": report["observer_diagnostics"]}))
     finally:
         assert ctx.observer.close(20)
         agent.close()

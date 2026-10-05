@@ -541,6 +541,8 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
         payload["event_cohorts"] = event_cohorts
     if candidates:
         payload["improvement_candidates"] = candidates
+    if isinstance(report.get("observer_diagnostics"), Mapping):
+        payload["observer_diagnostics"] = report["observer_diagnostics"]
     return payload
 
 

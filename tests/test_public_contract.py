@@ -315,6 +315,7 @@ PERSISTED_INDEX_METADATA_KEYS = {
     "jsonl_sha256",
 }
 USAGE_REPORT_KEYS = {
+    "observer_diagnostics",
     "success",
     "usage_db_path",
     "live_root",
@@ -870,6 +871,7 @@ def test_registered_handlers_return_stable_json_success_envelopes(workspace: Wor
         "feedback",
         "event_cohorts",
         "improvement_candidates",
+        "observer_diagnostics",
     }
     assert report["success"] is True
     assert report["event_count"] == 7

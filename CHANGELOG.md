@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.4b2] - 2026-10-05
+
+### Added
+
+- Concise usage-report observer diagnostics: privacy-safe durable aggregates by source root, report window and package version distinguish accepted/processed receipts, context skips, unknown results and overlapping failure reasons. Coverage remains explicitly best-effort and limited to callbacks supplied by the host.
+
+### Fixed
+
+- Admit legitimate multi-megabyte file/skill content to the existing bounded metadata-only projection, without retaining raw bodies or relaxing complete-envelope validation, same-turn attribution or search deduplication.
+
+[0.5.4b2]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.4b1...v0.5.4b2
+
 ## [0.5.4b1] - 2026-10-04
 
 ### Added
