@@ -24,6 +24,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -350,6 +352,13 @@ def build_child_env(
     return env
 
 
+def _notice(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass  # Optional diagnostics must not change the evaluation result.
+
+
 def _invoke_evaluator(
     checkout: Path,
     request: dict[str, Any],
@@ -375,8 +384,12 @@ def _invoke_evaluator(
         state_dir=state_dir,
         explicit_root=explicit_root,
     )
-    result = subprocess.run(
-        [
+    progress_path = request_path.with_suffix(".progress.json")
+    diagnostics_path = request_path.with_suffix(".failures.jsonl")
+    stderr_path = request_path.with_suffix(".stderr.log")
+    stdout_path = request_path.with_suffix(".stdout.json")
+    diagnostics_path.touch(mode=0o600)
+    command = [
             sys.executable,
             str(EVALUATOR),
             "--request",
@@ -385,14 +398,65 @@ def _invoke_evaluator(
             str(checkout.resolve()),
             "--api-module",
             api_module,
-        ],
-        cwd=checkout,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+            "--progress-file", str(progress_path),
+            "--diagnostics", str(diagnostics_path),
+        ]
+    started = time.monotonic()
+    last_status: Any = None
+    _notice("historical-progress evaluator_start")
+    with stderr_path.open("wb") as stderr_file, stdout_path.open("wb") as stdout_file:
+        stderr_path.chmod(0o600)
+        stdout_path.chmod(0o600)
+        with subprocess.Popen(command, cwd=checkout, env=env,
+                              stdout=stdout_file, stderr=stderr_file) as child:
+            try:
+                while True:
+                    try:
+                        child.wait(timeout=5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        status: Any = None
+                        try:
+                            status = json.loads(progress_path.read_text(encoding="utf-8"))
+                        except (OSError, ValueError):
+                            pass
+                        # Validate the private child status before displaying it.
+                        stages = {"start", "import", "dispatch", "labels", "build", "production_states", "replay_search",
+                                  "replay_get", "replay_neighbors", "synthetic", "complete", "failed"}
+                        safe = {}
+                        if (isinstance(status, dict) and isinstance(status.get("stage"), str)
+                                and status["stage"] in stages):
+                            safe["stage"] = status["stage"]
+                            for key in ("completed", "total"):
+                                if type(status.get(key)) is int and status[key] >= 0:
+                                    safe[key] = status[key]
+                        last_status = safe
+                        _notice("historical-progress " + _canonical_json({
+                            "elapsed_seconds": int(time.monotonic() - started), **safe}))
+            except BaseException:
+                child.kill()
+                child.wait()
+                raise
+            finally:
+                try:
+                    last_status = json.loads(progress_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    pass
+                try:
+                    write_private_json(request_path.with_suffix(".receipt.json"), {
+                        "action": request.get("action"), "api_module": api_module,
+                        "checkout": str(checkout), "returncode": child.returncode,
+                        "last_status": last_status, "stdout_file": str(stdout_path),
+                        "stderr_file": str(stderr_path), "failures_file": str(diagnostics_path),
+                        "captured_stdout_file": str(diagnostics_path.with_suffix(".stdout.log")),
+                        "request_file": str(request_path),
+                    })
+                except Exception:
+                    _notice("historical-progress receipt_write_failed")
+    stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+    stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+    result = subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
+    _notice("historical-progress evaluator_complete")
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -3578,6 +3642,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
     try:
         baseline_ref = str(args.refs[0])
         baseline_key = f"01-{safe_ref_name(baseline_ref)}"
+        _notice("historical-progress prepare_baseline")
         baseline_checkout = prepare_worktree(baseline_ref, base_dir, created_worktrees, baseline_key)
         resolved = _resolve_baseline_config(baseline_checkout, args, base_dir)
         live_source = Path(str(resolved["source_root"])).resolve()
@@ -3591,6 +3656,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
         if not live_hermes.is_dir():
             raise FileNotFoundError("effective Hermes home does not exist")
 
+        _notice("historical-progress freeze_inputs")
         frozen_paths, snapshot_report = _freeze_inputs(
             live_source,
             live_hermes,
@@ -3660,6 +3726,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
         evaluations = [baseline]
 
         for index, ref_value in enumerate(args.refs[1:], start=2):
+            _notice(f"historical-progress candidate {index}/{len(args.refs)}")
             ref = str(ref_value)
             ref_key = f"{index:02d}-{safe_ref_name(ref)}"
             checkout = prepare_worktree(ref, base_dir, created_worktrees, ref_key)
@@ -3707,6 +3774,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
                 _build_ref_evaluation(layout, oracle, frozen_usage, case_payload, output)
             )
 
+        _notice("historical-progress compare_results")
         comparisons = [
             _candidate_comparison(baseline, candidate, frozen_usage)
             for candidate in evaluations[1:]
@@ -3875,9 +3943,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     base_dir: Path | None = None
     temporary = False
+    failed = True  # cleanup is allowed only after a fully successful run
     try:
         base_dir, temporary = _work_dir(args)
         comparison = compare_refs(args, base_dir)
+        if not comparison.accepted:
+            failed = True
+            _notice(f"Private failure evidence retained at: {base_dir}")
         payload = dict(comparison.report)
         if args.details:
             payload["details"] = comparison.details
@@ -3890,8 +3962,21 @@ def main(argv: list[str] | None = None) -> int:
                 comparison.report,
                 base_dir=base_dir if args.keep_work_dir or args.work_dir is not None else None,
             )
+        failed = not comparison.accepted
         return 0 if comparison.accepted else 1
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
+        failed = True
+        if base_dir is not None:
+            try:
+                write_private_json(base_dir / "failure.json", {
+                    "error_type": type(exc).__name__, "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+            except Exception:
+                _notice("Private failure receipt could not be written")
+            _notice(f"Private failure evidence retained at: {base_dir}")
+        if isinstance(exc, KeyboardInterrupt):
+            raise
         error_payload = {
             "accepted": False,
             "error_type": type(exc).__name__,
@@ -3903,7 +3988,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"historical comparison failed: {error_payload['error_type']}:{error_payload['error_sha256']}", file=sys.stderr)
         return 2
     finally:
-        if temporary and base_dir is not None and not args.keep_work_dir:
+        if temporary and base_dir is not None and not args.keep_work_dir and not failed:
             cleanup_private_directory(base_dir)
         os.umask(old_umask)
 

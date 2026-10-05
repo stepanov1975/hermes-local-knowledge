@@ -9,7 +9,7 @@ index API.
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import asdict, is_dataclass, replace
 import hashlib
 import importlib
@@ -21,10 +21,78 @@ import math
 import os
 from pathlib import Path
 import sys
+import tempfile
 import time
-from typing import Any, Callable, Mapping, Sequence, cast
+import traceback
+from typing import Any, Callable, Iterator, Mapping, Sequence, cast
 
 DEFAULT_API_MODULE = "hermes_local_knowledge.indexer"
+_DIAGNOSTICS: Path | None = None
+_PROGRESS_FILE: Path | None = None
+_CONTEXT: dict[str, Any] = {}
+
+
+def _notice(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass  # Optional diagnostics must not change the evaluation result.
+
+
+def _progress(stage: str, **counts: int) -> None:
+    try:
+        _write_progress(stage, **counts)
+    except OSError:
+        _notice("evaluator-progress status_write_failed")
+
+
+def _write_progress(stage: str, **counts: int) -> None:
+    # Only evaluator-owned stage names and numeric counts cross this boundary.
+    if _PROGRESS_FILE is not None:
+        fd, name = tempfile.mkstemp(prefix=".progress-", dir=_PROGRESS_FILE.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"stage": stage, **counts}, sort_keys=True))
+            os.replace(name, _PROGRESS_FILE)
+        finally:
+            Path(name).unlink(missing_ok=True)
+    _notice("evaluator-progress " + json.dumps({"stage": stage, **counts}, sort_keys=True))
+
+
+def _failure_evidence(exc: BaseException, **extra: Any) -> None:
+    try:
+        _write_failure_evidence(exc, **extra)
+    except Exception:  # diagnostics must not replace the original lookup failure
+        _notice("evaluator-progress diagnostic_write_failed")
+
+
+def _write_failure_evidence(exc: BaseException, **extra: Any) -> None:
+    if _DIAGNOSTICS is None:
+        return
+    record = {"context": dict(_CONTEXT), "error_type": type(exc).__name__,
+              "message": str(exc), "traceback": traceback.format_exc(), **extra}
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(_DIAGNOSTICS, flags, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        if hasattr(os, "fchmod"):
+            os.fchmod(handle.fileno(), 0o600)
+        else:  # Windows does not expose fchmod.
+            os.chmod(_DIAGNOSTICS, 0o600)
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _observed_rows(stage: str, rows: Sequence[Any]) -> Iterator[Any]:
+    last = time.monotonic()
+    _CONTEXT.update(stage=stage, case=None)
+    _progress(stage, completed=0, total=len(rows))
+    for index, row in enumerate(rows):
+        _CONTEXT.update(stage=stage, case=row)
+        yield row
+        now = time.monotonic()
+        if index + 1 == len(rows) or index % 100 == 99 or now - last >= 5:
+            _progress(stage, completed=index + 1, total=len(rows))
+            last = now
+
 
 
 class ModuleProvenanceError(RuntimeError):
@@ -113,9 +181,19 @@ def _lookup_json_value(value: Any) -> Any:
 
 
 def _safe_call(callback: Callable[[], Any]) -> dict[str, Any]:
+    captured = sys.stdout if isinstance(sys.stdout, io.StringIO) else None
+    output_start = captured.tell() if captured is not None else 0
     try:
         value = _lookup_json_value(callback())
     except Exception as exc:  # individual replay failures are evaluator data
+        evidence = (
+            {"captured_stdout": captured.getvalue()[output_start:]}
+            if captured is not None
+            else {"captured_stdout_file": str(_DIAGNOSTICS.with_suffix(".stdout.log"))}
+            if _DIAGNOSTICS is not None
+            else {"captured_stdout": ""}
+        )
+        _failure_evidence(exc, **evidence)
         rendered = f"{type(exc).__name__}: {exc}"
         return {
             "status": "error",
@@ -212,7 +290,7 @@ def _action_build(module: Any, request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_builds, list):
         raise TypeError("builds must be a list")
     output: dict[str, Any] = {}
-    for raw_build in raw_builds:
+    for raw_build in _observed_rows("build", raw_builds):
         if not isinstance(raw_build, dict):
             raise TypeError("each build must be an object")
         name = str(raw_build["name"])
@@ -623,13 +701,15 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
     synthetic_db = Path(str(request["synthetic_db"])).resolve()
 
     label_results: dict[str, Any] = {}
-    for row in _case_query_rows(cases):
+    for row in _observed_rows("labels", _case_query_rows(cases)):
         label_results[str(row["query_id"])] = _search(module, full_db, str(row["query"]), 10, None)
 
     replay = cases.get("replay", {})
     if not isinstance(replay, dict):
         raise TypeError("replay must be an object")
     replay_results: dict[str, dict[str, Any]] = {"search": {}, "get": {}, "neighbors": {}}
+    _CONTEXT.update(stage="production_states", case=None)
+    _progress("production_states")
     production_services, service_module = _production_services(
         module,
         request,
@@ -648,7 +728,7 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
         key: _optional_sha256_file(Path(str(service.config.state_dir)) / "usage.sqlite")
         for key, service in production_services.items()
     }
-    for row in replay.get("search", []):
+    for row in _observed_rows("replay_search", replay.get("search", [])):
         case_id = str(row["case_id"])
         raw_recorded_limit = row.get("limit")
         recorded_limit = (
@@ -666,6 +746,7 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
             state_key = str(row["production_state_key"])
             if state_key not in production_services:
                 raise KeyError(f"missing production replay state: {state_key}")
+            _CONTEXT["stage"] = "production_search"
             production_results[case_id] = _production_search(
                 production_services[state_key],
                 service_module,
@@ -683,10 +764,10 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
                     )
                 ),
             )
-    for row in replay.get("get", []):
+    for row in _observed_rows("replay_get", replay.get("get", [])):
         case_id = str(row["case_id"])
         replay_results["get"][case_id] = _get(module, full_db, str(row["artifact_id"]))
-    for row in replay.get("neighbors", []):
+    for row in _observed_rows("replay_neighbors", replay.get("neighbors", [])):
         case_id = str(row["case_id"])
         replay_results["neighbors"][case_id] = _neighbors(
             module,
@@ -699,7 +780,7 @@ def _action_evaluate(module: Any, request: dict[str, Any]) -> dict[str, Any]:
     synthetic = cases.get("synthetic", [])
     if not isinstance(synthetic, list):
         raise TypeError("synthetic must be a list")
-    for row in synthetic:
+    for row in _observed_rows("synthetic", synthetic):
         case_id = str(row["case_id"])
         synthetic_results[case_id] = _search(
             module,
@@ -746,20 +827,86 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request", type=Path, required=True, help="private JSON request file")
     parser.add_argument("--ref-root", type=Path, required=True, help="intended ref checkout root")
     parser.add_argument("--api-module", default=DEFAULT_API_MODULE, help="explicit ref API module")
+    parser.add_argument("--progress-file", type=Path, help="private live status JSON file")
+    parser.add_argument("--diagnostics", type=Path, help="private failure JSONL file (raw evidence)")
     return parser
 
 
+def _close_capture(stream: io.IOBase) -> None:
+    try:
+        stream.close()
+    except (OSError, UnicodeError):
+        _notice("evaluator-progress capture_close_failed")
+
+
+class _PrivateCapture:
+    """Keep optional capture failures out of the evaluated callback."""
+
+    def __init__(self, stream: io.TextIOWrapper) -> None:
+        self.stream = stream
+        self.disabled = False
+
+    def _disable(self) -> None:
+        self.disabled = True
+        _notice("evaluator-progress capture_write_failed")
+
+    def write(self, text: str) -> int:
+        if not self.disabled:
+            try:
+                return self.stream.write(text)
+            except (OSError, UnicodeError):
+                self._disable()
+        return len(text)
+
+    def flush(self) -> None:
+        if not self.disabled:
+            try:
+                self.stream.flush()
+            except (OSError, UnicodeError):
+                self._disable()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    global _DIAGNOSTICS, _PROGRESS_FILE
     args = build_parser().parse_args(argv)
+    _DIAGNOSTICS = args.diagnostics
+    _PROGRESS_FILE = args.progress_file
+    _CONTEXT.clear()
+    _CONTEXT.update(stage="request", ref_root=str(args.ref_root), api_module=str(args.api_module))
+    _progress("start")
     captured_stdout = io.StringIO()
+    capture_path: Path | None = None
     status = 0
     try:
-        with redirect_stdout(captured_stdout):
-            request = json.loads(args.request.read_text(encoding="utf-8"))
-            if not isinstance(request, dict):
-                raise TypeError("request must contain a JSON object")
-            module, module_path = _import_api(str(args.api_module), args.ref_root)
-            result = _dispatch(module, request, args.ref_root.resolve())
+        with ExitStack() as stack:
+            capture: Any = captured_stdout
+            if _DIAGNOSTICS is not None:
+                path = _DIAGNOSTICS.with_suffix(".stdout.log")
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                    raw = os.fdopen(fd, "wb", buffering=0)
+                    stack.callback(_close_capture, raw)
+                    if hasattr(os, "fchmod"):
+                        os.fchmod(raw.fileno(), 0o600)
+                    else:
+                        os.chmod(path, 0o600)
+                    text = io.TextIOWrapper(raw, encoding="utf-8", newline="", write_through=True)
+                    stack.callback(_close_capture, text)
+                    capture = _PrivateCapture(text)
+                    capture_path = path
+                except OSError:
+                    _notice("evaluator-progress capture_write_failed")
+            with redirect_stdout(capture):
+                request = json.loads(args.request.read_text(encoding="utf-8"))
+                if not isinstance(request, dict):
+                    raise TypeError("request must contain a JSON object")
+                _CONTEXT.update(stage="import", action=request.get("action"))
+                _progress("import")
+                module, module_path = _import_api(str(args.api_module), args.ref_root)
+                _CONTEXT["stage"] = "dispatch"
+                _progress("dispatch")
+                result = _dispatch(module, request, args.ref_root.resolve())
         payload: dict[str, Any] = {
             "ok": True,
             "api_module": str(args.api_module),
@@ -767,6 +914,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             **result,
         }
     except Exception as exc:
+        if capture_path is not None:
+            _failure_evidence(exc, captured_stdout_file=str(capture_path))
+        else:
+            _failure_evidence(exc, captured_stdout=captured_stdout.getvalue())
         status = 1
         rendered = f"{type(exc).__name__}: {exc}"
         payload = {
@@ -774,11 +925,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "error_type": type(exc).__name__,
             "error_sha256": _sha256_text(rendered),
         }
-    captured = captured_stdout.getvalue()
-    if captured:
-        payload["captured_stdout_sha256"] = _sha256_text(captured)
-        payload["captured_stdout_bytes"] = len(captured.encode("utf-8"))
+    try:
+        captured_bytes = (
+            capture_path.read_bytes() if capture_path is not None
+            else captured_stdout.getvalue().encode("utf-8")
+        )
+    except (OSError, UnicodeError):
+        _notice("evaluator-progress capture_read_failed")
+        captured_bytes = b""
+    if captured_bytes:
+        payload["captured_stdout_sha256"] = hashlib.sha256(captured_bytes).hexdigest()
+        payload["captured_stdout_bytes"] = len(captured_bytes)
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    _progress("complete" if status == 0 else "failed")
     return status
 
 
