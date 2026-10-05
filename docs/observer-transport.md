@@ -72,7 +72,7 @@ this is not a synchronous feedback-visibility guarantee.
 Synchronous argument-shape capture reads at most eight children per container,
 with a shared 256-node traversal budget (including repeated references). Tool
 results are decoded only within a 65,536-character JSON envelope budget. For
-`read_file` and `skill_view`, strings up to 1,048,576 characters can additionally
+`read_file` and `skill_view`, strings up to 4,194,304 characters can additionally
 be scanned for complete, valid JSON `content` string values (at most 4096 string
 tokens). Those values are replaced with empty strings before decoding the entire
 remaining envelope within the normal budget. Invalid syntax, duplicate keys and
@@ -130,8 +130,38 @@ exception text. The registration's internal observer `stats()` reports accepted,
 completed, delivered, duplicate, discarded, pending and error/rejection counters;
 absent counter keys mean zero. `delivered` means the callback returned, not that
 all of its independently fail-open database writes succeeded. Existing consumer
-logs remain relevant. Counters are process-local diagnostics, not usage-report
-rows or a public persistence schema.
+logs remain relevant.
+
+The CLI/operator usage report exposes best-effort durable aggregate counters in
+`usage.sqlite`, scoped to the current source root, package
+version and report window (minute buckets; the first minute can be partial).
+`accepted`, `completed`, `delivered`, `discarded`, `duplicate` and rejection/error
+counters cover tool **and lifecycle** reservations. `tool_observed` counts distinct
+non-suppressed tool receipts; `outcome_success/error/unknown` partition those
+receipts, and `attributed`/`attribution_skipped` partition their context eligibility.
+Eligibility is **not successful learning**: no baseline match may exist, implicit
+learning may be disabled, or a consumer write may fail. Consumption rows remain
+separate evidence. Reason counters overlap (one unkeyed receipt can miss four IDs);
+never sum them as lost events. Counts are not inferred from sampled warning logs.
+
+Only fixed counter names/counts, root namespace, package version and minute bucket
+are stored: no tool names, identifiers, queries, arguments, paths from results or
+bodies. A bounded in-memory accumulator batches ready receipts before flushing
+on the observer thread: at a queue gap, a drain boundary, or after at most 256
+completions. This reduces per-receipt SQLite contention but does not isolate slow
+filesystem I/O; persistence can still delay later receipts and bounded drains.
+Tool-return paths do no diagnostic database I/O. Config-resolution
+failures cannot be safely assigned to a root. Startup failures/rejections with no
+subsequent processed work, in-flight work, process termination, lock/write failures
+and accumulator scope overflow can lose aggregates; write failures emit a fixed
+warning and are not retried. Teardown remains bounded. The report explicitly says
+`coverage: observed_callbacks_only` and `persistence: best_effort`; it is neither a
+complete host-call denominator nor a lossless learning-capture guarantee. Empty
+counts on old/legacy hosts mean no recorded diagnostics, not perfect capture.
+The native `knowledge_usage_report` response projects only observed tool outcomes,
+attribution gaps and capture/rejection failures with the coverage caveat. Internal
+queue accounting, missing-ID detail, package version and persistence metadata stay
+in the operator report; an empty native projection is omitted.
 
 ## Older hosts
 

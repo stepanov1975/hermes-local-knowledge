@@ -541,6 +541,21 @@ def _agent_usage_report(report: Mapping[str, Any]) -> dict[str, Any]:
         payload["event_cohorts"] = event_cohorts
     if candidates:
         payload["improvement_candidates"] = candidates
+    diagnostics = report.get("observer_diagnostics")
+    if isinstance(diagnostics, Mapping):
+        counts = diagnostics.get("counts")
+        if isinstance(counts, Mapping):
+            gaps = _nonempty_projection(counts, (
+                "tool_observed", "outcome_success", "outcome_error", "outcome_unknown",
+                "attribution_skipped", "full", "closed", "discarded", "oversize",
+                "consumer_error", "call_projection_error", "schema_projection_error",
+                "argument_projection_error", "result_projection_error",
+                "receipt_serialization_error", "enqueue_error", "config_error",
+            ))
+            if gaps:
+                payload["observer_diagnostics"] = {
+                    "coverage": "observed_callbacks_only", "counts": gaps,
+                }
     return payload
 
 

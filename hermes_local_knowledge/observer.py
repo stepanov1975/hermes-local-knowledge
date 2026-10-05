@@ -18,14 +18,16 @@ from contextvars import Context, copy_context
 from dataclasses import dataclass
 from typing import Any
 
-from . import okf, shadow, shadow_hooks
+from . import okf, shadow, shadow_hooks, telemetry
 from .config import _OBSERVER_CONFIG, resolve_config
 
 logger = logging.getLogger(__name__)
 IDENTITY = ("session_id", "task_id", "turn_id", "api_request_id", "tool_call_id")
 MAX_RECEIPT_BYTES = 65536
 MAX_RESULT_CHARS = 65536
-MAX_CONTENT_SCAN_CHARS = 1048576
+# A skill body has no host file-read cap. Keep scanning bounded while allowing
+# legitimate multi-megabyte skills; the decoded metadata budget stays unchanged.
+MAX_CONTENT_SCAN_CHARS = 4 * 1048576
 # Lex only complete JSON strings, with bounded input and no per-character
 # backtracking stack. The JSON decoder still validates the entire envelope.
 _JSON_STRING = re.compile(r'"(?:[^"\\\x00-\x1f]++|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*+"')
@@ -240,6 +242,9 @@ class Observer:
         self._queue: deque[_Slot] = deque()
         self._seen: OrderedDict[tuple[str, ...], None] = OrderedDict()
         self._counts: Counter[str] = Counter()
+        self._diagnostics: dict[tuple[str, str, str], Counter[str]] = {}
+        self._flushed_completed = 0
+        self._drain_targets: Counter[int] = Counter()
         self._closed = False
         self._thread: threading.Thread | None = None
 
@@ -247,20 +252,51 @@ class Observer:
         with self._condition:
             return {**self._counts, "pending": len(self._queue)}
 
-    def _notice(self, reason: str) -> None:
+    def _count(self, reason: str) -> int:
+        # Only fixed categories are passed here, not tool names or host values.
+        try:
+            cfg = _OBSERVER_CONFIG.get() or resolve_config()
+            key = (str(cfg.source_root), str(cfg.state_dir), telemetry._utc_now()[:16] + ":00Z")
+        except Exception:
+            key = None  # No safe profile/root attribution; never guess a destination.
         with self._condition:
             self._counts[reason] += 1
-            count = self._counts[reason]
+            if key is not None:
+                if key in self._diagnostics or len(self._diagnostics) < 256:
+                    self._diagnostics.setdefault(key, Counter())[reason] += 1
+                else:
+                    self._counts["diagnostic_scope_overflow"] += 1
+            return self._counts[reason]
+
+    def _flush_diagnostics(self) -> None:
+        with self._condition:
+            pending, self._diagnostics = self._diagnostics, {}
+        for (root, state_dir, bucket), counts in pending.items():
+            if not telemetry.record_observer_counts(root, state_dir, bucket, dict(counts)):
+                # Do not retry ambiguous writes or recurse into the persistence path.
+                with self._condition:
+                    self._counts["diagnostic_write_error"] += 1
+                logger.warning("Local knowledge observer diagnostic_write_error")
+
+    def _notice(self, reason: str, slot: _Slot | None = None) -> None:
+        count = slot.context.run(self._count, reason) if slot is not None else self._count(reason)
         # Log first and powers of two: overload must not create unbounded logs.
         if count & (count - 1) == 0:
             logger.warning("Local knowledge observer %s (count=%d)", reason, count)
 
     def reserve(self, kind: str) -> _Slot | None:
+        try:
+            # Resolve once: admission, producer diagnostics and consumers must
+            # share the same profile/root even if downstream changes context.
+            context = copy_context()
+            context.run(_OBSERVER_CONFIG.set, resolve_config())
+        except Exception:
+            self._notice("config_error")
+            return None
         with self._condition:
             if self._closed or len(self._queue) >= self.capacity:
                 self._notice("closed" if self._closed else "full")
                 return None
-            context = copy_context()
             slot = _Slot(context, kind)
             self._queue.append(slot)
             if self._thread is None:
@@ -273,16 +309,8 @@ class Observer:
                     return None
                 self._thread = thread
                 atexit.register(self.close, 1.0)
-            self._counts["accepted"] += 1
+            context.run(self._count, "accepted")
             self._condition.notify_all()
-        try:
-            # Freeze all custom settings, not just HERMES_HOME; no worker-time
-            # config reload or process-global environment mutation.
-            context.run(_OBSERVER_CONFIG.set, resolve_config())
-        except Exception:
-            self.finish(slot, None)
-            self._notice("config_error")
-            return None
         return slot
 
     def finish(self, slot: _Slot, payload: dict[str, Any] | None) -> None:
@@ -292,9 +320,9 @@ class Observer:
                 serialized = json.dumps(payload, ensure_ascii=True)
                 if len(serialized) > MAX_RECEIPT_BYTES:
                     serialized = None
-                    self._notice("oversize")
+                    self._notice("oversize", slot)
         except Exception:
-            self._notice("receipt_serialization_error")
+            self._notice("receipt_serialization_error", slot)
         finally:
             with self._condition:
                 slot.payload = serialized
@@ -309,9 +337,9 @@ class Observer:
             if slot is not None:
                 payload = project_call(args, metadata)
         except _CallProjectionError as error:
-            self._notice(str(error))
+            self._notice(str(error), slot)
         except Exception:
-            self._notice("call_projection_error")
+            self._notice("call_projection_error", slot)
         scope = None
         token = None
         try:
@@ -322,7 +350,7 @@ class Observer:
                 scope = shadow_hooks.search_scope(cfg, args, metadata)
                 token = shadow_hooks._SEARCH_SCOPE.set(scope)
         except Exception:
-            self._notice("scope_error")
+            self._notice("scope_error", slot)
         result: Any = None
         failed = True
         try:
@@ -339,15 +367,15 @@ class Observer:
                             payload["_promotion"] = scope.promotion
                         project_result(payload, result, failed)
                         if payload["status"] == "unknown":
-                            self._notice("result_unknown")
-                            self._notice(payload.pop("_result_diagnostic"))
+                            self._notice("result_unknown", slot)
+                            self._notice(payload.pop("_result_diagnostic"), slot)
                 except Exception:
                     payload = None
-                    self._notice("result_projection_error")
+                    self._notice("result_projection_error", slot)
                 try:
                     self.finish(slot, payload)
                 except Exception:
-                    self._notice("enqueue_error")
+                    self._notice("enqueue_error", slot)
 
     def submit(self, kind: str, payload: dict[str, Any]) -> None:
         slot = self.reserve(kind)
@@ -357,7 +385,7 @@ class Observer:
     def _deliver(self, slot: _Slot) -> None:
         if slot.payload is None:
             with self._condition:
-                self._counts["discarded"] += 1
+                self._count("discarded")
             return
         payload = json.loads(slot.payload)
         if slot.kind == "post":
@@ -368,7 +396,7 @@ class Observer:
                        payload["tool_name"], *ids)
                 if key in self._seen:
                     with self._condition:
-                        self._counts["duplicate"] += 1
+                        self._count("duplicate")
                     return
                 self._seen[key] = None
                 if len(self._seen) > self.dedup_capacity:
@@ -378,17 +406,32 @@ class Observer:
                 for field, value in zip(IDENTITY, ids):
                     if not value:
                         self._notice("missing_" + field)
+            self._count("tool_observed")
+            status = payload.get("status")
+            self._count("outcome_" + (status if status in {"success", "error", "unknown"} else "unknown"))
             # Tool-call ID is needed for replay suppression, not the downstream
             # exact session/task/turn/request joins. Never infer those joins.
             payload["_observer_attributed"] = all(ids[:4])
             if not payload["_observer_attributed"]:
                 self._notice("attribution_skipped")
+            else:
+                self._count("attributed")
         self.consume(slot.kind, **payload)
         with self._condition:
-            self._counts["delivered"] += 1
+            self._count("delivered")
 
     def _run(self) -> None:
         while True:
+            with self._condition:
+                completed = self._counts["completed"]
+                drain_ready = (completed > self._flushed_completed
+                               and any(target <= completed for target in self._drain_targets))
+            if drain_ready:
+                self._flush_diagnostics()
+                with self._condition:
+                    self._flushed_completed = completed
+                    self._condition.notify_all()
+                continue
             with self._condition:
                 if not self._queue:
                     self._condition.wait_for(lambda: self._queue or self._closed,
@@ -406,19 +449,34 @@ class Observer:
                 slot.context.run(self._deliver, slot)
             except Exception:
                 # Never log private exception text or retry partial effects.
-                self._notice("consumer_error")
+                slot.context.run(self._notice, "consumer_error")
             finally:
                 with self._condition:
                     self._queue.popleft()
-                    self._counts["completed"] += 1
-                    self._condition.notify_all()
+                    completed = slot.context.run(self._count, "completed")
+                    # Deliver admitted bursts before paying SQLite latency. Bound
+                    # a continuously busy batch by the existing queue capacity.
+                    flush = (not self._queue or not self._queue[0].ready
+                             or completed in self._drain_targets
+                             or completed - self._flushed_completed >= self.capacity)
+                if flush:
+                    self._flush_diagnostics()
+                    with self._condition:
+                        self._flushed_completed = completed
+                        self._condition.notify_all()
 
     def drain(self, timeout: float = 2.0) -> bool:
         """Wait for work admitted before this call, including active producers."""
         with self._condition:
             target = self._counts["accepted"]
-            done = self._condition.wait_for(lambda: self._counts["completed"] >= target,
-                                            timeout=max(0, timeout))
+            self._drain_targets[target] += 1
+            try:
+                done = self._condition.wait_for(lambda: self._flushed_completed >= target,
+                                                timeout=max(0, timeout))
+            finally:
+                self._drain_targets[target] -= 1
+                if not self._drain_targets[target]:
+                    del self._drain_targets[target]
         if not done:
             self._notice("drain_timeout")
         return done

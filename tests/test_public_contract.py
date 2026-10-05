@@ -315,6 +315,7 @@ PERSISTED_INDEX_METADATA_KEYS = {
     "jsonl_sha256",
 }
 USAGE_REPORT_KEYS = {
+    "observer_diagnostics",
     "success",
     "usage_db_path",
     "live_root",
