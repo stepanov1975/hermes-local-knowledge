@@ -32,11 +32,18 @@ _PROGRESS_FILE: Path | None = None
 _CONTEXT: dict[str, Any] = {}
 
 
+def _notice(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, UnicodeError):
+        pass  # Optional diagnostics must not change the evaluation result.
+
+
 def _progress(stage: str, **counts: int) -> None:
     try:
         _write_progress(stage, **counts)
     except OSError:
-        print("evaluator-progress status_write_failed", file=sys.stderr, flush=True)
+        _notice("evaluator-progress status_write_failed")
 
 
 def _write_progress(stage: str, **counts: int) -> None:
@@ -49,15 +56,14 @@ def _write_progress(stage: str, **counts: int) -> None:
             os.replace(name, _PROGRESS_FILE)
         finally:
             Path(name).unlink(missing_ok=True)
-    print("evaluator-progress " + json.dumps({"stage": stage, **counts}, sort_keys=True),
-          file=sys.stderr, flush=True)
+    _notice("evaluator-progress " + json.dumps({"stage": stage, **counts}, sort_keys=True))
 
 
 def _failure_evidence(exc: BaseException, **extra: Any) -> None:
     try:
         _write_failure_evidence(exc, **extra)
     except Exception:  # diagnostics must not replace the original lookup failure
-        print("evaluator-progress diagnostic_write_failed", file=sys.stderr, flush=True)
+        _notice("evaluator-progress diagnostic_write_failed")
 
 
 def _write_failure_evidence(exc: BaseException, **extra: Any) -> None:
@@ -830,7 +836,7 @@ def _close_capture(stream: io.IOBase) -> None:
     try:
         stream.close()
     except (OSError, UnicodeError):
-        print("evaluator-progress capture_close_failed", file=sys.stderr, flush=True)
+        _notice("evaluator-progress capture_close_failed")
 
 
 class _PrivateCapture:
@@ -842,7 +848,7 @@ class _PrivateCapture:
 
     def _disable(self) -> None:
         self.disabled = True
-        print("evaluator-progress capture_write_failed", file=sys.stderr, flush=True)
+        _notice("evaluator-progress capture_write_failed")
 
     def write(self, text: str) -> int:
         if not self.disabled:
@@ -890,7 +896,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     capture = _PrivateCapture(text)
                     capture_path = path
                 except OSError:
-                    print("evaluator-progress capture_write_failed", file=sys.stderr, flush=True)
+                    _notice("evaluator-progress capture_write_failed")
             with redirect_stdout(capture):
                 request = json.loads(args.request.read_text(encoding="utf-8"))
                 if not isinstance(request, dict):
@@ -925,7 +931,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else captured_stdout.getvalue().encode("utf-8")
         )
     except (OSError, UnicodeError):
-        print("evaluator-progress capture_read_failed", file=sys.stderr, flush=True)
+        _notice("evaluator-progress capture_read_failed")
         captured_bytes = b""
     if captured_bytes:
         payload["captured_stdout_sha256"] = hashlib.sha256(captured_bytes).hexdigest()

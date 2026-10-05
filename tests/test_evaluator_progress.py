@@ -479,8 +479,10 @@ def test_direct_evaluator_without_diagnostics_preserves_capture_contract(
 
 
 @pytest.mark.parametrize("failure", ["write", "flush", "unicode"])
+@pytest.mark.parametrize("warning_failure", [False, True])
 def test_capture_errors_do_not_change_successful_callback(
-    failure: str, capsys: pytest.CaptureFixture[str],
+    failure: str, warning_failure: bool, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     class BrokenStream:
         def write(self, text: str) -> int:
@@ -501,13 +503,16 @@ def test_capture_errors_do_not_change_successful_callback(
         print("more private output", flush=True)
         return {"value": "successful lookup"}
 
-    with redirect_stdout(sink):
-        result = evaluator._safe_call(callback)
+    with monkeypatch.context() as context:
+        if warning_failure:
+            context.setattr(evaluator.sys, "stderr", BrokenStream())
+        with redirect_stdout(sink):
+            result = evaluator._safe_call(callback)
     assert result == {"status": "ok", "value": {"value": "successful lookup"}}
     assert sink.disabled
     streams = capsys.readouterr()
     assert streams.out == ""
-    assert streams.err == "evaluator-progress capture_write_failed\n"
+    assert streams.err == ("" if warning_failure else "evaluator-progress capture_write_failed\n")
 
 
 @pytest.mark.parametrize("primary", [RuntimeError, KeyboardInterrupt])

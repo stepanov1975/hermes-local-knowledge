@@ -352,6 +352,13 @@ def build_child_env(
     return env
 
 
+def _notice(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, UnicodeError):
+        pass  # Optional diagnostics must not change the evaluation result.
+
+
 def _invoke_evaluator(
     checkout: Path,
     request: dict[str, Any],
@@ -396,7 +403,7 @@ def _invoke_evaluator(
         ]
     started = time.monotonic()
     last_status: Any = None
-    print("historical-progress evaluator_start", file=sys.stderr, flush=True)
+    _notice("historical-progress evaluator_start")
     with stderr_path.open("wb") as stderr_file, stdout_path.open("wb") as stdout_file:
         stderr_path.chmod(0o600)
         stdout_path.chmod(0o600)
@@ -424,9 +431,8 @@ def _invoke_evaluator(
                                 if type(status.get(key)) is int and status[key] >= 0:
                                     safe[key] = status[key]
                         last_status = safe
-                        print("historical-progress " + _canonical_json({
-                            "elapsed_seconds": int(time.monotonic() - started), **safe}),
-                            file=sys.stderr, flush=True)
+                        _notice("historical-progress " + _canonical_json({
+                            "elapsed_seconds": int(time.monotonic() - started), **safe}))
             except BaseException:
                 child.kill()
                 child.wait()
@@ -446,11 +452,11 @@ def _invoke_evaluator(
                         "request_file": str(request_path),
                     })
                 except Exception:
-                    print("historical-progress receipt_write_failed", file=sys.stderr, flush=True)
+                    _notice("historical-progress receipt_write_failed")
     stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
     stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
     result = subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
-    print("historical-progress evaluator_complete", file=sys.stderr, flush=True)
+    _notice("historical-progress evaluator_complete")
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -3636,7 +3642,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
     try:
         baseline_ref = str(args.refs[0])
         baseline_key = f"01-{safe_ref_name(baseline_ref)}"
-        print("historical-progress prepare_baseline", file=sys.stderr, flush=True)
+        _notice("historical-progress prepare_baseline")
         baseline_checkout = prepare_worktree(baseline_ref, base_dir, created_worktrees, baseline_key)
         resolved = _resolve_baseline_config(baseline_checkout, args, base_dir)
         live_source = Path(str(resolved["source_root"])).resolve()
@@ -3650,7 +3656,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
         if not live_hermes.is_dir():
             raise FileNotFoundError("effective Hermes home does not exist")
 
-        print("historical-progress freeze_inputs", file=sys.stderr, flush=True)
+        _notice("historical-progress freeze_inputs")
         frozen_paths, snapshot_report = _freeze_inputs(
             live_source,
             live_hermes,
@@ -3720,7 +3726,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
         evaluations = [baseline]
 
         for index, ref_value in enumerate(args.refs[1:], start=2):
-            print(f"historical-progress candidate {index}/{len(args.refs)}", file=sys.stderr, flush=True)
+            _notice(f"historical-progress candidate {index}/{len(args.refs)}")
             ref = str(ref_value)
             ref_key = f"{index:02d}-{safe_ref_name(ref)}"
             checkout = prepare_worktree(ref, base_dir, created_worktrees, ref_key)
@@ -3768,7 +3774,7 @@ def compare_refs(args: argparse.Namespace, base_dir: Path) -> ComparisonRun:
                 _build_ref_evaluation(layout, oracle, frozen_usage, case_payload, output)
             )
 
-        print("historical-progress compare_results", file=sys.stderr, flush=True)
+        _notice("historical-progress compare_results")
         comparisons = [
             _candidate_comparison(baseline, candidate, frozen_usage)
             for candidate in evaluations[1:]
@@ -3943,7 +3949,7 @@ def main(argv: list[str] | None = None) -> int:
         comparison = compare_refs(args, base_dir)
         if not comparison.accepted:
             failed = True
-            print(f"Private failure evidence retained at: {base_dir}", file=sys.stderr, flush=True)
+            _notice(f"Private failure evidence retained at: {base_dir}")
         payload = dict(comparison.report)
         if args.details:
             payload["details"] = comparison.details
@@ -3967,8 +3973,8 @@ def main(argv: list[str] | None = None) -> int:
                     "traceback": traceback.format_exc(),
                 })
             except Exception:
-                print("Private failure receipt could not be written", file=sys.stderr, flush=True)
-            print(f"Private failure evidence retained at: {base_dir}", file=sys.stderr, flush=True)
+                _notice("Private failure receipt could not be written")
+            _notice(f"Private failure evidence retained at: {base_dir}")
         if isinstance(exc, KeyboardInterrupt):
             raise
         error_payload = {
