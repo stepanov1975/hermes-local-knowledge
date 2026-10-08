@@ -443,7 +443,9 @@ def test_registered_mcp_capability_links_require_exact_tool_namespace(tmp_path: 
     packet = c.packet(origin, expand=True)
     sources = {s["artifact_id"]: s["logical_id"] for s in packet["sources"]}
     assert sources["tool_okf:widget-owned"] in packet["origin_capability_sources"]
-    assert sources["tool_okf:widget-decoy"] not in packet["origin_capability_sources"]
+    decoy = next(a for a in c.artifacts if a["id"] == "tool_okf:widget-decoy")
+    assert not c.mcp_capability(c.by_id[origin], decoy)
+    assert decoy["logical_id"] not in packet["origin_capability_sources"]
 
 
 def test_one_bad_quote_preserves_valid_drafts_and_only_regenerates_rejected(corpus: Corpus, tmp_path: Path) -> None:
@@ -838,9 +840,9 @@ def test_packet_selects_task_relevant_paragraphs_from_frozen_origin_context(tmp_
         assert span["evidence_id"] == digest([source["logical_id"], span["start"], span["end"], span["text"]])
 
 
-def test_v6_prompt_accepts_imperfect_goals_without_five_distinct_capabilities() -> None:
+def test_v7_prompt_accepts_imperfect_goals_without_five_distinct_capabilities() -> None:
     from scripts.lab_benchmark import PROTOCOL
-    assert PROTOCOL["name"] == "lk-synthetic-routing-v6"
+    assert PROTOCOL["name"] == "lk-synthetic-routing-v7"
     assert PROTOCOL["quota"] == 5
     for prompt in [GENERATION, JUDGMENT]:
         assert "Imperfect but" in prompt and "top five" in prompt
@@ -983,3 +985,186 @@ def test_identity_feedback_does_not_guess_from_close_tokens_or_literal_quotes(co
     assert "belongs to supplied logical_id" not in str(exc.value)
     assert repr(original_id) not in str(exc.value)
     assert encoded(case) == before
+
+
+
+def extend_fixture(c: Corpus, files: list[tuple[str, str, str, str]]) -> Corpus:
+    mapping = read_json(c.root / "mapping.json")
+    for kind, name, locator, text in files:
+        path = c.root / locator
+        if kind == "skill":
+            path /= "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        mapping.append({"logical_id": hashlib.sha256(json.dumps([kind, "fixture", locator,
+                        name if kind == "script" else ""]).encode()).hexdigest(),
+                        "id": name, "locator": locator, "type": kind, "source": "fixture",
+                        "content_sha256": hashlib.sha256(text.encode()).hexdigest()})
+    (c.root / "mapping.json").write_text(json.dumps(mapping))
+    (c.root / "manifest.json").write_text(json.dumps({"inputs": frozen_manifest(c.root),
+        "policy": "synthetic-fixture", "settings": {}}))
+    return Corpus(c.root, hashlib.sha256((c.root / "manifest.json").read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize("origin_id", ["tool_okf:skills-list", "script:hermes-home-scripts-widget"])
+def test_structural_tokens_do_not_supply_fallback_association(corpus: Corpus, origin_id: str) -> None:
+    kind = origin_id.split(":", 1)[0]
+    c = extend_fixture(corpus, [
+        (kind, origin_id, "source/skills/origin.md", "Inspect widget inventory."),
+        *[("skill_support_doc", f"doc:unrelated-{i}", f"source/skills/unrelated/references/item-{i}.md",
+           "Unrelated reference.") for i in range(30)],
+        *[("doc", f"doc:widget-{i:02d}", f"source/docs/widget-{i:02d}.md", "Widget routing.") for i in range(30)],
+    ])
+    origin = next(a for a in c.artifacts if a["id"] == origin_id)
+    for expanded, cap in [(False, 6), (True, 12)]:
+        related = c.related(origin, expand=expanded)
+        assert not any("unrelated" in a["id"] for a in related)
+        assert len(related) == (cap if "widget" in origin_id else 0)
+
+
+@pytest.fixture
+def dense_corpus(corpus: Corpus) -> Corpus:
+    references = " ".join(f"`neighbors/reference-{i:02d}.md`" for i in range(98))
+    files = [("doc", "doc:widget-index", "index.md", "widget backup routing. " + references)]
+    for i in range(98):
+        paragraph = "Widget backup: restore archive copies."
+        if i == 97:
+            paragraph += " Diagnose failures using the recovery ledger."
+        text = "# Reference\n\n" + "Background 历史 😀.\n\n" * 2000
+        text += paragraph + "\n\n" + "Background 历史 😀.\n\n" * 2000
+        files.append(("doc", f"doc:reference-{i:02d}", f"neighbors/reference-{i:02d}.md", text))
+    return extend_fixture(corpus, files)
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+def test_many_genuine_references_are_discovered_but_serialization_is_bounded(dense_corpus: Corpus, expanded: bool) -> None:
+    from scripts.lab_benchmark import MAX_PACKET_BYTES
+    c = dense_corpus
+    origin = next(a for a in c.artifacts if a["id"] == "doc:widget-index")
+    assert len(c.related(origin, expand=expanded)) == 98
+    packet = c.packet(origin["logical_id"], expand=expanded)
+    assert len(encoded(packet)) <= MAX_PACKET_BYTES
+    assert len(packet["sources"]) <= (24 if expanded else 12)
+    assert {a["logical_id"] for a in c.related(origin)} == {a["logical_id"] for a in packet["available_sources"]}
+    assert packet == c.packet(origin["logical_id"], expand=expanded)
+    for source in packet["sources"]:
+        text, _ = c.text(c.by_id[source["logical_id"]])
+        for span in source["spans"]:
+            assert span["text"] == text[span["start"]:span["end"]]
+            assert span["sha256"] == hashlib.sha256(span["text"].encode()).hexdigest()
+            assert span["evidence_id"] == digest([source["logical_id"], span["start"], span["end"], span["text"]])
+        if source["logical_id"] != origin["logical_id"]:
+            assert any("Widget backup: restore archive copies." in s["text"] for s in source["spans"])
+    focused = c.packet(origin["logical_id"], expand=True, focus="Diagnose failures using the recovery ledger")
+    assert "doc:reference-97" in {s["artifact_id"] for s in focused["sources"]}
+    assert len(encoded(focused)) <= MAX_PACKET_BYTES
+
+
+@pytest.mark.parametrize("role", ["generation", "judgment"])
+def test_actual_prompt_overhead_blocks_before_dispatch_without_dropping_received_data(
+    corpus: Corpus, tmp_path: Path, role: str,
+) -> None:
+    from scripts.lab_benchmark import MAX_PROMPT_BYTES
+    model = SyntheticModel()
+    origin = next(iter(corpus.by_id))
+    packet = corpus.packet(origin)
+    # Repeated realistic target rationales / raw feedback are received data,
+    # not a license to shorten labels or regenerate a received response.
+    cases = [draft(packet, f"inspect-{i}") for i in range(5)]
+    for case in cases:
+        case["targets"][0]["rationale"] = "Review frozen widget maintenance evidence. " * 1200
+    overhead = {"accepted": cases[:4], "rejected": [{"draft": cases[4], "category": "missing_evidence",
+                "reason": "The proposed recovery task needs source context."}], "missing": 1}
+    if role == "judgment":
+        overhead = {"accepted": [], "drafts": cases}
+    prefix = GENERATION if role == "generation" else JUDGMENT
+    prompt = prefix + encoded({"packet": packet, **overhead}).decode()
+    before = encoded(overhead)
+    assert len(prompt.encode()) > MAX_PROMPT_BYTES
+    campaign = Campaign(corpus, tmp_path / "oversize", model, model)
+    directory = campaign.root / "synthetic-round"
+    with pytest.raises(PreparationBlocked, match="prompt exceeds"):
+        campaign.call(directory, role, prompt, False)
+    assert not model.calls and not directory.exists()
+    assert encoded(overhead) == before
+
+
+def test_dense_packet_focused_resume_reconstructs_exact_receipts(dense_corpus: Corpus, tmp_path: Path) -> None:
+    c = dense_corpus
+    origin = next(a["logical_id"] for a in c.artifacts if a["id"] == "doc:widget-index")
+    base = SyntheticModel()
+
+    def judge(prompt: str) -> dict[str, Any]:
+        response = base(prompt)
+        data = json.loads(prompt[len(JUDGMENT):])
+        if not data["accepted"]:
+            obj = json.loads(response["text"])
+            obj["decisions"][-1].update(accept=False, category="missing_evidence", reason="Need recovery ledger context")
+            response["text"] = json.dumps(obj)
+        return response
+
+    campaign = Campaign(c, tmp_path / "dense-campaign", base, judge)
+    with pytest.raises(PreparationBlocked, match="quota unmet"):
+        campaign.prepare([origin], rounds=1)
+    first = campaign.accepted(origin)
+    run = campaign.root / "artifacts" / origin / "round-0000"
+    receipts = [(run / name).read_bytes() for name in ("generation.json", "judgment.json")]
+    assert campaign.prepare([origin], rounds=1)["accepted_cases"] == 5
+    assert campaign.accepted(origin)[:4] == first
+    assert receipts == [(run / name).read_bytes() for name in ("generation.json", "judgment.json")]
+    assert len(campaign.verify_cases(origin)) == 5
+    request = json.loads(base.calls[2][len(GENERATION):])
+    assert request["packet"]["focus"] and request["packet"]["selection"] == "expanded"
+    assert len(request["rejected"]) == 1 and request["rejected"][0]["draft"]["intent"] == "diagnose failures"
+    assert "doc:reference-97" in {s["artifact_id"] for s in request["packet"]["sources"]}
+    assert len(base.calls) == 4
+    resumed = Campaign(c, campaign.root, base, judge)
+    assert resumed.prepare([origin], rounds=1)["accepted_cases"] == 5
+    assert len(resumed.verify_cases(origin)) == 5 and len(base.calls) == 4
+
+
+def test_oversize_disclosure_metadata_pauses_instead_of_hiding_references(corpus: Corpus) -> None:
+    c = extend_fixture(corpus, [("doc", "doc:widget-origin", "origin.md", "Read `large-meta.md`.")])
+    origin = next(a for a in c.artifacts if a["id"] == "doc:widget-origin")
+    c = extend_fixture(c, [("doc", "doc:" + "界" * 45000, "large-meta.md", "Widget source.")])
+    assert len(c.related(origin)) == 1
+    with pytest.raises(PreparationBlocked, match="disclosure metadata"):
+        c.packet(origin["logical_id"])
+
+
+
+@pytest.mark.parametrize("blocked_role", ["generation", "judgment"])
+def test_received_oversize_workflow_overhead_is_retained_on_zero_send_resume(
+    corpus: Corpus, tmp_path: Path, blocked_role: str,
+) -> None:
+    base = SyntheticModel()
+
+    def generate(prompt: str) -> dict[str, Any]:
+        response = base(prompt)
+        obj = json.loads(response["text"])
+        obj["cases"][0]["targets"][0]["rationale"] = "Review frozen widget maintenance evidence. " * 5000
+        if blocked_role == "generation":
+            obj["cases"][0]["targets"][0]["logical_id"] = "raw-invalid-target"
+        response["text"] = json.dumps(obj)
+        return response
+
+    origin = next(iter(corpus.by_id))
+    campaign = Campaign(corpus, tmp_path / "overhead-campaign", generate, base)
+    with pytest.raises(PreparationBlocked, match=f"{blocked_role} prompt exceeds"):
+        campaign.prepare([origin])
+    run = campaign.root / "artifacts" / origin / "round-0000"
+    received = (run / "generation.json").read_bytes()
+    raw = json.loads(read_json(run / "generation.json")["response"]["text"])["cases"][0]
+    assert len(base.calls) == (2 if blocked_role == "generation" else 1)
+    if blocked_role == "generation":
+        result = read_json(run / "result.json")
+        assert result["rejected"][0]["draft"] == raw
+        assert len(campaign.accepted(origin)) == 4
+        assert not (run.with_name("round-0001") / "generation.json").exists()
+    else:
+        assert not (run / "judgment.json").exists()
+        assert not (run / "result.json").exists()
+    calls = len(base.calls)
+    with pytest.raises(PreparationBlocked, match=f"{blocked_role} prompt exceeds"):
+        Campaign(corpus, campaign.root, generate, base).prepare([origin])
+    assert len(base.calls) == calls and (run / "generation.json").read_bytes() == received

@@ -263,22 +263,28 @@ there is no automatic corpus refresh or original-source access.
 ### Evidence, rejection and durable recovery
 
 The corpus manifest, mapping and each source hash are verified. Packets use only
-scrubbed projection bytes, frozen locators and logical identities. Short sources
-are supplied completely; larger sources receive structural-heading/function/flag
-windows plus evenly spaced coverage, including the end. The selection limit is
-24,000 characters per source, not a reason to exclude a large artifact. Selection
-prioritizes owning skills and explicit quoted skill names, tool references and
-file references from the frozen origin text. For operational origins (cron, MCP,
-script and tool notes), six additional identity-domain leads follow, ordered by
-origin-term overlap and frozen locator. Generic update terms cannot displace a
-declared domain skill/report. These are context leads, not relevance judgments.
-A `missing_evidence` rejection or fewer drafts than requested expands subsequent
-rounds to the remaining frozen domain leads, without a live resnapshot. Per-source
-span selection stays fixed. **Relations and origin association never establish
-acceptable-target correctness.**
+scrubbed projection bytes, frozen locators and logical identities. Source selection
+retains task-relevant paragraphs and bounded structural/even coverage, with a
+24,000-character per-source upper bound rather than excluding large artifacts.
+Owning skills, explicit quoted skill names, tool/file references and exact MCP
+namespaces remain discovery evidence. Operational origins may acquire additional
+bounded capability/topic leads; structural directory or ID prefixes alone are
+not task association. These are context leads, not relevance judgments.
+A `missing_evidence` rejection or fewer drafts than requested acquires additional
+task-relevant frozen evidence within the request budget, without a live resnapshot.
+Genuine reference discovery is retained even when some source/span contents are
+transparently deferred from one packet; discovery does not require serializing
+an entire reference inventory into each request. Actual UTF-8 serialization is
+bounded to 131,072 bytes per evidence packet and 196,608 bytes per generation or
+judgment prompt, including accepted cases, rejected feedback and retained drafts.
+Received labels and raw rejection history are not repaired or silently truncated
+to fit; an unfit required request pauses before provider dispatch. These are
+workflow ceilings, not asserted provider context windows. **Relations and origin
+association never establish acceptable-target correctness.**
 For MCP-server origins, frozen tool notes with an exact matching qualified MCP
-namespace are selected before other leads and listed as `origin_capability_sources`.
-This establishes registration membership, not target correctness. The server's
+namespace remain discovery candidates. Supplied matching members are listed as
+`origin_capability_sources`; other discovered members may be deferred by bounded
+task selection. This establishes registration membership, not target correctness. The server's
 registration quote and a matching tool's documented task may jointly establish
 origin association; an unrelated namespace is never membership evidence.
 All corpus/draft/accepted text is explicitly untrusted data and no tools execute.

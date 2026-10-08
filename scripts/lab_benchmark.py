@@ -92,15 +92,19 @@ axis (unsupported_target also covers the reality/quality gate); missing_evidence
 may express uncertainty. accept and category must agree; no contradictory verdicts.
 This is AI validation, not human gold or a demonstrated retrieval outcome.
 """
+MAX_PACKET_BYTES = 131072
+MAX_PROMPT_BYTES = 196608
+
 PROTOCOL: dict[str, Any] = {
-    "name": "lk-synthetic-routing-v6", "generation": GENERATION, "judgment": JUDGMENT,
+    "name": "lk-synthetic-routing-v7", "generation": GENERATION, "judgment": JUDGMENT,
     "roles": {"generation": {"model": "gpt-6-luna", "provider": "openai-codex", "reasoning": "xhigh"},
               "judgment": {"model": "gpt-6.1-sol", "provider": "openai-codex", "reasoning": "high"}},
     "quota": 5, "partition": "sort case_id ascending per origin: first 3 development, last 2 validation",
     "digest": "SHA256 of UTF-8 JSON, sort_keys=true ensure_ascii=false separators=(',',':')",
     "case_id": "digest([campaign_id, origin_logical_id, question, intent, targets])",
     "campaign_id": "digest([protocol_digest, corpus_manifest_sha256])",
-    "evidence_selection": "v6: 24000 characters per source; origin-relevant paragraphs plus structural/even coverage; exact MCP tool namespace associations; canonical full/file-relative/owning-skill references and unique basenames, parent skill plus 6 origin-domain leads; ambiguous generic basenames do not expand globally; missing-evidence regeneration adds remaining domain leads",
+    "packet_bytes": MAX_PACKET_BYTES, "prompt_bytes": MAX_PROMPT_BYTES,
+    "evidence_selection": "v7: canonical references/parent/exact MCP discovery retained in available_sources; substantive identity/topic leads capped 6 initial/12 expanded; origin first plus task-ranked 11 initial/23 expanded sources; 24000/12000/6000/3000 character task/structural/even span budgets fitted to actual UTF-8 serialized packet; missing-evidence goals focus expanded acquisition; full feedback and labels preserved; oversize metadata/prompts pause before dispatch",
     "judgment_schema": "v5: exact positive/negative origin binding; per-target correctness; cited constructive additional_targets; goal distinctness; coherent categorical verdict",
     "regeneration": "per-draft structural validation preserves valid siblings and raw rejected drafts; unsupported identity feedback reports exact supplied evidence_id ownership when unique, never proximity/quote guesses or token repair; accepted work and cumulative rejected drafts/reasons; missing_evidence expands frozen-source context",
 }
@@ -161,6 +165,32 @@ def private_lock(root: Path) -> Iterator[None]:
         os.close(fd)
 
 
+def task_terms(text: str) -> set[str]:
+    """Scaffolding tokens never supply task association or evidence relevance."""
+    return set(re.findall(r"[a-z0-9]+", text.lower())) - {
+        "mcp", "cron", "script", "scripts", "skill", "skills", "doc", "docs",
+        "server", "run", "daily", "job", "source", "sources", "home", "hermes",
+        "references", "templates", "assets", "support", "md", "py", "sh", "tool", "okf",
+        "the", "and", "for", "with", "that", "this", "from", "not", "only", "must",
+        "read", "file", "files", "use", "all",
+    }
+
+
+def feedback_focus(rejected: list[dict[str, Any]]) -> str:
+    goals: list[str] = []
+    for rejection in rejected:
+        if rejection["category"] != "missing_evidence":
+            continue
+        draft = rejection.get("draft", {})
+        if isinstance(draft, dict):
+            cases = draft.get("cases", [draft])
+            if isinstance(cases, list):
+                for case in cases:
+                    if isinstance(case, dict):
+                        goals.extend(case[key] for key in ("question", "intent") if isinstance(case.get(key), str))
+    return "\n".join(goals)
+
+
 class Corpus:
     """Identity-verified projection reader; no live source or capture-review access."""
 
@@ -219,15 +249,13 @@ class Corpus:
         tool = re.search(r'''(?m)^tool:\s*["']?(mcp__[^\s"']+)["']?\s*$''', self.text(candidate)[0])
         return bool(tool and tool.group(1).startswith(f"mcp__{server}__"))
 
-    def related(self, origin: dict[str, Any], *, expand: bool = False) -> list[dict[str, Any]]:
+    def related(self, origin: dict[str, Any], *, expand: bool = False, focus: str = "") -> list[dict[str, Any]]:
         """Explicit references first, then same-domain leads; NEVER target labels."""
         locator = origin["locator"]
         text, _ = self.text(origin)
         # Normalize identifier separators only for discovery, not evidence/quotes.
         reference_text = re.sub(r"[_-]", "-", text.lower())
-        words = re.findall(r"[a-z0-9]+", origin["id"].split(":", 1)[-1].lower())
-        words = [w for w in words if w not in {"mcp", "cron", "script", "skill", "doc", "server", "run", "daily", "job"}]
-        domain = words[0] if words else ""
+        words = task_terms(origin["id"].split(":", 1)[-1])
         # Match whole path tokens, not a basename occurring inside another path.
         references = {m.group().rstrip(".") for m in re.finditer(r"[A-Za-z0-9_./-]+", text)}
         bases = [self.path(origin).parent.relative_to(self.root)]
@@ -264,32 +292,61 @@ class Corpus:
             if parent or referenced:
                 explicit.append(a)
                 continue
-            tokens = set(re.findall(r"[a-z0-9]+", (a["id"] + " " + path).lower()))
+            # Directory scaffolding is not capability association. Use the
+            # candidate identity/basename only, never arbitrary ancestor tokens.
+            tokens = task_terms(a["id"].split(":", 1)[-1] + " " + Path(path).name)
             if (origin["type"] in {"mcp_server", "cron_job", "script", "tool_okf"}
-                    and domain and domain in tokens):
-                scored.append((-len(set(words) & tokens), a["locator"], a))
+                    and words & tokens):
+                scored.append((-len((words | task_terms(focus)) & tokens), a["locator"], a))
         leads = [a for _, _, a in sorted(scored, key=lambda item: (item[0], item[1]))]
-        return sorted(owned, key=lambda a: a["locator"]) + sorted(explicit, key=lambda a: a["locator"]) + (leads if expand else leads[:6])
+        return sorted(owned, key=lambda a: a["locator"]) + sorted(explicit, key=lambda a: a["locator"]) + leads[:12 if expand else 6]
 
-    def packet(self, logical_id: str, *, expand: bool = False) -> dict[str, Any]:
+    def packet(self, logical_id: str, *, expand: bool = False, focus: str = "") -> dict[str, Any]:
         origin = self.by_id[logical_id]
-        sources = []
-        context = origin["id"] + "\n" + self.text(origin)[0]
-        for a in [origin, *self.related(origin, expand=expand)]:
+        related = self.related(origin, expand=expand, focus=focus)
+        context = focus or origin["id"] + "\n" + self.text(origin)[0]
+        words = task_terms(context)
+        # Discovery is not serialization: all genuine references remain available,
+        # even when their evidence is deferred. Lexical rank is not a target label.
+        related = sorted(related, key=lambda a: (
+            -len(words & task_terms(a["id"] + " " + self.text(a)[0])), a["locator"]))
+        packet: dict[str, Any] = {
+            "origin": logical_id, "selection": "expanded" if expand else "initial", "focus": focus,
+            "available_sources": [{"logical_id": a["logical_id"], "artifact_id": a["id"],
+                                   "locator": a["locator"]} for a in related],
+            "sources": [], "origin_capability_sources": [],
+        }
+        if len(encoded(packet)) > MAX_PACKET_BYTES:
+            raise PreparationBlocked("Evidence disclosure metadata exceeds packet byte budget")
+        candidates = [origin, *related[:23 if expand else 11]]
+        for index, a in enumerate(candidates):
             text, basis = self.text(a)
-            spans = select_spans(text, context=context)
-            sources.append({
-                "logical_id": a["logical_id"], "artifact_id": a["id"], "type": a["type"],
-                "locator": a["locator"], "source_sha256": a["content_sha256"],
-                "offset_basis": basis, "selected_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                "spans": [{"evidence_id": digest([a["logical_id"], start, end, text[start:end]]),
-                           "start": start, "end": end, "text": text[start:end],
-                           "sha256": hashlib.sha256(text[start:end].encode()).hexdigest()}
-                          for start, end in spans],
-            })
-        return {"origin": logical_id, "selection": "expanded" if expand else "initial", "sources": sources,
-                "origin_capability_sources": [s["logical_id"] for s in sources
-                                              if self.mcp_capability(origin, self.by_id[s["logical_id"]])]}
+            remaining = MAX_PACKET_BYTES - len(encoded(packet))
+            # Reserve space for later sources, using conservative UTF-8 width.
+            allowance = (remaining // (len(candidates) - index) - 1500) // 4
+            budgets = [b for b in (24000, 12000, 6000, 3000) if b <= max(3000, allowance)]
+            for budget in budgets:
+                spans = select_spans(text, budget, context=context)
+                source = {
+                    "logical_id": a["logical_id"], "artifact_id": a["id"], "type": a["type"],
+                    "locator": a["locator"], "source_sha256": a["content_sha256"],
+                    "offset_basis": basis, "selected_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                    "spans": [{"evidence_id": digest([a["logical_id"], start, end, text[start:end]]),
+                               "start": start, "end": end, "text": text[start:end],
+                               "sha256": hashlib.sha256(text[start:end].encode()).hexdigest()}
+                              for start, end in spans],
+                }
+                capability = self.mcp_capability(origin, a)
+                trial = {**packet, "sources": [*packet["sources"], source],
+                         "origin_capability_sources": [*packet["origin_capability_sources"],
+                                                       *([a["logical_id"]] if capability else [])]}
+                if len(encoded(trial)) <= MAX_PACKET_BYTES:
+                    packet = trial
+                    break
+            else:
+                if index == 0:
+                    raise PreparationBlocked("Origin evidence/metadata exceeds packet byte budget")
+        return packet
 
 
 def select_spans(text: str, budget: int = 24000, *, context: str = "") -> list[tuple[int, int]]:
@@ -303,10 +360,7 @@ def select_spans(text: str, budget: int = 24000, *, context: str = "") -> list[t
         return [(0, len(text))]
     width = min(1000, budget)
     slots = budget // width
-    words = set(re.findall(r"[a-z0-9]{3,}", context.lower())) - {
-        "the", "and", "for", "with", "that", "this", "from", "not", "only", "must",
-        "read", "source", "sources", "file", "files", "skill", "skills", "use", "all",
-    }
+    words = {word for word in task_terms(context) if len(word) >= 3}
     relevant = []
     for paragraph in re.finditer(r"\S[\s\S]*?(?=\n[ \t]*\n|\Z)", text):
         for start in range(paragraph.start(), paragraph.end(), width):
@@ -473,6 +527,8 @@ class Campaign:
             private_write(path, identity)
 
     def call(self, directory: Path, kind: str, prompt: str, retry_uncertain: bool) -> dict[str, Any]:
+        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise PreparationBlocked(f"{kind} prompt exceeds workflow byte budget; retained feedback/drafts require controller review")
         path = directory / (kind + ".json")
         role = "generation" if kind == "generation" else "judgment"
         request = {"kind": kind, "role": role, **PROTOCOL["roles"][role],
@@ -542,7 +598,8 @@ class Campaign:
             if completed >= rounds:
                 private_write(directory / "blocked.json", {"origin": origin, "reason": "Grounded quota unmet; retained accepted work. Operator may continue more rounds or review evidence/source sufficiency", "accepted": len(accepted)})
                 raise PreparationBlocked(f"Grounded quota unmet for artifact {origin}; accepted={len(accepted)}")
-            packet = self.corpus.packet(origin, expand=any(r["category"] == "missing_evidence" for r in rejected))
+            packet = self.corpus.packet(origin, expand=any(r["category"] == "missing_evidence" for r in rejected),
+                                        focus=feedback_focus(rejected))
             round_evidence = run / "evidence.json"
             if round_evidence.exists() and read_json(round_evidence) != packet:
                 raise PreparationBlocked("Round evidence selection drift")
@@ -668,6 +725,8 @@ class Campaign:
                 if (record["status"] != "received" or hashlib.sha256(record["request"]["prompt"].encode()).hexdigest()
                         != record["request"]["prompt_sha256"]):
                     raise PreparationBlocked("Missing/drifted model receipt")
+                if len(record["request"]["prompt"].encode("utf-8")) > MAX_PROMPT_BYTES:
+                    raise PreparationBlocked("Model receipt exceeds prompt byte budget")
                 receipts.append(record)
             generation, judgment = receipts
             generation_path = (self.root / case["generation_receipt"]).resolve()
@@ -685,8 +744,10 @@ class Campaign:
             selected = request["packet"]
             if selected.get("selection") not in {"initial", "expanded"}:
                 raise PreparationBlocked("Unknown evidence selection")
-            packet = self.corpus.packet(origin, expand=selected["selection"] == "expanded")
             generation_request = json.loads(generation["request"]["prompt"][len(GENERATION):])
+            packet = self.corpus.packet(origin, expand=any(r["category"] == "missing_evidence"
+                                                          for r in generation_request["rejected"]),
+                                        focus=feedback_focus(generation_request["rejected"]))
             evidence_path = (self.root / case["generation_receipt"]).parent / "evidence.json"
             if selected != packet or generation_request["packet"] != packet or read_json(evidence_path) != packet:
                 raise PreparationBlocked("Judgment evidence drift")
