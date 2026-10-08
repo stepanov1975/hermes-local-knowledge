@@ -183,7 +183,7 @@ def test_prior_protocol_campaign_cannot_carry_labels_forward(corpus: Corpus, tmp
     accepted_path = root / "artifacts" / next(iter(corpus.by_id)) / "accepted.json"
     accepted_bytes = accepted_path.read_bytes()
     meta = json.loads((root / "campaign.json").read_text())
-    meta["protocol"]["name"] = "lk-synthetic-routing-v3"
+    meta["protocol"]["name"] = "lk-synthetic-routing-v5"
     (root / "campaign.json").write_text(json.dumps(meta))
     calls: list[str] = []
 
@@ -838,9 +838,9 @@ def test_packet_selects_task_relevant_paragraphs_from_frozen_origin_context(tmp_
         assert span["evidence_id"] == digest([source["logical_id"], span["start"], span["end"], span["text"]])
 
 
-def test_v5_prompt_accepts_imperfect_goals_without_five_distinct_capabilities() -> None:
+def test_v6_prompt_accepts_imperfect_goals_without_five_distinct_capabilities() -> None:
     from scripts.lab_benchmark import PROTOCOL
-    assert PROTOCOL["name"] == "lk-synthetic-routing-v5"
+    assert PROTOCOL["name"] == "lk-synthetic-routing-v6"
     assert PROTOCOL["quota"] == 5
     for prompt in [GENERATION, JUDGMENT]:
         assert "Imperfect but" in prompt and "top five" in prompt
@@ -874,3 +874,112 @@ def test_sparse_single_capability_can_support_five_distinct_goals() -> None:
     rejected.update(accept=False, category="unsupported_target", reason="Historical capture is not supported")
     rejected["target_correctness"][0]["supported"] = False
     assert not validate_judgment({"decisions": [rejected]}, [invented], packet)[0]["accept"]
+
+
+@pytest.mark.parametrize(("reference", "expected"), [
+    ("references/absorbed/archive/SOURCE_SKILL.md", "owned"),
+    ("../local/SOURCE_SKILL.md", "local"),
+    ("source/skills/other/references/SOURCE_SKILL.md", "other"),
+    ("unique-route.md", "unique"),
+    ("SOURCE_SKILL.md", None),
+    ("unmapped/path/unique-route.md", None),
+])
+def test_reference_paths_do_not_expand_generic_basenames(
+    tmp_path: Path, reference: str, expected: str | None,
+) -> None:
+    c = contextual_corpus(tmp_path)
+    mapping = read_json(c.root / "mapping.json")
+    files = [
+        ("skill", "owner", "source/skills/owner", "Owner operations."),
+        ("skill_support_doc", "origin", "source/skills/owner/references/history/origin.md", f"Read `{reference}`."),
+        ("skill_support_doc", "owned", "source/skills/owner/references/absorbed/archive/SOURCE_SKILL.md", "Owned archive."),
+        ("skill_support_doc", "local", "source/skills/owner/references/local/SOURCE_SKILL.md", "Local archive."),
+        ("skill_support_doc", "other", "source/skills/other/references/SOURCE_SKILL.md", "Other owner's archive."),
+        ("skill_support_doc", "third", "source/skills/third/references/SOURCE_SKILL.md", "Third owner's archive."),
+        ("doc", "unique", "source/docs/unique-route.md", "Unique route."),
+    ]
+    for kind, name, locator, text in files:
+        path = c.root / locator
+        if kind == "skill":
+            path /= "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        mapping.append({"logical_id": hashlib.sha256(json.dumps([kind, "fixture", locator, ""]).encode()).hexdigest(),
+                        "id": f"{kind}:{name}", "locator": locator, "type": kind, "source": "fixture",
+                        "content_sha256": hashlib.sha256(text.encode()).hexdigest()})
+    (c.root / "mapping.json").write_text(json.dumps(mapping))
+    (c.root / "manifest.json").write_text(json.dumps({"inputs": frozen_manifest(c.root), "policy": "synthetic-fixture", "settings": {}}))
+    c = Corpus(c.root, hashlib.sha256((c.root / "manifest.json").read_bytes()).hexdigest())
+    origin = next(a for a in c.artifacts if a["id"] == "skill_support_doc:origin")
+    expected_ids = {"skill:owner"}
+    if expected:
+        expected_ids.add(next(a["id"] for a in c.artifacts if a["id"].split(":", 1)[-1] == expected))
+    assert {a["id"] for a in c.related(origin)} == expected_ids
+    assert {a["id"] for a in c.related(origin, expand=True)} == expected_ids
+
+
+def test_identity_feedback_regenerates_without_repairing_rejected_drafts(corpus: Corpus, tmp_path: Path) -> None:
+    base = SyntheticModel()
+    raw: list[dict[str, Any]] = []
+    generations = 0
+
+    def model(prompt: str) -> dict[str, Any]:
+        nonlocal generations
+        result = base(prompt)
+        if prompt.startswith(GENERATION):
+            data = json.loads(prompt[len(GENERATION):])
+            obj = json.loads(result["text"])
+            if generations == 0:
+                obj["cases"][0]["targets"][0]["logical_id"] = data["packet"]["origin"][:-1]
+                obj["cases"][1]["targets"][0]["logical_id"] = "unknown-identity"
+                obj["cases"][2]["targets"][0]["quote"] = "not literal evidence"
+                raw.extend(json.loads(json.dumps(obj["cases"][:3])))
+                result["text"] = json.dumps(obj)
+            else:
+                assert len(data["accepted"]) == 2 and data["missing"] == 3
+                assert [r["draft"] for r in data["rejected"]] == raw
+                for rejected in data["rejected"][:2]:
+                    target = rejected["draft"]["targets"][0]
+                    assert repr(target["logical_id"]) in rejected["reason"]
+                    assert repr(target["evidence_id"]) in rejected["reason"]
+                    assert repr(data["packet"]["origin"]) in rejected["reason"]
+                    assert "belongs to supplied logical_id" in rejected["reason"]
+                    with pytest.raises(ValueError, match="Unsupported target identity"):
+                        validate_drafts({"cases": [rejected["draft"]]}, data["packet"], 1)
+                assert data["rejected"][2]["category"] == "invalid_quote"
+            generations += 1
+        else:
+            data = json.loads(prompt[len(JUDGMENT):])
+            assert all(len(t["logical_id"]) == 64 for d in data["drafts"] for t in d["targets"])
+        return result
+
+    campaign = Campaign(corpus, tmp_path / "identity-campaign", model, model)
+    origin = next(iter(corpus.by_id))
+    assert campaign.prepare([origin])["accepted_cases"] == 5
+    assert generations == 2
+    saved = read_json(campaign.root / "artifacts" / origin / "round-0000/result.json")
+    assert [r["draft"] for r in saved["rejected"]] == raw
+    assert len(raw[0]["targets"][0]["logical_id"]) == 63
+    assert len(saved["accepted"]) == 2
+    receipt = campaign.freeze()
+    assert (receipt["development_cases"], receipt["validation_cases"]) == (3, 2)
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_identity_feedback_does_not_guess_from_close_tokens_or_literal_quotes(corpus: Corpus, ambiguous: bool) -> None:
+    packet = corpus.packet(next(iter(corpus.by_id)))
+    case = draft(packet, "inspect")
+    target = case["targets"][0]
+    original_id = target["logical_id"]
+    target["logical_id"] = original_id[:-1]
+    if ambiguous:
+        packet["sources"].append({**packet["sources"][0], "logical_id": "another-supplied-identity"})
+    else:
+        target["evidence_id"] = target["evidence_id"][:-1]
+    before = encoded(case)
+    with pytest.raises(ValueError, match="Unsupported target identity") as exc:
+        validate_drafts({"cases": [case]}, packet, 1)
+    assert "no unique supplied owner" in str(exc.value)
+    assert "belongs to supplied logical_id" not in str(exc.value)
+    assert repr(original_id) not in str(exc.value)
+    assert encoded(case) == before

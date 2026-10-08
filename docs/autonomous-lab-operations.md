@@ -290,6 +290,13 @@ receipt stores the exact provider prompt, including accepted cases and cumulativ
 rejected drafts/reasons. Freeze verifies each case against its own round packet.
 Together these disclose precisely what selected evidence/accepted cases/drafts
 were sent. No unfiltered corpus blob or original-only capture identity is sent.
+Reference discovery preserves actual source ownership: relative references are
+resolved within the originating file or owning skill, rather than treating a
+generic basename such as `SOURCE_SKILL.md` as a global match. Genuine full paths,
+unambiguous filename referrals, parent skills and exact MCP capability associations
+remain available. A per-source span bound does not bound aggregate packet size;
+inspect initial and expanded packet sizes across the frozen corpus before a large
+preparation run rather than extrapolating from a few successful pilot families.
 This selection is not a guarantee that all useful content was supplied; an
 insufficient artifact blocks for operator review rather than forcing labels.
 
@@ -325,6 +332,10 @@ cosmetic capability-identification paraphrases do not fill the five-question quo
 Rejected drafts retain structured categories (`invalid_schema`, `invalid_quote`,
 `duplicate_intent`, `origin_mismatch`, `unsupported_target`, `missing_evidence`)
 and reasons; regeneration receives that feedback plus accepted intents on resume.
+Invalid source identities remain rejected literally. Identity-specific feedback
+may identify the exact supplied owner of a valid supplied evidence ID to help the
+next generation copy it correctly; it does not normalize the failed token, repair
+the received draft or silently accept a target through a successful lookup.
 Labels are **AI-validated synthetic**, not human labels or observed retrieval success. Accepted cases survive rejected regeneration rounds. A bad
 judgment schema retries only judgment, retaining the received drafts. Structural
 validation is per draft: one invalid quotation does not discard valid siblings.
@@ -378,11 +389,13 @@ failures remain controller-private. CLI stdout is aggregate only.
 All generated data belongs outside Git: new directories mode 0700, files 0600.
 Preserve the corpus, campaign, accepted work, disclosure and call receipts. Source
 module changes invalidate campaign identity instead of silently reinterpreting
-accepted labels. Protocol `lk-synthetic-routing-v5` records Luna/xhigh generation
+accepted labels. Protocol `lk-synthetic-routing-v6` records Luna/xhigh generation
 and Sol/high judgment roles, source-bound positive/negative origin verdicts,
-verified constructive target additions and pragmatic question quality. Start a
-new campaign directory; v1–v4 receipts and labels remain historical and cannot
-resume or freeze as v5 labels. Calibration controls are diagnostic AI evidence,
+verified constructive target additions, pragmatic question quality, owned reference
+resolution and exact-identity regeneration feedback. Start a new campaign directory;
+v1–v5 receipts and labels remain historical and cannot resume or freeze as v6 labels.
+Preserve the prior campaign and its exact source revision rather than editing labels
+or their original bound plans. Calibration controls are diagnostic AI evidence,
 not human gold, blind holdout accuracy, or permission to import old labels. This
 trusted controller targets the explicitly selected Alex host; these controller
 paths do not change the reusable plugin's runtime portability. A completed pilot demonstrates the pipeline, not the whole
