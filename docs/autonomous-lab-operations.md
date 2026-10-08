@@ -208,3 +208,183 @@ successful model inference. A provider HTTP rejection can still establish networ
 reachability. Separate lab-only model authentication and real Luna/Sol execution
 must pass before model-backed stages can be considered complete. Never put model
 credentials in an image, corpus, public issue, report or chat.
+
+## Evidence-grounded synthetic benchmark preparation (#67)
+
+`python -m scripts.lab_benchmark` is a trusted-controller-only preparation CLI,
+not a scoring engine, implementation worker, daemon, scheduler or production
+change. It uses the unmodified official `hermes-agent==0.19.0` public auxiliary
+client with two explicit roles: **generation** uses `gpt-6-luna` / `openai-codex`
+with requested wire reasoning `xhigh`; **judgment** uses `gpt-6.1-sol` /
+`openai-codex` with requested wire reasoning `high`. Both use empty tools and the
+adapter's stateless Codex Responses contract (`store=false`, streaming, SDK
+retries zero). The sender inspects emitted inference metadata and records the
+role, exact prompt hash, requested model/effort and accepted wire settings without
+credentials or headers. No fallback model/provider is allowed. Successful
+calls establish acceptance of the requested adapter/wire contract; the shim does
+not preserve server model/reasoning echoes or detailed cached/reasoning usage.
+This controller-host access does **not** establish worker network isolation.
+
+Use a candidate-bound Python 3.12 environment with the official Hermes package
+and `-e '.[test]'`. Verify the absolute interpreter and imported plugin path.
+The sender rejects inherited environment variables outside the documented clean
+allowlist. The official runtime credential resolver performs serialized,
+controller-owned lab-only refresh; the returned credential mapping is discarded.
+A separate shared lab-grant file lock prevents simultaneous benchmark senders.
+No production grant, `.env`, SSH key or other profile is read/copied. Auth/quota
+errors pause; receipts contain only safe error class/status, never provider bodies.
+
+### Commands and scope
+
+From the reviewed candidate checkout, replace all placeholders with the approved
+private paths. Keep the same source modules for the lifetime of this campaign:
+
+```sh
+env -i PATH='<candidate-venv>/bin:/usr/bin:/bin' \
+ HOME='/home/alex/.local/share/lk-autonomous-lab-execution/lab-auth-client' \
+ HERMES_HOME='/home/alex/.local/share/lk-autonomous-lab-execution/lab-auth' \
+ CODEX_HOME='/home/alex/.local/share/lk-autonomous-lab-execution/lab-auth-client/.codex' \
+ TMPDIR='/home/alex/.hermes/cache/scratch' PYTHONDONTWRITEBYTECODE=1 \
+ '<candidate-venv>/bin/python' -m scripts.lab_benchmark prepare \
+ --corpus '<approved-frozen-corpus>' --manifest-sha256 '<approved-projected-manifest-SHA256>' \
+ --campaign '<new-private-campaign>' --representative
+```
+
+`--representative` selects one median-source-size artifact in **each** corpus
+family for a bounded pilot. `--artifact <exact-logical-ID>` selects individual
+origins and can be repeated. These are incomplete campaigns, never full freezes.
+**Omit both selection options for complete generation over every mapped artifact.**
+Run `status` with the same corpus/hash/campaign arguments for aggregate progress;
+run `freeze` only once every artifact has five accepted cases. Freeze refuses
+partial quotas and verifies case IDs, exact evidence and received generation/
+judgment receipt bindings before publishing. Repeat commands resume existing work;
+there is no automatic corpus refresh or original-source access.
+
+### Evidence, rejection and durable recovery
+
+The corpus manifest, mapping and each source hash are verified. Packets use only
+scrubbed projection bytes, frozen locators and logical identities. Short sources
+are supplied completely; larger sources receive structural-heading/function/flag
+windows plus evenly spaced coverage, including the end. The selection limit is
+24,000 characters per source, not a reason to exclude a large artifact. Selection
+prioritizes owning skills and explicit quoted skill names, tool references and
+file references from the frozen origin text. For operational origins (cron, MCP,
+script and tool notes), six additional identity-domain leads follow, ordered by
+origin-term overlap and frozen locator. Generic update terms cannot displace a
+declared domain skill/report. These are context leads, not relevance judgments.
+A `missing_evidence` rejection or fewer drafts than requested expands subsequent
+rounds to the remaining frozen domain leads, without a live resnapshot. Per-source
+span selection stays fixed. **Relations and origin association never establish
+acceptable-target correctness.**
+For MCP-server origins, frozen tool notes with an exact matching qualified MCP
+namespace are selected before other leads and listed as `origin_capability_sources`.
+This establishes registration membership, not target correctness. The server's
+registration quote and a matching tool's documented task may jointly establish
+origin association; an unrelated namespace is never membership evidence.
+All corpus/draft/accepted text is explicitly untrusted data and no tools execute.
+Text-poor runtime artifacts select only the specific projected JSON fragment;
+character offsets are then into its documented canonical JSON, not the original
+registry. Initial `evidence.json` and each `round-*/evidence.json` record exact
+supplied spans, offsets/basis, fragment, source and excerpt hashes; each call
+receipt stores the exact provider prompt, including accepted cases and cumulative
+rejected drafts/reasons. Freeze verifies each case against its own round packet.
+Together these disclose precisely what selected evidence/accepted cases/drafts
+were sent. No unfiltered corpus blob or original-only capture identity is sent.
+This selection is not a guarantee that all useful content was supplied; an
+insufficient artifact blocks for operator review rather than forcing labels.
+
+Structural checks require supplied target identities and exact quote substrings.
+A separate real Sol/high call semantically judges origin association independently
+from proposed-target correctness, realism and distinct user goal against prior
+accepted cases and earlier accepted drafts. Imperfect but recognizable wording
+is acceptable: these are practical Hit@5 routing queries, not polished answers.
+Both positive and negative `origin_association` verdicts must bind the exact
+origin logical ID and cite a nonempty literal quote from its actual source.
+A supplied neighbor is not the origin. Another artifact may still be the correct
+target, and useful neighbor targets cannot rescue an off-origin question.
+
+Every proposed target receives its own cited correctness assessment, and at
+least one genuinely useful first read is required. Sol may return constructive
+`additional_targets`, each with exact logical identity, span, literal quote and
+usefulness rationale. Only structurally valid, source-supported alternatives
+are materialized alongside the unchanged generated targets. The original draft
+and judgment remain in their raw receipts; case identity/readback binds the
+exact combined target list to both. Missing an alternative does not by itself
+reject an otherwise usable question; this positive set is not claimed exhaustive.
+An unlisted actual result is unjudged, not automatically irrelevant. Before
+future promotion claims, material unknown top-five results must be source-reviewed
+symmetrically for incumbent and candidate, using the same frozen scoring labels.
+
+Off-origin tasks, incorrect targets, fabricated capabilities, obviously duplicate
+goals and incoherent verdicts remain invalid. Missing or wrong-origin citations
+and contradictory decisions are malformed validation, not regeneration feedback.
+Quote validity is structural, not semantic correctness. Target quotes establish
+usefulness as a first read of the whole artifact, not possession of complete answer
+text. Distinctness means different supported user goals, not different capabilities;
+cosmetic capability-identification paraphrases do not fill the five-question quota.
+Rejected drafts retain structured categories (`invalid_schema`, `invalid_quote`,
+`duplicate_intent`, `origin_mismatch`, `unsupported_target`, `missing_evidence`)
+and reasons; regeneration receives that feedback plus accepted intents on resume.
+Labels are **AI-validated synthetic**, not human labels or observed retrieval success. Accepted cases survive rejected regeneration rounds. A bad
+judgment schema retries only judgment, retaining the received drafts. Structural
+validation is per draft: one invalid quotation does not discard valid siblings.
+Only structurally valid drafts reach semantic judgment, while rejected drafts
+retain their own categorized feedback. Freeze validates each accepted draft
+against its original generation receipt without requiring invalid siblings to pass.
+
+The practical default is at most three **new generation rounds per artifact per
+invocation**, and three new malformed-judgment retries for a retained draft batch;
+`--rounds` changes this operational policy. This is not a contractual regeneration
+cap or spending allowance. Quota failure leaves a private artifact/reason blocker.
+The operator may resume more rounds, inspect the supplied evidence, or decide
+that a separately identified preparation protocol/campaign is needed. Do not
+omit the artifact, manufacture cases, relabel on origin alone or change frozen
+sources. There is no independently enforced token allowance; aggregate receipts
+report provider usage actually surfaced by received responses.
+
+Requests are checkpointed before dispatch; raw returned drafts and usage are
+atomically fsynced before parsing/judging. Completed received calls are replayed
+locally, never silently repeated. A crash/transport failure before a durable
+response is fundamentally ambiguous. Default resume pauses. After checking that
+no controller is alive, `--retry-uncertain` explicitly acknowledges a possible
+duplicate provider charge and preserves prior attempts; it is not exactly-once
+provider delivery. Failures with no returned usage have unknown provider cost.
+The campaign lock prevents overlapping controllers for the same campaign.
+
+### Identity, partition and worker protection
+
+Digest encoding is frozen: SHA-256 of UTF-8 JSON with `sort_keys=true`,
+`ensure_ascii=false` and separators `(',', ':')`. Protocol identity binds prompts,
+model/settings, selection and partition rules **and the two preparation module
+file hashes**. Campaign ID hashes `[protocol_digest, corpus_manifest_sha256]`.
+Case ID hashes `[campaign_id, origin_logical_id, question, intent, targets]`.
+An independent golden vector is:
+
+```text
+bytes: ["campaign","origin","question","intent",[]]
+SHA256: ddc83dcabcc747b76df43748796c24fb92fa3f701491789fbd8430057f69574f
+```
+
+The complete freeze sorts case IDs per origin, places the first three in
+development and the last two in hidden validation, and records the fixed rule
+and source/campaign identities before any scoring. `frozen.json` is the atomic
+controller authority; `freeze-receipt.json` binds the complete and development
+payload hashes/counts. Only `worker-development/development.json` is exported to
+a worker. **Mount only that development directory plus the approved read-only
+corpus, never the campaign root, `artifacts/`, model receipts, `frozen.json` or
+controller reports.** Validation questions, targets, judgments and per-case
+failures remain controller-private. CLI stdout is aggregate only.
+
+All generated data belongs outside Git: new directories mode 0700, files 0600.
+Preserve the corpus, campaign, accepted work, disclosure and call receipts. Source
+module changes invalidate campaign identity instead of silently reinterpreting
+accepted labels. Protocol `lk-synthetic-routing-v5` records Luna/xhigh generation
+and Sol/high judgment roles, source-bound positive/negative origin verdicts,
+verified constructive target additions and pragmatic question quality. Start a
+new campaign directory; v1–v4 receipts and labels remain historical and cannot
+resume or freeze as v5 labels. Calibration controls are diagnostic AI evidence,
+not human gold, blind holdout accuracy, or permission to import old labels. This
+trusted controller targets the explicitly selected Alex host; these controller
+paths do not change the reusable plugin's runtime portability. A completed pilot demonstrates the pipeline, not the whole
+1,742-artifact quota; #67 remains open until complete generation and full 3/2
+freeze are actually verified.
