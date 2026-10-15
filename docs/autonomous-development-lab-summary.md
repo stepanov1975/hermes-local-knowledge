@@ -1,6 +1,6 @@
 # Local Knowledge development lab — design summary
 
-Status: approved design. The user confirmed shared understanding and authorized finalizing the design documents only. Implementation requires separate approval.
+Status: approved design, including the benchmark amendments approved in [#67](https://github.com/stepanov1975/hermes-local-knowledge/issues/67). Implementation requires separate, ticket-scoped approval; this summary is not a deployment-status record.
 
 ## 1. Repeatable environment
 
@@ -14,9 +14,9 @@ Only the trusted external controller controls Docker. Workers are non-root, unpr
 
 Copy and freeze the complete configured artifact corpus, preserving logical artifact identity and coverage. Remove credentials from runtime projections and model inputs; never activate copied production jobs.
 
-Luna generates five valid, distinct, realistic questions per artifact. AI validates the questions and acceptable targets against source evidence. Replace rejected questions; if an artifact cannot support five, block preparation and ask you rather than silently omit it or invent labels.
+Default to five valid, distinct, realistic questions per artifact, with documented source-appropriate exceptions for sparse or empty sources frozen before further outcomes. Retain every source and accepted case; failures do not reduce quotas. Luna saves tokens but is optional: the assistant may author questions directly, with honest provenance and the same source/AI validation. Unmet frozen quotas remain explicit rather than forcing labels or dropping sources.
 
-Freeze three development questions and two validation questions per artifact. Workers see development cases and experiment history, but not validation questions, labels, or per-case failures. Disclose aggregate validation metrics only. Selected source evidence is sent to Luna's provider; the corpus stays local.
+Freeze partitions per origin by SHA-256 of UTF-8(`origin + "\n" + case_id`), then `case_id`. An empty origin has no development cases; otherwise allocate `min(3, max(1, n - 1))` development cases and reserve the rest for validation. This gives three/two for five-case origins; disclose origins with no questions or no validation cases. Workers see development cases and experiment history, but not validation questions, labels, or per-case failures. Disclose aggregate validation metrics only. Selected source evidence is sent to configured authoring/judgment providers; the corpus stays local. AI labels are not human gold.
 
 Keep source artifacts, questions, targets, partitions, and scoring rules immutable during a campaign. Agents may improve plugin code, general indexing/enrichment methods, and plugin-owned configuration—not benchmark answer tables.
 
@@ -61,8 +61,8 @@ Keep the frozen corpus, benchmark, reports, and reproducible candidate revisions
 
 Notify your established Telegram Cron destination for promotions, blockers, and operational failures. Ordinary no-gain reports stay local for subsequent agents; no hourly notification spam.
 
-No image, container, improvement worker, corpus copy, or cron job has been created for this lab. Final design confirmation and implementation authorization are separate decisions.
+Final design confirmation and implementation authorization are separate decisions. Actual implementation and verification status belongs to the separately authorized GitHub tickets; completion of benchmark preparation does not enable an improvement worker, cron job, or production deployment.
 
 ## Approval scope
 
-The user confirmed this design and approved finalizing the documentation only. This summary is a reading aid; the canonical design and vocabulary are maintained in the repository. No implementation, corpus copying, worker launch, cron scheduling, or production deployment is authorized.
+The original confirmation authorized documentation only; later ticket-scoped instructions govern implementation. This summary is a reading aid; the canonical design and vocabulary are maintained in the repository. Do not infer worker launch, cron scheduling, or production deployment authority from design acceptance or another ticket's completion.

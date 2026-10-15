@@ -1,6 +1,6 @@
 # Autonomous Local Knowledge development lab — approved design
 
-Status: approved design; documentation finalized after the user's shared-understanding confirmation. Implementation, scheduling, corpus copying, and deployment require separate authorization. This document is the canonical design; [the summary](autonomous-development-lab-summary.md) is a shorter reading aid.
+Status: approved design, including the user-approved benchmark amendments recorded in [#67](https://github.com/stepanov1975/hermes-local-knowledge/issues/67). Implementation proceeds only under separately authorized tickets; scheduling and production deployment require separate authorization. This document is the canonical design; [the summary](autonomous-development-lab-summary.md) is a shorter reading aid.
 
 ## Purpose
 
@@ -11,7 +11,7 @@ Run repeatable candidate improvements against a frozen local artifact corpus, pr
 See [ADR 0001](adr/0001-autonomous-lab-boundaries.md) and the [domain vocabulary](../CONTEXT.md).
 
 - Start from a deliberately pinned plugin revision. The installed plugin and development checkout differ; do not silently select development HEAD.
-- Generate Luna questions and validate them against source evidence. Invalid cases are rejected and replaced; the final quota and unresolved-artifact policy are specified below.
+- Use Luna as a token-saving default for question generation, not a mandatory dependency. The assistant may directly author source-grounded questions when generation stalls, with explicit authorship rather than invented Luna receipts. Validate all questions against source evidence; the final quota and unresolved-artifact policy are specified below.
 - Keep sources, final questions, targets, and evaluator rules fixed within a campaign.
 - Permit changes to plugin code, indexing/enrichment logic, and plugin-owned configuration. Permit general candidate-generated enrichment, not benchmark answer tables.
 - Separate agent-visible development cases from evaluator-controlled validation cases.
@@ -24,8 +24,9 @@ See [ADR 0001](adr/0001-autonomous-lab-boundaries.md) and the [domain vocabulary
 - Keep the controller/evaluator outside worker access and evaluate the exact candidate revision in a separate clean container. Do not give workers privileged mode, the Docker socket, production Hermes data, SSH keys, broad host mounts, or production service credentials. Use non-root workers, resource limits without an elapsed-time cutoff, and enforced/tested network restrictions permitting necessary model access while blocking homelab services. Model authentication is supplied separately rather than baked into the image. Containers share the host kernel and are not VM-equivalent security boundaries.
 - Each hourly tick starts at most one experiment when idle. Skip ticks while busy, never overlap, never accumulate a backlog, and wait for the next hourly tick after completion rather than recursively starting workers.
 - Implementation uses `gpt-6.1-sol` / `openai-codex`, reasoning `high`; the user confirmed this exact mapping from the requested label `sol 6.1`. Independent review uses the same model and reasoning level in a separate session. No time limit: the proposed 45-minute allowance is rejected. No separately enforced monetary/token allowance; record provider-reported usage and pause with an alert on exhausted quota or persistent authentication failure.
-- Produce five valid, distinct realistic question intents per artifact, replacing rejected questions, then freeze three development questions and two validation questions per artifact. If source-grounded regeneration cannot meet the quota, block benchmark preparation and report the artifact for the user's decision; never silently exclude it or invent labels.
-- Luna receives routing-relevant source evidence rather than only filenames, with credentials removed and runtime configuration reduced to safe scanner inputs. The corpus remains local; selected evidence is sent to Luna's provider. Snapshot helpers that copy runtime configuration verbatim must not transfer production credentials into the lab or activate copied production jobs.
+- Default to five valid, distinct realistic question intents per artifact, with documented source-appropriate exceptions for genuinely sparse or empty sources. Freeze exceptions before further outcomes; retain every corpus item and accepted case, and never lower quotas after failed attempts. If a frozen quota remains unmet, report it rather than omit the artifact or force labels. Distinctness concerns a materially different practical user outcome, not wording or another source heading; an outcome explicitly requested by an accepted question is already covered.
+- Freeze deterministic partitions per origin: order retained cases by SHA-256 of UTF-8(`origin + "\n" + case_id`), breaking ties by `case_id`. For zero cases, allocate zero development cases; otherwise allocate `min(3, max(1, n - 1))` development cases and reserve the remainder for validation. This preserves three/two for five-case origins. Disclose zero-question origins and origins without held-out cases; do not imply per-origin validation where none exists. The coverage-aware format is not automatically compatible with legacy universal-five consumers.
+- Question authors and validators receive routing-relevant source evidence rather than only filenames, with credentials removed and runtime configuration reduced to safe scanner inputs. The corpus remains local; selected evidence is sent to the configured authoring and judgment model providers. Snapshot helpers that copy runtime configuration verbatim must not transfer production credentials into the lab or activate copied production jobs.
 - Workers see development cases and experiment reports. Validation question text, labels, and per-case failures remain hidden; expose aggregate validation metrics only.
 - Score one public plugin search per fixed question, using its actual top five, a candidate-built index over the same frozen sources, and clean feedback state. No conversational rewriting, repeated search attempts, or learning from evaluation searches.
 - Check installation/integration in disposable Hermes in addition to standalone evaluation.
@@ -72,7 +73,7 @@ Use the existing rootful Docker engine, controlled only by the trusted external 
 
 ## Approval scope and implementation prerequisites
 
-The user confirmed shared understanding and approved finalizing these design documents only. No policy decisions remain open. Building images, copying the corpus, starting workers, scheduling the lab, or deploying to production requires separate authorization. Verify image/runtime compatibility, provider access, and resource sizing during a separately authorized implementation pilot.
+The original shared-understanding confirmation approved finalizing the design documents only. Subsequent implementation permissions and acceptance amendments are recorded in the separately authorized implementation tickets, including #67's source-appropriate coverage and optional-Luna authoring decisions. Design acceptance or completion of an earlier ticket does not itself authorize another worker, hourly scheduling, or production deployment. Verify image/runtime compatibility, provider access, and resource sizing within the authorized implementation scope.
 
 ## Engineering details to resolve against the chosen environment
 
