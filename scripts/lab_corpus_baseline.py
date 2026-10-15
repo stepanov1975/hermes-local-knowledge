@@ -54,7 +54,7 @@ def locator(display: str, source: Path, scanner: Path, state: Path) -> str:
     raise ValueError("Unmapped native artifact")
 
 
-def native() -> None:
+def native(search_callback: Any = None) -> None:
     home, output, corpus = Path(os.environ["HERMES_HOME"]), Path("/output"), Path("/corpus")
     assert os.getuid() == 10000 and sys.executable == "/opt/hermes/.venv/bin/python"
     initial = {n: (home / n).exists() for n in ("knowledge", "cron", "auth.json", ".env", "state.db", "memories", "sessions")}
@@ -128,10 +128,15 @@ def native() -> None:
     representatives: dict[str, Any] = {}
     for a in sorted(built, key=lambda a: a.id):
         representatives.setdefault(a.type, a)
-    warm = next(iter(representatives.values()))
-    response = json.loads(handle_function_call("knowledge_search", {"query": warm.title, "limit": 5, "rebuild": False}, task_id="lk-lab-baseline-warm"))
-    assert not response.get("error")
     evidence = []
+    if search_callback is not None:
+        # #68 supplies query-only transport; comparator and labels stay on host.
+        search_callback(handle_function_call, expected)
+        representatives = {}
+    else:
+        warm = next(iter(representatives.values()))
+        response = json.loads(handle_function_call("knowledge_search", {"query": warm.title, "limit": 5, "rebuild": False}, task_id="lk-lab-baseline-warm"))
+        assert not response.get("error")
     for kind, a in sorted(representatives.items()):
         started = time.perf_counter()
         raw = handle_function_call("knowledge_search", {"query": a.title, "limit": 5, "rebuild": False}, task_id="lk-lab-baseline", tool_call_id="baseline-" + kind)
