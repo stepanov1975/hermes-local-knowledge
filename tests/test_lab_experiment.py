@@ -140,6 +140,129 @@ class Harness:
         return lab.finalized_reports(self.campaign, self.manifest())[-1]
 
 
+@pytest.mark.parametrize("available,expected", [(9, False), (10, True), (11, True)])
+def test_disk_preflight_before_attempt_or_dispatch(h, monkeypatch, available, expected):
+    from types import SimpleNamespace
+    from scripts import lab_disk_guard as disk
+    original = h.manifest()
+    sampled = []
+    def statvfs(path):
+        sampled.append(path)
+        # Twenty blocks are reserved: df-usable total is 100, not 120.
+        return SimpleNamespace(f_blocks=120, f_bfree=20 + available, f_bavail=available)
+    monkeypatch.setattr(disk.os, "statvfs", statvfs)
+    if expected:
+        assert h.run()["outcome"] == "accepted"
+    else:
+        with pytest.raises(disk.LabDiskPaused):
+            h.run()
+        assert h.calls == [] and h.evaluations == []
+        assert list((h.campaign / "attempts").iterdir()) == []
+        assert h.manifest() == {**original, "paused": True}
+        alert = lab.read_json(h.campaign / "disk-alert.json")
+        assert alert["available_blocks"] == available and alert["usable_blocks"] == 100
+        assert alert["kind"] == "lab_disk_paused" and "Free space" in alert["action"]
+    assert sampled == [h.campaign.resolve()]
+
+
+def test_unknown_disk_preflight_fails_closed(h, monkeypatch):
+    from scripts import lab_disk_guard as disk
+    def unavailable(path):
+        raise OSError("synthetic failure containing private text")
+    monkeypatch.setattr(disk.os, "statvfs", unavailable)
+    with pytest.raises(disk.LabDiskPaused):
+        h.run()
+    assert h.calls == [] and h.evaluations == []
+    alert = (h.campaign / "disk-alert.json").read_text()
+    assert "available_space_unknown" in alert and "private text" not in alert
+    assert h.manifest()["paused"] is True
+
+
+def test_disk_monitor_pauses_while_session_blocked_and_prevents_later_phases(h, monkeypatch):
+    import threading
+    from scripts import lab_disk_guard as disk
+    original = h.manifest()
+    trigger, sampled, stopped = threading.Event(), threading.Event(), threading.Event()
+    low = [False]
+    workers = {"this-attempt": True, "unrelated-campaign": True}
+    def space(path):
+        assert path == h.campaign.resolve()
+        return {"available_blocks": 9 if low[0] else 20, "usable_blocks": 100}
+    def monitor(self):
+        assert trigger.wait(5)
+        self.sample()
+        sampled.set()
+    monkeypatch.setattr(disk, "available_space", space)
+    monkeypatch.setattr(disk.DiskGuard, "_monitor", monitor)
+    def stop():
+        assert h.manifest()["paused"] is True
+        assert lab.read_json(h.campaign / "disk-alert.json")["kind"] == "lab_disk_paused"
+        workers["this-attempt"] = False
+        stopped.set()
+    original_session = h.session
+    def session(**kwargs):
+        with disk.owned_worker(stop):
+            low[0] = True
+            trigger.set()
+            # Simulate a provider request that has not returned: pause must already be durable.
+            assert stopped.wait(5) and sampled.wait(5)
+            assert h.manifest()["incumbent"] == original["incumbent"]
+            assert h.manifest()["reports"] == original["reports"]
+            return original_session(**kwargs)
+    with pytest.raises(disk.LabDiskPaused):
+        lab.run_experiment(h.campaign, session=session, evaluator=h.evaluator,
+                           checks=h.checks, loader=h.loader)
+    assert workers == {"this-attempt": False, "unrelated-campaign": True}
+    assert len(h.calls) == 1 and h.evaluations == []
+    assert h.manifest()["incumbent"] == original["incumbent"] and h.manifest()["paused"]
+    assert h.last_report()["outcome"] == "error"
+    assert h.last_report()["usage"][0]["usage"] == [{"input_tokens": 10}]
+    assert not any(t.name == "lab-disk-guard" for t in threading.enumerate())
+
+
+
+def test_disk_monitor_cadence_is_sixty_seconds_without_busy_polling(tmp_path, monkeypatch):
+    from scripts import lab_disk_guard as disk
+    waits, alerts = [], []
+    low = [False]
+    monkeypatch.setattr(disk, "available_space", lambda path: {
+        "available_blocks": 9 if low[0] else 20, "usable_blocks": 100})
+    guard = disk.DiskGuard(tmp_path, alerts.append)
+    class Clock:
+        def wait(self, seconds):
+            waits.append(seconds)
+            low[0] = len(waits) == 2
+            return False
+    monkeypatch.setattr(guard.stopping, "wait", Clock().wait)
+    guard._monitor()
+    assert waits == [60, 60] and len(alerts) == 1 and guard.failed
+
+
+def test_low_disk_at_full_checks_cannot_launch_review_or_promote(h, monkeypatch):
+    from scripts import lab_disk_guard as disk
+    h.run()  # Existing immutable history must survive the later safety pause.
+    original = h.manifest()
+    original_calls = len(h.calls)
+    low = [False]
+    monkeypatch.setattr(disk, "available_space", lambda path: {
+        "available_blocks": 9 if low[0] else 20, "usable_blocks": 100})
+    def checks(**kwargs):
+        result = h.checks(**kwargs)
+        low[0] = True
+        guard = disk._CURRENT.get()
+        assert guard is not None
+        guard.sample()
+        return result
+    with pytest.raises(disk.LabDiskPaused):
+        lab.run_experiment(h.campaign, session=h.session, evaluator=h.evaluator,
+                           checks=checks, loader=h.loader)
+    current = h.manifest()
+    assert current["incumbent"] == original["incumbent"] and current["paused"] is True
+    assert current["reports"][:-1] == original["reports"]
+    assert len(h.calls) == original_calls + 1
+    assert h.last_report()["outcome"] == "error"
+
+
 @pytest.fixture
 def h(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     return Harness(tmp_path, monkeypatch)

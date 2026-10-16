@@ -1,6 +1,7 @@
 """Offline tool-using implementation/review sessions controlled by trusted host code."""
 from __future__ import annotations
 
+from contextlib import ExitStack
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ from typing import Any
 from scripts import lab_agent_model as model
 from scripts.lab_runtime import run, scoped_name
 from scripts.lab_process_output import bounded_process
+from scripts import lab_disk_guard as disk
 
 IMAGE = "sha256:0b9b3c213a9a3cb6845f31b44a0a2b4ce67fa716d411217f6037cf792b3775af"
 SOURCE = "90194c64ff99933ec3b9ecfd9295b06e6c11e038"
@@ -214,6 +216,7 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
                 task: str, evidence: Path | None = None) -> dict[str, Any]:
     if role not in {"implementation", "review"} or image != IMAGE:
         raise ValueError("Fixed role/image required")
+    disk.checkpoint()
     scoped_name(name + "-setup")
     attempt = attempt.absolute()
     if not corpus.is_dir() or any(not p.is_file() for p in [development, history, *([evidence] if evidence else [])]):
@@ -221,6 +224,7 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
     image_spec = json.loads(run(["docker", "image", "inspect", image]))[0]
     if image_spec["Id"] != IMAGE or image_spec["Config"]["Labels"].get("org.opencontainers.image.revision") != SOURCE:
         raise ValueError("Official image identity mismatch")
+    disk.checkpoint()
     workspace = export(attempt, repo, revision)
     for source, filename in ((development, "development.json"), (history, "history.json"), (evidence, "evidence.json")):
         if source is not None:
@@ -256,21 +260,43 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
     worker_removed = False
     usages = []
     complete = False
+    lifecycle = ExitStack()
     try:
+        disk.checkpoint()
         ownership(attempt, image, name, "10000:10000")
         changed_owner = True
+        disk.checkpoint()
         container_id = run(worker_command(name, image, binds)).strip()
         spec = inspect(name)
         verify_worker_spec(spec, name, binds)
         model.save(private / "worker.json", spec)
-        run(["docker", "start", container_id])
+        def stop_disk() -> None:
+            current = inspect(name)
+            if (current["Id"] != container_id or current["Name"] != "/" + name
+                    or current["Config"]["Labels"].get("lk.lab") != "ticket-69"):
+                raise ValueError("Disk stop ownership mismatch")
+            if current["State"]["Running"]:
+                run(["docker", "kill", container_id])
+            stopped = inspect(container_id)
+            if (stopped["Id"] != container_id or stopped["Name"] != "/" + name
+                    or stopped["Config"]["Labels"].get("lk.lab") != "ticket-69"
+                    or stopped["State"]["Running"]):
+                raise ValueError("Disk stop not confirmed")
+
+        lifecycle.enter_context(disk.owned_worker(stop_disk))
+        with disk.action():
+            run(["docker", "start", container_id])
+        disk.checkpoint()
         turn = 0
         while True:
+            disk.checkpoint()
             turn += 1
             model.save(private / f"request-{turn}.json", messages)
             usages.append({"available": False})
+            disk.checkpoint()
             response = model.send(messages, private / f"wire-{turn}.json")
             usages[-1] = response["usage"]
+            disk.checkpoint()
             model.save(private / f"response-{turn}.json", response)
             message = response["message"]
             messages.append(message)
@@ -299,12 +325,14 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
                 ids.add(call["id"])
                 commands.append(arguments["command"])
             for index, (call, command) in enumerate(zip(calls, commands, strict=True)):
+                disk.checkpoint()
                 output = sandbox(name, command, private / f"tool-{turn}-{index}.json", container_id)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
     except SandboxOutputLimit as error:
         worker_removed = error.container_id == container_id and error.cleanup_complete
         raise
     finally:
+        lifecycle.close()
         cleanup_complete = False
         source_valid = False
         source_validation_attempted = False

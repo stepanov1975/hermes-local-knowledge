@@ -104,6 +104,47 @@ A shared combined 64 MiB per-command storage guard stops the exact worker if a
 producer exceeds it; this is an output resource guard, not an elapsed-time or
 token allowance. Normal full output remains in the raw private stream files;
 short log projections are previews, not complete diagnostics.
+The native evaluator transport separately drains stderr concurrently into the
+private `transport.stderr` file, capped at the same 64 MiB ceiling (exactly the
+ceiling is allowed). Monitoring continues while trusted tests run, while native
+Frames are quiet and through final EOF. Overflow fails the evaluation, stops only
+the inspected attempt worker and records `transport.stderr.json` plus cleanup
+receipts; it cannot yield a complete evaluation. Stdout framing, native query
+order, scoring and timing are unchanged.
+
+Before each `run`, before attempt records/workspace exports, the controller samples
+`statvfs` on the **campaign/lab filesystem**. An experiment-local joined monitor
+rechecks every 60 seconds throughout setup, sessions, evaluations, trusted checks
+and quiet provider/subprocess waits. No scheduler/daemon is installed. Available
+space is unprivileged `f_bavail / (f_blocks - f_bfree + f_bavail)`, the df-consistent
+usable-capacity basis excluding reserved blocks; comparisons use exact integers,
+not rounded display percentages. Exactly 10% is allowed. Below 10%, or an invalid/
+unavailable filesystem sample, fails closed, durably pauses the campaign and emits
+a safe structured `lab_disk_paused` alert on stderr and in `disk-alert.json`.
+Only registered current-attempt worker IDs with matching names and lab labels may
+be stopped; no global Docker listing/kill/prune is used. Pending/history/incumbent
+publication is fenced against the monitor, and no later phase, provider request
+or promotion is permitted after detection. Cleanup/ownership restoration still
+runs. A blocked in-flight provider request may remain blocked and bill usage, but
+worker stopping and durable pause/alert do **not** wait for its response; returned
+usage (or unknown usage) is retained on normal unwinding.
+
+There is no built-in Telegram delivery or new authentication. The controlling
+Hermes/operator can forward the safe structured alert using its existing channel.
+While a provider call is blocked, inspect the files from a separate terminal:
+
+```sh
+python -m scripts.lab_experiment status --campaign /private/new-campaign
+python -m json.tool /private/new-campaign/disk-alert.json
+```
+
+Free space on that filesystem, inspect exact-worker cleanup/status receipts and
+reconcile any pending attempt before explicitly resuming. The controller never
+auto-unpauses/retries. These alerts are local files/stderr, **not guaranteed remote
+notifications**. As with other durable state, an already unwritable filesystem or
+host/process failure can prevent persistence; retain the pending attempt and
+investigate rather than treating missing receipts as success.
+
 Usage and explicit cleanup completion survive source-validation failures. A
 missing or false cleanup receipt retains the pending attempt for investigation.
 

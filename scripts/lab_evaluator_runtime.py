@@ -1,6 +1,7 @@
 """Offline exact-revision Docker execution using #65/#66 isolation primitives."""
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,8 @@ from typing import Any
 from scripts.lab_corpus_baseline import baseline_command, corpus_integrity, digest, verify_baseline_spec
 from scripts.lab_evaluator import PROTOCOL, WARMUPS, percentile95, private_report, require, score
 from scripts.lab_runtime import prepare_attempt, run, scoped_name, validate_pin
-from scripts.lab_process_output import bounded_process, save_receipt
+from scripts.lab_process_output import NativeStderr, bounded_process, save_receipt
+from scripts import lab_disk_guard as disk
 
 
 class Frames:
@@ -112,6 +114,7 @@ def verify_spec(spec: dict, attempt: Path, corpus: Path, baseline: Path, probe: 
 
 def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path, image: str,
                       name: str, benchmark: dict, smoke: int | None = None) -> dict:
+    disk.checkpoint()
     scoped_name(name)
     validate_pin(image)
     # Fail before any launch if the immutable pre-existing runtime is unavailable.
@@ -120,6 +123,7 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
             "90194c64ff99933ec3b9ecfd9295b06e6c11e038", "Unexpected official runtime provenance")
     require(digest(corpus / "manifest.json") == benchmark["corpus_manifest_sha256"], "Benchmark source drift")
     manifest = corpus_integrity(corpus)
+    disk.checkpoint()
     prepare_attempt(attempt, repo, revision)
     excluded = candidate_export(attempt)
     attempt = attempt.resolve()
@@ -149,6 +153,7 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
     for child in ("home", "work", "output"):
         setup += ["--mount", f"type=bind,src={attempt / child},dst=/{child}"]
     # No candidate code runs in this narrowly privileged existing setup helper.
+    disk.checkpoint()
     run(setup + [image, "-R", "10000:10000", "/home", "/work", "/output"])
     private_report(attempt / "image.json", image_spec)
     private_report(attempt / "runner.json", {"protocol": PROTOCOL, "revision": revision,
@@ -158,88 +163,111 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         "trusted_tests": trusted_hashes,
         "process_output_sha256": digest(Path(__file__).with_name("lab_process_output.py"))})
     worker = name + "-worker"
-    run(command(worker, image, attempt, corpus, baseline, probe, tests))
+    disk.checkpoint()
+    worker_id = run(command(worker, image, attempt, corpus, baseline, probe, tests)).strip()
+    require(bool(worker_id), "Missing created worker identity")
     process: Any = None
     frames: Frames | None = None
+    capture: NativeStderr | None = None
+    lifecycle = ExitStack()
     try:
         before = json.loads(run(["docker", "inspect", worker]))[0]
+        require(before["Id"] == worker_id and before["Name"] == "/" + worker, "Created worker identity mismatch")
         verify_spec(before, attempt, corpus, baseline, probe, tests)
         require(before["Image"] == image_spec["Id"], "Runtime image mismatch")
         private_report(attempt / "worker-before.json", before)
         env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG") if k in os.environ}
-        with (attempt / "transport.stderr").open("xb") as stderr:
+        def stop_on_limit() -> None:
+            spec = json.loads(run(["docker", "inspect", worker]))[0]
+            require(spec["Id"] == worker_id and spec["Name"] == "/" + worker
+                    and spec["Config"]["Labels"].get("lk.lab") == "ticket-66",
+                    "Native worker stop ownership mismatch")
+            if spec["State"]["Running"]:
+                run(["docker", "kill", worker_id])
+            stopped = json.loads(run(["docker", "inspect", worker_id]))[0]
+            require(stopped["Id"] == worker_id and stopped["State"]["Running"] is False,
+                    "Native worker did not stop")
+
+        def stop_disk() -> None:
+            try:
+                stop_on_limit()
+            finally:
+                if process is not None and process.poll() is None:
+                    process.kill()
+
+        lifecycle.enter_context(disk.owned_worker(stop_disk))
+        with disk.action():
             process = subprocess.Popen(["docker", "start", "--attach", "--interactive", worker],
-                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, env=env)
-            frames = Frames(process)
-            ready = frames.read()
-            mapping = {m["id"]: m["logical_id"] for m in json.loads((corpus / "mapping.json").read_text())}
-            require(ready == {"ready": True, "mapping_count": len(mapping)}, "Incomplete native readiness")
-            # Fixed trusted test selection, supplied by controller, never the candidate's tests.
-            test_command = ["docker", "exec", "--env", "PYTHONPATH=/work/plugin", worker,
-                "/opt/lab-tools/bin/python", "-m", "pytest", "tests/test_public_contract.py",
-                "tests/test_plugin.py", "-q", "-p", "no:cacheprovider"]
-            def stop_on_limit() -> None:
-                spec = json.loads(run(["docker", "inspect", worker]))[0]
-                require(spec["Id"] == before["Id"] and spec["Name"] == "/" + worker
-                        and spec["Config"]["Labels"].get("lk.lab") == "ticket-66",
-                        "Trusted-test stop ownership mismatch")
-                if spec["State"]["Running"]:
-                    run(["docker", "kill", before["Id"]])
-                stopped = json.loads(run(["docker", "inspect", before["Id"]]))[0]
-                require(stopped["Id"] == before["Id"] and stopped["State"]["Running"] is False,
-                        "Trusted-test worker did not stop")
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        capture = NativeStderr(process, attempt / "transport.stderr", stop_on_limit)
+        frames = Frames(process)
+        ready = frames.read()
+        mapping = {m["id"]: m["logical_id"] for m in json.loads((corpus / "mapping.json").read_text())}
+        require(ready == {"ready": True, "mapping_count": len(mapping)}, "Incomplete native readiness")
+        # Fixed trusted test selection, supplied by controller, never the candidate's tests.
+        test_command = ["docker", "exec", "--env", "PYTHONPATH=/work/plugin", worker,
+            "/opt/lab-tools/bin/python", "-m", "pytest", "tests/test_public_contract.py",
+            "tests/test_plugin.py", "-q", "-p", "no:cacheprovider"]
+        test_output = bounded_process(test_command, prefix=attempt / "trusted-tests", env=env,
+                                      on_limit=stop_on_limit)
+        disk.checkpoint()
+        require(not capture.exceeded and capture.error is None, "Native stderr capture failed")
+        require(test_output.returncode == 0, "Trusted candidate tests failed")
+        sequence = 0
 
-            test_output = bounded_process(test_command, prefix=attempt / "trusted-tests", env=env,
-                                          on_limit=stop_on_limit)
-            require(test_output.returncode == 0, "Trusted candidate tests failed")
-            sequence = 0
+        def query(text: str) -> tuple[dict, float]:
+            nonlocal sequence
+            disk.checkpoint()
+            assert capture is not None
+            require(not capture.exceeded and capture.error is None, "Native stderr capture failed")
+            started = time.perf_counter_ns()
+            process.stdin.write((json.dumps({"sequence": sequence, "query": text}) + "\n").encode())
+            process.stdin.flush()
+            frame = frames.read()
+            elapsed = (time.perf_counter_ns() - started) / 1_000_000_000
+            require(set(frame) == {"sequence", "response"} and frame["sequence"] == sequence,
+                    "Out-of-order native result")
+            sequence += 1
+            return frame["response"], elapsed
 
-            def query(text: str) -> tuple[dict, float]:
-                nonlocal sequence
-                started = time.perf_counter_ns()
-                process.stdin.write((json.dumps({"sequence": sequence, "query": text}) + "\n").encode())
-                process.stdin.flush()
-                frame = frames.read()
-                elapsed = (time.perf_counter_ns() - started) / 1_000_000_000
-                require(set(frame) == {"sequence", "response"} and frame["sequence"] == sequence,
-                        "Out-of-order native result")
-                sequence += 1
-                return frame["response"], elapsed
-
-            warmups = []
-            for warmup in WARMUPS:
-                response, elapsed = query(warmup)
-                warmups.append({"query": warmup, "response": response, "controller_seconds": elapsed})
-                # Validate warmups too; an error cannot be hidden as unscored.
-                score([{"origin": "", "targets": []}], [response], [elapsed], mapping)
-            private_report(attempt / "warmups.json", {"unscored": warmups})
-            report: dict[str, Any] = {"benchmark_identity": benchmark["composite_id"], "revision": revision,
-                "image": image_spec["Id"], "protocol": PROTOCOL, "errors": 0, "trusted_tests": True}
-            timings = []
-            with (attempt / "private-cases.jsonl").open("x") as private:
-                (attempt / "private-cases.jsonl").chmod(0o600)
-                for split in ("development", "validation"):
-                    cases = sorted(benchmark[split], key=lambda c: c["case_id"])
-                    if smoke is not None:
-                        cases = cases[:smoke]
-                    responses, seconds = [], []
-                    for case in cases:
-                        response, elapsed = query(case["question"])
-                        responses.append(response)
-                        seconds.append(elapsed)
-                        private.write(json.dumps({"split": split, "case_id": case["case_id"],
-                            "response": response, "controller_seconds": elapsed}) + "\n")
-                        private.flush()
-                    report[split] = score(cases, responses, seconds, mapping)
-                    for metric in ("hit_at_5", "hit_at_1", "origin_hit_at_5"):
-                        report[split][metric + "_rate"] = report[split][metric] / len(cases)
-                    timings.extend(seconds)
-            process.stdin.close()
-            # EOF lets #66 run its final source/seed/config/provenance checks.
-            diagnostics = frames.finish()
-            require(process.wait() == 0, "Native integration postchecks failed")
-            (attempt / "transport.stdout").write_bytes(diagnostics)
+        warmups = []
+        for warmup in WARMUPS:
+            response, elapsed = query(warmup)
+            warmups.append({"query": warmup, "response": response, "controller_seconds": elapsed})
+            # Validate warmups too; an error cannot be hidden as unscored.
+            score([{"origin": "", "targets": []}], [response], [elapsed], mapping)
+        private_report(attempt / "warmups.json", {"unscored": warmups})
+        report: dict[str, Any] = {"benchmark_identity": benchmark["composite_id"], "revision": revision,
+            "image": image_spec["Id"], "protocol": PROTOCOL, "errors": 0, "trusted_tests": True}
+        timings = []
+        with (attempt / "private-cases.jsonl").open("x") as private:
+            (attempt / "private-cases.jsonl").chmod(0o600)
+            for split in ("development", "validation"):
+                cases = sorted(benchmark[split], key=lambda c: c["case_id"])
+                if smoke is not None:
+                    cases = cases[:smoke]
+                responses, seconds = [], []
+                for case in cases:
+                    response, elapsed = query(case["question"])
+                    responses.append(response)
+                    seconds.append(elapsed)
+                    private.write(json.dumps({"split": split, "case_id": case["case_id"],
+                        "response": response, "controller_seconds": elapsed}) + "\n")
+                    private.flush()
+                report[split] = score(cases, responses, seconds, mapping)
+                for metric in ("hit_at_5", "hit_at_1", "origin_hit_at_5"):
+                    report[split][metric + "_rate"] = report[split][metric] / len(cases)
+                timings.extend(seconds)
+        process.stdin.close()
+        # EOF lets #66 run its final source/seed/config/provenance checks.
+        diagnostics = frames.finish()
+        require(process.wait() == 0, "Native integration postchecks failed")
+        capture.finish()
+        capture = None
+        disk.checkpoint()
+        (attempt / "transport.stdout").write_bytes(diagnostics)
         after = json.loads(run(["docker", "inspect", worker]))[0]
+        require(after["Id"] == worker_id and after["Name"] == "/" + worker, "Final worker identity mismatch")
         verify_spec(after, attempt, corpus, baseline, probe, tests)
         require(after["State"]["ExitCode"] == 0, "Native worker failed")
         private_report(attempt / "worker-after.json", after)
@@ -251,24 +279,35 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         require(digest(config_path) == config_hash and tree_hashes(tests) == trusted_hashes, "Execution config/test drift")
         require(all(tree_hashes(attempt / d) == hashes for d, hashes in source_hashes.items()), "Plugin source drift")
         corpus_integrity(corpus)
+        disk.checkpoint()
         report.update(integrity=True, official_integration=True, warm_p95_seconds=percentile95(timings),
                       scored_cases=len(timings), complete=smoke is None)
-        private_report(attempt / "aggregate.json", report)
+        with disk.action():
+            private_report(attempt / "aggregate.json", report)
         return report
     finally:
+        lifecycle.close()
         if process is not None and process.poll() is None:
             process.kill()
             process.wait()
-        worker_removed = False
         try:
-            spec = json.loads(run(["docker", "inspect", worker]))[0]
-            require(spec["Config"]["Labels"]["lk.lab"] == "ticket-66", "Cleanup ownership mismatch")
-            run(["docker", "rm", "--force", "--volumes", worker])
-            require(not run(["docker", "ps", "--all", "--filter", "name=^/" + worker + "$", "--format", "{{.ID}}"]).strip(),
-                    "Worker remains after removal")
-            worker_removed = True
+            # Join the drainer/stop callback before normal removal. Even capture
+            # persistence errors must pass through the owned-worker cleanup below.
+            if capture is not None:
+                capture.finish(abort=True)
         finally:
-            save_receipt(attempt / "cleanup.json", {"worker_removed": worker_removed})
-        # Diagnostic persistence must never prevent owned-container cleanup.
-        if frames is not None:
-            (attempt / "transport.stdout").write_bytes(bytes(frames.noise))
+            worker_removed = False
+            try:
+                spec = json.loads(run(["docker", "inspect", worker]))[0]
+                require(spec["Id"] == worker_id and spec["Name"] == "/" + worker
+                        and spec["Config"]["Labels"]["lk.lab"] == "ticket-66", "Cleanup ownership mismatch")
+                run(["docker", "rm", "--force", "--volumes", worker_id])
+                require(not run(["docker", "ps", "--all", "--filter", "name=^/" + worker + "$", "--format", "{{.ID}}"]).strip(),
+                        "Worker remains after removal")
+                worker_removed = True
+            finally:
+                try:
+                    save_receipt(attempt / "cleanup.json", {"worker_removed": worker_removed})
+                finally:
+                    if frames is not None:
+                        (attempt / "transport.stdout").write_bytes(bytes(frames.noise))

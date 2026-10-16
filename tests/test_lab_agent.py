@@ -161,6 +161,60 @@ def setup_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict
             "name": "lk-lab-synthetic", "role": "implementation", "task": "synthetic task"}, events
 
 
+@pytest.mark.parametrize("replacement", [False, True])
+def test_disk_stop_during_blocked_model_is_exact_and_preserves_usage(tmp_path, monkeypatch, replacement):
+    import threading
+    from scripts import lab_disk_guard as disk
+    real_cleanup = agent.cleanup
+    kwargs, events = setup_session(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "cleanup", real_cleanup)
+    trigger, sampled = threading.Event(), threading.Event()
+    low = [False]
+    running = {"synthetic-id": True, "unrelated-id": True}
+    alerts = []
+    def space(path):
+        return {"available_blocks": 9 if low[0] else 20, "usable_blocks": 100}
+    def monitor(self):
+        assert trigger.wait(5)
+        self.sample()
+        sampled.set()
+    def inspect(name):
+        spec = spec_for(kwargs["name"], agent.mounts(kwargs["attempt"], kwargs["corpus"], "implementation", False))
+        spec["Id"] = "unrelated-id" if replacement and low[0] else "synthetic-id"
+        spec["State"] = {"Running": running[spec["Id"]]}
+        return spec
+    original_run = agent.run
+    def run(args, **kw):
+        if args[:2] == ["docker", "ps"]:
+            return ""
+        if args[:2] == ["docker", "kill"]:
+            assert args[-1] == "synthetic-id"
+            assert alerts, "durable pause callback precedes worker stop"
+            running["synthetic-id"] = False
+        return original_run(args, **kw)
+    def send(*args):
+        low[0] = True
+        trigger.set()
+        assert sampled.wait(5), "monitor must act before provider returns"
+        assert alerts and running["unrelated-id"]
+        assert running["synthetic-id"] is replacement
+        return {"usage": {"input_tokens": 23}, "message": {"content": json.dumps(FINAL)}}
+    monkeypatch.setattr(disk, "available_space", space)
+    monkeypatch.setattr(disk.DiskGuard, "_monitor", monitor)
+    monkeypatch.setattr(agent, "inspect", inspect)
+    monkeypatch.setattr(agent, "run", run)
+    monkeypatch.setattr(model, "send", send)
+    with disk.DiskGuard(tmp_path, alerts.append):
+        with pytest.raises(ValueError if replacement else disk.LabDiskPaused):
+            agent.run_session(**kwargs)
+    status = json.loads((kwargs["attempt"] / "private/status.json").read_text())
+    assert status["complete"] is False and status["usage"] == [{"input_tokens": 23}]
+    assert status["cleanup_complete"] is (not replacement)
+    assert (["docker", "rm", "-f", "synthetic-id"] in events) is (not replacement)
+    assert ["docker", "rm", "-f", "unrelated-id"] not in events
+    assert not any(t.name == "lab-disk-guard" for t in threading.enumerate())
+
+
 def test_real_session_loop_fake_model_and_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     kwargs, events = setup_session(tmp_path, monkeypatch)
     requests = []
@@ -234,6 +288,53 @@ def test_cleanup_exact_identity_and_absence(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls[1][1:3] == ["ps", "-aq"]
 
 
+@pytest.mark.parametrize("pressure", [False, True])
+def test_session_worker_start_is_disk_action_fenced(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pressure: bool) -> None:
+    from contextlib import contextmanager
+    from scripts import lab_disk_guard as disk
+    kwargs, events = setup_session(tmp_path, monkeypatch)
+    alerts: list[dict[str, Any]] = []
+    low = [False]
+    inside = [False]
+    monkeypatch.setattr(disk, "available_space", lambda path: {
+        "available_blocks": 9 if low[0] else 20, "usable_blocks": 100})
+    original_action = disk.action
+    original_run = agent.run
+    def inspect(name: str) -> dict[str, Any]:
+        spec = spec_for(kwargs["name"], agent.mounts(kwargs["attempt"], kwargs["corpus"], "implementation", False))
+        return {**spec, "State": {"Running": False}}
+    monkeypatch.setattr(agent, "inspect", inspect)
+    @contextmanager
+    def dispatch_action() -> Any:
+        low[0] = pressure
+        guard.sample()  # Deterministic detection at the short start-dispatch boundary.
+        with original_action():
+            inside[0] = True
+            try:
+                yield
+            finally:
+                inside[0] = False
+    def run(args: list[str], **options: Any) -> str:
+        if args[:2] == ["docker", "start"]:
+            assert inside[0], "worker start escaped the disk-action fence"
+        return original_run(args, **options)
+    monkeypatch.setattr(disk, "action", dispatch_action)
+    monkeypatch.setattr(agent, "run", run)
+    monkeypatch.setattr(model, "send", lambda *args: {
+        "message": {"role": "assistant", "content": json.dumps(FINAL), "tool_calls": []},
+        "usage": {"available": False}})
+    with disk.DiskGuard(tmp_path, alerts.append) as guard:
+        if pressure:
+            with pytest.raises(disk.LabDiskPaused):
+                agent.run_session(**kwargs)
+        else:
+            assert agent.run_session(**kwargs)["complete"]
+    starts = [event for event in events if isinstance(event, list) and event[:2] == ["docker", "start"]]
+    assert len(starts) == (0 if pressure else 1)
+    assert bool(alerts) is pressure
+
+
 def test_wire_inspection_uses_official_multiturn_conversion() -> None:
     httpx = pytest.importorskip("httpx")
     converter = pytest.importorskip("agent.codex_responses_adapter")._chat_messages_to_responses_input
@@ -252,7 +353,7 @@ def test_wire_inspection_uses_official_multiturn_conversion() -> None:
             model.inspect_request(httpx.Request("POST", model.ENDPOINT, json={**body, key: value}), messages)
 
 
-@pytest.mark.parametrize("failure", ["ok", "quota", "ambiguous"])
+@pytest.mark.parametrize("failure", ["ok", "quota", "ambiguous", "disk_pause"])
 def test_official_adapter_fake_http_preserves_usage_and_pauses_safely(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
     httpx = pytest.importorskip("httpx")
@@ -284,19 +385,32 @@ def test_official_adapter_fake_http_preserves_usage_and_pauses_safely(
     client = openai.OpenAI(api_key="synthetic-not-a-credential", base_url=model.ENDPOINT.rsplit("/", 1)[0],
                            max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
     wrapper = auxiliary.CodexAuxiliaryClient(client, model.MODEL)
-    monkeypatch.setattr(auxiliary, "resolve_provider_client", lambda **kw: (wrapper, model.MODEL))
+    from scripts import lab_disk_guard as disk
+    low = [False]
+    monkeypatch.setattr(disk, "available_space", lambda path: {
+        "available_blocks": 9 if low[0] else 20, "usable_blocks": 100})
+    def resolve(**kwargs: Any) -> Any:
+        if failure == "disk_pause":
+            low[0] = True
+            guard.sample()  # Pressure detected while preparing the provider client.
+        return wrapper, model.MODEL
+    monkeypatch.setattr(auxiliary, "resolve_provider_client", resolve)
     monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", lambda **kw: {})
     monkeypatch.setattr(model.importlib.metadata, "version", lambda name: "0.19.0")
     messages = [{"role": "system", "content": "synthetic system"}, {"role": "user", "content": "synthetic task"}]
-    if failure != "ok":
-        with pytest.raises(model.ModelPaused) as caught:
-            model._send(messages, tmp_path / "wire.json")
-        assert "SYNTHETIC_SECRET" not in str(caught.value)
-    else:
-        response = model._send(messages, tmp_path / "wire.json")
-        assert response["usage"] == usage
-        assert json.loads(response["message"]["content"]) == FINAL
-    assert len(calls) == 1
+    with disk.DiskGuard(tmp_path, lambda alert: model.save(tmp_path / "disk-alert.json", alert)) as guard:
+        if failure != "ok":
+            with pytest.raises(model.ModelPaused) as caught:
+                model._send(messages, tmp_path / "wire.json")
+            assert "SYNTHETIC_SECRET" not in str(caught.value)
+        else:
+            response = model._send(messages, tmp_path / "wire.json")
+            assert response["usage"] == usage
+            assert json.loads(response["message"]["content"]) == FINAL
+    assert len(calls) == (0 if failure == "disk_pause" else 1)
+    if failure == "disk_pause":
+        assert (tmp_path / "disk-alert.json").is_file()
+        assert not (tmp_path / "wire.json").exists()
     assert logging.root.manager.disable == previous_logging_disable
 
 

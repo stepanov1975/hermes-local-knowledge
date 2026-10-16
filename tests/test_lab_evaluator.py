@@ -327,6 +327,8 @@ def test_evaluator_trusted_tests_use_bounded_real_pipes(tmp_path, monkeypatch, m
             return json.dumps([{"Id": "different-worker" if unowned else cid, "Name": "/" + worker,
                 "Image": image, "Config": {"Labels": {"lk.lab": "ticket-66"}},
                 "State": {"Running": state["running"], "ExitCode": 0}}])
+        if args[:2] == ["docker", "create"]:
+            return cid
         if args[:2] == ["docker", "kill"]:
             assert args[-1] == cid
             state["running"] = False
@@ -337,6 +339,10 @@ def test_evaluator_trusted_tests_use_bounded_real_pipes(tmp_path, monkeypatch, m
 
     class Transport:
         def __init__(self):
+            import os
+            read_fd, write_fd = os.pipe()
+            os.close(write_fd)
+            self.stderr = os.fdopen(read_fd, "rb")
             self.stdin = io.BytesIO()
             self.code = None
         def poll(self):
@@ -400,7 +406,7 @@ def test_evaluator_trusted_tests_use_bounded_real_pipes(tmp_path, monkeypatch, m
     assert receipt["output_limit_exceeded"] is exceeded
     assert sum(receipt["stored_bytes"].values()) == ceiling
     assert (["docker", "kill", cid] in calls) is (mode == "infinite")
-    assert ["docker", "rm", "--force", "--volumes", worker] in calls
+    assert ["docker", "rm", "--force", "--volumes", cid] in calls
     assert json.loads((attempt / "cleanup.json").read_text())["worker_removed"]
     assert all(len(receipt[key]) <= output.PREVIEW_BYTES for key in ("stdout", "stderr"))
     for key in ("stdout", "stderr"):
@@ -410,3 +416,145 @@ def test_evaluator_trusted_tests_use_bounded_real_pipes(tmp_path, monkeypatch, m
         assert (attempt / receipt["files"]["stderr"]).read_bytes() == b'error'
     runner = json.loads((attempt / "runner.json").read_text())
     assert runner["process_output_sha256"] == runtime.digest(Path(output.__file__))
+
+
+@pytest.mark.parametrize("phase", ["ready", "trusted", "final", "normal", "limit", "disk", "unowned"])
+def test_native_transport_stderr_is_bounded_on_actual_evaluator_path(tmp_path, monkeypatch, phase):
+    from contextlib import ExitStack
+    from scripts import lab_disk_guard as disk
+    import subprocess
+    import sys
+    import threading
+    from scripts import lab_evaluator_runtime as runtime, lab_process_output as output
+
+    corpus, pins = fixture(tmp_path)
+    case = {"case_id": "synthetic", "origin": "a", "question": "synthetic", "targets": [{"logical_id": "b"}]}
+    benchmark = {"corpus_manifest_sha256": pins["manifest_sha256"], "composite_id": "synthetic",
+                 "development": [case], "validation": [case]}
+    attempt = tmp_path / "evaluation"
+    worker, cid = "lk-lab-native-stderr-worker", "exact-owned-id"
+    image = "sha256:" + "a" * 64
+    trigger, sampled = threading.Event(), threading.Event()
+    low = [False]
+    active, killed = tmp_path / "tests-active", tmp_path / "killed"
+    calls, children = [], []
+    state = {"running": True}
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(output, "COMMAND_OUTPUT_BYTES", 1024)
+
+    def prepare(attempt, repo, revision):
+        for directory in ("home/plugins/local_knowledge", "work/plugin", "output"):
+            (attempt / directory).mkdir(parents=True, exist_ok=True)
+        (attempt / "home/config.yaml").write_text('{"local_knowledge":{}}')
+        (attempt / "output/native-baseline.json").write_text('{"integrity":"ok","logical_mapping_count":2}')
+
+    def daemon(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["docker", "image", "inspect"]:
+            return json.dumps([{"Id": image, "Config": {"Labels": {
+                "org.opencontainers.image.revision": "90194c64ff99933ec3b9ecfd9295b06e6c11e038"}}}])
+        if args[:2] == ["docker", "inspect"]:
+            return json.dumps([{"Id": "replacement-id" if phase == "unowned" and children else cid,
+                "Name": "/" + worker, "Image": image,
+                "Config": {"Labels": {"lk.lab": "ticket-66"}},
+                "State": {"Running": state["running"], "ExitCode": 0}}])
+        if args[:2] == ["docker", "create"]:
+            return cid
+        if args[:2] == ["docker", "kill"]:
+            assert args[-1] == cid
+            state["running"] = False
+            killed.touch()
+            return cid
+        if args[:2] == ["docker", "rm"]:
+            assert args[-1] == cid
+            return ""
+        assert args[:2] in (["docker", "run"], ["docker", "create"], ["docker", "ps"])
+        return ""
+
+    code = f'''import os, sys, json, time
+from pathlib import Path
+phase = {phase!r}
+if phase in {{'ready', 'unowned'}}:
+    os.write(2, b'e' * 16384)
+print('LK68 '+json.dumps({{'ready': True, 'mapping_count': 2}}), flush=True)
+if phase == 'trusted':
+    while not Path({str(active)!r}).exists(): time.sleep(.005)
+    os.write(2, b'e' * 16384)
+if phase == 'normal': os.write(2, b'normal diagnostic')
+if phase == 'limit': os.write(2, b'e' * 1024)
+for line in sys.stdin:
+    if phase == 'disk': time.sleep(60)
+    request = json.loads(line)
+    print('LK68 '+json.dumps({{'sequence': request['sequence'], 'response': {{'results': [{{'id':'native-b'}}]}}}}), flush=True)
+if phase == 'final': os.write(2, b'e' * 16384)
+'''
+
+    def spawn(args, **kwargs):
+        if args[:2] == ["docker", "start"]:
+            child = real_popen([sys.executable, "-u", "-c", code], **kwargs)
+        else:
+            assert args[:2] == ["docker", "exec"]
+            tests = (f"from pathlib import Path; import time; Path({str(active)!r}).touch()\n"
+                     + (f"while not Path({str(killed)!r}).exists(): time.sleep(.005)\n" if phase == "trusted" else ""))
+            child = real_popen([sys.executable, "-u", "-c", tests], **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(runtime, "prepare_attempt", prepare)
+    monkeypatch.setattr(runtime, "corpus_integrity", lambda _: {"settings": {}})
+    monkeypatch.setattr(runtime, "verify_spec", lambda *args: None)
+    monkeypatch.setattr(runtime, "run", daemon)
+    monkeypatch.setattr(runtime.subprocess, "Popen", spawn)
+    kwargs = dict(attempt=attempt, repo=tmp_path, revision="a" * 40, corpus=corpus,
+                  image=image, name="lk-lab-native-stderr", benchmark=benchmark)
+    stack = ExitStack()
+    if phase == "disk":
+        original_read = runtime.Frames.read
+        read_count = [0]
+        def read(frames):
+            read_count[0] += 1
+            if read_count[0] == 2:
+                low[0] = True
+                trigger.set()
+            return original_read(frames)
+        def monitor(self):
+            assert trigger.wait(5)
+            self.sample()
+            sampled.set()
+        def pause(alert):
+            runtime.private_report(tmp_path / "disk-alert.json", alert)
+        monkeypatch.setattr(disk, "available_space", lambda path: {
+            "available_blocks": 9 if low[0] else 20, "usable_blocks": 100})
+        monkeypatch.setattr(disk.DiskGuard, "_monitor", monitor)
+        monkeypatch.setattr(runtime.Frames, "read", read)
+        stack.enter_context(disk.DiskGuard(tmp_path, pause))
+    try:
+        if phase in {"normal", "limit"}:
+            report = runtime.evaluate_revision(**kwargs)
+            assert report["complete"] is True and report["scored_cases"] == 2
+            expected = b'normal diagnostic' if phase == "normal" else b'e' * 1024
+            assert (attempt / "transport.stderr").read_bytes() == expected
+        else:
+            with pytest.raises((RuntimeError, ValueError)):
+                runtime.evaluate_revision(**kwargs)
+            assert not (attempt / "aggregate.json").exists()
+        receipt = json.loads((attempt / "transport.stderr.json").read_text())
+        overflow = phase in {"ready", "trusted", "final", "unowned"}
+        assert receipt["output_limit_exceeded"] is overflow
+        assert receipt["limit_action_complete"] is (overflow and phase != "unowned")
+        if phase == "disk":
+            assert sampled.wait(5)
+            assert json.loads((tmp_path / "disk-alert.json").read_text())["kind"] == "lab_disk_paused"
+        assert (attempt / "transport.stderr").stat().st_size <= 1024
+        assert (["docker", "kill", cid] in calls) is (phase in {"ready", "trusted", "final", "disk"})
+        assert (["docker", "rm", "--force", "--volumes", cid] in calls) is (phase != "unowned")
+        assert json.loads((attempt / "cleanup.json").read_text())["worker_removed"] is (phase != "unowned")
+        assert all(child.poll() is not None for child in children)
+        assert not any(t.name == "lab-native-stderr" for t in threading.enumerate())
+    finally:
+        stack.close()
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+        assert not any(t.name in {"lab-disk-guard", "lab-native-stderr"} for t in threading.enumerate())

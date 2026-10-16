@@ -17,12 +17,14 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import uuid
 from typing import Any, Callable, Iterator
 
 from scripts.lab_evaluator import load_benchmark, require, verdict
 from scripts.lab_runtime import validate_pin
 from scripts.lab_process_output import bounded_process
+from scripts import lab_disk_guard as disk
 
 INITIAL_INCUMBENT = "a20a456f76db636740a1f2aef81b6aeb0f4f18a2"
 SCHEMA = "private-manual-lab/v1"
@@ -181,6 +183,7 @@ def isolated_check(args: list[str], *, name: str, image: str, work: Path,
     from scripts.lab_runtime import run
     expected_env = {args[i + 1] for i, value in enumerate(args) if value == "--env"}
     expected_command = args[args.index(image) + 1:]
+    disk.checkpoint()
     container_id = run(args).strip()
     cleanup_complete = False
 
@@ -224,9 +227,12 @@ def isolated_check(args: list[str], *, name: str, image: str, work: Path,
                 and mounts == {("bind", str(work.resolve()), "/candidate", False),
                                ("bind", str(inputs.resolve()), "/check-inputs", False)},
                 "Full-check isolation readback mismatch")
-        result = bounded_process(["docker", "start", "--attach", container_id], prefix=prefix,
-                                 env={k: os.environ[k] for k in ("PATH", "HOME", "LANG") if k in os.environ},
-                                 on_limit=stop_on_limit)
+        with disk.owned_worker(stop_on_limit):
+            disk.checkpoint()
+            result = bounded_process(["docker", "start", "--attach", container_id], prefix=prefix,
+                                     env={k: os.environ[k] for k in ("PATH", "HOME", "LANG") if k in os.environ},
+                                     on_limit=stop_on_limit)
+            disk.checkpoint()
         stopped = json.loads(run(["docker", "inspect", container_id]))[0]
         require(stopped["State"]["Running"] is False, "Full-check worker did not stop")
         if result.returncode == 0:
@@ -253,6 +259,7 @@ def full_candidate_checks(*, attempt: Path, repo: Path, revision: str, image: st
     The Git revision still supplies all candidate runtime package bytes.
     """
     from scripts.lab_runtime import prepare_attempt
+    disk.checkpoint()
     identity_before = controller_identity()
     require(check_tools_identity(check_tools) == check_tools_sha256, "Check-tool pin mismatch")
     prepare_attempt(attempt, repo, revision)
@@ -540,160 +547,182 @@ def run_experiment(campaign: Path, *, session: Callable[..., dict] | None = None
         config = read_json(campaign / "config.json")
         require(sha(config) == manifest["config_sha256"], "Campaign configuration drift")
         require(not manifest["paused"] and manifest["pending"] is None, "Campaign paused or pending; manual reconciliation required")
-        # A crash between mkdir/record and manifest publication must also block relaunch.
-        finalized = {p["attempt_id"] for p in manifest["reports"]}
-        require(all(p.name in finalized for p in (campaign / "attempts").iterdir()), "Unreconciled attempt directory")
-        benchmark = validate_config(config, loader)
-        identity = controller_identity()
-        previous = manifest["incumbent"]
-        repo = campaign / "repo.git"
-        revision_exists(repo, previous)
-        attempt_id = uuid.uuid4().hex
-        attempt = campaign / "attempts" / attempt_id
-        attempt.mkdir(mode=0o700)
-        fsync_directory(attempt.parent)
-        binding = {"config": sha(config), "controller": sha(identity), "image": config["image"],
-                   "benchmark": config["composite_id"], "previous_incumbent": previous}
-        durable_json(attempt / "attempt.json", {"attempt_id": attempt_id, **binding, **MODEL})
-        reports = finalized_reports(campaign, manifest)
-        durable_json(attempt / "history.json", {"reports": [history_projection(r) for r in reports]})
-        pending = {**manifest, "pending": attempt_id}
-        durable_json(campaign / "manifest.json", pending, replace=True)
-        report: dict[str, Any] = {"attempt_id": attempt_id, **binding, "revision": previous,
-            "hypothesis": None, "strategy": None, "related_attempts": [], "revisit_reason": None,
-            "actual_changes": [], "checks": [], "measured_outcomes": {}, "outcome": "error",
-            "lessons": [], "usage": [], "semantic_caveat": "Unknown returned top-five targets remain unjudged."}
-        sessions: list[dict] = []
-        inflight: tuple[str, str] | None = None
-        common = {"repo": repo, "corpus": Path(config["corpus"]), "development": Path(config["development"]),
-                  "history": attempt / "history.json", "image": config["image"]}
+        def pause_disk(alert: dict) -> None:
+            current = read_json(campaign / "manifest.json")
+            durable_json(campaign / "manifest.json", {**current, "paused": True}, replace=True)
+            durable_json(campaign / "disk-alert.json", alert, replace=True)
+            require(read_json(campaign / "manifest.json")["paused"] is True,
+                    "Disk pause readback failed")
+            require(read_json(campaign / "disk-alert.json") == alert, "Disk alert readback failed")
+            print(json.dumps(alert, sort_keys=True), file=sys.stderr, flush=True)
 
-        def pins_unchanged() -> None:
-            require(read_json(campaign / "config.json") == config and controller_identity() == identity,
-                    "Controller/config evidence became stale")
-            validate_config(config, loader)
+        with disk.DiskGuard(campaign, pause_disk) as guard:
+            # A crash between mkdir/record and manifest publication must also block relaunch.
+            finalized = {p["attempt_id"] for p in manifest["reports"]}
+            require(all(p.name in finalized for p in (campaign / "attempts").iterdir()), "Unreconciled attempt directory")
+            benchmark = validate_config(config, loader)
+            identity = controller_identity()
+            previous = manifest["incumbent"]
+            repo = campaign / "repo.git"
+            revision_exists(repo, previous)
+            attempt_id = uuid.uuid4().hex
+            attempt = campaign / "attempts" / attempt_id
+            guard.check()
+            attempt.mkdir(mode=0o700)
+            fsync_directory(attempt.parent)
+            binding = {"config": sha(config), "controller": sha(identity), "image": config["image"],
+                       "benchmark": config["composite_id"], "previous_incumbent": previous}
+            durable_json(attempt / "attempt.json", {"attempt_id": attempt_id, **binding, **MODEL})
+            reports = finalized_reports(campaign, manifest)
+            durable_json(attempt / "history.json", {"reports": [history_projection(r) for r in reports]})
+            with guard.action():
+                pending = {**manifest, "pending": attempt_id}
+                durable_json(campaign / "manifest.json", pending, replace=True)
+            report: dict[str, Any] = {"attempt_id": attempt_id, **binding, "revision": previous,
+                "hypothesis": None, "strategy": None, "related_attempts": [], "revisit_reason": None,
+                "actual_changes": [], "checks": [], "measured_outcomes": {}, "outcome": "error",
+                "lessons": [], "usage": [], "semantic_caveat": "Unknown returned top-five targets remain unjudged."}
+            sessions: list[dict] = []
+            inflight: tuple[str, str] | None = None
+            common = {"repo": repo, "corpus": Path(config["corpus"]), "development": Path(config["development"]),
+                      "history": attempt / "history.json", "image": config["image"]}
 
-        def measured(revision: str, role: str) -> dict:
-            nonlocal inflight
-            pins_unchanged()
-            inflight = ("evaluation", role)
-            result = evaluator(attempt=attempt / ("evaluation-" + role), repo=repo, revision=revision,
-                               corpus=Path(config["corpus"]), image=config["image"],
-                               name="lk-lab-" + attempt_id + "-" + role, benchmark=benchmark)
-            inflight = None
-            require(result.get("revision") == revision and result.get("image") == config["image"]
-                    and result.get("benchmark_identity") == config["composite_id"], "Stale evaluation identity")
-            pins_unchanged()
-            return safe_aggregate(result)
+            def pins_unchanged() -> None:
+                guard.check()
+                require(read_json(campaign / "config.json") == config and controller_identity() == identity,
+                        "Controller/config evidence became stale")
+                validate_config(config, loader)
 
-        try:
-            inflight = ("session", "implementation")
-            implementation = session(attempt=attempt / "implementation", revision=previous,
-                name="lk-lab-" + attempt_id + "-impl", role="implementation", task=IMPLEMENT_TASK, **common)
-            inflight = None
-            session_valid(implementation, "implementation", previous)
-            validate_session_source(implementation, attempt / "implementation/work/plugin")
-            sessions.append(implementation)
-            final = implementation["final"]
-            for key in ("hypothesis", "strategy", "related_attempts", "revisit_reason", "lessons"):
-                report[key] = final[key]
-            require(isinstance(final["strategy"], str) and bool(final["strategy"].strip()), "Strategy missing")
-            require(type(final["no_change"]) is bool, "Explicit no-change decision required")
-            report["strategy_id"] = sha(" ".join(final["strategy"].lower().split()))
-            failed = [r for r in reports if r.get("strategy_id") == report["strategy_id"] and r["outcome"] == "rejected"]
-            require(not failed or final["no_change"] or bool(str(final["revisit_reason"] or "").strip()),
-                    "Repeated failed strategy needs a new reason or no-change decision")
-            workspace = Path(implementation["workspace"])
-            work_identity = snapshot(workspace)
-            revision, changes = candidate_commit(repo, previous, workspace, attempt)
-            report.update(revision=revision, actual_changes=changes)
-            require(not final["no_change"] or not changes, "No-change claim contradicts actual files")
-            exact_binding = {**binding, "revision": revision, "tree": git(repo, "rev-parse", revision + "^{tree}").decode().strip()}
-            durable_json(attempt / "candidate.json", exact_binding)
-            old = measured(previous, "incumbent")
-            report["measured_outcomes"]["incumbent"] = old
-            new = measured(revision, "candidate")
-            report["measured_outcomes"]["candidate"] = new
-            decision = verdict(old, new)
-            report["measured_outcomes"]["score_verdict"] = decision
-            report["checks"] = [{"name": gate, "passed": new.get(gate) is True, "revision": revision}
-                                for gate in ("integrity", "trusted_tests", "official_integration", "complete")]
-            inflight = ("checks", "full-checks")
-            full_checks = checks(attempt=attempt / "full-checks", repo=repo, revision=revision,
-                                 image=config["image"], name="lk-lab-" + attempt_id + "-checks",
-                                 check_tools=Path(config["check_tools"]),
-                                 check_tools_sha256=config["check_tools_sha256"])
-            inflight = None
-            require(full_checks.get("revision") == revision and full_checks.get("image") == config["image"]
-                    and full_checks.get("controller") == sha(identity), "Stale full-check evidence")
-            actual_checks = full_checks.get("checks", [])
-            full_passed = (full_checks.get("passed") is True
-                           and {c["name"] for c in actual_checks} == {"full_pytest", "ruff", "mypy"}
-                           and all(c.get("passed") is True for c in actual_checks))
-            report["checks"].extend({**c, "revision": revision} for c in actual_checks)
-            clearance_binding = {**exact_binding, "measured_outcomes_sha256": sha(report["measured_outcomes"])}
-            cleared = clearance(campaign, clearance_binding) if decision["score_eligible"] else False
-            report["unknown_target_gate"] = {"cleared": cleared, "binding": clearance_binding}
-            # Reviewer sees aggregate integers and actual checks, never cases or raw responses.
-            durable_json(attempt / "review-evidence.json", {"binding": exact_binding, "draft_report": report})
-            pins_unchanged()
-            require(snapshot(workspace) == work_identity, "Candidate changed after execution")
-            inflight = ("session", "review")
-            review = session(attempt=attempt / "review", revision=revision,
-                name="lk-lab-" + attempt_id + "-review", role="review", task=REVIEW_TASK,
-                evidence=attempt / "review-evidence.json", **common)
-            inflight = None
-            session_valid(review, "review", revision)
-            validate_session_source(review, attempt / "review/work/plugin")
-            sessions.append(review)
-            require(review["session_id"] != implementation["session_id"], "Review must be independent")
-            # The frozen Git object is authoritative; nevertheless fail on edits to either export.
-            review_commit, review_changes = candidate_commit(repo, revision, Path(review["workspace"]), attempt / "review")
-            require(review_commit == revision and not review_changes, "Reviewer source changed")
-            require(snapshot(workspace) == work_identity, "Implementation source changed after gates")
-            pins_unchanged()
-            review_final = review["final"]
-            approved = all(review_final.get(k) is True for k in (
-                "approved", "shortcuts_checked", "compatibility_checked", "report_checked"))
-            report["independent_review"] = {"session_id": review["session_id"], "approved": approved,
-                "revision": revision, "binding_sha256": sha(exact_binding), "findings": review_final.get("findings", [])}
-            report["outcome"] = ("no_change" if not changes else "accepted"
-                                 if decision["score_eligible"] and approved and full_passed and cleared else "rejected")
-            report["usage"] = safe_usage(sessions)
-            publish(campaign, pending, report)
-            return report
-        except Exception as error:
-            # Never put arbitrary candidate/provider exception text into safe reports.
-            report["error_class"] = type(error).__name__
-            report["outcome"] = "error"
-            report["usage"] = safe_usage(recover_usage(attempt, sessions))
-            paused = bool(re.search(r"auth|quota|modelpaused|ratelimit|credential", type(error).__name__, re.I))
-            report["paused"] = paused
-            uncertain = inflight is not None
-            if inflight is not None:
-                kind, role = inflight
-                if kind == "session":
-                    # Status exists even after failed cleanup; only an explicit
-                    # completed-cleanup receipt is safe-to-relaunch evidence.
-                    status = attempt / role / "private/status.json"
-                    uncertain = not (status.is_file() and read_json(status).get("cleanup_complete") is True)
-                elif kind == "evaluation":
-                    cleanup = attempt / ("evaluation-" + role) / "cleanup.json"
-                    uncertain = not (cleanup.is_file() and read_json(cleanup).get("worker_removed") is True)
-                elif kind == "checks":
-                    cleanup = attempt / "full-checks/checks.json"
-                    uncertain = not (cleanup.is_file() and read_json(cleanup).get("cleanup_complete") is True)
-            report["reconciliation_required"] = uncertain
-            if not (attempt / "report.json").exists():
-                publish(campaign, pending, report, paused=paused, hold_pending=uncertain)
-            raise
-        except BaseException as error:
-            report.update(outcome="interrupted", error_class=type(error).__name__,
-                          usage=safe_usage(recover_usage(attempt, sessions)), reconciliation_required=True)
-            if not (attempt / "interrupted.json").exists():
-                durable_json(attempt / "interrupted.json", report)
-            raise
-        # Interruption/process death deliberately leaves pending intact.
+            def measured(revision: str, role: str) -> dict:
+                nonlocal inflight
+                pins_unchanged()
+                inflight = ("evaluation", role)
+                result = evaluator(attempt=attempt / ("evaluation-" + role), repo=repo, revision=revision,
+                                   corpus=Path(config["corpus"]), image=config["image"],
+                                   name="lk-lab-" + attempt_id + "-" + role, benchmark=benchmark)
+                inflight = None
+                require(result.get("revision") == revision and result.get("image") == config["image"]
+                        and result.get("benchmark_identity") == config["composite_id"], "Stale evaluation identity")
+                pins_unchanged()
+                return safe_aggregate(result)
+
+            try:
+                guard.check()
+                inflight = ("session", "implementation")
+                implementation = session(attempt=attempt / "implementation", revision=previous,
+                    name="lk-lab-" + attempt_id + "-impl", role="implementation", task=IMPLEMENT_TASK, **common)
+                session_valid(implementation, "implementation", previous)
+                sessions.append(implementation)
+                guard.check()
+                inflight = None
+                validate_session_source(implementation, attempt / "implementation/work/plugin")
+                final = implementation["final"]
+                for key in ("hypothesis", "strategy", "related_attempts", "revisit_reason", "lessons"):
+                    report[key] = final[key]
+                require(isinstance(final["strategy"], str) and bool(final["strategy"].strip()), "Strategy missing")
+                require(type(final["no_change"]) is bool, "Explicit no-change decision required")
+                report["strategy_id"] = sha(" ".join(final["strategy"].lower().split()))
+                failed = [r for r in reports if r.get("strategy_id") == report["strategy_id"] and r["outcome"] == "rejected"]
+                require(not failed or final["no_change"] or bool(str(final["revisit_reason"] or "").strip()),
+                        "Repeated failed strategy needs a new reason or no-change decision")
+                workspace = Path(implementation["workspace"])
+                work_identity = snapshot(workspace)
+                revision, changes = candidate_commit(repo, previous, workspace, attempt)
+                report.update(revision=revision, actual_changes=changes)
+                require(not final["no_change"] or not changes, "No-change claim contradicts actual files")
+                exact_binding = {**binding, "revision": revision, "tree": git(repo, "rev-parse", revision + "^{tree}").decode().strip()}
+                durable_json(attempt / "candidate.json", exact_binding)
+                old = measured(previous, "incumbent")
+                report["measured_outcomes"]["incumbent"] = old
+                new = measured(revision, "candidate")
+                report["measured_outcomes"]["candidate"] = new
+                decision = verdict(old, new)
+                report["measured_outcomes"]["score_verdict"] = decision
+                report["checks"] = [{"name": gate, "passed": new.get(gate) is True, "revision": revision}
+                                    for gate in ("integrity", "trusted_tests", "official_integration", "complete")]
+                guard.check()
+                inflight = ("checks", "full-checks")
+                full_checks = checks(attempt=attempt / "full-checks", repo=repo, revision=revision,
+                                     image=config["image"], name="lk-lab-" + attempt_id + "-checks",
+                                     check_tools=Path(config["check_tools"]),
+                                     check_tools_sha256=config["check_tools_sha256"])
+                guard.check()
+                inflight = None
+                require(full_checks.get("revision") == revision and full_checks.get("image") == config["image"]
+                        and full_checks.get("controller") == sha(identity), "Stale full-check evidence")
+                actual_checks = full_checks.get("checks", [])
+                full_passed = (full_checks.get("passed") is True
+                               and {c["name"] for c in actual_checks} == {"full_pytest", "ruff", "mypy"}
+                               and all(c.get("passed") is True for c in actual_checks))
+                report["checks"].extend({**c, "revision": revision} for c in actual_checks)
+                clearance_binding = {**exact_binding, "measured_outcomes_sha256": sha(report["measured_outcomes"])}
+                cleared = clearance(campaign, clearance_binding) if decision["score_eligible"] else False
+                report["unknown_target_gate"] = {"cleared": cleared, "binding": clearance_binding}
+                # Reviewer sees aggregate integers and actual checks, never cases or raw responses.
+                durable_json(attempt / "review-evidence.json", {"binding": exact_binding, "draft_report": report})
+                pins_unchanged()
+                require(snapshot(workspace) == work_identity, "Candidate changed after execution")
+                inflight = ("session", "review")
+                review = session(attempt=attempt / "review", revision=revision,
+                    name="lk-lab-" + attempt_id + "-review", role="review", task=REVIEW_TASK,
+                    evidence=attempt / "review-evidence.json", **common)
+                session_valid(review, "review", revision)
+                sessions.append(review)
+                guard.check()
+                inflight = None
+                validate_session_source(review, attempt / "review/work/plugin")
+                require(review["session_id"] != implementation["session_id"], "Review must be independent")
+                # The frozen Git object is authoritative; nevertheless fail on edits to either export.
+                review_commit, review_changes = candidate_commit(repo, revision, Path(review["workspace"]), attempt / "review")
+                require(review_commit == revision and not review_changes, "Reviewer source changed")
+                require(snapshot(workspace) == work_identity, "Implementation source changed after gates")
+                pins_unchanged()
+                review_final = review["final"]
+                approved = all(review_final.get(k) is True for k in (
+                    "approved", "shortcuts_checked", "compatibility_checked", "report_checked"))
+                report["independent_review"] = {"session_id": review["session_id"], "approved": approved,
+                    "revision": revision, "binding_sha256": sha(exact_binding), "findings": review_final.get("findings", [])}
+                report["outcome"] = ("no_change" if not changes else "accepted"
+                                     if decision["score_eligible"] and approved and full_passed and cleared else "rejected")
+                report["usage"] = safe_usage(sessions)
+                with guard.action():
+                    publish(campaign, pending, report)
+                return report
+            except Exception as error:
+                # Never put arbitrary candidate/provider exception text into safe reports.
+                report["error_class"] = type(error).__name__
+                report["outcome"] = "error"
+                report["usage"] = safe_usage(recover_usage(attempt, sessions))
+                paused = guard.failed or bool(re.search(r"auth|quota|modelpaused|ratelimit|credential", type(error).__name__, re.I))
+                report["paused"] = paused
+                uncertain = inflight is not None
+                if inflight is not None:
+                    kind, role = inflight
+                    if kind == "session":
+                        # Status exists even after failed cleanup; only an explicit
+                        # completed-cleanup receipt is safe-to-relaunch evidence.
+                        status = attempt / role / "private/status.json"
+                        uncertain = not (status.is_file() and read_json(status).get("cleanup_complete") is True)
+                    elif kind == "evaluation":
+                        cleanup = attempt / ("evaluation-" + role) / "cleanup.json"
+                        uncertain = not (cleanup.is_file() and read_json(cleanup).get("worker_removed") is True)
+                    elif kind == "checks":
+                        cleanup = attempt / "full-checks/checks.json"
+                        uncertain = not (cleanup.is_file() and read_json(cleanup).get("cleanup_complete") is True)
+                report["reconciliation_required"] = uncertain
+                if not (attempt / "report.json").exists():
+                    with guard.lock:
+                        report["paused"] = paused or guard.failed
+                        publish(campaign, read_json(campaign / "manifest.json") if guard.failed else pending,
+                                report, paused=paused or guard.failed, hold_pending=uncertain)
+                raise
+            except BaseException as error:
+                report.update(outcome="interrupted", error_class=type(error).__name__,
+                              usage=safe_usage(recover_usage(attempt, sessions)), reconciliation_required=True)
+                if not (attempt / "interrupted.json").exists():
+                    durable_json(attempt / "interrupted.json", report)
+                raise
+            # Interruption/process death deliberately leaves pending intact.
 
 
 def main() -> None:

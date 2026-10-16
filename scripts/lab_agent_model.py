@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.lab_model_client import ENDPOINT, LAB_ROOT, ModelPaused, check_environment
+from scripts import lab_disk_guard as disk
 
 MODEL = "gpt-6.1-sol"
 PROVIDER = "openai-codex"
@@ -91,11 +92,14 @@ def _send(messages: list[dict[str, Any]], receipt: Path) -> dict[str, Any]:
             raise ModelPaused("Official no-retry session client unavailable")
 
         def inspect(request: Any) -> None:
-            if wire:
-                raise ModelPaused("Repeated session inference refused")
-            metadata = inspect_request(request, messages)
-            save(receipt, metadata)
-            wire.append(metadata)
+            # Provider setup may have blocked while the disk monitor paused us.
+            # Fence only this pre-dispatch hook, never the response wait.
+            with disk.action():
+                if wire:
+                    raise ModelPaused("Repeated session inference refused")
+                metadata = inspect_request(request, messages)
+                save(receipt, metadata)
+                wire.append(metadata)
 
         class UsageStream(httpx.SyncByteStream):
             """Observe SSE usage losslessly; official adapter otherwise drops details."""
