@@ -282,3 +282,131 @@ def test_final_drain_shares_prior_read_diagnostic_allowance(stdout_child):
         with pytest.raises(ValueError, match="diagnostic"):
             frames.finish()
         assert len(frames.noise) <= 4 * 1024 * 1024
+
+
+@pytest.mark.parametrize("mode", ["finite", "failed", "infinite", "unowned"])
+def test_evaluator_trusted_tests_use_bounded_real_pipes(tmp_path, monkeypatch, mode):
+    """Exercise evaluate_revision itself, with fixed local producers and a fake daemon."""
+    import io
+    import subprocess
+    import sys
+    import tracemalloc
+    from scripts import lab_evaluator_runtime as runtime, lab_process_output as output
+    corpus, pins = fixture(tmp_path)
+    benchmark = {"corpus_manifest_sha256": pins["manifest_sha256"], "composite_id": "synthetic",
+        "development": [{"case_id": "d", "origin": "a", "question": "synthetic d", "targets": [{"logical_id": "b"}]}],
+        "validation": [{"case_id": "v", "origin": "a", "question": "synthetic v", "targets": [{"logical_id": "b"}]}]}
+    attempt = tmp_path / "evaluation"
+    worker, cid = "lk-lab-stream-worker", "synthetic-worker-id"
+    image = "sha256:" + "a" * 64
+    calls, exec_calls, children = [], [], []
+    state = {"running": True, "unowned": False}
+    real_popen = subprocess.Popen
+    ceiling = 1024 * 1024 + 5
+    monkeypatch.setattr(output, "COMMAND_OUTPUT_BYTES", ceiling)
+    code = ("import os\nwhile True: os.write(1,b'x'*8192); os.write(2,b'e'*8192)"
+            if mode in {"infinite", "unowned"} else
+            "import os; os.write(1,b'x'*1048576); os.write(2,b'error'); raise SystemExit(" +
+            ("7" if mode == "failed" else "0") + ")")
+
+    def prepare(attempt, repo, revision):
+        for directory in ("home/plugins/local_knowledge", "work/plugin", "output"):
+            (attempt / directory).mkdir(parents=True, exist_ok=True)
+        (attempt / "home/config.yaml").write_text('{"local_knowledge":{}}')
+        (attempt / "output/native-baseline.json").write_text('{"integrity":"ok","logical_mapping_count":2}')
+
+    def daemon(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["docker", "image", "inspect"]:
+            return json.dumps([{"Id": image, "Config": {"Labels": {
+                "org.opencontainers.image.revision": "90194c64ff99933ec3b9ecfd9295b06e6c11e038"}}}])
+        if args[:2] == ["docker", "inspect"]:
+            # The final cleanup readback still sees its original worker; refuse only the stop check.
+            unowned = state["unowned"]
+            state["unowned"] = False
+            return json.dumps([{"Id": "different-worker" if unowned else cid, "Name": "/" + worker,
+                "Image": image, "Config": {"Labels": {"lk.lab": "ticket-66"}},
+                "State": {"Running": state["running"], "ExitCode": 0}}])
+        if args[:2] == ["docker", "kill"]:
+            assert args[-1] == cid
+            state["running"] = False
+            return cid
+        if args[:2] in (["docker", "run"], ["docker", "create"], ["docker", "rm"], ["docker", "ps"]):
+            return ""
+        raise AssertionError("unbounded candidate test path: " + repr(args))
+
+    class Transport:
+        def __init__(self):
+            self.stdin = io.BytesIO()
+            self.code = None
+        def poll(self):
+            return self.code
+        def kill(self):
+            self.code = -9
+        def wait(self):
+            self.code = self.code or 0
+            state["running"] = False
+            return self.code
+
+    class NativeFrames:
+        def __init__(self, process):
+            self.count = -1
+            self.noise = b""
+        def read(self):
+            self.count += 1
+            if self.count == 0:
+                return {"ready": True, "mapping_count": 2}
+            return {"sequence": self.count - 1, "response": {"results": [{"id": "native-b"}]}}
+        def finish(self):
+            return b""
+
+    def spawn(args, **kwargs):
+        if args[:2] == ["docker", "start"]:
+            return Transport()
+        assert args == ["docker", "exec", "--env", "PYTHONPATH=/work/plugin", worker,
+            "/opt/lab-tools/bin/python", "-m", "pytest", "tests/test_public_contract.py",
+            "tests/test_plugin.py", "-q", "-p", "no:cacheprovider"]
+        assert "shell" not in kwargs and "timeout" not in kwargs
+        assert set(kwargs["env"]) <= {"PATH", "HOME", "LANG"}
+        exec_calls.append(args)
+        state["unowned"] = mode == "unowned"
+        child = real_popen([sys.executable, "-c", code], **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(runtime, "prepare_attempt", prepare)
+    monkeypatch.setattr(runtime, "corpus_integrity", lambda path: {"settings": {}})
+    monkeypatch.setattr(runtime, "verify_spec", lambda *args: None)
+    monkeypatch.setattr(runtime, "run", daemon)
+    monkeypatch.setattr(runtime, "Frames", NativeFrames)
+    monkeypatch.setattr(output.subprocess, "Popen", spawn)
+    tracemalloc.start()
+    try:
+        kwargs = dict(attempt=attempt, repo=tmp_path, revision="a" * 40, corpus=corpus,
+                      image=image, name="lk-lab-stream", benchmark=benchmark)
+        if mode == "finite":
+            report = runtime.evaluate_revision(**kwargs)
+            assert report["trusted_tests"] and report["complete"] and report["integrity"]
+        else:
+            with pytest.raises(ValueError, match="ownership" if mode == "unowned" else "Trusted candidate tests failed"):
+                runtime.evaluate_revision(**kwargs)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1024 * 1024
+    assert len(exec_calls) == 1 and children[0].poll() is not None
+    receipt = json.loads((attempt / "trusted-tests.output.json").read_text())
+    exceeded = mode in {"infinite", "unowned"}
+    assert receipt["output_limit_exceeded"] is exceeded
+    assert sum(receipt["stored_bytes"].values()) == ceiling
+    assert (["docker", "kill", cid] in calls) is (mode == "infinite")
+    assert ["docker", "rm", "--force", "--volumes", worker] in calls
+    assert json.loads((attempt / "cleanup.json").read_text())["worker_removed"]
+    assert all(len(receipt[key]) <= output.PREVIEW_BYTES for key in ("stdout", "stderr"))
+    for key in ("stdout", "stderr"):
+        assert (attempt / receipt["files"][key]).stat().st_size == receipt["stored_bytes"][key]
+    if not exceeded:
+        assert (attempt / receipt["files"]["stdout"]).read_bytes() == b'x' * 1048576
+        assert (attempt / receipt["files"]["stderr"]).read_bytes() == b'error'
+    runner = json.loads((attempt / "runner.json").read_text())
+    assert runner["process_output_sha256"] == runtime.digest(Path(output.__file__))

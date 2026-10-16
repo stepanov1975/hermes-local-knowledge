@@ -13,6 +13,7 @@ from typing import Any
 from scripts.lab_corpus_baseline import baseline_command, corpus_integrity, digest, verify_baseline_spec
 from scripts.lab_evaluator import PROTOCOL, WARMUPS, percentile95, private_report, require, score
 from scripts.lab_runtime import prepare_attempt, run, scoped_name, validate_pin
+from scripts.lab_process_output import bounded_process, save_receipt
 
 
 class Frames:
@@ -154,7 +155,8 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         "image": image, "excluded_controller_paths": excluded,
         "baseline_sha256": digest(baseline), "probe_sha256": digest(probe),
         "controller_sha256": digest(Path(__file__)), "comparator_sha256": digest(Path(__file__).with_name("lab_evaluator.py")),
-        "trusted_tests": trusted_hashes})
+        "trusted_tests": trusted_hashes,
+        "process_output_sha256": digest(Path(__file__).with_name("lab_process_output.py"))})
     worker = name + "-worker"
     run(command(worker, image, attempt, corpus, baseline, probe, tests))
     process: Any = None
@@ -176,8 +178,20 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
             test_command = ["docker", "exec", "--env", "PYTHONPATH=/work/plugin", worker,
                 "/opt/lab-tools/bin/python", "-m", "pytest", "tests/test_public_contract.py",
                 "tests/test_plugin.py", "-q", "-p", "no:cacheprovider"]
-            test_output = run(test_command, timeout=None)
-            (attempt / "trusted-tests.log").write_text(test_output)
+            def stop_on_limit() -> None:
+                spec = json.loads(run(["docker", "inspect", worker]))[0]
+                require(spec["Id"] == before["Id"] and spec["Name"] == "/" + worker
+                        and spec["Config"]["Labels"].get("lk.lab") == "ticket-66",
+                        "Trusted-test stop ownership mismatch")
+                if spec["State"]["Running"]:
+                    run(["docker", "kill", before["Id"]])
+                stopped = json.loads(run(["docker", "inspect", before["Id"]]))[0]
+                require(stopped["Id"] == before["Id"] and stopped["State"]["Running"] is False,
+                        "Trusted-test worker did not stop")
+
+            test_output = bounded_process(test_command, prefix=attempt / "trusted-tests", env=env,
+                                          on_limit=stop_on_limit)
+            require(test_output.returncode == 0, "Trusted candidate tests failed")
             sequence = 0
 
             def query(text: str) -> tuple[dict, float]:
@@ -245,12 +259,16 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         if process is not None and process.poll() is None:
             process.kill()
             process.wait()
-        spec = json.loads(run(["docker", "inspect", worker]))[0]
-        require(spec["Config"]["Labels"]["lk.lab"] == "ticket-66", "Cleanup ownership mismatch")
-        run(["docker", "rm", "--force", "--volumes", worker])
-        require(not run(["docker", "ps", "--all", "--filter", "name=^/" + worker + "$", "--format", "{{.ID}}"]).strip(),
-                "Worker remains after removal")
-        private_report(attempt / "cleanup.json", {"worker_removed": True})
+        worker_removed = False
+        try:
+            spec = json.loads(run(["docker", "inspect", worker]))[0]
+            require(spec["Config"]["Labels"]["lk.lab"] == "ticket-66", "Cleanup ownership mismatch")
+            run(["docker", "rm", "--force", "--volumes", worker])
+            require(not run(["docker", "ps", "--all", "--filter", "name=^/" + worker + "$", "--format", "{{.ID}}"]).strip(),
+                    "Worker remains after removal")
+            worker_removed = True
+        finally:
+            save_receipt(attempt / "cleanup.json", {"worker_removed": worker_removed})
         # Diagnostic persistence must never prevent owned-container cleanup.
         if frames is not None:
             (attempt / "transport.stdout").write_bytes(bytes(frames.noise))
