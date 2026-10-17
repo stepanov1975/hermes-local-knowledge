@@ -1,4 +1,4 @@
-"""Synthetic model/Docker controls only: these tests make no API/container calls."""
+"""Offline agent tests; real fixed-image Docker proof requires explicit opt-in."""
 from __future__ import annotations
 
 import io
@@ -176,7 +176,8 @@ def review_inputs(kwargs: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     lab.git(repo, "commit", "-qm", "synthetic")
     revision = lab.git(repo, "rev-parse", "HEAD").decode().strip()
     checks_root = tmp_path / "review-checks"
-    identity = {"synthetic": "fixture"}
+    from scripts.lab_check_inputs import trusted_test_inputs
+    identity = {"synthetic": "fixture", **trusted_test_inputs(Path(lab.__file__).parent.parent)}
     harness = Harness.__new__(Harness)
     harness.identity = identity
     harness.checks_passed = True
@@ -607,6 +608,157 @@ def test_output_guard_session_does_not_remove_owned_worker_twice(
     assert status["cleanup_complete"] and not status["complete"]
     assert status["usage"] == [{"total_tokens": 168}]
     assert len([event for event in events if event[0] == "cleanup"]) == 1
+
+
+@pytest.mark.parametrize("failure", ["settled", "listing", "identity", "inspect", "removal", "readback", "restore"])
+def test_campaign_setup_accepted_timeout_requires_owned_helper_quiescence(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    from tests.test_lab_experiment import Harness
+    real_ownership = agent.ownership
+    setup_session(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "ownership", real_ownership)
+    root = tmp_path / "harness"
+    root.mkdir()
+    h = Harness(root, monkeypatch)
+    monkeypatch.setattr(h, "session", agent.run_session)
+    calls: list[list[str]] = []
+    live: dict[str, list[str]] = {}
+    launches: list[list[str]] = []
+    removed: list[str] = []
+
+    def daemon(args: list[str], **kw: Any) -> str:
+        calls.append(args)
+        if args[:3] == ["docker", "image", "inspect"]:
+            return json.dumps([{"Id": agent.IMAGE, "Config": {"Labels": {
+                "org.opencontainers.image.revision": agent.SOURCE}}}])
+        if args[:2] == ["docker", "run"]:
+            assert args[args.index("--tmpfs") + 1] == (
+                "/opt/data:rw,nosuid,nodev,noexec,size=1048576,mode=0700")
+            launches.append(args)
+            if len(launches) == 2:
+                assert not live, "restoration raced the setup helper"
+                assert removed == ["helper-1"]
+                assert args[args.index(agent.IMAGE) + 3] == f"{os.getuid()}:{os.getgid()}"
+                if failure != "restore":
+                    return ""
+            live["helper-" + str(len(launches))] = args
+            raise subprocess.TimeoutExpired(args, 120)
+        if args[:2] == ["docker", "ps"]:
+            if failure == "listing":
+                raise subprocess.CalledProcessError(1, args)
+            return "\n".join(live)
+        if args[:2] == ["docker", "inspect"]:
+            if failure == "inspect":
+                raise subprocess.CalledProcessError(1, args)
+            command = live[args[-1]]
+            binds = []
+            for i, arg in enumerate(command):
+                if arg == "--mount":
+                    fields = dict(p.split("=", 1) for p in command[i + 1].split(","))
+                    binds.append({"Type": fields["type"], "Source": fields["src"],
+                                  "Destination": fields["dst"], "RW": True})
+            binds.append({"Type": "tmpfs", "Source": "", "Destination": "/opt/data", "RW": True})
+            return json.dumps([{"Id": args[-1], "Name": "/" + command[command.index("--name") + 1],
+                "Image": agent.IMAGE, "Mounts": binds, "Config": {
+                    "Labels": {"lk.lab": "unowned" if failure == "identity" else "ticket-69"},
+                    "Entrypoint": ["/bin/chown"], "Cmd": command[command.index(agent.IMAGE) + 1:]}}])
+        if args[:2] == ["docker", "rm"]:
+            assert args == ["docker", "rm", "--force", "--volumes", "helper-" + str(len(launches))]
+            if failure == "removal":
+                raise subprocess.CalledProcessError(1, args)
+            removed.append(args[-1])
+            if failure != "readback":
+                del live[args[-1]]
+            return ""
+        pytest.fail(f"Unexpected Docker operation: {args}")
+
+    monkeypatch.setattr(agent, "run", daemon)
+    monkeypatch.setattr(model, "send", lambda *args: pytest.fail("provider dispatch forbidden"))
+    expected = subprocess.TimeoutExpired if failure in {"settled", "restore"} else agent.OwnershipUncertain
+    with pytest.raises(expected):
+        h.run()
+    manifest = h.manifest()
+    report = h.last_report()
+    attempt = next((h.campaign / "attempts").iterdir())
+    status = json.loads((attempt / "implementation/private/status.json").read_text())
+    settled = failure == "settled"
+    assert status["cleanup_complete"] is settled
+    assert not status["complete"] and not h.evaluations
+    assert report["reconciliation_required"] is (not settled)
+    assert (manifest["pending"] is None) is settled
+    assert manifest["paused"] is (not settled)
+    assert len(launches) == (2 if failure in {"settled", "restore"} else 1)
+    if failure in {"settled", "restore"}:
+        assert not live
+    else:
+        assert live
+    if failure in {"listing", "inspect", "identity"}:
+        assert not any(c[:2] == ["docker", "rm"] for c in calls)
+    assert len(list((attempt / "resources").glob("*.json"))) == len(launches)
+
+
+@pytest.mark.skipif(os.environ.get("LK_LAB_SYNTHETIC_DOCKER") != "1",
+                    reason="Explicit opt-in offline Docker ownership cleanup proof")
+def test_real_ownership_accepted_create_timeout_removes_exact_helper(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject only transport loss after real create; inspect/remove/readback stay real."""
+    for child in ("home", "work", "scratch", "output"):
+        (tmp_path / child).mkdir()
+    real_run = agent.run
+    calls: list[list[str]] = []
+    accepted: list[str] = []
+    helper_names: list[str] = []
+
+    def transport(args: list[str], **options: Any) -> str:
+        calls.append(args)
+        if args[:2] == ["docker", "run"]:
+            helper_names.append(args[args.index("--name") + 1])
+            # Preserve the exact production options, image and original chown command.
+            # An unstarted container makes the accepted-but-present race deterministic.
+            accepted.append(real_run(["docker", "create", *args[2:]]).strip())
+            raise subprocess.TimeoutExpired(args, 120)
+        if args[:2] == ["docker", "inspect"]:
+            raw = real_run(args, **options)
+            spec = json.loads(raw)[0]
+            assert spec["Id"] == accepted[0] and spec["State"]["Status"] == "created"
+            assert spec["Image"] == agent.IMAGE
+            assert spec["Config"]["Entrypoint"] == ["/bin/chown"]
+            assert spec["HostConfig"]["NetworkMode"] == "none"
+            assert spec["HostConfig"]["ReadonlyRootfs"] is True
+            assert spec["HostConfig"]["Tmpfs"] == {
+                "/opt/data": "rw,nosuid,nodev,noexec,size=1048576,mode=0700"}
+            assert not any(m["Type"] == "volume" for m in spec["Mounts"])
+            assert {m["Destination"] for m in spec["Mounts"] if m["Type"] == "bind"} == {
+                "/home", "/work", "/scratch", "/output"}
+            print("REAL OWNERSHIP ACCEPTED " + json.dumps({
+                "id": spec["Id"], "name": spec["Name"], "state": spec["State"]["Status"],
+                "tmpfs": spec["HostConfig"]["Tmpfs"], "mounts": spec["Mounts"]}, sort_keys=True))
+            return raw
+        return real_run(args, **options)
+
+    monkeypatch.setattr(agent, "run", transport)
+    monkeypatch.setattr(model, "send", lambda *args: pytest.fail("provider dispatch forbidden"))
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            agent.ownership(tmp_path, agent.IMAGE, "lk-lab-synthetic-owner-" + agent.uuid.uuid4().hex[:12],
+                            f"{os.getuid()}:{os.getgid()}")
+        assert len(accepted) == 1
+        removal = ["docker", "rm", "--force", "--volumes", accepted[0]]
+        assert removal in calls
+        listing = ["docker", "ps", "-aq", "--no-trunc", "--filter",
+                   "name=^/" + helper_names[0] + "$"]
+        assert calls[calls.index(removal) + 1:] == [listing], "absence readback must follow removal"
+        assert not real_run(listing).strip()
+        assert not real_run(["docker", "ps", "-aq", "--no-trunc", "--filter", "id=" + accepted[0]]).strip()
+        print("REAL OWNERSHIP REMOVED AND ABSENT " + accepted[0])
+    finally:
+        if accepted:
+            # On regression, run only the original same-owner chown on fresh empty
+            # test directories; its original --rm lifecycle also cleans any volume.
+            listing = ["docker", "ps", "-aq", "--no-trunc", "--filter", "id=" + accepted[0]]
+            if real_run(listing).strip():
+                real_run(["docker", "start", "-a", accepted[0]])
+            assert not real_run(listing).strip()
 
 
 def test_private_receipts_mode_and_file_then_directory_fsync(

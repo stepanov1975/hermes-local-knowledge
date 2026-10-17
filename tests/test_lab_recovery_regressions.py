@@ -89,7 +89,7 @@ def test_disk_paused_pending_reconciles_only_after_fresh_space_check(h, monkeypa
     assert not h.manifest()["paused"] and not h.calls
 
 
-@pytest.mark.parametrize("receipt", ["request", "wire"])
+@pytest.mark.parametrize("receipt", ["wire"])
 @pytest.mark.parametrize("role", ["implementation", "review"])
 def test_response_loss_after_provider_acceptance_stays_pending_despite_local_cleanup(h, receipt, role):
     from scripts import lab_automation as automation

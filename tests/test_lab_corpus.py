@@ -1,6 +1,7 @@
 """Trusted preparation seam: no runtime service or production-state access."""
 from pathlib import Path
 import json
+import sys
 
 import pytest
 
@@ -112,6 +113,7 @@ def test_scrub_removes_near_reference_credential_values(value, template, suffix)
         ast.parse(safe)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux scanner snapshot and symlink safety primitives")
 def test_freeze_is_snapshot_not_continuing_live_review(tmp_path):
     source, scanner, state, settings = scanner_layout(tmp_path)
     (source / "scripts/demo.py").write_text('TOKEN = "private-literal"\nprint("route")')
@@ -201,6 +203,7 @@ def scanner_layout(tmp_path: Path):
     return source, scanner, state, settings
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux scanner snapshot and symlink safety primitives")
 def test_source_manifest_rejects_external_runtime_registry_link(tmp_path):
     source, scanner, state, settings = scanner_layout(tmp_path)
     outside = tmp_path / "outside.json"
@@ -211,6 +214,7 @@ def test_source_manifest_rejects_external_runtime_registry_link(tmp_path):
         source_manifest(source, scanner, state, settings)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux scanner snapshot and symlink safety primitives")
 def test_source_manifest_tracks_aliases_recursive_notes_and_drift(tmp_path):
     source, scanner, state, settings = scanner_layout(tmp_path)
     nested = state / "okfs/tools/nested"

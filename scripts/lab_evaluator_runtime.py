@@ -17,6 +17,7 @@ from scripts.lab_runtime import prepare_attempt, run, scoped_name, validate_pin
 from scripts.lab_process_output import NativeStderr, bounded_process, save_receipt
 from scripts import lab_disk_guard as disk
 from scripts import lab_recovery as recovery
+from scripts import lab_workspace as workspace_source
 
 
 class Frames:
@@ -74,7 +75,7 @@ class Frames:
 
 
 def tree_hashes(root: Path) -> dict:
-    return {p.relative_to(root).as_posix(): digest(p) for p in root.rglob("*") if p.is_file()}
+    return {name: workspace_source.file_hash(path) for name, path in workspace_source.inventory(root).items()}
 
 
 def candidate_export(attempt: Path) -> list[str]:
@@ -111,6 +112,23 @@ def verify_spec(spec: dict, attempt: Path, corpus: Path, baseline: Path, probe: 
             "Unapproved evaluator command")
     checked["Config"]["Cmd"] = ["/trusted/baseline.py"]
     verify_baseline_spec(checked, attempt, corpus, baseline)
+
+
+def quiesce_helper(args: list[str], image_id: str) -> None:
+    """Stop only the exact planned helper; unknown daemon state is never absence."""
+    name = args[args.index("--name") + 1]
+    listing = ["docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + name + "$"]
+    ids = run(listing).split()
+    if not ids:
+        return
+    require(len(ids) == 1, "Ownership helper identity uncertain")
+    spec = json.loads(run(["docker", "inspect", ids[0]]))[0]
+    require(spec["Id"] == ids[0] and recovery.resource_matches(
+        {"args": args, "image": image_id}, spec, None), "Ownership helper identity mismatch")
+    # Force removal waits for daemon-owned processes even if the attached CLI
+    # timed out. Exact ID prevents deleting a later same-name replacement.
+    run(["docker", "rm", "--force", "--volumes", spec["Id"]])
+    require(not run(listing).strip(), "Ownership helper removal unconfirmed")
 
 
 def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path, image: str,
@@ -150,33 +168,57 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
     setup = ["docker", "run", "--rm", "--name", name + "-setup", "--label", "lk.lab=ticket-66",
              "--network", "none", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN",
              "--cap-add", "DAC_OVERRIDE", "--security-opt", "no-new-privileges:true", "--read-only",
-             "--memory", "64m", "--cpus", "0.25", "--pids-limit", "16", "--entrypoint", "/bin/chown"]
+             "--memory", "64m", "--cpus", "0.25", "--pids-limit", "16",
+             "--tmpfs", "/opt/data:rw,nosuid,nodev,size=1048576", "--entrypoint", "/bin/chown"]
     for child in ("home", "work", "output"):
         setup += ["--mount", f"type=bind,src={attempt / child},dst=/{child}"]
     # No candidate code runs in this narrowly privileged existing setup helper.
     disk.checkpoint()
     setup_command = setup + [image, "-R", "10000:10000", "/home", "/work", "/output"]
     recovery.plan_resource(setup_command, image)
-    run(setup_command)
-    private_report(attempt / "image.json", image_spec)
-    private_report(attempt / "runner.json", {"protocol": PROTOCOL, "revision": revision,
-        "image": image, "excluded_controller_paths": excluded,
-        "baseline_sha256": digest(baseline), "probe_sha256": digest(probe),
-        "controller_sha256": digest(Path(__file__)), "comparator_sha256": digest(Path(__file__).with_name("lab_evaluator.py")),
-        "trusted_tests": trusted_hashes,
-        "process_output_sha256": digest(Path(__file__).with_name("lab_process_output.py"))})
     worker = name + "-worker"
-    disk.checkpoint()
-    worker_command = command(worker, image, attempt, corpus, baseline, probe, tests)
-    planned = recovery.plan_resource(worker_command, image)
-    worker_id = run(worker_command).strip()
-    recovery.observed_resource(planned, worker_id)
-    require(bool(worker_id), "Missing created worker identity")
+    worker_id = ""
+    worker_planned = False
+    ownership_restored = False
+    setup_quiescent = False
+    restore_quiescent = False
+    restore_attempted = False
     process: Any = None
     frames: Frames | None = None
     capture: NativeStderr | None = None
     lifecycle = ExitStack()
+    def restore_ownership() -> None:
+        nonlocal ownership_restored, setup_quiescent, restore_quiescent, restore_attempted
+        quiesce_helper(setup_command, image_spec["Id"])
+        setup_quiescent = True
+        restore = setup + [image, "-R", "--no-dereference", f"{os.getuid()}:{os.getgid()}", "/home", "/work", "/output"]
+        restore[restore.index("--name") + 1] = name + "-restore"
+        recovery.plan_resource(restore, image)
+        restore_attempted = True
+        try:
+            run(restore)
+        finally:
+            quiesce_helper(restore, image_spec["Id"])
+            restore_quiescent = True
+        ownership_restored = True
+
     try:
+        run(setup_command)
+        private_report(attempt / "image.json", image_spec)
+        private_report(attempt / "runner.json", {"protocol": PROTOCOL, "revision": revision,
+            "image": image, "excluded_controller_paths": excluded,
+            "baseline_sha256": digest(baseline), "probe_sha256": digest(probe),
+            "controller_sha256": digest(Path(__file__)), "comparator_sha256": digest(Path(__file__).with_name("lab_evaluator.py")),
+            "trusted_tests": trusted_hashes,
+            "workspace_sha256": digest(Path(__file__).with_name("lab_workspace.py")),
+            "process_output_sha256": digest(Path(__file__).with_name("lab_process_output.py"))})
+        disk.checkpoint()
+        worker_command = command(worker, image, attempt, corpus, baseline, probe, tests)
+        planned = recovery.plan_resource(worker_command, image)
+        worker_planned = True
+        worker_id = run(worker_command).strip()
+        recovery.observed_resource(planned, worker_id)
+        require(bool(worker_id), "Missing created worker identity")
         before = json.loads(run(["docker", "inspect", worker]))[0]
         require(before["Id"] == worker_id and before["Name"] == "/" + worker, "Created worker identity mismatch")
         verify_spec(before, attempt, corpus, baseline, probe, tests)
@@ -276,15 +318,12 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         after = json.loads(run(["docker", "inspect", worker]))[0]
         require(after["Id"] == worker_id and after["Name"] == "/" + worker, "Final worker identity mismatch")
         verify_spec(after, attempt, corpus, baseline, probe, tests)
-        require(after["State"]["ExitCode"] == 0, "Native worker failed")
+        require(after["State"]["ExitCode"] == 0 and after["State"]["Running"] is False, "Native worker failed")
         private_report(attempt / "worker-after.json", after)
         # Official Hermes secures config.yaml to 0600. Restore only this stopped
         # disposable export to its controller owner before host-side readback.
-        restore_command = setup + [image, "-R", f"{os.getuid()}:{os.getgid()}", "/home", "/work", "/output"]
-        restore_command[restore_command.index("--name") + 1] = name + "-restore"
-        recovery.plan_resource(restore_command, image)
-        run(restore_command)
-        native = json.loads((attempt / "output/native-baseline.json").read_text())
+        restore_ownership()
+        native = json.loads(b"".join(workspace_source.chunks(attempt / "output/native-baseline.json")))
         require(native["integrity"] == "ok" and native["logical_mapping_count"] == len(mapping), "Native mapping failed")
         require(digest(config_path) == config_hash and tree_hashes(tests) == trusted_hashes, "Execution config/test drift")
         require(all(tree_hashes(attempt / d) == hashes for d, hashes in source_hashes.items()), "Plugin source drift")
@@ -296,11 +335,11 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
             private_report(attempt / "aggregate.json", report)
         return report
     finally:
-        lifecycle.close()
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
         try:
+            lifecycle.close()
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
             # Join the drainer/stop callback before normal removal. Even capture
             # persistence errors must pass through the owned-worker cleanup below.
             if capture is not None:
@@ -308,16 +347,22 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         finally:
             worker_removed = False
             try:
-                spec = json.loads(run(["docker", "inspect", worker]))[0]
-                require(spec["Id"] == worker_id and spec["Name"] == "/" + worker
-                        and spec["Config"]["Labels"]["lk.lab"] == "ticket-66", "Cleanup ownership mismatch")
-                run(["docker", "rm", "--force", "--volumes", worker_id])
-                require(not run(["docker", "ps", "--all", "--filter", "name=^/" + worker + "$", "--format", "{{.ID}}"]).strip(),
-                        "Worker remains after removal")
+                if worker_planned:
+                    spec = json.loads(run(["docker", "inspect", worker]))[0]
+                    require(bool(worker_id) and spec["Id"] == worker_id and spec["Name"] == "/" + worker
+                            and spec["Config"]["Labels"]["lk.lab"] == "ticket-66", "Cleanup ownership mismatch")
+                    run(["docker", "rm", "--force", "--volumes", worker_id])
+                    require(not run(["docker", "ps", "--all", "--filter", "name=^/" + worker + "$", "--format", "{{.ID}}"]).strip(),
+                            "Worker remains after removal")
                 worker_removed = True
+                if not ownership_restored and not restore_attempted:
+                    restore_ownership()
             finally:
                 try:
-                    save_receipt(attempt / "cleanup.json", {"worker_removed": worker_removed})
+                    save_receipt(attempt / "cleanup.json", {"worker_removed": worker_removed,
+                                 "ownership_restored": ownership_restored,
+                                 "setup_quiescent": setup_quiescent, "restore_quiescent": restore_quiescent,
+                                 "cleanup_complete": worker_removed and ownership_restored and setup_quiescent and restore_quiescent})
                 finally:
                     if frames is not None:
                         (attempt / "transport.stdout").write_bytes(bytes(frames.noise))

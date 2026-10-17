@@ -178,10 +178,16 @@ def session_completion(attempt: Path) -> str:
     incomplete = False
     for session in session_directories(attempt):
         private = session / "private"
-        for request in [*private.glob("request-*.json"), *private.glob("wire-*.json")]:
-            response = private / ("response-" + request.name.split("-", 1)[1])
+        for wire in private.glob("wire-*.json"):
+            response = private / wire.name.replace("wire-", "response-", 1)
             if not response.exists():
                 raise RecoveryPaused("model_completion_unknown")
+        for request in private.glob("request-*.json"):
+            wire = private / request.name.replace("request-", "wire-", 1)
+            if not wire.exists():
+                # The adapter durably saves wire in its HTTP request hook BEFORE
+                # transport dispatch. A request alone never reached the provider.
+                incomplete = True
         for intent in private.glob("tool-intent-*.json"):
             receipt = private / intent.name.replace("tool-intent-", "tool-")
             if not receipt.exists():

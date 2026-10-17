@@ -19,6 +19,7 @@ from scripts.lab_process_output import bounded_process
 from scripts import lab_disk_guard as disk
 from scripts import lab_recovery as recovery
 from scripts import lab_review_evidence as review_evidence
+from scripts import lab_workspace as workspace_source
 
 IMAGE = "sha256:0b9b3c213a9a3cb6845f31b44a0a2b4ce67fa716d411217f6037cf792b3775af"
 SOURCE = "90194c64ff99933ec3b9ecfd9295b06e6c11e038"
@@ -43,18 +44,10 @@ def permitted(path: str) -> bool:
 
 def identity(workspace: Path) -> dict[str, Any]:
     files = {}
-    for path in sorted(workspace.rglob("*")):
-        relative = path.relative_to(workspace).as_posix()
-        if path.is_symlink():
-            raise ValueError("Worker source contains a symlink")
-        if path.is_file():
-            if any(x in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"} for x in path.parts):
-                continue
-            if not permitted(relative):
-                raise ValueError("Worker wrote outside permitted source scope")
-            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-        elif not path.is_dir():
-            raise ValueError("Worker source contains a nonregular file")
+    for relative, path in sorted(workspace_source.inventory(workspace, ignore_caches=True).items()):
+        if not permitted(relative):
+            raise ValueError("Worker wrote outside permitted source scope")
+        files[relative] = workspace_source.file_hash(path)
     encoded = json.dumps(files, sort_keys=True).encode()
     return {"sha256": hashlib.sha256(encoded).hexdigest(), "files": files}
 
@@ -160,6 +153,28 @@ def cleanup(name: str, container_id: str) -> None:
         raise ValueError("Worker removal not confirmed")
 
 
+class OwnershipUncertain(ValueError):
+    """The daemon has not confirmed that an ownership helper is absent."""
+
+
+def quiesce_helper(args: list[str], image: str) -> None:
+    """Settle only the exact planned helper, including after client timeout."""
+    name = args[args.index("--name") + 1]
+    listing = ["docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + name + "$"]
+    ids = run(listing).split()
+    if not ids:
+        return
+    if len(ids) != 1:
+        raise ValueError("Ownership helper identity uncertain")
+    spec = json.loads(run(["docker", "inspect", ids[0]]))[0]
+    if spec["Id"] != ids[0] or not recovery.resource_matches(
+            {"args": args, "image": image}, spec, None):
+        raise ValueError("Ownership helper identity mismatch")
+    run(["docker", "rm", "--force", "--volumes", spec["Id"]])
+    if run(listing).strip():
+        raise ValueError("Ownership helper removal unconfirmed")
+
+
 def ownership(attempt: Path, image: str, name: str, owner: str) -> None:
     """Trusted one-shot helper only mounts this fresh session's mutable exports."""
     helper = scoped_name(name + "-setup-" + uuid.uuid4().hex[:6])
@@ -167,15 +182,20 @@ def ownership(attempt: Path, image: str, name: str, owner: str) -> None:
             "--network", "none", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN",
             "--cap-add", "DAC_OVERRIDE", "--security-opt", "no-new-privileges:true", "--read-only",
             "--memory", "64m", "--memory-swap", "64m", "--cpus", "0.25", "--pids-limit", "16",
+            "--tmpfs", "/opt/data:rw,nosuid,nodev,noexec,size=1048576,mode=0700",
             "--entrypoint", "/bin/chown"]
     children = ("home", "work", "scratch", "output")
     for child in children:
         args += ["--mount", f"type=bind,src={attempt / child},dst=/{child}"]
     args += [image, "-R", "--no-dereference", owner, *["/" + c for c in children]]
     recovery.plan_resource(args, image)
-    run(args)
-    if run(["docker", "ps", "-aq", "--filter", "name=^/" + helper + "$"]).strip():
-        raise ValueError("Ownership helper removal not confirmed")
+    try:
+        run(args)
+    finally:
+        try:
+            quiesce_helper(args, image)
+        except Exception as error:
+            raise OwnershipUncertain("Ownership helper quiescence unconfirmed") from error
 
 
 class SandboxOutputLimit(model.ModelPaused):
@@ -284,14 +304,16 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
     binds = mounts(attempt, corpus, role, evidence is not None)
     container_id: str | None = None
     changed_owner = False
+    helper_uncertain = False
     worker_removed = False
     usages = []
     complete = False
     lifecycle = ExitStack()
     try:
         disk.checkpoint()
-        ownership(attempt, image, name, "10000:10000")
+        # A client failure can follow partial daemon-side ownership changes.
         changed_owner = True
+        ownership(attempt, image, name, "10000:10000")
         disk.checkpoint()
         command = worker_command(name, image, binds)
         planned = recovery.plan_resource(command, image)
@@ -360,6 +382,9 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
                            {"container_id": container_id, "command": command})
                 output = sandbox(name, command, private / f"tool-{turn}-{index}.json", container_id)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+    except OwnershipUncertain:
+        helper_uncertain = True
+        raise
     except SandboxOutputLimit as error:
         worker_removed = error.container_id == container_id and error.cleanup_complete
         raise
@@ -370,6 +395,8 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         source_validation_attempted = False
         source_identity = None
         try:
+            if helper_uncertain:
+                raise OwnershipUncertain("Setup helper quiescence unconfirmed; recovery required")
             # Never restore ownership while a model-selected process can still write.
             if container_id is not None and not worker_removed:
                 cleanup(name, container_id)

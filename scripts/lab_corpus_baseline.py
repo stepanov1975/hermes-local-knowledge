@@ -22,7 +22,11 @@ from typing import Any
 
 
 def digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            result.update(chunk)
+    return result.hexdigest()
 
 
 def corpus_integrity(corpus: Path) -> dict:
@@ -178,7 +182,12 @@ def baseline_command(name: str, image: str, attempt: Path, corpus: Path, evaluat
     command[command.index("--network") + 1] = "none"
     command[command.index("--label") + 1] = "lk.lab=ticket-66"
     command[-1] = "/trusted/baseline.py"
-    command += []
+    work = f"type=bind,src={(attempt / 'work').resolve()},dst=/work"
+    command[command.index(work)] = work + ",readonly"
+    # Official Hermes loads this copy, not /work/plugin. Keep the fresh home
+    # writable while sealing the actual executed candidate subtree as well.
+    position = command.index("--entrypoint")
+    command[position:position] = ["--mount", f"type=bind,src={(attempt / 'home/plugins/local_knowledge').resolve()},dst=/opt/data/plugins/local_knowledge,readonly"]
     command[command.index("--entrypoint"):command.index("--entrypoint")] = ["--env", "LAB_CORPUS_MANIFEST_SHA256=" + digest(corpus / "manifest.json")]
     command[command.index("--entrypoint"):command.index("--entrypoint")] = ["--mount", f"type=bind,src={evaluator.resolve()},dst=/trusted/baseline.py,readonly"]
     return command
@@ -195,6 +204,14 @@ def verify_baseline_spec(spec: dict, attempt: Path, corpus: Path, evaluator: Pat
     assert checked["Config"]["Entrypoint"] == ["/opt/hermes/.venv/bin/python"] and checked["Config"]["Cmd"] == ["/trusted/baseline.py"]
     assert "LAB_CORPUS_MANIFEST_SHA256=" + digest(corpus / "manifest.json") in checked["Config"]["Env"]
     checked["Mounts"].remove(mount[0])
+    runtime = [m for m in checked["Mounts"] if m["Destination"] == "/opt/data/plugins/local_knowledge"]
+    assert (len(runtime) == 1 and runtime[0]["Type"] == "bind" and not runtime[0]["RW"]
+            and runtime[0]["Source"] == str((attempt / "home/plugins/local_knowledge").resolve())), "Executed candidate source must be read-only"
+    checked["Mounts"].remove(runtime[0])
+    work = [m for m in checked["Mounts"] if m["Destination"] == "/work"]
+    assert len(work) == 1 and not work[0]["RW"], "Candidate source must be read-only"
+    # Normalize only the explicitly enforced stronger source boundary.
+    work[0]["RW"] = True
     checked["HostConfig"]["NetworkMode"] = "container:offline-audit"
     checked["Config"]["Labels"]["lk.lab"] = "ticket-65"
     verify_worker_spec(checked, attempt, corpus, "offline-audit")

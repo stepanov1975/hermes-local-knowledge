@@ -18,20 +18,19 @@ def test_mcp_http_server_exception_is_scanner_manifest_only(tmp_path):
     step = workflow.split("      - name: Run pip-audit\n", 1)[1]
     script = textwrap.dedent(step.split("        run: |\n", 1)[1])
     assert "semgrep scan --config p/ci --config p/secrets --error --metrics=off ." in workflow
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
     calls = tmp_path / "audit-calls.jsonl"
-    fake = fake_bin / "pip-audit"
-    fake.write_text("#!" + sys.executable + "\n"
-        "import json, os, sys\n"
+    fake = tmp_path / "pip-audit.py"
+    fake.write_text("import json, os, sys\n"
         "with open(os.environ['TEST_AUDIT_LOG'], 'a') as stream:\n"
         "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n")
-    fake.chmod(0o755)
     for name in ("requirements-release.txt", "requirements-security.txt", "requirements-other.txt"):
         (tmp_path / name).write_text("example==1\n")
     (tmp_path / "project-dependencies.txt").write_text("example==1\n")
-    env = {**os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+    env = {**os.environ, "TEST_AUDIT_PYTHON": sys.executable, "TEST_AUDIT_SCRIPT": str(fake),
            "TEST_AUDIT_LOG": str(calls), "RUNNER_TEMP": str(tmp_path)}
+    # The fixed read-only full-check worker uses a noexec /tmp. Invoke the fake
+    # through Python without relaxing that isolation; the workflow is unchanged.
+    script = 'pip-audit() { "$TEST_AUDIT_PYTHON" "$TEST_AUDIT_SCRIPT" "$@"; }\n' + script
     result = subprocess.run([shutil.which("bash") or "/bin/bash", "-c", script],
                             cwd=tmp_path, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -160,7 +161,7 @@ def test_evaluator_mounts_do_not_expose_controller_or_benchmark(tmp_path):
     args = command("lk-lab-evaluation-control", "sha256:" + "a" * 64,
                    tmp_path, corpus, baseline, probe, tests)
     mounts = [args[i + 1] for i, x in enumerate(args) if x == "--mount"]
-    assert len(mounts) == 7
+    assert len(mounts) == 8
     assert args[args.index("--network") + 1] == "none"
     assert all("frozen.json" not in m and "lab_evaluator.py" not in m and "policy.json" not in m for m in mounts)
     assert all(m.endswith(",readonly") for m in mounts if "dst=/trusted/" in m or "dst=/work/plugin/tests" in m)
@@ -180,19 +181,28 @@ def test_evaluator_spec_extension_preserves_original_resource_and_mount_checks(t
             "SecurityOpt": ["no-new-privileges:true"], "ReadonlyRootfs": True, "NetworkMode": "none",
             "Memory": 2147483648, "MemorySwap": 2147483648, "NanoCpus": 2000000000, "PidsLimit": 256},
         "Mounts": [{"Type": "bind", "Source": str(p), "Destination": dst, "RW": rw} for p, dst, rw in (
-            (tmp_path / "home", "/opt/data", True), (tmp_path / "work", "/work", True),
+            (tmp_path / "home", "/opt/data", True), (tmp_path / "work", "/work", False),
+            (tmp_path / "home/plugins/local_knowledge", "/opt/data/plugins/local_knowledge", False),
             (tmp_path / "output", "/output", True), (corpus, "/corpus", False),
             (baseline, "/trusted/baseline.py", False), (probe, "/trusted/probe.py", False),
             (tests, "/work/plugin/tests", False))]}
     verify_spec(spec, tmp_path, corpus, baseline, probe, tests)
-    for mutation in ("privileged", "extra_mount", "writable_probe"):
+    for mutation in ("privileged", "extra_mount", "writable_probe", "runtime_writable", "runtime_missing", "runtime_source"):
         changed = copy.deepcopy(spec)
         if mutation == "privileged":
             changed["HostConfig"]["Privileged"] = True
         elif mutation == "extra_mount":
             changed["Mounts"].append({"Type": "bind", "Source": "/", "Destination": "/host", "RW": False})
-        else:
+        elif mutation == "writable_probe":
             changed["Mounts"][-2]["RW"] = True
+        else:
+            runtime = next(m for m in changed["Mounts"] if m["Destination"] == "/opt/data/plugins/local_knowledge")
+            if mutation == "runtime_writable":
+                runtime["RW"] = True
+            elif mutation == "runtime_missing":
+                changed["Mounts"].remove(runtime)
+            else:
+                runtime["Source"] = str(tmp_path / "wrong-source")
         with pytest.raises((ValueError, AssertionError)):
             verify_spec(changed, tmp_path, corpus, baseline, probe, tests)
 
@@ -231,6 +241,7 @@ def stdout_child():
     return child
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux select on native subprocess pipes")
 def test_frame_noise_budget_is_cumulative_across_valid_responses(stdout_child):
     from scripts.lab_evaluator_runtime import Frames
     code = ("import os, json\n"
@@ -246,6 +257,7 @@ def test_frame_noise_budget_is_cumulative_across_valid_responses(stdout_child):
         assert len(frames.noise) <= 4 * 1024 * 1024
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux select on native subprocess pipes")
 def test_final_stdout_drain_is_bounded(stdout_child):
     from scripts.lab_evaluator_runtime import Frames
     code = ("import os\nprint('LK68 {\"ready\":true}', flush=True)\n"
@@ -258,6 +270,7 @@ def test_final_stdout_drain_is_bounded(stdout_child):
         assert len(frames.noise) <= 4 * 1024 * 1024
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux select on native subprocess pipes")
 def test_final_stdout_preserves_buffered_and_trailing_diagnostics(stdout_child):
     from scripts.lab_evaluator_runtime import Frames
     code = "import os; os.write(1, b'before\\nLK68 {\"ready\":true}\\nafter-without-newline')"
@@ -269,6 +282,7 @@ def test_final_stdout_preserves_buffered_and_trailing_diagnostics(stdout_child):
 
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux select on native subprocess pipes")
 def test_final_drain_shares_prior_read_diagnostic_allowance(stdout_child):
     from scripts.lab_evaluator_runtime import Frames
     code = ("import os\n"
@@ -285,6 +299,7 @@ def test_final_drain_shares_prior_read_diagnostic_allowance(stdout_child):
 
 
 @pytest.mark.parametrize("mode", ["finite", "failed", "infinite", "unowned"])
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux O_NOFOLLOW receipts, private modes and real pipes")
 def test_evaluator_trusted_tests_use_bounded_real_pipes(tmp_path, monkeypatch, mode):
     """Exercise evaluate_revision itself, with fixed local producers and a fake daemon."""
     import io
@@ -419,6 +434,7 @@ def test_evaluator_trusted_tests_use_bounded_real_pipes(tmp_path, monkeypatch, m
 
 
 @pytest.mark.parametrize("phase", ["ready", "trusted", "final", "normal", "limit", "disk", "unowned"])
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux O_NOFOLLOW receipts, private modes and real pipes")
 def test_native_transport_stderr_is_bounded_on_actual_evaluator_path(tmp_path, monkeypatch, phase):
     from contextlib import ExitStack
     from scripts import lab_disk_guard as disk
@@ -457,7 +473,7 @@ def test_native_transport_stderr_is_bounded_on_actual_evaluator_path(tmp_path, m
             return json.dumps([{"Id": "replacement-id" if phase == "unowned" and children else cid,
                 "Name": "/" + worker, "Image": image,
                 "Config": {"Labels": {"lk.lab": "ticket-66"}},
-                "State": {"Running": state["running"], "ExitCode": 0}}])
+                "State": {"Running": state["running"] and not (children and children[0].poll() is not None), "ExitCode": 0}}])
         if args[:2] == ["docker", "create"]:
             return cid
         if args[:2] == ["docker", "kill"]:

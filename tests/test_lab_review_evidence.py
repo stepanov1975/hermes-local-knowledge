@@ -78,6 +78,12 @@ def verify(packet_path, proof_path):
     assert inputs['candidate'] == {n: v['sha256'] for n, v in members.items()}
     assert checks['exact_candidate_sha256'] == sha(inputs['candidate'])
     assert checks['overlay_sha256'] == sha(inputs['overlay'])
+    assert checks['controller'] == sha(inputs['controller'])
+    required_inputs = {'docker/autonomous_lab/native_probe.py', '.github/workflows/security.yml'}
+    assert set(inputs['trusted_test_inputs']) == required_inputs
+    for name, digest in inputs['trusted_test_inputs'].items():
+        assert re.fullmatch('[0-9a-f]{64}', digest)
+        assert inputs['controller'][name] == inputs['overlay'][name] == digest
     assert checks['check_tools_sha256'] == inputs['check_tools_sha256'] == sha(inputs['tools'])
     assert packet['inputs_snapshot_contract'] == CONTRACT
     snapshot = {'exact-candidate/' + n: h for n, h in inputs['candidate'].items()}
@@ -197,6 +203,32 @@ def packet(tmp_path, monkeypatch):
     kwargs, _ = setup_session(tmp_path, monkeypatch)
     review_inputs(kwargs, tmp_path, monkeypatch)
     return kwargs, lab.read_json(kwargs["evidence"]), tmp_path / "review-proof"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "overlay", "controller", "controller-digest"])
+def test_trusted_public_input_correspondence_rejects_rehashed_receipts(packet, tmp_path, mutation):
+    kwargs, value, directory = packet
+    checks = lab.read_json(directory / "checks.json")
+    inputs = lab.read_json(directory / "inputs.json")
+    name = "docker/autonomous_lab/native_probe.py"
+    if mutation == "missing":
+        inputs["trusted_test_inputs"].pop(name)
+    elif mutation == "extra":
+        inputs["trusted_test_inputs"]["private/heldout.json"] = "0" * 64
+    elif mutation == "controller-digest":
+        inputs["controller"]["scripts/another.py"] = "0" * 64
+    else:
+        inputs[mutation][name] = "0" * 64
+    checks["overlay_sha256"] = lab.sha(inputs["overlay"])
+    refresh_links(value, directory, inputs=inputs)
+    snapshot = {"exact-candidate/" + n: h for n, h in inputs["candidate"].items()}
+    snapshot.update({"tools/" + n: h for n, h in inputs["tools"].items()})
+    snapshot["inputs.json"] = lab.file_sha(directory / "inputs.json")
+    checks["inputs_sha256"] = lab.sha(snapshot)
+    refresh_links(value, directory, checks=checks)
+    with pytest.raises(ValueError, match="[Tt]rusted"):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    assert visible_verify(value, directory, tmp_path).returncode != 0
 
 
 def test_explicit_projection_and_receipts_exclude_controller_bytes(packet):

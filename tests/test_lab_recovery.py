@@ -151,7 +151,7 @@ def test_unavailable_docker_is_not_absence(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("role", ["implementation", "review", "generation-1/review"])
-@pytest.mark.parametrize("receipt", ["request", "wire"])
+@pytest.mark.parametrize("receipt", ["wire"])
 def test_unknown_model_completion_pauses_never_replays(h, role, receipt):
     attempt = pending_candidate(h)
     private = attempt / role / "private"
@@ -196,6 +196,7 @@ def test_final_response_can_be_recovered_only_after_cleanup_and_source_validatio
     metadata = {k: result[k] for k in ("session_id", "role", "revision", "model", "provider", "effort")}
     lab.durable_json(private / "session.json", {**metadata, "source_identity": agent.identity(workspace)})
     lab.durable_json(private / "request-1.json", {"synthetic": True})
+    lab.durable_json(private / "wire-1.json", {"synthetic": True})
     lab.durable_json(private / "response-1.json", {"message": {"content": json.dumps(result["final"])},
                                                 "usage": {"input_tokens": 19}})
     events = []

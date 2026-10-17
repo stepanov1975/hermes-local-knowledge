@@ -124,6 +124,9 @@ def validate(packet: dict, proof: Path, *, revision: str, image: str) -> None:
     lab.require(inventory(proof) == packet["proof_files"], "Review proof hash/size mismatch")
     checks = lab.read_json(proof / "checks.json")
     inputs = lab.read_json(proof / "inputs.json")
+    from scripts.lab_check_inputs import validate_test_inputs
+    validate_test_inputs(inputs)
+    lab.require(lab.sha(inputs["controller"]) == checks["controller"], "Trusted controller identity mismatch")
     lab.require(lab.sha(checks) == binding["checks_sha256"] and checks["revision"] == revision
                 and checks["image"] == image and checks["controller"] == binding["controller"]
                 and inputs["revision"] == revision and checks["cleanup_complete"] is True
@@ -187,7 +190,9 @@ def build(*, repo: Path, revision: str, binding: dict, report: dict, checks_root
               "inputs_snapshot_contract": INPUTS_SNAPSHOT_CONTRACT,
               "projection": manifest, "projection_sha256": lab.sha(manifest), "proof_files": inventory(proof),
               "proof_directory": "/inputs/review-proof",
-              "trusted_full_checks": "Full Git source plus trusted tests/scripts/pyproject overlay; inputs.json binds both maps. "
+              "trusted_full_checks": "Full Git source plus trusted tests/scripts/pyproject overlay and the explicit public "
+                  "docker/autonomous_lab/native_probe.py and .github/workflows/security.yml test inputs; "
+                  "inputs.json binds candidate/overlay maps and exact trusted_test_inputs hashes to the controller map/digest. "
                   "commit_object contains strict base64 raw commit body: SHA1(b'commit ' + str(len(body)).encode('ascii') + "
                   "b'\\0' + body) must equal revision, and its first tree header must equal the bound tree. "
                   "Full trusted checks are not reproducible from this partial projection. Overlay code and hidden/controller files remain excluded. "

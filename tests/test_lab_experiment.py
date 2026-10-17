@@ -13,6 +13,7 @@ import pytest
 
 from scripts import lab_experiment as lab
 from scripts.lab_agent import IMAGE
+from scripts.lab_check_inputs import trusted_test_inputs
 
 
 class Harness:
@@ -52,7 +53,7 @@ class Harness:
         self.config["check_tools"] = str(tmp_path / "tools")
         self.config["check_tools_sha256"] = lab.freeze_check_tools(tmp_path / "tools", tool_sources)
         self.campaign = tmp_path / "campaign"
-        self.identity = {"synthetic": "controller-frozen"}
+        self.identity = {"synthetic": "controller-frozen", **trusted_test_inputs(Path(lab.__file__).parent.parent)}
         monkeypatch.setattr(lab, "controller_identity", lambda: dict(self.identity))
         lab.init_campaign(self.campaign, self.config, loader=self.loader)
         self.calls: list[dict] = []
@@ -145,10 +146,13 @@ class Harness:
         candidate = {name: hashlib.sha256(lab.git(kwargs["repo"], "cat-file", "blob", oid)).hexdigest()
                      for name, (_, oid) in lab.tracked(kwargs["repo"], kwargs["revision"]).items()}
         overlay = {**candidate, "scripts/synthetic_check.py": hashlib.sha256(b"synthetic overlay").hexdigest()}
+        public_inputs = trusted_test_inputs(Path(lab.__file__).parent.parent)
+        overlay.update(public_inputs)
         tools = {name: hashlib.sha256(data).hexdigest()
                  for name, data in lab.workspace_files(kwargs["check_tools"]).items()}
         lab.durable_json(inputs_dir / "inputs.json", {"revision": kwargs["revision"],
             "candidate": candidate, "overlay": overlay, "tools": tools,
+            "trusted_test_inputs": public_inputs, "controller": self.identity,
             "check_tools_sha256": kwargs["check_tools_sha256"]})
         checks = []
         for name in evidence.CHECKS:

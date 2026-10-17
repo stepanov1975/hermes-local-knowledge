@@ -26,6 +26,8 @@ def tree_identity(root: Path) -> dict[str, str]:
 def pytest_configure(config: object) -> None:
     root = Path("/check-inputs")
     receipt = json.loads((root / "inputs.json").read_text())
+    from scripts.lab_check_inputs import validate_test_inputs
+    validate_test_inputs(receipt)
     for key, path in (("candidate", root / "exact-candidate"),
                       ("overlay", Path("/candidate")), ("tools", root / "tools")):
         if tree_identity(path) != receipt[key]:

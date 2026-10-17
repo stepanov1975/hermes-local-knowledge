@@ -145,6 +145,8 @@ def controller_identity() -> dict:
         for path in sorted(directory.rglob("*.py")):
             files[str(path.relative_to(scripts.parent))] = file_sha(path)
     files["pyproject.toml"] = file_sha(scripts.parent / "pyproject.toml")
+    from scripts.lab_check_inputs import trusted_test_inputs
+    files.update(trusted_test_inputs(scripts.parent))
     return files
 
 
@@ -299,9 +301,12 @@ def full_candidate_checks(*, attempt: Path, repo: Path, revision: str, image: st
         shutil.copytree(trusted / directory, work / directory,
                         ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", ".mypy_cache"))
     shutil.copyfile(trusted / "pyproject.toml", work / "pyproject.toml")
+    from scripts.lab_check_inputs import overlay_test_inputs
+    trusted_inputs = overlay_test_inputs(trusted, work)
     source_before = snapshot(work)
     durable_json(inputs / "inputs.json", {"revision": revision,
                  "candidate": expected, "overlay": tree_identity(work),
+                 "trusted_test_inputs": trusted_inputs, "controller": identity_before,
                  "tools": tree_identity(inputs / "tools"), "check_tools_sha256": check_tools_sha256})
     inputs_before = snapshot(inputs)
     commands = {
@@ -423,21 +428,13 @@ def editable(name: str) -> bool:
 
 
 def workspace_files(workspace: Path) -> dict[str, bytes]:
-    require(workspace.is_dir() and not workspace.is_symlink(), "Missing regular workspace")
-    result = {}
-    for directory, dirs, files in os.walk(workspace, followlinks=False):
-        for name in dirs:
-            require(not (Path(directory) / name).is_symlink(), "Workspace directory symlink")
-        for name in files:
-            path = Path(directory) / name
-            require(stat.S_ISREG(path.lstat().st_mode) and path.stat().st_nlink == 1,
-                    "Workspace must contain only unlinked regular files")
-            result[path.relative_to(workspace).as_posix()] = path.read_bytes()
-    return result
+    from scripts.lab_workspace import read_files
+    return read_files(workspace)
 
 
 def snapshot(workspace: Path) -> str:
-    return sha({name: hashlib.sha256(data).hexdigest() for name, data in workspace_files(workspace).items()})
+    from scripts.lab_workspace import file_hash, inventory
+    return sha({name: file_hash(path) for name, path in inventory(workspace).items()})
 
 
 def candidate_commit(repo: Path, previous: str, workspace: Path, attempt: Path) -> tuple[str, list[dict]]:
@@ -543,6 +540,26 @@ def history_projection(report: dict) -> dict:
             "actual_changes", "revision", "previous_incumbent", "outcome", "lessons", "checks", "usage",
             "delivery_validation")
     result = {key: report[key] for key in keys if key in report}
+    review = report.get("independent_review")
+    if isinstance(review, dict):
+        from scripts.lab_corpus import scrub_content
+        findings = review.get("findings", [])
+        prose = []
+        for finding in findings[:20] if isinstance(findings, list) else []:
+            if isinstance(finding, dict):
+                # Reviewer schemas permit structured findings. Keep actionable
+                # prose fields, never arbitrary nested evidence/provider bodies.
+                finding = "; ".join(f"{key}: {finding[key]}" for key in (
+                    "severity", "summary", "message", "reason", "description", "recommendation", "path")
+                    if isinstance(finding.get(key), str) and len(finding[key]) <= 16000)
+            if isinstance(finding, str) and finding and len(finding) <= 16000:
+                prose.append(scrub_content(finding)[0][:1000])
+        result["independent_review"] = {
+            "approved": review.get("approved") is True,
+            "revision": review.get("revision"),
+            # Scrub before truncating so a cut cannot hide credential syntax.
+            "findings": prose,
+        }
     measured = report.get("measured_outcomes", {})
     result["measured_outcomes"] = {role: safe_aggregate(measured[role])
         for role in ("incumbent", "candidate") if role in measured}
@@ -981,6 +998,7 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
             paused = guard.failed or bool(re.search(r"auth|quota|modelpaused|ratelimit|credential", type(error).__name__, re.I))
             report["paused"] = paused
             uncertain = inflight is not None
+            ambiguous_model_pause = False
             if inflight is not None:
                 kind, role = inflight
                 if kind == "session":
@@ -988,19 +1006,28 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
                     # completed. Reuse recovery's controller-owned receipt scan.
                     status = (attempt if role == "implementation" else generation_root) / role / "private/status.json"
                     uncertain = not (status.is_file() and read_json(status).get("cleanup_complete") is True)
-                    if not uncertain:
-                        try:
-                            uncertain = recovery.session_completion(attempt) != "settled"
-                        except Exception:
-                            uncertain = True
+                    try:
+                        recovery.session_completion(attempt)
+                    except recovery.RecoveryPaused as reason:
+                        uncertain = True
+                        from scripts.lab_model_client import ModelPaused
+                        # The real sender masks transport loss as ModelPaused.
+                        # Only an unanswered durable wire makes that pause
+                        # recovery-owned, not preflight/schema/auth exceptions.
+                        ambiguous_model_pause = (type(error) is ModelPaused
+                                                 and str(reason) == "model_completion_unknown")
+                    except Exception:
+                        uncertain = True
                 elif kind == "evaluation":
                     cleanup = generation_root / ("evaluation-" + role) / "cleanup.json"
-                    uncertain = not (cleanup.is_file() and read_json(cleanup).get("worker_removed") is True)
+                    receipt = read_json(cleanup) if cleanup.is_file() else {}
+                    uncertain = not (receipt.get("worker_removed") is True
+                                     and receipt.get("ownership_restored", True) is True)
                 elif kind == "checks":
                     cleanup = generation_root / "full-checks/checks.json"
                     uncertain = not (cleanup.is_file() and read_json(cleanup).get("cleanup_complete") is True)
             report["reconciliation_required"] = uncertain
-            recovery_paused = uncertain and not paused
+            recovery_paused = uncertain and (not paused or ambiguous_model_pause)
             paused = paused or uncertain
             if not (attempt / "report.json").exists():
                 with guard.lock:
