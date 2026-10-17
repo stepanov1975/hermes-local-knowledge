@@ -407,11 +407,25 @@ def test_readonly_live_resources_block_before_permission_change(readonly_disposa
 
 
 def test_missing_response_retains_pairs_and_workspace(finished):
+    from scripts import lab_automation as auto
+
     h, attempt = finished
-    (attempt / "implementation/private/response-1.json").unlink()
-    assert clean(h)["blocked"]
+    private = attempt / "implementation/private"
+    (private / "response-1.json").unlink()
+    # A later never-dispatched request must not hide an earlier unanswered wire.
+    lab.durable_json(private / "request-2.json", {"messages": []})
+    auto.initialize(h.campaign)
+    def forbidden(*args, **kwargs) -> dict:
+        raise AssertionError("Unanswered provider work must prevent admission")
+    for now in (100, 100 + retention.RAW_RETENTION_SECONDS):
+        assert auto.tick(h.campaign, now=now, action=forbidden)["state"] == "paused"
+        assert auto.status(h.campaign)["retention"]["blocked"] == [
+            {"attempt_id": attempt.name, "reason": "model_completion_unknown"}]
+    assert auto.status(h.campaign)["admission"] == {}
+    assert not (attempt / "retention-plan.json").exists()
     assert (attempt / "implementation/work").exists()
-    assert (attempt / "implementation/private/request-1.json").exists()
+    assert (private / "request-1.json").exists() and (private / "wire-1.json").exists()
+    assert (private / "request-2.json").exists()
 
 
 def test_interrupted_disposal_retries_original_plan(finished, monkeypatch):
@@ -618,6 +632,26 @@ def test_cleanup_finished_requires_existing_campaign_lock(finished):
     with lab.campaign_lock(h.campaign):
         assert retention.cleanup_finished(h.campaign, now=100)["blocked"] == []
     assert not (attempt / "implementation/work").exists()
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_saved_plan_blocks_new_unanswered_wire_before_admission(finished, expired):
+    from scripts import lab_automation as automation
+    h, attempt = finished
+    assert retention.cleanup_campaign(h.campaign, now=100)["blocked"] == []
+    private = attempt / "implementation/private"
+    lab.durable_json(private / "request-2.json", {})
+    lab.durable_json(private / "wire-2.json", {})
+    automation.initialize(h.campaign)
+    admitted = []
+    def sentinel(*args, **kwargs):
+        admitted.append(True)
+        return {"outcome": "no_change"}
+    now = 100 + retention.RAW_RETENTION_SECONDS if expired else 101
+    result = automation.tick(h.campaign, now=now, action=sentinel)
+    assert result["state"] == "paused" and admitted == []
+    assert (private / "wire-2.json").exists()
+    assert (private / "response-1.json").exists()
 
 
 @pytest.mark.parametrize("substitution", ["other_campaign", "replaced_inode"])

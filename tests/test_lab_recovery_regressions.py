@@ -43,8 +43,34 @@ def test_init_rejects_repository_campaign_before_any_write(h, monkeypatch, owner
     assert Path(h.config["repo"]) == h.repo
 
 
+@pytest.fixture
+def absent_session_helper(monkeypatch):
+    """Model a controller-planned helper and successful exact-name absence lookup."""
+    names = set()
+
+    def inspect(name):
+        assert name in names, "Only this fixture's planned helpers may be inspected"
+        return None  # Successful exact-name lookup: helper has already exited/been removed.
+
+    monkeypatch.setattr(recovery, "docker_inspect", inspect)
+
+    def plan(session, image):
+        name = f"lk-lab-{session.parent.name}-{session.name}-setup"
+        args = ["docker", "run", "--rm", "--name", name, "--label", "lk.lab=ticket-69",
+                "--network", "none", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN",
+                "--security-opt", "no-new-privileges:true", "--read-only",
+                "--mount", f"type=bind,src={session / 'work'},dst=/work",
+                "--entrypoint", "/bin/chown", image, "-R", "--no-dereference", "10000:10000", "/work"]
+        # The controller resource context is active around the injected session.
+        assert recovery.plan_resource(args, image) is not None
+        names.add(name)
+
+    return plan
+
+
 @pytest.mark.parametrize("unanswered", [False, True])
-def test_disk_paused_pending_reconciles_only_after_fresh_space_check(h, monkeypatch, unanswered):
+def test_disk_paused_pending_reconciles_only_after_fresh_space_check(h, monkeypatch, unanswered,
+                                                                  absent_session_helper):
     from scripts import lab_automation as automation
     low = [False]
     monkeypatch.setattr(disk, "available_space", lambda path: {
@@ -52,6 +78,7 @@ def test_disk_paused_pending_reconciles_only_after_fresh_space_check(h, monkeypa
     def interrupted(**kwargs) -> dict:
         private = kwargs["attempt"] / "private"
         private.mkdir(parents=True)
+        absent_session_helper(kwargs["attempt"], kwargs["image"])
         lab.durable_json(private / "session.json", {"session_id": "synthetic-disk-session", **lab.MODEL})
         if unanswered:
             recovery.atomic_json(private / "wire-1.json", [{"role": "user", "content": "synthetic"}])
@@ -91,7 +118,8 @@ def test_disk_paused_pending_reconciles_only_after_fresh_space_check(h, monkeypa
 
 @pytest.mark.parametrize("receipt", ["wire"])
 @pytest.mark.parametrize("role", ["implementation", "review"])
-def test_response_loss_after_provider_acceptance_stays_pending_despite_local_cleanup(h, receipt, role):
+def test_response_loss_after_provider_acceptance_stays_pending_despite_local_cleanup(
+        h, receipt, role, absent_session_helper):
     from scripts import lab_automation as automation
     accepted = []
     original_response = {"message": {"role": "assistant", "content": "Synthetic accepted response"},
@@ -101,6 +129,7 @@ def test_response_loss_after_provider_acceptance_stays_pending_despite_local_cle
             return h.session(**kwargs)
         private = kwargs["attempt"] / "private"
         private.mkdir(parents=True)
+        absent_session_helper(kwargs["attempt"], kwargs["image"])
         metadata = {"session_id": "accepted-response-lost", "role": role, **lab.MODEL}
         lab.durable_json(private / "session.json", metadata)
         recovery.atomic_json(private / (receipt + "-1.json"),

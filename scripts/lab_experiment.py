@@ -777,10 +777,24 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
                 if attempt_id in finalized:
                     require(any(r["attempt_id"] == attempt_id and r["outcome"] != "accepted" for r in reports),
                             "Invalid pending publication")
-                    durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
-                                 "state": "finalized_report_settled", "resources": resources,
-                                 "report_sha256": file_sha(attempt / "report.json")}, replace=True)
-                    updated = {**manifest, "pending": None, "paused": False}
+                    from scripts.lab_retention import settlement_evidence
+                    # settle_resources returns its pre-removal observations. Bind
+                    # authorization to a fresh all-absent readback instead.
+                    resources = recovery.inspect_resources(attempt)
+                    require(bool(resources) and all(r["state"] == "absent" for r in resources),
+                            "Recovery resource settlement unconfirmed")
+                    receipt_path = attempt / "recovery-report.json"
+                    receipt = {"schema": "lab-finalized-recovery/v1", "attempt_id": attempt_id,
+                               "state": "finalized_report_settled", "resources": resources,
+                               "model_completion": completion, "config_sha256": manifest["config_sha256"],
+                               "report_sha256": file_sha(attempt / "report.json"),
+                               "evidence": settlement_evidence(attempt)}
+                    durable_json(receipt_path, receipt, replace=True)
+                    require(read_json(receipt_path) == receipt, "Recovery receipt readback failed")
+                    updated = {**manifest, "pending": None, "paused": False,
+                               "reports": [{**p, "recovery_sha256": file_sha(receipt_path)}
+                                           if p["attempt_id"] == attempt_id else p
+                                           for p in manifest["reports"]]}
                     updated.pop("pause_source", None)
                     with guard.action():
                         durable_json(campaign / "manifest.json", updated, replace=True)

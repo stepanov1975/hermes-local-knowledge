@@ -102,7 +102,8 @@ def docker_inspect(name: str) -> dict | None:
     """Only a successful exact-name list can establish absence; daemon errors pause."""
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
     def run(args: list[str]) -> str:
-        return subprocess.run(args, check=True, capture_output=True, env=env).stdout.decode()
+        return subprocess.run(args, check=True, capture_output=True, env=env,
+                              pass_fds=lock_fds()).stdout.decode()
     try:
         ids = run(["docker", "ps", "-aq", "--no-trunc", "--filter", "name=^/" + name + "$"]).split()
         if not ids:
@@ -159,7 +160,7 @@ def settle_resources(attempt: Path) -> list[dict]:
         if row["state"] == "stopped":
             # No force: if unexpectedly running, Docker refuses rather than killing it.
             subprocess.run(["docker", "rm", "--volumes", row["container_id"]],
-                           check=True, capture_output=True,
+                           check=True, capture_output=True, pass_fds=lock_fds(),
                            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
             if docker_inspect(row["name"]) is not None:
                 raise RecoveryPaused("resource_removal_unconfirmed")

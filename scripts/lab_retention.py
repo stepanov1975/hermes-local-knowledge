@@ -216,6 +216,38 @@ def _dispose(attempt: Path, entries: dict[str, dict]) -> None:
              "disposal_readback_failed")
 
 
+def settlement_evidence(attempt: Path) -> dict[str, str]:
+    """Bind recovery to exact controller receipts, not a reusable success flag."""
+    paths = [attempt / "attempt.json", attempt / "checkpoint.json"]
+    paths.extend((attempt / "resources").iterdir())
+    for session in recovery.session_directories(attempt):
+        private = session / "private"
+        _plain(private, missing=True)
+        paths.extend(private.glob("*.json"))
+    return {p.relative_to(attempt).as_posix(): _digest(p) for p in sorted(paths)}
+
+
+def _reconciled(attempt: Path, manifest: dict, pointer: dict, report: dict) -> dict | None:
+    flag = report.get("reconciliation_required", False)
+    if flag is False:
+        return None
+    _require(flag is True and report.get("outcome") != "accepted", "reconciliation_required")
+    path = attempt / "recovery-report.json"
+    _require(pointer.get("recovery_sha256") == _digest(path), "recovery_receipt_drift")
+    receipt = _json(path)
+    _require(receipt.get("schema") == "lab-finalized-recovery/v1"
+             and receipt.get("state") == "finalized_report_settled"
+             and receipt.get("attempt_id") == pointer["attempt_id"]
+             and receipt.get("report_sha256") == pointer["sha256"]
+             and receipt.get("config_sha256") == manifest["config_sha256"]
+             and receipt.get("model_completion") in {"settled", "incomplete"}
+             and isinstance(receipt.get("resources"), list)
+             and bool(receipt["resources"])
+             and all(r.get("state") == "absent" for r in receipt["resources"]),
+             "recovery_receipt_invalid")
+    return receipt
+
+
 def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) -> dict:
     from scripts.lab_experiment import sha
     attempt_id = pointer["attempt_id"]
@@ -228,7 +260,7 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
     _require(_digest(report_path) == pointer["sha256"], "report_drift")
     report = _json(report_path)
     _require(report.get("attempt_id") == attempt_id, "report_identity_mismatch")
-    _require(report.get("reconciliation_required", False) is False, "reconciliation_required")
+    reconciled = _reconciled(attempt, manifest, pointer, report)
     _require(report.get("outcome") in {"accepted", "rejected", "no_change", "error", "interrupted"},
              "outcome_unknown")
     config = _json(campaign / "config.json")
@@ -249,12 +281,25 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
             _require(_digest(attempt / name) == digest, "structural_evidence_drift")
     resources = recovery.inspect_resources(attempt)
     _require(all(r.get("state") in {"absent", "stopped"} for r in resources), "resource_not_quiescent")
+    if reconciled is not None:
+        _require(resources == reconciled["resources"], "recovery_settlement_drift")
     if receipt_path.exists() or receipt_path.is_symlink():
         plan = _json(receipt_path)
         _require(plan.get("schema") == SCHEMA and plan["report_sha256"] == pointer["sha256"]
                  and plan["attempt_id"] == attempt_id, "retention_plan_drift")
+        if reconciled is not None:
+            _require(plan.get("recovery_sha256") == pointer["recovery_sha256"],
+                     "retention_plan_drift")
     else:
-        _require(recovery.session_completion(attempt) == "settled", "completion_uncertain")
+        # Finalized, non-pending work may have a request saved before dispatch
+        # (or an unfinished local tool intent). With resources quiescent it need
+        # not have succeeded to be disposable. Unanswered wires still raise.
+        completion = recovery.session_completion(attempt)
+        _require(completion in {"settled", "incomplete"}, "completion_uncertain")
+        if reconciled is not None:
+            _require(completion == reconciled["model_completion"]
+                     and settlement_evidence(attempt) == reconciled.get("evidence"),
+                     "recovery_settlement_drift")
         roots = _roots(attempt)
         # Never delete a frozen/configured source even if its path was placed
         # inside an otherwise disposable export.
@@ -290,7 +335,9 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
                 "finalized_at": now, "raw_delete_after": now + RAW_RETENTION_SECONDS,
                 "disposable": disposable, "raw": raw, "protected": protected_hashes,
                 "refs": refs, "usage": usage, "report_usage": report.get("usage", []),
-                "completion": "settled", "resources": resources}
+                "completion": completion, "resources": resources}
+        if reconciled is not None:
+            plan["recovery_sha256"] = pointer["recovery_sha256"]
         _save(receipt_path, plan)
     _require(type(plan["finalized_at"]) in {int, float} and math.isfinite(plan["finalized_at"])
              and plan["raw_delete_after"] == plan["finalized_at"] + RAW_RETENTION_SECONDS,
@@ -300,6 +347,18 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
     for name, digest in plan["protected"].items():
         _require(_digest(attempt / name) == digest, "structural_evidence_drift")
     expired = now >= plan["raw_delete_after"]
+    if reconciled is not None:
+        evidence = dict(reconciled["evidence"])
+        if expired:
+            # A durable retention plan, not a missing response alone, authorizes
+            # raw removal and restart after a partially disposed raw pair.
+            for name in plan["raw"]:
+                if not (attempt / name).exists():
+                    evidence.pop(name, None)
+        _require(settlement_evidence(attempt) == evidence, "recovery_settlement_drift")
+    # A saved plan authorizes removal of only its original receipt set. Newly
+    # arrived request/wire evidence must block admission even on resumed cleanup.
+    _require(set(_raw_paths(attempt)) <= set(plan["raw"]), "unplanned_raw_evidence")
     _validate_remaining(attempt, plan["raw"])
     if not expired:
         # Before expiry even a missing raw file is unexplained drift.
