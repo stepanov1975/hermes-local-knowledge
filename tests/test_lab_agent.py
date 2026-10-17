@@ -161,6 +161,50 @@ def setup_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict
             "name": "lk-lab-synthetic", "role": "implementation", "task": "synthetic task"}, events
 
 
+def review_inputs(kwargs: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import lab_experiment as lab, lab_review_evidence as proof
+    from tests.test_lab_experiment import Harness
+    repo = tmp_path / "review-repo"
+    repo.mkdir()
+    lab.git(repo, "init", "-q")
+    (repo / "README.md").write_text("synthetic")
+    (repo / "tests").mkdir()
+    (repo / "tests/test_config.py").write_text("# synthetic admitted test fixture")
+    (repo / "scripts").mkdir()
+    (repo / "scripts/controller.py").write_text("# excluded synthetic controller")
+    lab.git(repo, "add", ".")
+    lab.git(repo, "commit", "-qm", "synthetic")
+    revision = lab.git(repo, "rev-parse", "HEAD").decode().strip()
+    checks_root = tmp_path / "review-checks"
+    identity = {"synthetic": "fixture"}
+    harness = Harness.__new__(Harness)
+    harness.identity = identity
+    harness.checks_passed = True
+    tools = tmp_path / "synthetic-tools"
+    tools.mkdir()
+    checks = harness.checks(
+        attempt=checks_root, repo=repo, revision=revision, image=agent.IMAGE,
+        check_tools=tools, check_tools_sha256=lab.sha({}))
+    binding = {"revision": revision, "image": agent.IMAGE, "controller": lab.sha(identity),
+               "tree": lab.git(repo, "rev-parse", revision + "^{tree}").decode().strip(),
+               "checks_sha256": lab.sha(checks)}
+    packet = proof.build(repo=repo, revision=revision, binding=binding, report={},
+                         checks_root=checks_root, proof=tmp_path / "review-proof")
+    path = tmp_path / "review-evidence.json"
+    lab.durable_json(path, packet)
+    kwargs.update(repo=repo, revision=revision, evidence=path)
+    original = agent.export
+    def export(attempt: Path, repo: Path, revision: str) -> Path:
+        workspace = original(attempt, repo, revision)
+        (workspace / "tests").mkdir()
+        (workspace / "tests/test_config.py").write_text("# synthetic admitted test fixture")
+        for path in workspace.rglob("*"):
+            if path.is_file():
+                path.chmod(0o644)
+        return workspace
+    monkeypatch.setattr(agent, "export", export)
+
+
 @pytest.mark.parametrize("replacement", [False, True])
 def test_disk_stop_during_blocked_model_is_exact_and_preserves_usage(tmp_path, monkeypatch, replacement):
     import threading
@@ -243,8 +287,10 @@ def test_session_prompt_defines_authoritative_source_delivery(tmp_path: Path, mo
                                                             role: str) -> None:
     kwargs, _ = setup_session(tmp_path, monkeypatch)
     kwargs["role"] = role
+    if role == "review":
+        review_inputs(kwargs, tmp_path, monkeypatch)
     monkeypatch.setattr(agent, "inspect", lambda name: spec_for(
-        name, agent.mounts(kwargs["attempt"], kwargs["corpus"], role, False)))
+        name, agent.mounts(kwargs["attempt"], kwargs["corpus"], role, role == "review")))
     requests = []
     final = FINAL if role == "implementation" else {
         "approved": True, "shortcuts_checked": True, "compatibility_checked": True,
@@ -452,8 +498,9 @@ def test_independent_review_session_is_revision_bound_readonly(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: bool) -> None:
     kwargs, _ = setup_session(tmp_path, monkeypatch)
     kwargs["role"] = "review"
+    review_inputs(kwargs, tmp_path, monkeypatch)
     monkeypatch.setattr(agent, "inspect", lambda name: spec_for(name, agent.mounts(
-        kwargs["attempt"], kwargs["corpus"], "review", False)))
+        kwargs["attempt"], kwargs["corpus"], "review", True)))
     final = {"approved": True, "shortcuts_checked": True, "compatibility_checked": True,
              "report_checked": True, "findings": []}
     def send(*args: Any) -> Any:
@@ -463,7 +510,7 @@ def test_independent_review_session_is_revision_bound_readonly(
                 "usage": {"available": False}}
     monkeypatch.setattr(model, "send", send)
     if tamper:
-        with pytest.raises(ValueError, match="Read-only review source changed"):
+        with pytest.raises(ValueError, match="projection bytes/modes mismatch"):
             agent.run_session(**kwargs)
         assert not (kwargs["attempt"] / "private/result.json").exists()
     else:
@@ -473,7 +520,7 @@ def test_independent_review_session_is_revision_bound_readonly(
         assert result["role"] == "review" and result["revision"] == receipt["revision"]
         assert result["source_identity"] == receipt["source_identity"]
         create = agent.worker_command(kwargs["name"], agent.IMAGE, agent.mounts(
-            kwargs["attempt"], kwargs["corpus"], "review", False))
+            kwargs["attempt"], kwargs["corpus"], "review", True))
         assert "none" == create[create.index("--network") + 1]
         assert not any("/inputs," in arg or "docker.sock" in arg for arg in create)
 
@@ -483,8 +530,10 @@ def test_paid_source_rejection_retains_usage_and_cleanup(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str) -> None:
     kwargs, events = setup_session(tmp_path, monkeypatch)
     kwargs["role"] = role
+    if role == "review":
+        review_inputs(kwargs, tmp_path, monkeypatch)
     monkeypatch.setattr(agent, "inspect", lambda name: spec_for(name, agent.mounts(
-        kwargs["attempt"], kwargs["corpus"], role, False)))
+        kwargs["attempt"], kwargs["corpus"], role, role == "review")))
     usage = {"input_tokens": 123, "output_tokens": 45, "total_tokens": 168}
     def send(*args: Any) -> Any:
         source = kwargs["attempt"] / "work/plugin"

@@ -95,6 +95,11 @@ def _raw_paths(attempt: Path) -> list[str]:
             if root.exists():
                 paths.extend(p for p in root.iterdir() if re.fullmatch(
                     r"(?:(?:transport|trusted-tests|full_pytest|ruff|mypy)\.(?:stdout|stderr)|private-cases\.jsonl|warmups\.json)", p.name))
+        proof = generation / "review-proof"
+        _plain(proof, missing=True)
+        if proof.exists():
+            paths.extend(p for p in proof.iterdir() if re.fullmatch(
+                r"(?:full_pytest|ruff|mypy)\.(?:stdout|stderr)", p.name))
     return sorted(p.relative_to(attempt).as_posix() for p in paths)
 
 
@@ -105,7 +110,9 @@ def _entry(path: Path) -> dict:
         return {**result, "kind": "link", "target": os.readlink(path)}
     if stat.S_ISDIR(info.st_mode):
         return {**result, "kind": "directory"}
-    _require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "foreign_or_special_file")
+    # Disposal unlinks only an enumerated name; other hardlinks retain their
+    # inode and bytes. Link counts also change legitimately during partial disposal.
+    _require(stat.S_ISREG(info.st_mode), "foreign_or_special_file")
     return {**result, "kind": "file", "sha256": _digest(path)}
 
 

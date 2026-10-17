@@ -42,10 +42,15 @@ If revisiting the same failed strategy, explain new evidence or a changed premis
 otherwise stop with no_change. Checks you report are advisory, never trusted gates.
 Unknown returned top-five targets are unjudged, not automatically incorrect.
 """
-REVIEW_TASK = """Independently inspect this exact read-only candidate after actual trusted
+REVIEW_TASK = """Independently inspect the declared filtered read-only candidate projection after actual trusted
 execution. Verify no shortcuts/label tampering, official compatibility and that
 the draft report corresponds to execution evidence. Return approved,
 shortcuts_checked, compatibility_checked, report_checked booleans and findings.
+Read /inputs/evidence.json and /inputs/review-proof. Verify projection paths/digests/Git modes,
+full revision/tree binding, raw check/input/output/cleanup receipts and trusted overlay scope.
+Challenge evidence content, not just pass booleans; reject drift, mismatches or incomplete evidence.
+Run the declared runnable_scope.command, not the full suite (omitted scripts prevent collection).
+Do not reconstruct a full Git tree from this partial export or treat supplied checks as independently reproduced.
 Unknown returned top-five targets remain unjudged; never reinterpret labels.
 """
 
@@ -290,10 +295,10 @@ def full_candidate_checks(*, attempt: Path, repo: Path, revision: str, image: st
                  "tools": tree_identity(inputs / "tools"), "check_tools_sha256": check_tools_sha256})
     inputs_before = snapshot(inputs)
     commands = {
-        "full_pytest": ["-m", "pytest", "-ra", "-p", "no:cacheprovider",
-                        "-p", "scripts.lab_full_check_probe"],
-        "ruff": ["-m", "ruff", "check", "--no-cache", "."],
-        "mypy": ["-m", "mypy", "--cache-dir=/tmp/mypy"],
+        "full_pytest": ["-m", "pytest", "-ra", "--tb=no", "--show-capture=no", "--disable-warnings", "--no-summary",
+                        "-p", "no:cacheprovider", "-p", "scripts.lab_full_check_probe"],
+        "ruff": ["-m", "ruff", "check", "--no-cache", "--output-format=concise", "."],
+        "mypy": ["-m", "mypy", "--no-pretty", "--cache-dir=/tmp/mypy"],
     }
     checks = []
     for key, command in commands.items():
@@ -313,7 +318,10 @@ def full_candidate_checks(*, attempt: Path, repo: Path, revision: str, image: st
                 "--workdir", "/candidate", "--entrypoint", "/opt/lab-tools/bin/python", image, *command]
         prefix = attempt / key  # Private controller output, outside both candidate binds.
         result = isolated_check(args, name=check_name, image=image, work=work, inputs=inputs, prefix=prefix)
-        checks.append({"name": key, "passed": result.returncode == 0, "returncode": result.returncode,
+        from scripts.lab_review_evidence import receipt_files
+        checks.append({"name": key, "command": ["/opt/lab-tools/bin/python", *command],
+                       "evidence_files": receipt_files(attempt, key),
+                       "passed": result.returncode == 0, "returncode": result.returncode,
                        "output_receipt": prefix.with_suffix(".output.json").name,
                        "cleanup_receipt": prefix.with_suffix(".cleanup.json").name})
     require(snapshot(work) == source_before and snapshot(inputs) == inputs_before, "Full-check source drift")
@@ -321,7 +329,8 @@ def full_candidate_checks(*, attempt: Path, repo: Path, revision: str, image: st
     require(controller_identity() == identity_before, "Full-check controller drift")
     result_report = {"revision": revision, "image": image, "controller": sha(identity_before),
                      "checks": checks, "passed": all(c["passed"] for c in checks),
-                     "inputs_sha256": inputs_before, "check_tools_sha256": check_tools_sha256,
+                     "inputs_sha256": inputs_before, "inputs_manifest_sha256": file_sha(inputs / "inputs.json"),
+                     "check_tools_sha256": check_tools_sha256,
                      "exact_candidate_sha256": snapshot(exact), "overlay_sha256": source_before,
                      "cleanup_complete": True}
     durable_json(attempt / "checks.json", result_report)
@@ -898,7 +907,10 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
             cleared = clearance(campaign, clearance_binding) if decision["score_eligible"] else False
             report["unknown_target_gate"] = {"cleared": cleared, "binding": clearance_binding}
             # Reviewer sees aggregate integers and actual checks, never cases or raw responses.
-            durable_json(generation_root / "review-evidence.json", {"binding": gate_binding, "draft_report": report})
+            from scripts import lab_review_evidence as review_evidence
+            packet = review_evidence.build(repo=repo, revision=revision, binding=gate_binding, report=report,
+                checks_root=generation_root / "full-checks", proof=generation_root / "review-proof")
+            durable_json(generation_root / "review-evidence.json", packet)
             pins_unchanged()
             require(snapshot(workspace) == work_identity, "Candidate changed after execution")
             inflight = ("session", "review")

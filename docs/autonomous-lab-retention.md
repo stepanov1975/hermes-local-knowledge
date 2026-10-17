@@ -67,8 +67,16 @@ cleanup rather than being removed.
 
 Top-level paths and all their ancestors must not be symlinks. Internal sandbox
 symlinks are explicitly inventoried and unlinked without following their targets.
-Special files, hard-linked regular files, replacements and unplanned new children
-block cleanup. Deletion proceeds leaf-first with nonrecursive unlink/rmdir and
+Special files (including FIFOs and sockets), replacements and unplanned new
+children block cleanup. Ordinary regular hardlinks are allowed: retention owns
+only the enumerated disposable names, not every link to their inodes. Unlinking
+an owned alias leaves any outside/protected alias and its file bytes/inode intact;
+retention never writes or truncates the shared file. Every remaining planned name
+still must match its recorded kind, device, inode and content hash. Link counts
+are deliberately not a plan invariant: deleting one alias can lower the count
+before an interrupted disposal resumes from the same immutable plan. This is a
+deletion-only policy; candidate workspace import/write validation continues to
+reject hardlinks. Deletion proceeds leaf-first with nonrecursive unlink/rmdir and
 parent-directory fsync; no recursively following wildcard remover is used.
 This assumes the trusted controller owns its receipts and the campaign flock
 fences controller activity; it is not a filesystem isolation boundary against a
@@ -87,7 +95,10 @@ enumerated raw files are eligible:
 - session `private/tool-N-N.stdout` and `.stderr`;
 - evaluator `transport.stdout` and `.stderr`, `trusted-tests.stdout` and `.stderr`;
 - evaluator `private-cases.jsonl` and `warmups.json` (per-query responses/timings);
-- full-check `full_pytest`, `ruff`, `mypy` `.stdout` and `.stderr` streams.
+- full-check `full_pytest`, `ruff`, `mypy` `.stdout` and `.stderr` streams;
+- the same named raw stream copies under controller-owned `review-proof/`,
+  including numbered recovery generations. Their hash/size and check/input/output/cleanup
+  metadata remain protected; the duplicate raw bytes do not bypass seven-day expiry.
 
 Before securing the plan, every request/wire must have a response and every tool
 intent must have its receipt, with resources conclusively quiescent. The durable

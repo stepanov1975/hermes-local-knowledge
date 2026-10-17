@@ -162,6 +162,130 @@ def test_sandbox_internal_symlink_removed_without_following(finished, tmp_path):
     assert (foreign / "keep").read_text() == "keep"
 
 
+def test_internal_regular_hardlinks_are_disposed(finished):
+    h, attempt = finished
+    scratch = attempt / "implementation/scratch"
+    first = scratch / "hardlink-a"
+    second = scratch / "hardlink-b"
+    first.write_bytes(b"ordinary pytest scratch")
+    second.hardlink_to(first)
+    assert first.stat().st_nlink == second.stat().st_nlink == 2
+    assert first.stat().st_ino == second.stat().st_ino
+
+    assert clean(h)["blocked"] == []
+    plan = lab.read_json(attempt / "retention-plan.json")
+    rows = [plan["disposable"][p.relative_to(attempt).as_posix()] for p in (first, second)]
+    assert rows[0] == rows[1]
+    assert rows[0]["kind"] == "file"
+    assert not scratch.exists()
+    assert lab.read_json(attempt / "retention-result.json")["disposable_complete"] is True
+
+
+@pytest.mark.parametrize("target_kind", ["outside", "protected"])
+def test_owned_hardlink_unlink_preserves_other_target(finished, tmp_path, target_kind):
+    h, attempt = finished
+    target = tmp_path / "outside-keep" if target_kind == "outside" else attempt / "protected-keep"
+    target.write_bytes(b"protected regular file bytes")
+    before = target.stat()
+    alias = attempt / "implementation/scratch/owned-alias"
+    alias.hardlink_to(target)
+    assert target.stat().st_nlink == 2
+
+    assert clean(h)["blocked"] == []
+    assert not alias.exists()
+    assert target.read_bytes() == b"protected regular file bytes"
+    assert (target.stat().st_dev, target.stat().st_ino) == (before.st_dev, before.st_ino)
+    assert target.stat().st_nlink == 1
+    if target_kind == "protected":
+        plan = lab.read_json(attempt / "retention-plan.json")
+        assert plan["protected"]["protected-keep"] == lab.file_sha(target)
+
+
+def test_interrupted_hardlink_disposal_reuses_immutable_plan(finished, monkeypatch):
+    h, attempt = finished
+    scratch = attempt / "implementation/scratch"
+    first, second = scratch / "hardlink-a", scratch / "hardlink-b"
+    first.write_bytes(b"restartable scratch")
+    second.hardlink_to(first)
+    original = Path.unlink
+    removed = []
+
+    def interrupt(path, *args, **kwargs):
+        result = original(path, *args, **kwargs)
+        if path in (first, second):
+            removed.append(path)
+            raise KeyboardInterrupt
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            clean(h)
+    assert len(removed) == 1
+    remaining = first if removed[0] == second else second
+    assert remaining.stat().st_nlink == 1
+    plan = (attempt / "retention-plan.json").read_bytes()
+    assert clean(h, 200)["blocked"] == []
+    assert (attempt / "retention-plan.json").read_bytes() == plan
+    assert not scratch.exists()
+
+
+@pytest.mark.parametrize("kind", ["fifo", "socket"])
+def test_special_file_blocks_before_any_disposal(finished, monkeypatch, kind):
+    import socket
+
+    h, attempt = finished
+    scratch = attempt / "implementation/scratch"
+    special = scratch / "special"
+    sock = socket.socket(socket.AF_UNIX) if kind == "socket" else None
+    try:
+        if sock is not None:
+            # Use a relative bind name to avoid AF_UNIX's short path limit.
+            monkeypatch.chdir(scratch)
+            sock.bind(special.name)
+        else:
+            os.mkfifo(special)
+        outcome = clean(h)
+        assert outcome["blocked"][0]["reason"] == "foreign_or_special_file"
+        assert special.exists()
+        assert (scratch / "data").read_text() == "disposable"
+        assert (attempt / "candidate.index").read_text() == "index"
+        assert (attempt / "implementation/work").is_dir()
+        assert not (attempt / "retention-plan.json").exists()
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+@pytest.mark.parametrize("drift", ["content", "inode", "new_child"])
+def test_hardlink_plan_drift_blocks_before_further_deletion(finished, monkeypatch, drift):
+    h, attempt = finished
+    scratch = attempt / "implementation/scratch"
+    first, second = scratch / "hardlink-a", scratch / "hardlink-b"
+    first.write_bytes(b"original")
+    second.hardlink_to(first)
+    with monkeypatch.context() as patch:
+        patch.setattr(retention, "_dispose", lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            clean(h)
+    plan = (attempt / "retention-plan.json").read_bytes()
+    if drift == "content":
+        second.write_bytes(b"drifted")
+    elif drift == "inode":
+        second.unlink()
+        second.write_bytes(b"original")
+        assert first.stat().st_ino != second.stat().st_ino
+    else:
+        (scratch / "new-child").write_bytes(b"unplanned")
+    outcome = clean(h, 200)
+    assert outcome["blocked"][0]["reason"] == (
+        "unplanned_data" if drift == "new_child" else "planned_path_drift")
+    assert first.exists() and second.exists()
+    assert (scratch / "data").read_text() == "disposable"
+    assert (attempt / "candidate.index").exists()
+    assert (attempt / "retention-plan.json").read_bytes() == plan
+
+
 def test_missing_response_retains_pairs_and_workspace(finished):
     h, attempt = finished
     (attempt / "implementation/private/response-1.json").unlink()
@@ -340,6 +464,29 @@ def test_evaluator_aggregate_drift_blocks_expired_raw_disposal(finished):
     result = clean(h, 100 + retention.RAW_RETENTION_SECONDS)
     assert result["blocked"][0]["reason"] == "structural_evidence_drift"
     assert (root / "private-cases.jsonl").read_text() == "raw"
+
+
+@pytest.mark.parametrize("prefix", ["", "generation-2"])
+def test_review_proof_raw_copies_expire_but_receipts_survive(finished, prefix):
+    import shutil
+    h, attempt = finished
+    proof = attempt / "review-proof"
+    if prefix:
+        proof = attempt / prefix / "review-proof"
+        proof.parent.mkdir()
+        shutil.copytree(attempt / "review-proof", proof)
+    raw = [proof / (name + suffix) for name in ("full_pytest", "ruff", "mypy")
+           for suffix in (".stdout", ".stderr")]
+    protected = {p.name: p.read_bytes() for p in proof.iterdir() if p not in raw}
+    assert clean(h)["blocked"] == []
+    plan = lab.read_json(attempt / "retention-plan.json")
+    assert all(p.relative_to(attempt).as_posix() in plan["raw"] for p in raw)
+    cutoff = 100 + retention.RAW_RETENTION_SECONDS
+    assert clean(h, cutoff - 0.01)["blocked"] == []
+    assert all(p.exists() for p in raw)
+    assert clean(h, cutoff)["blocked"] == []
+    assert all(not p.exists() for p in raw)
+    assert all((proof / name).read_bytes() == value for name, value in protected.items())
 
 
 def test_cleanup_finished_requires_existing_campaign_lock(finished):

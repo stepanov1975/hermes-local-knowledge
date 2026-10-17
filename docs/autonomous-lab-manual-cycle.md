@@ -31,12 +31,73 @@ locations, not automatic import channels. Scratch checks and advisory lessons mu
 identify the source path/digest they exercised, not claim verification of another
 tree. Set `no_change=true` only when the imported workspace has no candidate edits.
 
-The review sandbox receives the exact stopped/frozen candidate read-only plus
-safe execution evidence. It has independent writable scratch state, not the
+The review sandbox receives a hash-bound, deliberately **filtered projection** of
+the stopped/frozen candidate read-only, plus safe execution evidence. It does not
+receive the complete Git tree or the full trusted-check source overlay. It has
+independent writable scratch state, not the
 implementation session's memory. Review checks benchmark shortcuts, official
 compatibility and agreement between the draft report and actual execution.
 Neither a worker's claimed test result nor the model's approval substitutes for
 controller-owned verification.
+
+## Reviewer projection and proof contract (#71)
+
+`review-evidence.json` (`lab-review-evidence/v1`) explicitly identifies the full
+candidate commit/tree separately from admitted files. `projection` contains each
+admitted and omitted path's SHA-256, Git object ID and Git mode, the positive
+`lab_agent.permitted/v1` policy and controller policy-source digest. Omitted
+members carry a policy reason; their code bytes remain excluded. The canonical
+projection digest binds this manifest. Git archive modes are exported as canonical
+0644/0755 rather than archive-dependent group-write bits. Before dispatch and after
+completed review, the controller checks the actual admitted bytes, complete file
+inventory and permission modes, and rejects source or evidence drift.
+
+The only additional bind is session-local `/inputs/review-proof`, read-only.
+It contains `checks.json`, the full-check `inputs.json` manifest and the three
+checks' named `.output.json`, `.cleanup.json`, `.stdout` and `.stderr` files.
+Each file is size/SHA-256 bound; `checks.json` also binds the per-check receipt
+hashes, commands, exact full revision, image, controller, candidate/overlay hashes
+and input-manifest hash. Raw logs are streamed to bounded controller files and
+copied intact, never inlined into the prompt. Any stdout/stderr previews inside
+output JSON are **incomplete previews**, not substitutes for the full streams.
+Trusted checks disable pytest traceback/captured-output/warning excerpts and short
+failure summaries (older pinned pytest can include assertion text there), plus
+Ruff snippets and mypy pretty excerpts. Progress/count diagnostics and exit codes
+remain, without exporting controller implementation lines. Controller-owned raw
+stream copies in `review-proof/` follow the same seven-day expiry as the originals;
+projection, hash/size, input/output/check and cleanup metadata remain protected.
+Check receipts must agree on worker ID, exit code, byte sizes and confirmed
+cleanup. Missing, changed, extra, symlinked or special proof files fail closed.
+
+Full trusted pytest/Ruff/mypy ran against full Git source **plus controller-owned
+tests/scripts/pyproject.toml**, not just this admitted projection. `inputs.json`
+provides candidate, effective overlay and tool digest maps, without those excluded
+code bytes. Runtime package digests must still match the candidate. These are
+controller-supplied receipts to challenge for content and correspondence, not an
+independent attestation or a direction to trust pass booleans.
+
+The deliberately small runnable reviewer scope is:
+
+```sh
+/opt/lab-tools/bin/python -m pytest -q -p no:cacheprovider tests/test_config.py::test_verified_routing_defaults_are_off_and_immutable
+```
+
+This tests admitted configuration-default behavior; it is not a full compatibility
+or suite claim. The declared node is exercised by an offline filtered-export
+regression; pinned-image execution is a separate integration acceptance gate.
+Other admitted tests can import omitted scripts, so full-suite collection and
+full Git-tree reconstruction are intentionally unsupported here. Reviewers should
+run that node, inspect admitted changes and actual full-check evidence, and reject
+incomplete or contradictory proof rather than approving a different tree.
+
+Neither implementation sessions nor their writable scope inherit proof mounts.
+The proof copy never mounts a campaign parent, original pilot, private case/warmup
+or held-out-label data, authentication, controller implementation source or frozen
+hidden files. Filenames/digests for omitted source and overlay are metadata only.
+A synthetic test fixture is explicitly labeled synthetic and does not establish
+production checks or real reviewer approval. Historical rejected pilot reports
+and their `approved=false` decisions remain immutable; this offline repair does
+not authorize another model call, recovery replay or promotion.
 
 ## Durable state and outcome
 

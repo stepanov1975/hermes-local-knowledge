@@ -25,6 +25,9 @@ class Harness:
         (self.repo / "hermes_local_knowledge" / "obsolete.py").write_text("OLD = 1\n")
         (self.repo / "scripts").mkdir()
         (self.repo / "scripts" / "controller.py").write_text("TRUSTED = True\n")
+        (self.repo / "tests").mkdir()
+        (self.repo / "tests/test_config.py").write_text(
+            "def test_verified_routing_defaults_are_off_and_immutable():\n    assert True  # synthetic fixture only\n")
         lab.git(self.repo, "add", ".")
         lab.git(self.repo, "commit", "-m", "synthetic incumbent")
         self.initial = lab.git(self.repo, "rev-parse", "HEAD").decode().strip()
@@ -71,10 +74,11 @@ class Harness:
 
     def export(self, repo: Path, revision: str, workspace: Path) -> None:
         workspace.mkdir(parents=True)
-        for name, (_, oid) in lab.tracked(repo, revision).items():
+        for name, (mode, oid) in lab.tracked(repo, revision).items():
             target = workspace / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(lab.git(repo, "cat-file", "blob", oid))
+            target.chmod(int(mode[3:], 8))
 
     def session(self, **kwargs: Any) -> dict:
         self.calls.append(kwargs)
@@ -95,11 +99,19 @@ class Harness:
                      "changes": ["advisory"], "checks": ["untrusted worker claim"],
                      "lessons": ["Synthetic observations only"], "no_change": not self.change}
         else:
+            from scripts import lab_agent, lab_review_evidence
             evidence = lab.read_json(kwargs["evidence"])
+            for path in workspace.rglob("*"):
+                if path.is_file() and not lab_agent.permitted(path.relative_to(workspace).as_posix()):
+                    path.unlink()
+            lab_review_evidence.validate(evidence, kwargs["evidence"].parent / "review-proof",
+                                         revision=kwargs["revision"], image=kwargs["image"])
+            lab_review_evidence.validate_projection(workspace, evidence["projection"])
             assert evidence["draft_report"]["measured_outcomes"]
             assert "private-cases" not in json.dumps(evidence)
             if self.review_mutate:
                 self.review_mutate(workspace)
+            lab_review_evidence.validate_projection(workspace, evidence["projection"])
             final = {"approved": self.review_approved, "shortcuts_checked": True,
                      "compatibility_checked": True, "report_checked": True, "findings": []}
         files = {name: hashlib.sha256(data).hexdigest()
@@ -124,9 +136,42 @@ class Harness:
         return result
 
     def checks(self, **kwargs: Any) -> dict:
-        return {"revision": kwargs["revision"], "image": kwargs["image"], "controller": lab.sha(self.identity),
-                "passed": self.checks_passed, "checks": [
-                    {"name": name, "passed": self.checks_passed} for name in ("full_pytest", "ruff", "mypy")]}
+        from scripts import lab_review_evidence as evidence
+        attempt = kwargs["attempt"]
+        attempt.mkdir(parents=True)
+        inputs_dir = attempt / "check-inputs"
+        inputs_dir.mkdir()
+        candidate = {name: hashlib.sha256(lab.git(kwargs["repo"], "cat-file", "blob", oid)).hexdigest()
+                     for name, (_, oid) in lab.tracked(kwargs["repo"], kwargs["revision"]).items()}
+        overlay = {**candidate, "scripts/synthetic_check.py": hashlib.sha256(b"synthetic overlay").hexdigest()}
+        tools = {name: hashlib.sha256(data).hexdigest()
+                 for name, data in lab.workspace_files(kwargs["check_tools"]).items()}
+        lab.durable_json(inputs_dir / "inputs.json", {"revision": kwargs["revision"],
+            "candidate": candidate, "overlay": overlay, "tools": tools,
+            "check_tools_sha256": kwargs["check_tools_sha256"]})
+        checks = []
+        for name in evidence.CHECKS:
+            code = 0 if self.checks_passed else 1
+            raw = b"Synthetic receipt fixture only; no checks executed.\n"
+            (attempt / (name + ".stdout")).write_bytes(raw)
+            (attempt / (name + ".stderr")).write_bytes(b"")
+            lab.durable_json(attempt / (name + ".output.json"), {
+                "args": ["docker", "start", "--attach", "synthetic-" + name],
+                "exit_code": code, "output_limit_exceeded": False, "error_class": None,
+                "files": {s: name + "." + s for s in ("stdout", "stderr")},
+                "stored_bytes": {"stdout": len(raw), "stderr": 0}})
+            lab.durable_json(attempt / (name + ".cleanup.json"), {
+                "container_id": "synthetic-" + name, "cleanup_complete": True})
+            checks.append({"name": name, "passed": self.checks_passed, "returncode": code,
+                           "command": ["synthetic-only", name], "evidence_files": evidence.receipt_files(attempt, name),
+                           "output_receipt": name + ".output.json", "cleanup_receipt": name + ".cleanup.json"})
+        result = {"revision": kwargs["revision"], "image": kwargs["image"], "controller": lab.sha(self.identity),
+                  "passed": self.checks_passed, "checks": checks, "cleanup_complete": True,
+                  "exact_candidate_sha256": lab.sha(candidate), "overlay_sha256": lab.sha(overlay),
+                  "inputs_manifest_sha256": lab.file_sha(inputs_dir / "inputs.json"),
+                  "check_tools_sha256": kwargs["check_tools_sha256"]}
+        lab.durable_json(attempt / "checks.json", result)
+        return result
 
     def run(self, **kwargs: Any) -> dict:
         return lab.run_experiment(self.campaign, session=self.session, evaluator=self.evaluator,
@@ -384,7 +429,7 @@ def test_rejects_unsafe_worker_files(h: Harness, kind: str) -> None:
         if kind == "forbidden":
             (work / "scripts/controller.py").write_text("TAMPER = True")
         elif kind == "new_forbidden":
-            (work / "tests").mkdir()
+            (work / "tests").mkdir(exist_ok=True)
             (work / "tests/fake.py").write_text("pass")
         elif kind == "symlink":
             path = work / "hermes_local_knowledge/rank.py"
@@ -428,7 +473,7 @@ def test_stale_evaluation_cannot_promote(h: Harness, field: str, value: str) -> 
 
 def test_reviewer_edit_invalidates_gates(h: Harness) -> None:
     h.review_mutate = lambda work: (work / "hermes_local_knowledge/rank.py").write_text("CHANGED = 1\n")
-    with pytest.raises(ValueError, match="Reviewer source changed"):
+    with pytest.raises(ValueError, match="Reviewer projection bytes/modes mismatch"):
         h.run()
     assert h.manifest()["incumbent"] == h.initial
 
@@ -609,8 +654,16 @@ def test_full_checks_keep_exact_export_separate_from_trusted_overlay(h: Harness,
         assert "--network" in args and args[args.index("--network") + 1] == "none"
         assert args.count("--mount") == 2
         assert "CI=1" in args
+        if "pytest" in args:
+            assert {"--tb=no", "--show-capture=no", "--disable-warnings"} <= set(args)
+        elif "ruff" in args:
+            assert "--output-format=concise" in args
+        else:
+            assert "--no-pretty" in args
         receipt = lab.read_json(inputs / "inputs.json")
         assert set(receipt["candidate"]) == set(lab.tracked(h.repo, h.initial))
+        for suffix in (".output.json", ".cleanup.json", ".stdout", ".stderr"):
+            kwargs["prefix"].with_suffix(suffix).write_bytes(b"synthetic isolated-check fixture")
         return subprocess.CompletedProcess(args, 0, stdout=b"synthetic control only", stderr=b"")
     monkeypatch.setattr(lab, "isolated_check", isolated)
     report = lab.full_candidate_checks(attempt=h.root / "full-checks", repo=h.repo,

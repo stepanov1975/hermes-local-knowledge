@@ -18,6 +18,7 @@ from scripts.lab_runtime import run, scoped_name
 from scripts.lab_process_output import bounded_process
 from scripts import lab_disk_guard as disk
 from scripts import lab_recovery as recovery
+from scripts import lab_review_evidence as review_evidence
 
 IMAGE = "sha256:0b9b3c213a9a3cb6845f31b44a0a2b4ce67fa716d411217f6037cf792b3775af"
 SOURCE = "90194c64ff99933ec3b9ecfd9295b06e6c11e038"
@@ -84,7 +85,7 @@ def export(attempt: Path, repo: Path, revision: str) -> Path:
                 assert stream is not None
                 with stream:
                     path.write_bytes(stream.read())
-                path.chmod(member.mode & 0o777)
+                path.chmod(0o755 if member.mode & 0o111 else 0o644)
     for child in ("home", "output", "scratch", "private", "inputs"):
         (attempt / child).mkdir(mode=0o700)
     return workspace
@@ -98,7 +99,10 @@ def mounts(attempt: Path, corpus: Path, role: str, evidence: bool) -> list[tuple
               (attempt / "inputs/development.json", "/inputs/development.json", False),
               (attempt / "inputs/history.json", "/inputs/history.json", False)]
     if evidence:
+        if role != "review":
+            raise ValueError("Proof inputs are review-only")
         values.append((attempt / "inputs/evidence.json", "/inputs/evidence.json", False))
+        values.append((attempt / "inputs/review-proof", "/inputs/review-proof", False))
     for source, _, _ in values:
         if "," in str(source.resolve()):
             raise ValueError("Invalid bind path")
@@ -220,6 +224,10 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
                 task: str, evidence: Path | None = None) -> dict[str, Any]:
     if role not in {"implementation", "review"} or image != IMAGE:
         raise ValueError("Fixed role/image required")
+    if role == "implementation" and evidence is not None:
+        raise ValueError("Proof inputs are review-only")
+    if role == "review" and evidence is None:
+        raise ValueError("Review requires explicit projection and proof evidence")
     disk.checkpoint()
     scoped_name(name + "-setup")
     attempt = attempt.absolute()
@@ -230,6 +238,9 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         raise ValueError("Official image identity mismatch")
     disk.checkpoint()
     workspace = export(attempt, repo, revision)
+    review_packet = None
+    if evidence is not None:
+        review_packet = review_evidence.prepare(evidence, attempt, workspace, repo, revision, image)
     for source, filename in ((development, "development.json"), (history, "history.json"), (evidence, "evidence.json")):
         if source is not None:
             # Inputs are caller-projected safe development/history/aggregate evidence only.
@@ -252,7 +263,11 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         "Set no_change=true only when /work/plugin has no candidate edits; otherwise set no_change=false. "
         if role == "implementation" else
         "Source /work/plugin is read-only for review; do not edit it. "
-        "Review checks shortcuts, compatibility and report/execution correspondence on this exact revision. ")
+        "Review checks shortcuts, compatibility and report/execution correspondence on the explicitly filtered projection. "
+        "Read /inputs/evidence.json and the read-only /inputs/review-proof receipts. "
+        "Challenge hashes, Git modes, omitted-member policy, overlay and raw output/cleanup content; "
+        "never blindly trust pass booleans. Run runnable_scope.command; full suite/full Git tree reconstruction "
+        "is not supported by this partial export. Reject drift, mismatches or incomplete evidence. ")
     messages: list[dict[str, Any]] = [{"role": "system", "content":
         "You are an isolated Local Knowledge plugin " + role + ". Product goal: fast relevant whole-artifact routing. "
         "Only sandbox(command) is available. All commands run offline as nonroot. Source: /work/plugin; "
@@ -364,6 +379,13 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
             if complete:
                 source_validation_attempted = True
                 source_identity = identity(workspace)
+                if review_packet is not None:
+                    review_evidence.validate_projection(workspace, review_packet["projection"])
+                    current_packet = json.loads((attempt / "inputs/evidence.json").read_text())
+                    if current_packet != review_packet:
+                        raise ValueError("Review packet drift")
+                    review_evidence.validate(current_packet, attempt / "inputs/review-proof",
+                                             revision=revision, image=image)
                 if role == "review" and source_identity != initial:
                     raise ValueError("Read-only review source changed")
                 source_valid = True
