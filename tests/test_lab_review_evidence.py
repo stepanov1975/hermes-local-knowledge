@@ -1,6 +1,8 @@
 """Offline receipt/projection regressions; synthetic checks are never production evidence."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,182 @@ import pytest
 
 from scripts import lab_agent as agent, lab_experiment as lab, lab_review_evidence as proof
 from tests.test_lab_agent import review_inputs, setup_session, spec_for
+
+
+# This verifier runs with -I from scratch, with only the visible JSON/sidecars.
+# No repository imports, Git checkout, or omitted source are available to it.
+VISIBLE_VERIFIER = r'''
+import base64
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+CONTRACT = (
+    "check-inputs snapshot: map exact-candidate/<path> to inputs.json.candidate[<path>], "
+    "tools/<path> to inputs.json.tools[<path>], and inputs.json to SHA256 of its raw sidecar bytes. "
+    "inputs_sha256 is SHA256 of UTF-8 (json.dumps(map, sort_keys=True, separators=(',', ':'), "
+    "allow_nan=False, ensure_ascii=True) + '\\n'); inputs_manifest_sha256 is only the raw inputs.json SHA256."
+)
+
+def sha(value):
+    return hashlib.sha256((json.dumps(value, sort_keys=True, separators=(',', ':'),
+        allow_nan=False, ensure_ascii=True) + '\n').encode('utf-8')).hexdigest()
+
+
+def verify(packet_path, proof_path):
+    packet = json.loads(Path(packet_path).read_bytes())
+    proof = Path(proof_path)
+    assert packet['schema'] == 'lab-review-evidence/v2'
+    binding, projection = packet['binding'], packet['projection']
+    assert sha(projection) == packet['projection_sha256']
+    assert binding['revision'] == projection['revision']
+    assert binding['tree'] == projection['tree']
+    obj = packet['commit_object']
+    assert obj['kind'] == 'commit'
+    body = base64.b64decode(obj['body_base64'], validate=True)
+    assert base64.b64encode(body).decode('ascii') == obj['body_base64']
+    assert b'\x00' not in body and b'\n\n' in body
+    headers = body.split(b'\n\n', 1)[0].split(b'\n')
+    assert re.fullmatch(rb'tree [0-9a-f]{40}', headers[0])
+    assert any(h.startswith(b'author ') for h in headers)
+    assert any(h.startswith(b'committer ') for h in headers)
+    oid = hashlib.sha1(b'commit ' + str(len(body)).encode('ascii') + b'\0' + body).hexdigest()
+    assert oid == binding['revision']
+    assert headers[0][5:].decode('ascii') == binding['tree']
+    names = {'checks.json', 'inputs.json'} | {
+        n + s for n in ('full_pytest', 'ruff', 'mypy')
+        for s in ('.output.json', '.cleanup.json', '.stdout', '.stderr')}
+    assert {p.name for p in proof.iterdir()} == names == set(packet['proof_files'])
+    for name in names:
+        path = proof / name
+        assert path.is_file() and not path.is_symlink()
+        raw = path.read_bytes()
+        assert packet['proof_files'][name] == {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+    checks = json.loads((proof / 'checks.json').read_bytes())
+    raw_inputs = (proof / 'inputs.json').read_bytes()
+    inputs = json.loads(raw_inputs)
+    assert sha(checks) == binding['checks_sha256']
+    assert checks['revision'] == inputs['revision'] == binding['revision']
+    assert checks['image'] == binding['image'] and checks['controller'] == binding['controller']
+    assert checks['inputs_manifest_sha256'] == hashlib.sha256(raw_inputs).hexdigest()
+    members = {**projection['admitted'], **projection['omitted']}
+    assert inputs['candidate'] == {n: v['sha256'] for n, v in members.items()}
+    assert checks['exact_candidate_sha256'] == sha(inputs['candidate'])
+    assert checks['overlay_sha256'] == sha(inputs['overlay'])
+    assert checks['check_tools_sha256'] == inputs['check_tools_sha256'] == sha(inputs['tools'])
+    assert packet['inputs_snapshot_contract'] == CONTRACT
+    snapshot = {'exact-candidate/' + n: h for n, h in inputs['candidate'].items()}
+    snapshot.update({'tools/' + n: h for n, h in inputs['tools'].items()})
+    snapshot['inputs.json'] = hashlib.sha256(raw_inputs).hexdigest()
+    assert checks['inputs_sha256'] == sha(snapshot)
+    print(json.dumps({'revision': oid, 'tree': binding['tree'],
+        'inputs_sha256': checks['inputs_sha256'], 'snapshot_entries': len(snapshot)}, sort_keys=True))
+
+if __name__ == '__main__':
+    verify(*sys.argv[1:])
+'''
+
+
+def visible_verify(value, directory, tmp_path):
+    packet_path = tmp_path / "visible-packet.json"
+    packet_path.write_text(json.dumps(value))
+    return subprocess.run([sys.executable, "-I", "-c", VISIBLE_VERIFIER,
+                           str(packet_path), str(directory)], cwd=tmp_path,
+                          capture_output=True, text=True)
+
+
+def refresh_links(value, directory, *, inputs=None, checks=None):
+    if inputs is not None:
+        path = directory / "inputs.json"
+        path.chmod(0o644)
+        path.write_text(json.dumps(inputs, ensure_ascii=False))
+    if checks is not None:
+        checks["inputs_manifest_sha256"] = hashlib.sha256((directory / "inputs.json").read_bytes()).hexdigest()
+        path = directory / "checks.json"
+        path.chmod(0o644)
+        path.write_text(json.dumps(checks))
+        value["binding"]["checks_sha256"] = lab.sha(checks)
+    value["projection_sha256"] = lab.sha(value["projection"])
+    value["proof_files"] = proof.inventory(directory)
+
+
+def test_visible_links_reproduce_without_controller_or_checkout(packet, tmp_path):
+    _, value, directory = packet
+    result = visible_verify(value, directory, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["revision"] == value["binding"]["revision"]
+
+
+@pytest.mark.parametrize("mutation", ["base64", "kind", "body", "tree", "revision", "malformed", "forged-tree"])
+def test_commit_link_rejects_rehashed_forgery(packet, tmp_path, mutation):
+    kwargs, value, directory = packet
+    obj = value["commit_object"]
+    body = base64.b64decode(obj["body_base64"])
+    if mutation == "base64":
+        obj["body_base64"] += "\n"
+    elif mutation == "kind":
+        obj["kind"] = "blob"
+    elif mutation == "body":
+        obj["body_base64"] = base64.b64encode(body + b"changed").decode("ascii")
+    elif mutation == "revision":
+        value["projection"]["revision"] = "0" * 40
+    elif mutation == "tree":
+        value["binding"]["tree"] = value["projection"]["tree"] = "0" * 40
+    else:
+        altered = b"not a commit" if mutation == "malformed" else body.replace(
+            body.split(b"\n", 1)[0], b"tree " + b"0" * 40, 1)
+        obj["body_base64"] = base64.b64encode(altered).decode("ascii")
+        if mutation == "forged-tree":
+            value["binding"]["tree"] = value["projection"]["tree"] = "0" * 40
+    refresh_links(value, directory)
+    with pytest.raises(ValueError):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    assert visible_verify(value, directory, tmp_path).returncode != 0
+
+
+@pytest.mark.parametrize("mutation", ["digest", "preimage", "descriptor"])
+def test_snapshot_link_rejects_rehashed_forgery(packet, tmp_path, mutation):
+    kwargs, value, directory = packet
+    checks = lab.read_json(directory / "checks.json")
+    inputs = lab.read_json(directory / "inputs.json")
+    if mutation == "digest":
+        checks["inputs_sha256"] = "0" * 64
+    elif mutation == "preimage":
+        inputs["tools"]["changed-tool"] = hashlib.sha256(b"changed").hexdigest()
+        checks["check_tools_sha256"] = inputs["check_tools_sha256"] = lab.sha(inputs["tools"])
+    else:
+        value["inputs_snapshot_contract"] = "hash inputs.json instead"
+    refresh_links(value, directory, inputs=inputs, checks=checks)
+    with pytest.raises(ValueError, match="snapshot"):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    assert visible_verify(value, directory, tmp_path).returncode != 0
+
+
+def test_snapshot_unicode_uses_ascii_escaped_canonical_json(packet, tmp_path):
+    kwargs, value, directory = packet
+    checks = lab.read_json(directory / "checks.json")
+    inputs = lab.read_json(directory / "inputs.json")
+    inputs["tools"]["bin/é-工具"] = hashlib.sha256(b"synthetic Unicode tool").hexdigest()
+    checks["check_tools_sha256"] = inputs["check_tools_sha256"] = lab.sha(inputs["tools"])
+    refresh_links(value, directory, inputs=inputs, checks=checks)
+    snapshot = {"exact-candidate/" + n: h for n, h in inputs["candidate"].items()}
+    snapshot.update({"tools/" + n: h for n, h in inputs["tools"].items()})
+    snapshot["inputs.json"] = hashlib.sha256((directory / "inputs.json").read_bytes()).hexdigest()
+    raw = (json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                      ensure_ascii=True) + "\n").encode("utf-8")
+    checks["inputs_sha256"] = hashlib.sha256(raw).hexdigest()
+    refresh_links(value, directory, checks=checks)
+    proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    result = visible_verify(value, directory, tmp_path)
+    assert result.returncode == 0, result.stderr
+    checks["inputs_sha256"] = hashlib.sha256((json.dumps(snapshot, sort_keys=True,
+        separators=(",", ":"), allow_nan=False, ensure_ascii=False) + "\n").encode()).hexdigest()
+    refresh_links(value, directory, checks=checks)
+    with pytest.raises(ValueError, match="snapshot"):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    assert visible_verify(value, directory, tmp_path).returncode != 0
 
 
 @pytest.fixture
@@ -117,6 +295,9 @@ def test_proof_narrow_regular_inventory(packet, kind):
 
 def test_old_unexplained_packet_and_implementation_proof_refused(packet):
     kwargs, value, directory = packet
+    old = {**value, "schema": "lab-review-evidence/v1"}
+    with pytest.raises(ValueError, match="schema"):
+        proof.validate(old, directory, revision=kwargs["revision"], image=agent.IMAGE)
     with pytest.raises((ValueError, KeyError)):
         proof.validate({"binding": value["binding"], "draft_report": {}}, directory,
                        revision=kwargs["revision"], image=agent.IMAGE)

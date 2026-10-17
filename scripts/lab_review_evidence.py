@@ -1,8 +1,11 @@
 """Narrow reviewer projection and full-check receipt packet (no private case data)."""
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 from pathlib import Path
+import re
 import shutil
 import stat
 from typing import Any
@@ -14,6 +17,34 @@ CHECKS = ("full_pytest", "ruff", "mypy")
 PROOF_FILES = {"checks.json", "inputs.json"} | {
     name + suffix for name in CHECKS
     for suffix in (".output.json", ".cleanup.json", ".stdout", ".stderr")}
+
+
+INPUTS_SNAPSHOT_CONTRACT = (
+    "check-inputs snapshot: map exact-candidate/<path> to inputs.json.candidate[<path>], "
+    "tools/<path> to inputs.json.tools[<path>], and inputs.json to SHA256 of its raw sidecar bytes. "
+    "inputs_sha256 is SHA256 of UTF-8 (json.dumps(map, sort_keys=True, separators=(',', ':'), "
+    "allow_nan=False, ensure_ascii=True) + '\\n'); inputs_manifest_sha256 is only the raw inputs.json SHA256."
+)
+
+
+def validate_commit_object(value: dict, revision: str, tree: str) -> None:
+    from scripts.lab_evaluator import require
+    require(value.get("kind") == "commit", "Commit object kind mismatch")
+    encoded = value.get("body_base64")
+    if not isinstance(encoded, str):
+        raise ValueError("Malformed commit object encoding")
+    try:
+        body = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Malformed commit object encoding") from exc
+    require(base64.b64encode(body).decode("ascii") == encoded, "Noncanonical commit object encoding")
+    headers = body.split(b"\n\n", 1)[0].split(b"\n")
+    require(b"\0" not in body and b"\n\n" in body
+            and bool(re.fullmatch(rb"tree [0-9a-f]{40}", headers[0]))
+            and any(h.startswith(b"author ") for h in headers)
+            and any(h.startswith(b"committer ") for h in headers), "Malformed commit object body")
+    oid = hashlib.sha1(b"commit " + str(len(body)).encode("ascii") + b"\0" + body).hexdigest()
+    require(oid == revision and headers[0][5:].decode("ascii") == tree, "Commit object revision/tree mismatch")
 
 
 def digest(data: bytes) -> str:
@@ -82,12 +113,13 @@ def inventory(root: Path) -> dict:
 
 def validate(packet: dict, proof: Path, *, revision: str, image: str) -> None:
     from scripts import lab_experiment as lab
-    lab.require(packet.get("schema") == "lab-review-evidence/v1", "Review evidence schema mismatch")
+    lab.require(packet.get("schema") == "lab-review-evidence/v2", "Review evidence schema mismatch")
     binding = packet["binding"]
     manifest = packet["projection"]
     lab.require(binding["revision"] == manifest["revision"] == revision
                 and binding["tree"] == manifest["tree"] and binding["image"] == image,
                 "Review evidence identity mismatch")
+    validate_commit_object(packet["commit_object"], revision, binding["tree"])
     lab.require(lab.sha(manifest) == packet["projection_sha256"], "Projection manifest mismatch")
     lab.require(inventory(proof) == packet["proof_files"], "Review proof hash/size mismatch")
     checks = lab.read_json(proof / "checks.json")
@@ -104,7 +136,13 @@ def validate(packet: dict, proof: Path, *, revision: str, image: str) -> None:
                 "Check-tool identity mismatch")
     lab.require(all(inputs["overlay"].get(n) == v["sha256"] for n, v in all_members.items()
                     if n.startswith("hermes_local_knowledge/")), "Overlay changed candidate runtime bytes")
-    # These snapshot hashes use the controller's sorted path/digest map contract.
+    lab.require(packet.get("inputs_snapshot_contract") == INPUTS_SNAPSHOT_CONTRACT,
+                "Input snapshot contract mismatch")
+    snapshot = {"exact-candidate/" + n: h for n, h in inputs["candidate"].items()}
+    snapshot.update({"tools/" + n: h for n, h in inputs["tools"].items()})
+    snapshot["inputs.json"] = lab.file_sha(proof / "inputs.json")
+    lab.require(checks["inputs_sha256"] == lab.sha(snapshot), "Input snapshot digest mismatch")
+    # Candidate and overlay map digests are distinct from the composite input snapshot.
     lab.require(checks["exact_candidate_sha256"] == lab.sha(inputs["candidate"])
                 and checks["overlay_sha256"] == lab.sha(inputs["overlay"]), "Check-input digest mismatch")
     lab.require({c["name"] for c in checks["checks"]} == set(CHECKS)
@@ -143,11 +181,16 @@ def build(*, repo: Path, revision: str, binding: dict, report: dict, checks_root
         shutil.copyfile(regular(source, name), proof / name)
         (proof / name).chmod(0o444)
     manifest = projection(repo, revision)
-    packet = {"schema": "lab-review-evidence/v1", "binding": binding, "draft_report": report,
+    packet = {"schema": "lab-review-evidence/v2", "binding": binding, "draft_report": report,
+              "commit_object": {"kind": "commit", "body_base64": base64.b64encode(
+                  lab.git(repo, "cat-file", "commit", revision)).decode("ascii")},
+              "inputs_snapshot_contract": INPUTS_SNAPSHOT_CONTRACT,
               "projection": manifest, "projection_sha256": lab.sha(manifest), "proof_files": inventory(proof),
               "proof_directory": "/inputs/review-proof",
               "trusted_full_checks": "Full Git source plus trusted tests/scripts/pyproject overlay; inputs.json binds both maps. "
-                  "Not reproducible from this partial projection. Overlay code and hidden/controller files remain excluded. "
+                  "commit_object contains strict base64 raw commit body: SHA1(b'commit ' + str(len(body)).encode('ascii') + "
+                  "b'\\0' + body) must equal revision, and its first tree header must equal the bound tree. "
+                  "Full trusted checks are not reproducible from this partial projection. Overlay code and hidden/controller files remain excluded. "
                   "Receipts are controller-supplied evidence, not independent attestation. Challenge contents and correspondence. "
                   "Output JSON stdout/stderr fields are incomplete previews; complete bounded raw streams are sidecars.",
               "runnable_scope": {"command": COMMAND, "scope": "One admitted config default test, not the full suite.",

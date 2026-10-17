@@ -169,6 +169,10 @@ class Harness:
                   "passed": self.checks_passed, "checks": checks, "cleanup_complete": True,
                   "exact_candidate_sha256": lab.sha(candidate), "overlay_sha256": lab.sha(overlay),
                   "inputs_manifest_sha256": lab.file_sha(inputs_dir / "inputs.json"),
+                  "inputs_sha256": lab.sha({
+                      **{"exact-candidate/" + n: h for n, h in candidate.items()},
+                      **{"tools/" + n: h for n, h in tools.items()},
+                      "inputs.json": lab.file_sha(inputs_dir / "inputs.json")}),
                   "check_tools_sha256": kwargs["check_tools_sha256"]}
         lab.durable_json(attempt / "checks.json", result)
         return result

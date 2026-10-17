@@ -42,7 +42,7 @@ controller-owned verification.
 
 ## Reviewer projection and proof contract (#71)
 
-`review-evidence.json` (`lab-review-evidence/v1`) explicitly identifies the full
+`review-evidence.json` (`lab-review-evidence/v2`) explicitly identifies the full
 candidate commit/tree separately from admitted files. `projection` contains each
 admitted and omitted path's SHA-256, Git object ID and Git mode, the positive
 `lab_agent.permitted/v1` policy and controller policy-source digest. Omitted
@@ -51,6 +51,13 @@ projection digest binds this manifest. Git archive modes are exported as canonic
 0644/0755 rather than archive-dependent group-write bits. Before dispatch and after
 completed review, the controller checks the actual admitted bytes, complete file
 inventory and permission modes, and rejects source or evidence drift.
+
+`commit_object.kind` is `commit`; strict base64 decoding of `body_base64` yields
+the actual raw Git commit body. Reproduce the revision with
+`sha1(b'commit ' + str(len(body)).encode('ascii') + b'\0' + body).hexdigest()`;
+its first `tree <40-lowercase-hex>` header must equal the bound tree. The controller
+validates both links. No checkout, omitted code or extra sidecar is needed.
+Unexplained v1 packets are rejected, not migrated or rewritten.
 
 The only additional bind is session-local `/inputs/review-proof`, read-only.
 It contains `checks.json`, the full-check `inputs.json` manifest and the three
@@ -68,6 +75,17 @@ stream copies in `review-proof/` follow the same seven-day expiry as the origina
 projection, hash/size, input/output/check and cleanup metadata remain protected.
 Check receipts must agree on worker ID, exit code, byte sizes and confirmed
 cleanup. Missing, changed, extra, symlinked or special proof files fail closed.
+
+`inputs_snapshot_contract` specifies the fixed preimage of `checks.inputs_sha256`:
+combine `{'exact-candidate/'+p: h for p,h in inputs.candidate.items()}` and
+`{'tools/'+p: h for p,h in inputs.tools.items()}`, then add
+`{'inputs.json': sha256(raw_inputs_sidecar_bytes).hexdigest()}`. Hash the UTF-8
+encoding of `json.dumps(map, sort_keys=True, separators=(',', ':'), allow_nan=False,
+ensure_ascii=True) + '\n'` with SHA-256 (including ASCII escaping for Unicode).
+The controller reconstructs and validates this snapshot digest, separately from
+`inputs_manifest_sha256`, which hashes only the raw `inputs.json` file. Overlay
+metadata is in that manifest; it is not an additional snapshot directory. The
+descriptor is a fixed contract, not an executable hashing language.
 
 Full trusted pytest/Ruff/mypy ran against full Git source **plus controller-owned
 tests/scripts/pyproject.toml**, not just this admitted projection. `inputs.json`
