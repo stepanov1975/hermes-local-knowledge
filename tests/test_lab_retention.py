@@ -286,6 +286,126 @@ def test_hardlink_plan_drift_blocks_before_further_deletion(finished, monkeypatc
     assert (attempt / "retention-plan.json").read_bytes() == plan
 
 
+@pytest.fixture
+def readonly_disposable(finished):
+    h, attempt = finished
+    home = attempt / "implementation/home"
+    knowledge = home / "knowledge"
+    okfs = knowledge / "okfs"
+    okfs.mkdir(parents=True)
+    leaf = okfs / "frozen.md"
+    leaf.write_bytes(b"frozen disposable bytes")
+    leaf.chmod(0o444)
+    directories = [home, knowledge, okfs]
+    for path in directories:
+        path.chmod(0o555)
+    try:
+        # Exercise the real normal-user permission failure, not a mocked unlink.
+        with pytest.raises(PermissionError):
+            leaf.unlink()
+        yield h, attempt, directories, leaf
+    finally:
+        for path in directories:
+            if path.exists():
+                path.chmod(0o755)
+
+
+@pytest.mark.parametrize("target_kind", ["outside", "protected"])
+def test_readonly_disposable_directories_preserve_shared_file_inode(
+        readonly_disposable, tmp_path, target_kind):
+    h, attempt, directories, leaf = readonly_disposable
+    target = tmp_path / "outside-keep" if target_kind == "outside" else attempt / "protected-keep"
+    target.hardlink_to(leaf)
+    before = target.stat()
+    protected_directory = attempt / "implementation/private"
+    protected_directory.chmod(0o555)
+    try:
+        assert clean(h)["blocked"] == []
+        assert all(not path.exists() for path in directories)
+        after = target.stat()
+        assert (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid) == (
+            before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid)
+        assert target.read_bytes() == b"frozen disposable bytes"
+        assert after.st_nlink == 1
+        assert protected_directory.stat().st_mode & 0o777 == 0o555
+    finally:
+        protected_directory.chmod(0o755)
+
+
+def test_readonly_disposal_restart_after_chmod_before_unlink(readonly_disposable, monkeypatch):
+    h, attempt, directories, leaf = readonly_disposable
+    original = os.fchmod
+    changed = []
+
+    def interrupt(fd, mode):
+        original(fd, mode)
+        changed.append(os.fstat(fd).st_ino)
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fchmod", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            clean(h)
+    assert len(changed) == 1
+    assert any(path.stat().st_mode & 0o200 for path in directories)
+    assert leaf.exists()
+    plan = (attempt / "retention-plan.json").read_bytes()
+    assert clean(h, 200)["blocked"] == []
+    assert (attempt / "retention-plan.json").read_bytes() == plan
+    assert not directories[0].exists()
+
+
+@pytest.mark.parametrize("drift", ["content", "inode", "new_child", "symlink"])
+def test_readonly_disposal_drift_blocks_before_chmod(readonly_disposable, monkeypatch, drift):
+    h, attempt, directories, leaf = readonly_disposable
+    with monkeypatch.context() as patch:
+        patch.setattr(retention, "_dispose", lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            clean(h)
+    plan = (attempt / "retention-plan.json").read_bytes()
+    if drift == "content":
+        leaf.chmod(0o644)
+        leaf.write_bytes(b"drifted")
+    else:
+        leaf.parent.chmod(0o755)
+        if drift == "inode":
+            leaf.rename(leaf.with_name("original"))
+            leaf.write_bytes(b"frozen disposable bytes")
+            leaf.with_name("original").unlink()
+        elif drift == "symlink":
+            leaf.unlink()
+            leaf.symlink_to(attempt / "report.json")
+        else:
+            (leaf.parent / "new-child").write_bytes(b"unplanned")
+        leaf.parent.chmod(0o555)
+    outcome = clean(h, 200)
+    assert outcome["blocked"]
+    assert all(path.stat().st_mode & 0o777 == 0o555 for path in directories)
+    assert leaf.exists()
+    assert (attempt / "candidate.index").exists()
+    assert (attempt / "retention-plan.json").read_bytes() == plan
+
+
+def test_readonly_directory_foreign_owner_blocks_permission_change(readonly_disposable, monkeypatch):
+    _, attempt, directories, leaf = readonly_disposable
+    entries = retention._inventory(attempt, ["implementation/home"])
+    # Model a directory not owned by the current cleanup identity without chown.
+    monkeypatch.setattr(os, "geteuid", lambda: -1)
+    with pytest.raises(retention.RetentionBlocked, match="directory_owner_mismatch"):
+        retention._dispose(attempt, entries)
+    assert leaf.exists()
+    assert all(path.stat().st_mode & 0o777 == 0o555 for path in directories)
+
+
+@pytest.mark.parametrize("state", ["running", "unknown", "foreign"])
+def test_readonly_live_resources_block_before_permission_change(readonly_disposable, monkeypatch, state):
+    h, _, directories, leaf = readonly_disposable
+    monkeypatch.setattr(retention.recovery, "inspect_resources", lambda _: [{"state": state}])
+    assert clean(h)["blocked"]
+    assert leaf.exists()
+    assert all(path.stat().st_mode & 0o777 == 0o555 for path in directories)
+
+
 def test_missing_response_retains_pairs_and_workspace(finished):
     h, attempt = finished
     (attempt / "implementation/private/response-1.json").unlink()

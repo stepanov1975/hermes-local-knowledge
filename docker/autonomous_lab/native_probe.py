@@ -66,7 +66,9 @@ def main() -> None:
         for ip in ips:
             try:
                 with socket.create_connection((ip, 443), timeout=8) as sock:
-                    with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
+                    context = ssl.create_default_context()
+                    context.minimum_version = ssl.TLSVersion.TLSv1_2
+                    with context.wrap_socket(sock, server_hostname=host) as tls:
                         tls.settimeout(8)
                         tls.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
                         line = tls.recv(1024).split(b"\r\n", 1)[0].decode("ascii", "replace")

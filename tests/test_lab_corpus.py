@@ -52,6 +52,66 @@ def test_scrub_does_not_treat_a_mixed_environment_value_as_only_a_reference():
     assert "${TEST_PASSWORD}" in pure
 
 
+@pytest.mark.parametrize("value,accepted", [
+    ("$DEMO_TOKEN", True), ("${DEMO_TOKEN}", True), ("$_", True),
+    ("$A0", True), ("${A0", True), ("$A0}", True),
+    ("os.getenv", True), ("os.environ", True), ("process.env", True),
+    ("", False), ("$", False), ("${}", False), ("$0A", False),
+    ("$demo", False), ("${Demo}", False), ("${A}}", False),
+    ("$A\n", False), (" $A", False), ("$A ", False),
+    ("prefix${DEMO_TOKEN}", False), ("${DEMO_TOKEN}suffix", False),
+    ("${DEMO_TOKEN:-fallback}", False), ("${DEMO_TOKEN}${OTHER}", False),
+    ("os.getenv()", False), ("os.environ.get", False), ("getenv", False),
+    ("process.env.DEMO_TOKEN", False), ("OS.getenv", False),
+])
+def test_environment_reference_classifier_preserves_complete_reference_grammar(value, accepted):
+    from scripts.lab_corpus import _is_environment_reference
+
+    # Unpaired braces are an existing policy edge, not new shell validation.
+    assert _is_environment_reference(value) is accepted
+
+
+@pytest.mark.parametrize("value", ["$DEMO_TOKEN", "${DEMO_TOKEN}", "os.getenv", "os.environ", "process.env"])
+@pytest.mark.parametrize("template,suffix", [
+    ('password = "{}"\n', ""),
+    ('command --password "{}"\n', ""),
+    ('password = "{}"\n', ".py"),
+])
+def test_scrub_preserves_only_complete_reference_values(value, template, suffix):
+    import ast
+
+    raw = template.format(value)
+    safe, _ = scrub_content(raw, suffix=suffix)
+    assert safe == raw
+    if suffix == ".py":
+        assert ast.dump(ast.parse(safe)) == ast.dump(ast.parse(raw))
+
+
+@pytest.mark.parametrize("value", ["$DEMO_TOKEN", "os.getenv", "os.environ", "process.env"])
+def test_scrub_preserves_bare_complete_reference_values(value):
+    raw = f"password = {value}\n"
+    assert scrub_content(raw)[0] == raw
+
+
+@pytest.mark.parametrize("value", [
+    "prefix${DEMO_TOKEN}", "${DEMO_TOKEN}suffix", "${DEMO_TOKEN:-fallback}",
+    "${DEMO_TOKEN}${OTHER}", "os.getenv()", "os.environ.get", "process.env.DEMO_TOKEN",
+])
+@pytest.mark.parametrize("template,suffix", [
+    ('password = "{}"\n', ""),
+    ('command --password "{}"\n', ""),
+    ('password = "{}"\n', ".py"),
+])
+def test_scrub_removes_near_reference_credential_values(value, template, suffix):
+    import ast
+
+    safe, _ = scrub_content(template.format(value), suffix=suffix)
+    assert value not in safe
+    assert "LK_REDACTED" in safe
+    if suffix == ".py":
+        ast.parse(safe)
+
+
 def test_freeze_is_snapshot_not_continuing_live_review(tmp_path):
     source, scanner, state, settings = scanner_layout(tmp_path)
     (source / "scripts/demo.py").write_text('TOKEN = "private-literal"\nprint("route")')

@@ -182,6 +182,26 @@ def _validate_remaining(attempt: Path, entries: dict[str, dict]) -> None:
 
 def _dispose(attempt: Path, entries: dict[str, dict]) -> None:
     _validate_remaining(attempt, entries)
+    # Frozen corpus exports retain 0555 directories. Grant only owner-write on
+    # verified disposable directories, never chmod files (which may be hardlinked
+    # to protected data). Directory plan identity excludes mode, so an interruption
+    # after this authorized chmod resumes against the same immutable plan.
+    for name, row in entries.items():
+        path = attempt / name
+        if row["kind"] != "directory" or not path.exists():
+            continue
+        _plain(path)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            _require((info.st_dev, info.st_ino) == (row["device"], row["inode"]),
+                     "planned_path_drift")
+            if not info.st_mode & stat.S_IWUSR:
+                _require(info.st_uid == os.geteuid(), "directory_owner_mismatch")
+                os.fchmod(fd, stat.S_IMODE(info.st_mode) | stat.S_IWUSR)
+                os.fsync(fd)
+        finally:
+            os.close(fd)
     for name in sorted(entries, key=lambda n: (n.count("/"), n), reverse=True):
         path = attempt / name
         _plain(path.parent, missing=True)

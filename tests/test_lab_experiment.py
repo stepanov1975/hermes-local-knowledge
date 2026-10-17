@@ -12,6 +12,7 @@ import uuid
 import pytest
 
 from scripts import lab_experiment as lab
+from scripts.lab_agent import IMAGE
 
 
 class Harness:
@@ -37,7 +38,7 @@ class Harness:
         for name in ("frozen", "development", "policy"):
             (tmp_path / name).write_text("{}")
         self.config = {"schema": lab.SCHEMA, "repo": str(self.repo), "initial_incumbent": self.initial,
-                       "image": "sha256:" + "a" * 64, "composite_id": "synthetic-benchmark"}
+                       "image": IMAGE, "composite_id": "synthetic-benchmark"}
         for key in lab.INPUT_KEYS:
             if key in lab.PATH_KEYS:
                 self.config[key] = str(tmp_path / key)
@@ -207,7 +208,7 @@ def test_disk_preflight_before_attempt_or_dispatch(h, monkeypatch, available, ex
             h.run()
         assert h.calls == [] and h.evaluations == []
         assert list((h.campaign / "attempts").iterdir()) == []
-        assert h.manifest() == {**original, "paused": True}
+        assert h.manifest() == {**original, "paused": True, "pause_source": "disk"}
         alert = lab.read_json(h.campaign / "disk-alert.json")
         assert alert["available_blocks"] == available and alert["usable_blocks"] == 100
         assert alert["kind"] == "lab_disk_paused" and "Free space" in alert["action"]
@@ -713,9 +714,10 @@ def test_failed_session_cleanup_receipt_controls_pending_and_preserves_usage(h: 
     assert manifest["incumbent"] == h.initial
 
 
-@pytest.mark.parametrize("infinite", [False, True])
+@pytest.mark.parametrize("infinite,stopped_exit,attach_exit", [(False, 0, 0), (False, 1, 0),
+                                                           (False, 0, 7), (True, 0, 0)])
 def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: pytest.MonkeyPatch,
-                                                     infinite: bool) -> None:
+                                                     infinite: bool, stopped_exit: int, attach_exit: int) -> None:
     """Real full-check caller and pipes, mocked daemon only; no candidate host execution."""
     import os
     import sys
@@ -728,7 +730,7 @@ def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: p
     ceiling = 1024 * 1024 + 5
     monkeypatch.setattr(output, "COMMAND_OUTPUT_BYTES", ceiling)
     code = ("import os\nwhile True: os.write(1,b'x'*8192); os.write(2,b'e'*8192)" if infinite else
-            "import os; os.write(1,b'x'*1048576); os.write(2,b'error')")
+            f"import os; os.write(1,b'x'*1048576); os.write(2,b'error'); raise SystemExit({attach_exit})")
 
     def daemon(args: list[str], **kwargs: Any) -> str:
         if args[0] != "docker":
@@ -753,7 +755,7 @@ def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: p
                 "Mounts": [{"Type": "bind", "Source": mount.split("src=", 1)[1].split(",")[0],
                             "Destination": mount.split("dst=", 1)[1].split(",")[0], "RW": False}
                            for i, a in enumerate(args) if a == "--mount" for mount in [args[i + 1]]],
-                "State": {"Running": False, "ExitCode": 0}}
+                "State": {"Running": False, "ExitCode": stopped_exit}}
             return cid
         if args[:2] == ["docker", "inspect"]:
             return json.dumps([specs[args[-1]]])
@@ -789,7 +791,7 @@ def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: p
         tracemalloc.stop()
     assert peak < 2 * 1024 * 1024
     assert len(attached) == 3 and all(child.poll() is not None for child in children)
-    assert report["passed"] is not infinite and report["cleanup_complete"]
+    assert report["passed"] == (not infinite and stopped_exit == attach_exit == 0) and report["cleanup_complete"]
     assert lab.read_json(attempt / "checks.json") == report
     for check, args in zip(report["checks"], attached):
         receipt = lab.read_json(attempt / check["output_receipt"])
@@ -804,6 +806,21 @@ def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: p
         assert lab.read_json(attempt / check["cleanup_receipt"])["cleanup_complete"]
         assert ["docker", "rm", "--force", "--volumes", args[-1]] in calls
         assert (["docker", "kill", args[-1]] in calls) is infinite
+
+    if not infinite:
+        from scripts import lab_review_evidence as evidence
+        for check in report["checks"]:
+            receipt = lab.read_json(attempt / check["output_receipt"])
+            assert receipt["exit_code"] == check["returncode"] == (attach_exit or stopped_exit)
+            assert receipt["process_exit_code"] == attach_exit
+            assert receipt["container_exit_code"] == stopped_exit
+            assert receipt["exit_code_source"] == ("attach_process" if attach_exit else "stopped_container")
+        binding = {"revision": h.initial, "image": h.config["image"],
+                   "tree": lab.git(h.repo, "rev-parse", h.initial + "^{tree}").decode().strip(),
+                   "controller": lab.sha(h.identity), "checks_sha256": lab.sha(report)}
+        packet = evidence.build(repo=h.repo, revision=h.initial, binding=binding, report={},
+                                checks_root=attempt, proof=h.root / "stream-proof")
+        evidence.validate(packet, h.root / "stream-proof", revision=h.initial, image=h.config["image"])
 
 
 def test_process_output_helper_is_controller_identity_input() -> None:

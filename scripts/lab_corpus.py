@@ -270,7 +270,8 @@ def write_private_report(path: Path, report: Mapping[str, Any]) -> None:
 POLICY = "lk-corpus-structural-scrub-v2"
 MARKER = "LK_REDACTED"
 _SECRET = re.compile(r"(?i)(?:password|passwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|cookie)")
-_ENV = re.compile(r"\$\{?[A-Z_][A-Z0-9_]*\}?|(?:os\.(?:getenv|environ)|process\.env)")
+_SHELL_ENV_REFERENCE = re.compile(r"\$\{?[A-Z_][A-Z0-9_]*\}?")
+_ENV_API_REFERENCES = frozenset({"os.getenv", "os.environ", "process.env"})
 _ASSIGN = re.compile(r"(?i)((?:[\w.-]*(?:password|passwd|secret|token|api[_-]?key|authorization|credential|cookie)[\w.-]*)[\"']?\s*(?:=|:)\s*)([\"'])(.*?)(\2)")
 _BARE = re.compile(r"(?i)((?:[\w.-]*(?:password|passwd|secret|token|api[_-]?key|authorization|credential|cookie)[\w.-]*)\s*(?:=|:)\s*)([^\s,;\]}\"'&<>`()]+)")
 _OPTION = re.compile(r"(?i)(--[\w-]*(?:password|passwd|secret|token|api[_-]?key|credential)[\w-]*\s+)(?:([\"'])(.*?)(\2)|([^\s,;\]}\"'`]+))")
@@ -300,6 +301,11 @@ def _entropy(value: str) -> float:
     return -sum((n / len(value)) * math.log2(n / len(value)) for n in Counter(value).values())
 
 
+def _is_environment_reference(value: str) -> bool:
+    """Classify a complete reference, never evaluate an API or expand a value."""
+    return value in _ENV_API_REFERENCES or _SHELL_ENV_REFERENCE.fullmatch(value) is not None
+
+
 def _scrub_text(text: str, counts: Counter) -> str:
     text = text.replace("<redacted>", MARKER)
     def substitute(pattern: re.Pattern, callback: Callable) -> None:
@@ -314,12 +320,12 @@ def _scrub_text(text: str, counts: Counter) -> str:
     substitute(_URL, lambda m: _sanitize_mcp_url(m.group()).replace("<redacted>", MARKER))
     substitute(_HEADER, lambda m: m[1] + MARKER if MARKER not in m[2] else m.group())
     substitute(_ASSIGN, lambda m: m[1] + m[2] + MARKER + m[4]
-               if MARKER not in m[3] and not _ENV.fullmatch(m[3]) else m.group())
+               if MARKER not in m[3] and not _is_environment_reference(m[3]) else m.group())
     substitute(_BARE, lambda m: m[1] + MARKER
-               if MARKER not in m[2] and not _ENV.fullmatch(m[2])
+               if MARKER not in m[2] and not _is_environment_reference(m[2])
                and m[2] not in ('"', "'", '[', '{') else m.group())
     substitute(_OPTION, lambda m: m[1] + (m[2] or "") + MARKER + (m[2] or "")
-               if MARKER not in (m[3] or m[5] or "") and not _ENV.fullmatch(m[3] or m[5] or "") else m.group())
+               if MARKER not in (m[3] or m[5] or "") and not _is_environment_reference(m[3] or m[5] or "") else m.group())
     substitute(_KNOWN, lambda m: MARKER)
     # Noncredential hashes and identifiers are contextual evidence, not an
     # automatic exemption: explicit credential contexts were removed above.
@@ -366,7 +372,7 @@ def scrub_content(text: str, *, suffix: str = "") -> tuple[str, dict[str, Any]]:
                     if keyword.arg != "key":
                         mark(keyword.value)
                 return
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and _ENV.fullmatch(node.value):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and _is_environment_reference(node.value):
                 counts["reviewed-environment-reference"] += 1
                 return
             if not any(isinstance(part, (ast.Constant, ast.JoinedStr)) for part in ast.walk(node)):

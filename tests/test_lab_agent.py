@@ -341,15 +341,22 @@ def test_unknown_tool_refused_before_any_exec(tmp_path: Path, monkeypatch: pytes
         agent.run_session(**kwargs)
 
 
-def test_final_schema_and_source_symlinks(tmp_path: Path) -> None:
+def test_final_schema_and_source_symlinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     agent.validate_final(FINAL, "implementation")
     with pytest.raises(model.ModelPaused):
         agent.validate_final({**FINAL, "no_change": "true"}, "implementation")
     with pytest.raises(model.ModelPaused):
         agent.validate_final({"approved": True}, "review")
-    (tmp_path / "README.md").symlink_to("/etc/passwd")
+    source = tmp_path / "source"
+    source.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("owned fixture outside the source boundary")
+    assert outside.is_file() and not outside.is_symlink()
+    (source / "README.md").symlink_to(outside)
+    assert (source / "README.md").resolve(strict=True) == outside
+    monkeypatch.setattr(Path, "read_bytes", lambda self: pytest.fail("symlink target must not be read"))
     with pytest.raises(ValueError, match="symlink"):
-        agent.identity(tmp_path)
+        agent.identity(source)
 
 
 def test_cleanup_exact_identity_and_absence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -461,7 +468,7 @@ def test_official_adapter_fake_http_preserves_usage_and_pauses_safely(
         if failure == "ambiguous":
             raise httpx.ReadError("SYNTHETIC_SECRET_MUST_NOT_ESCAPE: accepted then lost response")
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=SyntheticStream())
-    client = openai.OpenAI(api_key="synthetic-not-a-credential", base_url=model.ENDPOINT.rsplit("/", 1)[0],
+    client = openai.OpenAI(api_key="mock", base_url=model.ENDPOINT.rsplit("/", 1)[0],
                            max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
     wrapper = auxiliary.CodexAuxiliaryClient(client, model.MODEL)
     from scripts import lab_disk_guard as disk

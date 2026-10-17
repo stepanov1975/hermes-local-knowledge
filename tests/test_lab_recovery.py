@@ -333,8 +333,8 @@ def test_disk_pause_during_recovery_cannot_be_relabelled_or_cleared(h, monkeypat
     monkeypatch.setattr(recovery, "settle_resources", settle)
     with pytest.raises(disk.LabDiskPaused):
         h.run()
-    assert h.manifest()["paused"] and h.manifest().get("pause_source") != "recovery"
-    with pytest.raises(ValueError, match="paused or pending"):
+    assert h.manifest()["paused"] and h.manifest()["pause_source"] == "disk"
+    with pytest.raises(disk.LabDiskPaused):
         h.run(recover_only=True)
     assert h.manifest()["pending"] == attempt.name and len(h.calls) == calls
     assert h.manifest()["reports"] == []

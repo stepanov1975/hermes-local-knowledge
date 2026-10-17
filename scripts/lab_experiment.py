@@ -244,8 +244,18 @@ def isolated_check(args: list[str], *, name: str, image: str, work: Path,
             disk.checkpoint()
         stopped = json.loads(run(["docker", "inspect", container_id]))[0]
         require(stopped["State"]["Running"] is False, "Full-check worker did not stop")
-        if result.returncode == 0:
+        process_exit = result.returncode
+        if process_exit == 0:
             result.returncode = stopped["State"]["ExitCode"]
+        # This is a check-level receipt: distinguish the effective worker result
+        # from the attach CLI's raw process status, retaining both provenance facts.
+        output_path = prefix.with_suffix(".output.json")
+        output = read_json(output_path)
+        require(output["exit_code"] == process_exit, "Attach process receipt mismatch")
+        durable_json(output_path, {**output, "process_exit_code": process_exit,
+                     "container_exit_code": stopped["State"]["ExitCode"],
+                     "exit_code": result.returncode,
+                     "exit_code_source": "stopped_container" if process_exit == 0 else "attach_process"}, replace=True)
         return result
     finally:
         try:
@@ -355,7 +365,9 @@ def unknown_target_clearance(campaign: Path, binding: dict) -> bool:
 def validate_config(config: dict, loader: Callable[..., dict] = load_benchmark) -> dict:
     require(config.get("schema") == SCHEMA, "Unsupported campaign")
     require(config.get("initial_incumbent") == INITIAL_INCUMBENT, "Original incumbent must be explicit")
+    from scripts.lab_agent import IMAGE
     validate_pin(config["image"])
+    require(config["image"] == IMAGE, "Campaign requires the fixed agent image")
     require(check_tools_identity(Path(config["check_tools"])) == config["check_tools_sha256"],
             "Check-tool pin mismatch")
     for key in ("frozen_sha256", "policy_sha256", "development_sha256", "manifest_sha256"):
@@ -365,10 +377,12 @@ def validate_config(config: dict, loader: Callable[..., dict] = load_benchmark) 
 
 def init_campaign(campaign: Path, config: dict, *, loader: Callable[..., dict] = load_benchmark) -> dict:
     """Explicit initialization; no default image, HEAD, benchmark or incumbent."""
-    campaign = campaign.absolute()
+    campaign = campaign.resolve()
     config = dict(config)
     for key in PATH_KEYS | {"repo", "check_tools"}:
         config[key] = str(Path(config[key]).resolve(strict=True))
+    for repository in (Path(__file__).resolve().parents[1], Path(config["repo"])):
+        require(not campaign.is_relative_to(repository), "Campaign must be outside the repository")
     validate_config(config, loader)
     revision_exists(Path(config["repo"]), config["initial_incumbent"])
     campaign.mkdir(mode=0o700)  # Never reuse a partially initialized campaign.
@@ -545,7 +559,7 @@ def finalized_reports(campaign: Path, manifest: dict) -> list[dict]:
 
 
 def publish(campaign: Path, expected: dict, report: dict, *, paused: bool = False,
-            hold_pending: bool = False) -> dict:
+            hold_pending: bool = False, recovery_pause: bool = False) -> dict:
     require(read_json(campaign / "manifest.json") == expected, "Campaign compare-and-swap failed")
     path = campaign / "attempts" / report["attempt_id"] / "report.json"
     durable_json(path, report)
@@ -553,7 +567,10 @@ def publish(campaign: Path, expected: dict, report: dict, *, paused: bool = Fals
     updated = {**expected, "pending": expected["pending"] if hold_pending else None, "paused": paused,
                "incumbent": report["revision"] if report["outcome"] == "accepted" else expected["incumbent"],
                "reports": [*expected["reports"], {"attempt_id": report["attempt_id"], "sha256": file_sha(path)}]}
-    updated.pop("pause_source", None)
+    if not paused:
+        updated.pop("pause_source", None)
+    elif recovery_pause and not expected["paused"]:
+        updated["pause_source"] = "recovery"
     durable_json(campaign / "manifest.json", updated, replace=True)
     require(read_json(campaign / "manifest.json") == updated, "Manifest readback failed")
     return updated
@@ -677,7 +694,7 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
     if recover_only and manifest["pending"] is None:
         return recovery_status(campaign)
     require(not manifest["paused"] or (recover_only and manifest["pending"]
-            and manifest.get("pause_source") == "recovery"),
+            and manifest.get("pause_source") in {"recovery", "disk"}),
             "Campaign paused or pending; explicit recovery required")
     if sha(config) != manifest["config_sha256"]:
         if manifest["pending"]:
@@ -685,7 +702,10 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
         raise ValueError("Campaign configuration drift")
     def pause_disk(alert: dict) -> None:
         current = read_json(campaign / "manifest.json")
-        current.pop("pause_source", None)
+        # Disk failure supersedes recovery, but must not grant permission to
+        # bypass a pre-existing manual/auth pause (which has no recovery owner).
+        if not current["paused"] or current.get("pause_source") in {"recovery", "disk"}:
+            current["pause_source"] = "disk"
         durable_json(campaign / "manifest.json", {**current, "paused": True}, replace=True)
         durable_json(campaign / "disk-alert.json", alert, replace=True)
         require(read_json(campaign / "manifest.json")["paused"] is True,
@@ -694,6 +714,13 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
         print(json.dumps(alert, sort_keys=True), file=sys.stderr, flush=True)
 
     with disk.DiskGuard(campaign, pause_disk) as guard, ExitStack() as lifecycle:
+        if recover_only and manifest["paused"] and manifest.get("pause_source") == "disk":
+            # __enter__ sampled fresh space successfully. Explicit recovery may
+            # now reconcile this same pending attempt, never admit a new one.
+            with guard.action():
+                manifest = {**manifest, "pause_source": "recovery"}
+                durable_json(campaign / "manifest.json", manifest, replace=True)
+                require(read_json(campaign / "manifest.json") == manifest, "Disk reconciliation readback failed")
         # Unknown directories predate the manifest checkpoint: never guess ownership.
         finalized = {p["attempt_id"] for p in manifest["reports"]}
         known = finalized | ({manifest["pending"]} if manifest["pending"] else set())
@@ -957,10 +984,15 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
             if inflight is not None:
                 kind, role = inflight
                 if kind == "session":
-                    # Status exists even after failed cleanup; only an explicit
-                    # completed-cleanup receipt is safe-to-relaunch evidence.
+                    # Local cleanup is not proof a dispatched provider call
+                    # completed. Reuse recovery's controller-owned receipt scan.
                     status = (attempt if role == "implementation" else generation_root) / role / "private/status.json"
                     uncertain = not (status.is_file() and read_json(status).get("cleanup_complete") is True)
+                    if not uncertain:
+                        try:
+                            uncertain = recovery.session_completion(attempt) != "settled"
+                        except Exception:
+                            uncertain = True
                 elif kind == "evaluation":
                     cleanup = generation_root / ("evaluation-" + role) / "cleanup.json"
                     uncertain = not (cleanup.is_file() and read_json(cleanup).get("worker_removed") is True)
@@ -968,11 +1000,13 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
                     cleanup = generation_root / "full-checks/checks.json"
                     uncertain = not (cleanup.is_file() and read_json(cleanup).get("cleanup_complete") is True)
             report["reconciliation_required"] = uncertain
+            recovery_paused = uncertain and not paused
+            paused = paused or uncertain
             if not (attempt / "report.json").exists():
                 with guard.lock:
                     report["paused"] = paused or guard.failed
                     publish(campaign, read_json(campaign / "manifest.json") if guard.failed else pending,
-                            report, paused=paused or guard.failed, hold_pending=uncertain)
+                            report, paused=paused or guard.failed, hold_pending=uncertain, recovery_pause=recovery_paused)
             raise
         except BaseException as error:
             report.update(outcome="interrupted", error_class=type(error).__name__,

@@ -13,6 +13,8 @@ Run repeatable candidate improvements against a frozen local artifact corpus, pr
 
 ## Accepted boundaries
 
+The optional private lab controller/process orchestration is Linux-only (`flock`, `/proc`, inherited file descriptors, directory fsync and POSIX permissions); its explicitly listed orchestration tests are excluded before collection on other platforms, while portable lab tests and the core plugin's Windows test lane remain enabled.
+
 See [ADR 0001](adr/0001-autonomous-lab-boundaries.md) and the [domain vocabulary](../CONTEXT.md).
 
 - Start from a deliberately pinned plugin revision. The installed plugin and development checkout differ; do not silently select development HEAD.

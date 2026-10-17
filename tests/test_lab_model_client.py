@@ -82,7 +82,7 @@ def test_official_adapter_wire_and_provenance(monkeypatch: pytest.MonkeyPatch, s
                               text="".join("data: " + json.dumps(event) + "\n\n" for event in events))
 
     http = httpx.Client(transport=httpx.MockTransport(provider))
-    real = OpenAI(api_key="synthetic-fixture-only", base_url="https://chatgpt.com/backend-api/codex", max_retries=1 if failure == "retries" else 0, http_client=http)
+    real = OpenAI(api_key="mock", base_url="https://chatgpt.com/backend-api/codex", max_retries=1 if failure == "retries" else 0, http_client=http)
     client = auxiliary_client.CodexAuxiliaryClient(real, model)
     resolved = []
 
@@ -113,7 +113,7 @@ def test_official_adapter_wire_and_provenance(monkeypatch: pytest.MonkeyPatch, s
     assert provenance["wire"] == {"role": role, "endpoint": lab.ENDPOINT, "wire_model": model,
         "wire_effort": effort, "store": False, "stream": True, "tools_count": 0,
         "prompt_sha256": hashlib.sha256(b"synthetic prompt").hexdigest()}
-    assert "synthetic-fixture-only" not in json.dumps(response)
+    assert "mock" not in json.dumps(response)
 
 
 @pytest.mark.parametrize("defect", ["endpoint", "model", "effort", "store", "tools", "prompt", "stream"])

@@ -78,11 +78,12 @@ def _send(prompt: str, role: str) -> dict[str, Any]:
     not a server-confirmed identity/effort echo.
     """
     check_environment()
+    previous_logging_disable = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
     client: Any = None
-    requested_model, effort = ROLES[role]
     wire: list[dict[str, Any]] = []
     try:
+        requested_model, effort = ROLES[role]
         if importlib.metadata.version("hermes-agent") != "0.19.0":
             raise ModelPaused("Expected official hermes-agent 0.19.0")
         from hermes_cli.auth import resolve_codex_runtime_credentials  # type: ignore[import-untyped]
@@ -130,5 +131,10 @@ def _send(prompt: str, role: str) -> dict[str, Any]:
         status = getattr(exc, "status_code", None)
         raise ModelPaused(f"Lab model paused: {type(exc).__name__}, HTTP {status if isinstance(status, int) else 'unknown'}") from None
     finally:
-        if client is not None:
-            client.close()
+        try:
+            if client is not None:
+                client.close()
+        except Exception:
+            raise ModelPaused("Lab model paused: client cleanup failed; provider details withheld") from None
+        finally:
+            logging.disable(previous_logging_disable)
