@@ -16,6 +16,7 @@ from scripts.lab_evaluator import PROTOCOL, WARMUPS, percentile95, private_repor
 from scripts.lab_runtime import prepare_attempt, run, scoped_name, validate_pin
 from scripts.lab_process_output import NativeStderr, bounded_process, save_receipt
 from scripts import lab_disk_guard as disk
+from scripts import lab_recovery as recovery
 
 
 class Frames:
@@ -154,7 +155,9 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         setup += ["--mount", f"type=bind,src={attempt / child},dst=/{child}"]
     # No candidate code runs in this narrowly privileged existing setup helper.
     disk.checkpoint()
-    run(setup + [image, "-R", "10000:10000", "/home", "/work", "/output"])
+    setup_command = setup + [image, "-R", "10000:10000", "/home", "/work", "/output"]
+    recovery.plan_resource(setup_command, image)
+    run(setup_command)
     private_report(attempt / "image.json", image_spec)
     private_report(attempt / "runner.json", {"protocol": PROTOCOL, "revision": revision,
         "image": image, "excluded_controller_paths": excluded,
@@ -164,7 +167,10 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         "process_output_sha256": digest(Path(__file__).with_name("lab_process_output.py"))})
     worker = name + "-worker"
     disk.checkpoint()
-    worker_id = run(command(worker, image, attempt, corpus, baseline, probe, tests)).strip()
+    worker_command = command(worker, image, attempt, corpus, baseline, probe, tests)
+    planned = recovery.plan_resource(worker_command, image)
+    worker_id = run(worker_command).strip()
+    recovery.observed_resource(planned, worker_id)
     require(bool(worker_id), "Missing created worker identity")
     process: Any = None
     frames: Frames | None = None
@@ -198,7 +204,8 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         lifecycle.enter_context(disk.owned_worker(stop_disk))
         with disk.action():
             process = subprocess.Popen(["docker", "start", "--attach", "--interactive", worker],
-                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                                       pass_fds=recovery.lock_fds())
         capture = NativeStderr(process, attempt / "transport.stderr", stop_on_limit)
         frames = Frames(process)
         ready = frames.read()
@@ -273,7 +280,10 @@ def evaluate_revision(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         private_report(attempt / "worker-after.json", after)
         # Official Hermes secures config.yaml to 0600. Restore only this stopped
         # disposable export to its controller owner before host-side readback.
-        run(setup + [image, "-R", f"{os.getuid()}:{os.getgid()}", "/home", "/work", "/output"])
+        restore_command = setup + [image, "-R", f"{os.getuid()}:{os.getgid()}", "/home", "/work", "/output"]
+        restore_command[restore_command.index("--name") + 1] = name + "-restore"
+        recovery.plan_resource(restore_command, image)
+        run(restore_command)
         native = json.loads((attempt / "output/native-baseline.json").read_text())
         require(native["integrity"] == "ok" and native["logical_mapping_count"] == len(mapping), "Native mapping failed")
         require(digest(config_path) == config_hash and tree_hashes(tests) == trusted_hashes, "Execution config/test drift")

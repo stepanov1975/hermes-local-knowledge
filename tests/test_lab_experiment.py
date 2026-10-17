@@ -492,8 +492,17 @@ def test_interrupted_publication_exposes_neither_unpublished_incumbent_nor_repor
     assert manifest["pending"]
     assert (h.campaign / "attempts" / manifest["pending"] / "report.json").exists()
     assert lab.finalized_reports(h.campaign, manifest) == []
-    with pytest.raises(ValueError, match="paused or pending"):
-        h.run()
+    # #70 continues the SAME attempt, never installs the orphan's old gates.
+    monkeypatch.setattr(lab, "durable_json", durable)
+    old_evaluations = len(h.evaluations)
+    recovered = h.run()
+    assert recovered["attempt_id"] == manifest["pending"]
+    assert recovered["verification_generation"] == 1
+    assert len(h.evaluations) == old_evaluations + 2
+    assert h.manifest()["incumbent"] == recovered["revision"]
+    assert len(h.manifest()["reports"]) == 1 and h.manifest()["pending"] is None
+    archived = list((h.campaign / "attempts" / recovered["attempt_id"]).glob("report.pre-recovery-*.json"))
+    assert len(archived) == 1 and lab.read_json(archived[0])["verification_generation"] == 0
 
 
 def test_publication_compare_and_swap_and_immutable_reports(h: Harness) -> None:

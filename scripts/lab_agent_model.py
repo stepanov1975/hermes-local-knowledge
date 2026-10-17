@@ -12,6 +12,7 @@ from typing import Any
 
 from scripts.lab_model_client import ENDPOINT, LAB_ROOT, ModelPaused, check_environment
 from scripts import lab_disk_guard as disk
+from scripts.lab_recovery import atomic_json
 
 MODEL = "gpt-6.1-sol"
 PROVIDER = "openai-codex"
@@ -24,17 +25,7 @@ TOOL: dict[str, Any] = {"type": "function", "function": {
 
 def save(path: Path, value: Any) -> None:
     """Private receipts are durable before dispatch, not sandbox output files."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=True, indent=2)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(parent)
-    finally:
-        os.close(parent)
+    atomic_json(path, value)
 
 
 def inspect_request(request: Any, messages: list[dict[str, Any]]) -> dict[str, Any]:

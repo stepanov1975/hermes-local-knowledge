@@ -143,7 +143,9 @@ def prepare_attempt(attempt: Path, repo: Path, revision: str) -> None:
 def run(args: list[str], *, timeout: int | None = 120) -> str:
     # No inherited provider credentials, import paths, Docker contexts or proxies.
     env = {key: os.environ[key] for key in ("PATH", "HOME", "LANG") if key in os.environ}
-    result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=timeout)
+    from scripts.lab_recovery import lock_fds
+    result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=timeout,
+                            pass_fds=lock_fds())
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, args, output=result.stdout, stderr=result.stderr)
     return result.stdout

@@ -11,6 +11,7 @@ import threading
 from typing import Any, Callable
 
 from scripts import lab_disk_guard as disk
+from scripts import lab_recovery as recovery
 
 # Combined storage resource guard, not a time/token/session allowance.
 COMMAND_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -132,7 +133,8 @@ def bounded_process(args: list[str], *, prefix: Path, env: dict[str, str],
             for key, path in paths.items()}
         selector = stack.enter_context(selectors.DefaultSelector())
         with disk.action():
-            process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       pass_fds=recovery.lock_fds())
         assert process.stdout is not None and process.stderr is not None
         for key, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
             stack.enter_context(pipe)

@@ -2,6 +2,11 @@
 
 Status: approved design, including the user-approved benchmark amendments recorded in [#67](https://github.com/stepanov1975/hermes-local-knowledge/issues/67). Implementation proceeds only under separately authorized tickets; scheduling and production deployment require separate authorization. This document is the canonical design; [the summary](autonomous-development-lab-summary.md) is a shorter reading aid.
 
+The current continuation authorizes ticket #70 source changes and controlled
+interruption/recovery proofs only. It does not authorize another real model
+trial, resuming the original paused campaign, a public push, scheduling, or any
+production change.
+
 ## Purpose
 
 Run repeatable candidate improvements against a frozen local artifact corpus, preserving a useful incumbent and experimental evidence without interfering with production.

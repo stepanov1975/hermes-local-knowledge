@@ -17,6 +17,7 @@ from scripts import lab_agent_model as model
 from scripts.lab_runtime import run, scoped_name
 from scripts.lab_process_output import bounded_process
 from scripts import lab_disk_guard as disk
+from scripts import lab_recovery as recovery
 
 IMAGE = "sha256:0b9b3c213a9a3cb6845f31b44a0a2b4ce67fa716d411217f6037cf792b3775af"
 SOURCE = "90194c64ff99933ec3b9ecfd9295b06e6c11e038"
@@ -157,7 +158,8 @@ def cleanup(name: str, container_id: str) -> None:
 
 def ownership(attempt: Path, image: str, name: str, owner: str) -> None:
     """Trusted one-shot helper only mounts this fresh session's mutable exports."""
-    args = ["docker", "run", "--rm", "--name", scoped_name(name + "-setup"), "--label", LABEL,
+    helper = scoped_name(name + "-setup-" + uuid.uuid4().hex[:6])
+    args = ["docker", "run", "--rm", "--name", helper, "--label", LABEL,
             "--network", "none", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN",
             "--cap-add", "DAC_OVERRIDE", "--security-opt", "no-new-privileges:true", "--read-only",
             "--memory", "64m", "--memory-swap", "64m", "--cpus", "0.25", "--pids-limit", "16",
@@ -165,8 +167,10 @@ def ownership(attempt: Path, image: str, name: str, owner: str) -> None:
     children = ("home", "work", "scratch", "output")
     for child in children:
         args += ["--mount", f"type=bind,src={attempt / child},dst=/{child}"]
-    run(args + [image, "-R", "--no-dereference", owner, *["/" + c for c in children]])
-    if run(["docker", "ps", "-aq", "--filter", "name=^/" + name + "-setup$"]).strip():
+    args += [image, "-R", "--no-dereference", owner, *["/" + c for c in children]]
+    recovery.plan_resource(args, image)
+    run(args)
+    if run(["docker", "ps", "-aq", "--filter", "name=^/" + helper + "$"]).strip():
         raise ValueError("Ownership helper removal not confirmed")
 
 
@@ -274,7 +278,10 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         ownership(attempt, image, name, "10000:10000")
         changed_owner = True
         disk.checkpoint()
-        container_id = run(worker_command(name, image, binds)).strip()
+        command = worker_command(name, image, binds)
+        planned = recovery.plan_resource(command, image)
+        container_id = run(command).strip()
+        recovery.observed_resource(planned, container_id)
         spec = inspect(name)
         verify_worker_spec(spec, name, binds)
         model.save(private / "worker.json", spec)
@@ -334,6 +341,8 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
                 commands.append(arguments["command"])
             for index, (call, command) in enumerate(zip(calls, commands, strict=True)):
                 disk.checkpoint()
+                model.save(private / f"tool-intent-{turn}-{index}.json",
+                           {"container_id": container_id, "command": command})
                 output = sandbox(name, command, private / f"tool-{turn}-{index}.json", container_id)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
     except SandboxOutputLimit as error:

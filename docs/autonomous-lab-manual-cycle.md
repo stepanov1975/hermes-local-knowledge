@@ -62,14 +62,51 @@ the single authoritative incumbent manifest under the campaign lock. The next
 fresh run reads that manifest; it does not rebuild the fixed runtime image.
 Interruption must leave either the previous valid authority or the complete new
 one, never a half-published incumbent. An unfinished attempt remains visible and
-blocks an unverified duplicate launch; general interrupted-worker recovery is
-tracked separately in #70.
+is recovered under the same non-expiring campaign flock by `run` (or explicitly
+by `recover`). A recovery invocation never starts a second attempt in that call.
+
+### Restart recovery (#70)
+
+A durable draft/checkpoint precedes implementation and each execution boundary.
+Exact container/helper names, image, command and bind intents are persisted before
+Docker creation; observed IDs are persisted before start. Docker launch clients
+inherit the campaign flock so a surviving create/start/exec client also fences
+new controllers. Recovery inspects all named resources, including #66 evaluation
+helpers and #69 session/full-check workers. An unavailable daemon is not absence.
+A live original (including an idle sleep container) is preserved and pauses with
+`original_worker_still_running`; recovery never kills it to make room. Only
+identity-matched stopped containers can be removed, without force.
+
+Completed implementation/result checkpoints continue the **same attempt**.
+A persisted final response may become a result only after conclusive quiescence,
+owned cleanup/ownership restoration and exact source validation. A settled partial
+session without a final result is finalized interrupted rather than replaying its
+tools/conversation. A request/wire receipt without its response pauses permanently
+until evidence is reconciled; elapsed time, worker removal and cleanup receipts do
+not establish remote inference completion. No inference or tool request is replayed.
+Missing legacy checkpoints, ownership uncertainty and input/source/candidate drift
+also pause with fixed safe reasons in private `recovery-alert.json`.
+
+Recovery reruns both evaluations and all full checks in fresh generation-specific
+paths, obtains generation-bound clearance and a new independent review. Old review
+sessions/usage remain evidence, not gate authorization. An accepted report orphaned
+before manifest replacement is archived by hash and **not** installed blindly;
+refreshed gates must pass before a replacement report/manifest can promote. Already
+published history is never rewritten or duplicated; the previous incumbent remains
+authoritative until the atomic manifest publication.
+
+`status` reads durable checkpoint/alert data without creating a lock, inspecting
+Docker, or modifying the campaign. `recover` operates only on a pending attempt;
+when none exists it returns status without launching anything. After a recovery
+pause, an explicit `recover` may re-inspect evidence; it cannot bypass an ambiguous
+model call, auth/quota pause or disk pause. This is invocation-driven recovery, not
+a watchdog or scheduler, and alerts are local files, not Telegram delivery.
 
 ## Operator invocation and fixed-image prerequisites
 
 Use the trusted checkout and a separate, explicit Python environment containing
 unmodified official `hermes-agent==0.19.0` plus the repository's test dependencies.
-`python -m scripts.lab_experiment --help` exposes `init`, `run` and `status`.
+`python -m scripts.lab_experiment --help` exposes `init`, `run`, `recover` and `status`.
 
 The private initialization JSON is flat: `schema: private-manual-lab/v1`, `repo`,
 `initial_incumbent`, `image`, the nine pinned benchmark input fields documented by
