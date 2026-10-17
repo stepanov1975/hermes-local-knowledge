@@ -469,7 +469,8 @@ def safe_usage(sessions: list[dict]) -> list[dict]:
                  "input_tokens", "output_tokens", "total_tokens", "prompt_tokens", "completion_tokens",
                  "cache_read_input_tokens", "cache_creation_input_tokens", "cost"}
                  and type(v) in (int, float)} for item in s["usage"] if isinstance(item, dict)],
-            "usage_status": "provider_reported" if any(
+             "cleanup_complete": s.get("cleanup_complete") if type(s.get("cleanup_complete")) is bool else None,
+             "usage_status": "provider_reported" if any(
                  isinstance(item, dict) and any(type(v) in (int, float) for v in item.values())
                  for item in s["usage"]) else "unknown"} for s in sessions]
 
@@ -498,7 +499,8 @@ def safe_aggregate(report: dict) -> dict:
 def history_projection(report: dict) -> dict:
     """Safe handoff includes measured aggregates, never cases or returned bodies."""
     keys = ("attempt_id", "hypothesis", "strategy", "strategy_id", "related_attempts", "revisit_reason",
-            "actual_changes", "revision", "previous_incumbent", "outcome", "lessons", "checks", "usage")
+            "actual_changes", "revision", "previous_incumbent", "outcome", "lessons", "checks", "usage",
+            "delivery_validation")
     result = {key: report[key] for key in keys if key in report}
     measured = report.get("measured_outcomes", {})
     result["measured_outcomes"] = {role: safe_aggregate(measured[role])
@@ -629,7 +631,11 @@ def run_experiment(campaign: Path, *, session: Callable[..., dict] | None = None
                 work_identity = snapshot(workspace)
                 revision, changes = candidate_commit(repo, previous, workspace, attempt)
                 report.update(revision=revision, actual_changes=changes)
-                require(not final["no_change"] or not changes, "No-change claim contradicts actual files")
+                if final["no_change"] != (not changes):
+                    report["delivery_validation"] = {
+                        "passed": False, "reason": "no_change_imported_edits_mismatch",
+                        "declared_no_change": final["no_change"], "imported_edits": bool(changes)}
+                    raise ValueError("Candidate delivery mismatch: no_change contradicts imported edits")
                 exact_binding = {**binding, "revision": revision, "tree": git(repo, "rev-parse", revision + "^{tree}").decode().strip()}
                 durable_json(attempt / "candidate.json", exact_binding)
                 old = measured(previous, "incumbent")

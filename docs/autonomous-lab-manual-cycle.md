@@ -25,6 +25,12 @@ request timeouts are transport failures, not a campaign-duration policy. Auth,
 quota or ambiguous inference failure pauses instead of silently retrying or
 falling back.
 
+Implementation edits must be made directly in writable `/work/plugin`, the only
+candidate-import workspace. `/scratch` and `/output` are writable auxiliary
+locations, not automatic import channels. Scratch checks and advisory lessons must
+identify the source path/digest they exercised, not claim verification of another
+tree. Set `no_change=true` only when the imported workspace has no candidate edits.
+
 The review sandbox receives the exact stopped/frozen candidate read-only plus
 safe execution evidence. It has independent writable scratch state, not the
 implementation session's memory. Review checks benchmark shortcuts, official
@@ -37,8 +43,13 @@ controller-owned verification.
 Create the experiment record before launching a session. Keep a hypothesis,
 strategy, references to related attempts, changes, reproducible revision,
 executed checks, measured results, outcome and lessons for **every** attempt.
-A no-change outcome is legitimate. Repeating an apparently unchanged failed
-strategy needs a stated new premise or materially different implementation.
+A no-change outcome is legitimate. Before scoring, full checks or review, the
+controller requires the explicit `no_change` decision to agree with imported
+file differences in both directions. A contradiction produces a durable error
+report with a fixed `delivery_validation` reason, retained usage/cleanup evidence
+and unchanged incumbent; auxiliary output files are not silently applied.
+Repeating an apparently unchanged failed strategy needs a stated new premise or
+materially different implementation.
 
 Freeze and validate the candidate before tests, trusted public-search evaluation
 and independent review. Bind evidence to its exact revision and campaign inputs;

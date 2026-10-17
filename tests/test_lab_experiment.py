@@ -243,6 +243,7 @@ def test_low_disk_at_full_checks_cannot_launch_review_or_promote(h, monkeypatch)
     h.run()  # Existing immutable history must survive the later safety pause.
     original = h.manifest()
     original_calls = len(h.calls)
+    h.change = False  # Legitimate no-change still reaches full checks.
     low = [False]
     monkeypatch.setattr(disk, "available_space", lambda path: {
         "available_blocks": 9 if low[0] else 20, "usable_blocks": 100})
@@ -306,6 +307,65 @@ def test_each_gate_independently_rejects_without_losing_history(h: Harness, gate
     assert h.manifest()["pending"] is None
 
 
+@pytest.mark.parametrize("no_change,changed", [(False, False), (True, True)])
+def test_delivery_mismatch_stops_before_gates_and_preserves_evidence(h: Harness, no_change: bool,
+                                                                  changed: bool) -> None:
+    h.run()  # Preserve an existing successful incumbent and immutable report.
+    original = h.manifest()
+    h.change = changed
+    if changed:
+        h.mutate = lambda work: (work / "hermes_local_knowledge/rank.py").write_text("VALUE = 3\n")
+    original_session = h.session
+
+    def session(**kwargs: Any) -> dict:
+        result = original_session(**kwargs)
+        result["final"]["no_change"] = no_change
+        result["usage"] = [{"input_tokens": 123, "output_tokens": 12}]
+        result["cleanup_complete"] = True
+        return result
+
+    h.evaluations.clear()
+    h.calls.clear()
+    with pytest.raises(ValueError, match="Candidate delivery mismatch"):
+        lab.run_experiment(h.campaign, session=session, evaluator=h.evaluator,
+                           checks=lambda **kwargs: pytest.fail("must not run full checks"), loader=h.loader)
+    report = h.last_report()
+    current = h.manifest()
+    assert report["outcome"] == "error"
+    assert report["delivery_validation"] == {
+        "passed": False, "reason": "no_change_imported_edits_mismatch",
+        "declared_no_change": no_change, "imported_edits": bool(report["actual_changes"])}
+    assert lab.history_projection(report)["delivery_validation"] == report["delivery_validation"]
+    assert bool(report["actual_changes"]) is changed
+    assert report["usage"][0]["usage"] == [{"input_tokens": 123, "output_tokens": 12}]
+    assert report["usage"][0]["cleanup_complete"] is True
+    assert report["reconciliation_required"] is False
+    assert report["checks"] == [] and report["measured_outcomes"] == {}
+    assert h.evaluations == [] and [c["role"] for c in h.calls] == ["implementation"]
+    assert current["incumbent"] == original["incumbent"]
+    assert current["reports"][:-1] == original["reports"]
+    assert current["pending"] is None
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_delivery_uses_imported_edits_not_advisory_changes(h: Harness, changed: bool) -> None:
+    h.change = changed
+    original_session = h.session
+
+    def session(**kwargs: Any) -> dict:
+        result = original_session(**kwargs)
+        if kwargs["role"] == "implementation":
+            result["final"]["changes"] = [] if changed else ["advisory observation, not an edit"]
+        return result
+
+    report = lab.run_experiment(h.campaign, session=session, evaluator=h.evaluator,
+        checks=h.checks, clearance=lambda *_: True, loader=h.loader)
+    assert report["outcome"] == ("accepted" if changed else "no_change")
+    assert bool(report["actual_changes"]) is changed
+    assert len(h.evaluations) == 2
+    assert [c["role"] for c in h.calls] == ["implementation", "review"]
+
+
 def test_nochange_has_execution_review_report_and_unknown_usage(h: Harness) -> None:
     h.change = False
     report = h.run()
@@ -315,6 +375,7 @@ def test_nochange_has_execution_review_report_and_unknown_usage(h: Harness) -> N
     assert report["revision"] == h.initial
     session = {"role": "review", "session_id": "s", "usage": []}
     assert lab.safe_usage([session])[0]["usage_status"] == "unknown"
+    assert lab.safe_usage([session])[0]["cleanup_complete"] is None
 
 
 @pytest.mark.parametrize("kind", ["forbidden", "new_forbidden", "symlink", "directory_symlink", "generated", "hardlink"])

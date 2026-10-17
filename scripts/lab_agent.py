@@ -243,16 +243,24 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
               "approved,shortcuts_checked,compatibility_checked,report_checked (all booleans),findings (list)")
     if role == "implementation":
         schema += "; hypothesis,strategy,revisit_reason must be strings; related_attempts,changes,checks,lessons must be lists"
+    source_instructions = (
+        "Source /work/plugin is writable for implementation. Apply intended candidate edits directly to /work/plugin. "
+        "Set no_change=true only when /work/plugin has no candidate edits; otherwise set no_change=false. "
+        if role == "implementation" else
+        "Source /work/plugin is read-only for review; do not edit it. "
+        "Review checks shortcuts, compatibility and report/execution correspondence on this exact revision. ")
     messages: list[dict[str, Any]] = [{"role": "system", "content":
         "You are an isolated Local Knowledge plugin " + role + ". Product goal: fast relevant whole-artifact routing. "
         "Only sandbox(command) is available. All commands run offline as nonroot. Source: /work/plugin; "
         "corpus: /corpus; development: /inputs/development.json; past reports: /inputs/history.json; "
         "optional safe evidence: /inputs/evidence.json. Writable scratch: /scratch, home: /opt/data, output: /output. "
         "Never attempt credentials, network, orchestration/evaluation changes or held-out labels. "
-        "Do not launch model calls or background workers. Source is read-only for review. "
+        "Do not launch model calls or background workers. " + source_instructions +
+        "Only /work/plugin is imported as the candidate; /output files are not automatically applied. "
+        "Scratch checks and advisory lessons must identify their source path and digest and "
+        "must not claim verification of a different tree. "
         "Inspect public contracts, make reusable plugin improvements only, run meaningful checks. "
         "A useful no-change outcome is permitted. Explain revisiting prior failed strategies. "
-        "Review checks shortcuts, compatibility and report/execution correspondence on this exact revision. "
         "Finish with ONLY a JSON object containing: " + schema}, {"role": "user", "content": task}]
     binds = mounts(attempt, corpus, role, evidence is not None)
     container_id: str | None = None
@@ -363,6 +371,6 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
     result = {"role": role, "session_id": session_id, "revision": revision,
               "model": model.MODEL, "provider": model.PROVIDER, "effort": model.EFFORT,
               "workspace": str(workspace), "final": final, "usage": usages,
-              "complete": True, "source_identity": source_identity}
+              "complete": True, "cleanup_complete": cleanup_complete, "source_identity": source_identity}
     model.save(private / "result.json", result)
     return result

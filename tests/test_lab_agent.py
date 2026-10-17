@@ -230,11 +230,44 @@ def test_real_session_loop_fake_model_and_docker(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(agent, "sandbox", lambda *a: "synthetic /work/plugin")
     result = agent.run_session(**kwargs)
     assert result["complete"] and result["final"]["no_change"]
+    assert result["cleanup_complete"] is True
     assert result["revision"] == REVISION
     assert requests[1][-1] == {"role": "tool", "tool_call_id": "call1", "content": "synthetic /work/plugin"}
     assert len(result["usage"]) == 2
     assert events[-2][0] == "cleanup" and events[-1][0] == "ownership"
     assert json.loads((kwargs["attempt"] / "private/result.json").read_text()) == result
+
+
+@pytest.mark.parametrize("role", ["implementation", "review"])
+def test_session_prompt_defines_authoritative_source_delivery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            role: str) -> None:
+    kwargs, _ = setup_session(tmp_path, monkeypatch)
+    kwargs["role"] = role
+    monkeypatch.setattr(agent, "inspect", lambda name: spec_for(
+        name, agent.mounts(kwargs["attempt"], kwargs["corpus"], role, False)))
+    requests = []
+    final = FINAL if role == "implementation" else {
+        "approved": True, "shortcuts_checked": True, "compatibility_checked": True,
+        "report_checked": True, "findings": []}
+
+    def send(messages: Any, receipt: Path) -> dict[str, Any]:
+        requests.append(json.loads(json.dumps(messages)))
+        return {"message": {"role": "assistant", "content": json.dumps(final)}, "usage": {}}
+
+    monkeypatch.setattr(model, "send", send)
+    agent.run_session(**kwargs)
+    prompt = requests[0][0]["content"]
+    if role == "implementation":
+        assert "Source /work/plugin is writable for implementation" in prompt
+        assert "Apply intended candidate edits directly to /work/plugin" in prompt
+        assert "no_change=true only when /work/plugin has no candidate edits" in prompt
+    else:
+        assert "Source /work/plugin is read-only for review; do not edit it" in prompt
+        assert "Apply intended candidate edits" not in prompt
+    assert "Only /work/plugin is imported as the candidate" in prompt
+    assert "/output files are not automatically applied" in prompt
+    assert "source path and digest" in prompt
+    assert "must not claim verification of a different tree" in prompt
 
 
 def test_pause_no_retry_and_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
