@@ -177,8 +177,9 @@ runs. A blocked in-flight provider request may remain blocked and bill usage, bu
 worker stopping and durable pause/alert do **not** wait for its response; returned
 usage (or unknown usage) is retained on normal unwinding.
 
-There is no built-in Telegram delivery or new authentication. The controlling
-Hermes/operator can forward the safe structured alert using its existing channel.
+The manual runner itself has no Telegram delivery or new authentication. The
+optional [hourly controller/outbox](autonomous-lab-hourly.md) can forward structured
+alerts through an explicitly configured existing messaging channel.
 While a provider call is blocked, inspect the files from a separate terminal:
 
 ```sh

@@ -636,321 +636,339 @@ def run_experiment(campaign: Path, *, session: Callable[..., dict] | None = None
                    clearance: Callable[[Path, dict], bool] = unknown_target_clearance,
                    loader: Callable[..., dict] = load_benchmark,
                    recover_only: bool = False) -> dict:
-    """Run or recover one attempt. Injection is Python-test-only, never CLI input."""
+    """Run or recover one attempt under the campaign's non-expiring flock."""
     campaign = campaign.resolve(strict=True)
+    with campaign_lock(campaign):
+        return run_under_existing_lock(campaign, session=session, evaluator=evaluator,
+                                       checks=checks, clearance=clearance, loader=loader,
+                                       recover_only=recover_only)
+
+
+def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | None = None,
+                   evaluator: Callable[..., dict] | None = None,
+                   checks: Callable[..., dict] = full_candidate_checks,
+                   clearance: Callable[[Path, dict], bool] = unknown_target_clearance,
+                   loader: Callable[..., dict] = load_benchmark,
+                   recover_only: bool = False) -> dict:
+    """Run or recover one attempt. Injection is Python-test-only, never CLI input."""
+    require(bool(recovery.lock_fds()), "Existing campaign lock required")
+    campaign = campaign.resolve(strict=True)
+    expected_lock = (campaign / "lock").stat()
+    held_lock = os.fstat(recovery.lock_fds()[0])
+    require((held_lock.st_dev, held_lock.st_ino) == (expected_lock.st_dev, expected_lock.st_ino),
+            "Existing lock belongs to another campaign")
     if session is None:
         from scripts.lab_agent import run_session
         session = run_session
     if evaluator is None:
         from scripts.lab_evaluator_runtime import evaluate_revision
         evaluator = evaluate_revision
-    with campaign_lock(campaign):
-        manifest = read_json(campaign / "manifest.json")
-        config = read_json(campaign / "config.json")
-        if recover_only and manifest["pending"] is None:
-            return recovery_status(campaign)
-        require(not manifest["paused"] or (recover_only and manifest["pending"]
-                and manifest.get("pause_source") == "recovery"),
-                "Campaign paused or pending; explicit recovery required")
-        if sha(config) != manifest["config_sha256"]:
-            if manifest["pending"]:
-                pause_recovery(campaign, "configuration_drift")
-            raise ValueError("Campaign configuration drift")
-        def pause_disk(alert: dict) -> None:
-            current = read_json(campaign / "manifest.json")
-            current.pop("pause_source", None)
-            durable_json(campaign / "manifest.json", {**current, "paused": True}, replace=True)
-            durable_json(campaign / "disk-alert.json", alert, replace=True)
-            require(read_json(campaign / "manifest.json")["paused"] is True,
-                    "Disk pause readback failed")
-            require(read_json(campaign / "disk-alert.json") == alert, "Disk alert readback failed")
-            print(json.dumps(alert, sort_keys=True), file=sys.stderr, flush=True)
+    manifest = read_json(campaign / "manifest.json")
+    config = read_json(campaign / "config.json")
+    if recover_only and manifest["pending"] is None:
+        return recovery_status(campaign)
+    require(not manifest["paused"] or (recover_only and manifest["pending"]
+            and manifest.get("pause_source") == "recovery"),
+            "Campaign paused or pending; explicit recovery required")
+    if sha(config) != manifest["config_sha256"]:
+        if manifest["pending"]:
+            pause_recovery(campaign, "configuration_drift")
+        raise ValueError("Campaign configuration drift")
+    def pause_disk(alert: dict) -> None:
+        current = read_json(campaign / "manifest.json")
+        current.pop("pause_source", None)
+        durable_json(campaign / "manifest.json", {**current, "paused": True}, replace=True)
+        durable_json(campaign / "disk-alert.json", alert, replace=True)
+        require(read_json(campaign / "manifest.json")["paused"] is True,
+                "Disk pause readback failed")
+        require(read_json(campaign / "disk-alert.json") == alert, "Disk alert readback failed")
+        print(json.dumps(alert, sort_keys=True), file=sys.stderr, flush=True)
 
-        with disk.DiskGuard(campaign, pause_disk) as guard, ExitStack() as lifecycle:
-            # Unknown directories predate the manifest checkpoint: never guess ownership.
-            finalized = {p["attempt_id"] for p in manifest["reports"]}
-            known = finalized | ({manifest["pending"]} if manifest["pending"] else set())
-            require(all(p.name in known for p in (campaign / "attempts").iterdir()), "Unreconciled attempt directory")
+    with disk.DiskGuard(campaign, pause_disk) as guard, ExitStack() as lifecycle:
+        # Unknown directories predate the manifest checkpoint: never guess ownership.
+        finalized = {p["attempt_id"] for p in manifest["reports"]}
+        known = finalized | ({manifest["pending"]} if manifest["pending"] else set())
+        require(all(p.name in known for p in (campaign / "attempts").iterdir()), "Unreconciled attempt directory")
+        try:
+            benchmark = validate_config(config, loader)
+            identity = controller_identity()
+        except Exception:
+            if manifest["pending"] and not guard.failed:
+                pause_recovery(campaign, "campaign_inputs_unavailable_or_changed")
+            raise
+        previous = manifest["incumbent"]
+        repo = campaign / "repo.git"
+        revision_exists(repo, previous)
+        resuming = manifest["pending"] is not None
+        attempt_id = manifest["pending"] or uuid.uuid4().hex
+        attempt = campaign / "attempts" / attempt_id
+        guard.check()
+        binding = {"config": sha(config), "controller": sha(identity), "image": config["image"],
+                   "benchmark": config["composite_id"], "previous_incumbent": previous}
+        reports = finalized_reports(campaign, manifest)
+        implementation = None
+        generation = 0
+        if resuming:
             try:
-                benchmark = validate_config(config, loader)
-                identity = controller_identity()
-            except Exception:
-                if manifest["pending"] and not guard.failed:
-                    pause_recovery(campaign, "campaign_inputs_unavailable_or_changed")
-                raise
-            previous = manifest["incumbent"]
-            repo = campaign / "repo.git"
-            revision_exists(repo, previous)
-            resuming = manifest["pending"] is not None
-            attempt_id = manifest["pending"] or uuid.uuid4().hex
-            attempt = campaign / "attempts" / attempt_id
-            guard.check()
-            binding = {"config": sha(config), "controller": sha(identity), "image": config["image"],
-                       "benchmark": config["composite_id"], "previous_incumbent": previous}
-            reports = finalized_reports(campaign, manifest)
-            implementation = None
-            generation = 0
-            if resuming:
-                try:
-                    require((attempt / "checkpoint.json").exists(), "Missing recovery checkpoint")
-                    if read_json(attempt / "attempt.json") != {"attempt_id": attempt_id, **binding, **MODEL}:
-                        raise recovery.RecoveryPaused("controller_or_campaign_drift")
-                    guard.check()
-                    resources = recovery.settle_resources(attempt)
-                    guard.check()
-                    completion = recovery.session_completion(attempt)
+                require((attempt / "checkpoint.json").exists(), "Missing recovery checkpoint")
+                if read_json(attempt / "attempt.json") != {"attempt_id": attempt_id, **binding, **MODEL}:
+                    raise recovery.RecoveryPaused("controller_or_campaign_drift")
+                guard.check()
+                resources = recovery.settle_resources(attempt)
+                guard.check()
+                completion = recovery.session_completion(attempt)
+                durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
+                             "resources": resources, "model_completion": completion,
+                             "state": "quiescent"}, replace=True)
+                # A published error that held pending may now be conclusively settled.
+                if attempt_id in finalized:
+                    require(any(r["attempt_id"] == attempt_id and r["outcome"] != "accepted" for r in reports),
+                            "Invalid pending publication")
                     durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
-                                 "resources": resources, "model_completion": completion,
-                                 "state": "quiescent"}, replace=True)
-                    # A published error that held pending may now be conclusively settled.
-                    if attempt_id in finalized:
-                        require(any(r["attempt_id"] == attempt_id and r["outcome"] != "accepted" for r in reports),
-                                "Invalid pending publication")
-                        durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
-                                     "state": "finalized_report_settled", "resources": resources,
-                                     "report_sha256": file_sha(attempt / "report.json")}, replace=True)
-                        updated = {**manifest, "pending": None, "paused": False}
-                        updated.pop("pause_source", None)
-                        with guard.action():
-                            durable_json(campaign / "manifest.json", updated, replace=True)
-                            require(read_json(campaign / "manifest.json") == updated, "Recovery readback failed")
-                        return next(r for r in reports if r["attempt_id"] == attempt_id)
-                    with recovery.resources(attempt):
-                        try:
-                            guard.check()
-                            implementation = recovered_implementation(attempt, config) if completion == "settled" else None
-                            guard.check()
-                        except Exception:
-                            raise recovery.RecoveryPaused("implementation_checkpoint_invalid") from None
-                    generations = [int(p.name.split("-")[1]) for p in attempt.glob("generation-*")
-                                   if p.name.split("-")[1].isdigit()]
-                    generation = max([read_json(attempt / "checkpoint.json")["generation"], *generations]) + 1
-                    if implementation is not None:
-                        session_valid(implementation, "implementation", previous)
-                        if (attempt / "candidate.json").exists():
-                            pinned = read_json(attempt / "candidate.json")
-                            candidate, _ = candidate_commit(repo, previous, Path(implementation["workspace"]), attempt)
-                            if pinned != {**binding, "revision": candidate,
-                                    "tree": git(repo, "rev-parse", candidate + "^{tree}").decode().strip()}:
-                                raise recovery.RecoveryPaused("candidate_revision_drift")
-                    if implementation is None:
-                        # No transcript replay. Real settled partial sessions can be finalized;
-                        # missing session identity is not proof a model call never happened.
-                        require((attempt / "implementation/private/session.json").exists(),
-                                "Campaign paused or pending; session ownership unknown")
-                        draft = read_json(attempt / "draft-report.json")
-                        draft.update(outcome="interrupted", reconciliation_required=False,
-                                     usage=safe_usage(recover_usage(attempt, [])))
-                        if (attempt / "report.json").exists():
-                            archive_report(attempt)
-                        with guard.action():
-                            publish(campaign, manifest, draft)
-                        durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
-                                     "state": "interrupted_finalized", "resources": resources,
-                                     "report_sha256": file_sha(attempt / "report.json")}, replace=True)
-                        return draft
-                    orphan = attempt / "report.json"
-                    if orphan.exists():
-                        archive_report(attempt)
-                except Exception as error:
-                    # Recovery must not relabel/clear an independent disk pause.
-                    if guard.failed:
-                        guard.check()
-                    reason = str(error) if isinstance(error, recovery.RecoveryPaused) else "recovery_evidence_uncertain"
-                    pause_recovery(campaign, reason)
-                    raise ValueError("Campaign paused or pending; " + reason) from None
-            else:
-                attempt.mkdir(mode=0o700)
-                fsync_directory(attempt.parent)
-                durable_json(attempt / "attempt.json", {"attempt_id": attempt_id, **binding, **MODEL})
-                durable_json(attempt / "history.json", {"reports": [history_projection(r) for r in reports]})
-            with guard.action():
-                pending = {**manifest, "pending": attempt_id, "paused": False}
-                pending.pop("pause_source", None)
-                durable_json(campaign / "manifest.json", pending, replace=True)
-            report: dict[str, Any] = {"attempt_id": attempt_id, **binding, "revision": previous,
-                "hypothesis": None, "strategy": None, "related_attempts": [], "revisit_reason": None,
-                "actual_changes": [], "checks": [], "measured_outcomes": {}, "outcome": "error",
-                "lessons": [], "usage": [], "semantic_caveat": "Unknown returned top-five targets remain unjudged."}
-            lifecycle.enter_context(recovery.resources(attempt))
-            generation_root = attempt if generation == 0 else attempt / ("generation-" + str(generation))
-            if generation:
-                generation_root.mkdir(mode=0o700)
-            report["verification_generation"] = generation
-            sessions: list[dict] = recover_usage(attempt, []) if resuming else []
-            inflight: tuple[str, str] | None = None
-
-            def checkpoint(phase: str) -> None:
-                guard.check()
-                durable_json(attempt / "draft-report.json", report, replace=True)
-                durable_json(attempt / "checkpoint.json", {"phase": phase, "generation": generation,
-                             "revision": report["revision"]}, replace=True)
-
-            checkpoint("created")
-            worker_prefix = "lk-lab-" + attempt_id + ("-g" + str(generation) if generation else "")
-            common = {"repo": repo, "corpus": Path(config["corpus"]), "development": Path(config["development"]),
-                      "history": attempt / "history.json", "image": config["image"]}
-
-            def pins_unchanged() -> None:
-                guard.check()
-                require(read_json(campaign / "config.json") == config and controller_identity() == identity,
-                        "Controller/config evidence became stale")
-                validate_config(config, loader)
-
-            def measured(revision: str, role: str) -> dict:
-                nonlocal inflight
-                pins_unchanged()
-                inflight = ("evaluation", role)
-                checkpoint("evaluation-" + role)
-                result = evaluator(attempt=generation_root / ("evaluation-" + role), repo=repo, revision=revision,
-                                   corpus=Path(config["corpus"]), image=config["image"],
-                                   name=worker_prefix + "-" + role, benchmark=benchmark)
-                inflight = None
-                require(result.get("revision") == revision and result.get("image") == config["image"]
-                        and result.get("benchmark_identity") == config["composite_id"], "Stale evaluation identity")
-                pins_unchanged()
-                return safe_aggregate(result)
-
-            try:
-                guard.check()
-                pins_unchanged()
-                if implementation is None:
-                    inflight = ("session", "implementation")
-                    checkpoint("implementation")
-                    implementation = session(attempt=attempt / "implementation", revision=previous,
-                        name="lk-lab-" + attempt_id + "-impl", role="implementation", task=IMPLEMENT_TASK, **common)
-                    durable_json(attempt / "implementation-result.json", implementation)
-                session_valid(implementation, "implementation", previous)
-                if not any(s["session_id"] == implementation["session_id"] for s in sessions):
-                    sessions.append(implementation)
-                guard.check()
-                inflight = None
-                validate_session_source(implementation, attempt / "implementation/work/plugin")
-                final = implementation["final"]
-                for key in ("hypothesis", "strategy", "related_attempts", "revisit_reason", "lessons"):
-                    report[key] = final[key]
-                require(isinstance(final["strategy"], str) and bool(final["strategy"].strip()), "Strategy missing")
-                require(type(final["no_change"]) is bool, "Explicit no-change decision required")
-                report["strategy_id"] = sha(" ".join(final["strategy"].lower().split()))
-                failed = [r for r in reports if r.get("strategy_id") == report["strategy_id"] and r["outcome"] == "rejected"]
-                require(not failed or final["no_change"] or bool(str(final["revisit_reason"] or "").strip()),
-                        "Repeated failed strategy needs a new reason or no-change decision")
-                workspace = Path(implementation["workspace"])
-                work_identity = snapshot(workspace)
-                revision, changes = candidate_commit(repo, previous, workspace, attempt)
-                report.update(revision=revision, actual_changes=changes)
-                if final["no_change"] != (not changes):
-                    report["delivery_validation"] = {
-                        "passed": False, "reason": "no_change_imported_edits_mismatch",
-                        "declared_no_change": final["no_change"], "imported_edits": bool(changes)}
-                    raise ValueError("Candidate delivery mismatch: no_change contradicts imported edits")
-                exact_binding = {**binding, "revision": revision, "tree": git(repo, "rev-parse", revision + "^{tree}").decode().strip()}
-                if (attempt / "candidate.json").exists():
-                    require(read_json(attempt / "candidate.json") == exact_binding, "Recovered candidate drift")
-                else:
-                    durable_json(attempt / "candidate.json", exact_binding)
-                checkpoint("candidate")
-                old = measured(previous, "incumbent")
-                report["measured_outcomes"]["incumbent"] = old
-                new = measured(revision, "candidate")
-                report["measured_outcomes"]["candidate"] = new
-                decision = verdict(old, new)
-                report["measured_outcomes"]["score_verdict"] = decision
-                report["checks"] = [{"name": gate, "passed": new.get(gate) is True, "revision": revision}
-                                    for gate in ("integrity", "trusted_tests", "official_integration", "complete")]
-                guard.check()
-                inflight = ("checks", "full-checks")
-                checkpoint("full-checks")
-                full_checks = checks(attempt=generation_root / "full-checks", repo=repo, revision=revision,
-                                     image=config["image"], name=worker_prefix + "-checks",
-                                     check_tools=Path(config["check_tools"]),
-                                     check_tools_sha256=config["check_tools_sha256"])
-                guard.check()
-                inflight = None
-                require(full_checks.get("revision") == revision and full_checks.get("image") == config["image"]
-                        and full_checks.get("controller") == sha(identity), "Stale full-check evidence")
-                actual_checks = full_checks.get("checks", [])
-                full_passed = (full_checks.get("passed") is True
-                               and {c["name"] for c in actual_checks} == {"full_pytest", "ruff", "mypy"}
-                               and all(c.get("passed") is True for c in actual_checks))
-                report["checks"].extend({**c, "revision": revision} for c in actual_checks)
-                gate_binding = {**exact_binding, "verification_generation": generation,
-                                "checks_sha256": sha(full_checks)}
-                clearance_binding = {**gate_binding, "measured_outcomes_sha256": sha(report["measured_outcomes"])}
-                cleared = clearance(campaign, clearance_binding) if decision["score_eligible"] else False
-                report["unknown_target_gate"] = {"cleared": cleared, "binding": clearance_binding}
-                # Reviewer sees aggregate integers and actual checks, never cases or raw responses.
-                durable_json(generation_root / "review-evidence.json", {"binding": gate_binding, "draft_report": report})
-                pins_unchanged()
-                require(snapshot(workspace) == work_identity, "Candidate changed after execution")
-                inflight = ("session", "review")
-                checkpoint("review")
-                review = session(attempt=generation_root / "review", revision=revision,
-                    name=worker_prefix + "-review", role="review", task=REVIEW_TASK,
-                    evidence=generation_root / "review-evidence.json", **common)
-                durable_json(generation_root / "review-result.json", review)
-                session_valid(review, "review", revision)
-                sessions.append(review)
-                guard.check()
-                inflight = None
-                validate_session_source(review, generation_root / "review/work/plugin")
-                require(review["session_id"] != implementation["session_id"], "Review must be independent")
-                # The frozen Git object is authoritative; nevertheless fail on edits to either export.
-                review_commit, review_changes = candidate_commit(repo, revision, Path(review["workspace"]), generation_root / "review")
-                require(review_commit == revision and not review_changes, "Reviewer source changed")
-                require(snapshot(workspace) == work_identity, "Implementation source changed after gates")
-                pins_unchanged()
-                review_final = review["final"]
-                approved = all(review_final.get(k) is True for k in (
-                    "approved", "shortcuts_checked", "compatibility_checked", "report_checked"))
-                report["independent_review"] = {"session_id": review["session_id"], "approved": approved,
-                    "revision": revision, "binding_sha256": sha(gate_binding), "findings": review_final.get("findings", [])}
-                report["outcome"] = ("no_change" if not changes else "accepted"
-                                     if decision["score_eligible"] and approved and full_passed and cleared else "rejected")
-                report["usage"] = safe_usage(sessions)
-                checkpoint("publication")
-                with guard.action():
-                    publish(campaign, pending, report)
-                if resuming:
-                    durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
-                                 "state": "complete", "verification_generation": generation,
+                                 "state": "finalized_report_settled", "resources": resources,
                                  "report_sha256": file_sha(attempt / "report.json")}, replace=True)
-                return report
+                    updated = {**manifest, "pending": None, "paused": False}
+                    updated.pop("pause_source", None)
+                    with guard.action():
+                        durable_json(campaign / "manifest.json", updated, replace=True)
+                        require(read_json(campaign / "manifest.json") == updated, "Recovery readback failed")
+                    return next(r for r in reports if r["attempt_id"] == attempt_id)
+                with recovery.resources(attempt):
+                    try:
+                        guard.check()
+                        implementation = recovered_implementation(attempt, config) if completion == "settled" else None
+                        guard.check()
+                    except Exception:
+                        raise recovery.RecoveryPaused("implementation_checkpoint_invalid") from None
+                generations = [int(p.name.split("-")[1]) for p in attempt.glob("generation-*")
+                               if p.name.split("-")[1].isdigit()]
+                generation = max([read_json(attempt / "checkpoint.json")["generation"], *generations]) + 1
+                if implementation is not None:
+                    session_valid(implementation, "implementation", previous)
+                    if (attempt / "candidate.json").exists():
+                        pinned = read_json(attempt / "candidate.json")
+                        candidate, _ = candidate_commit(repo, previous, Path(implementation["workspace"]), attempt)
+                        if pinned != {**binding, "revision": candidate,
+                                "tree": git(repo, "rev-parse", candidate + "^{tree}").decode().strip()}:
+                            raise recovery.RecoveryPaused("candidate_revision_drift")
+                if implementation is None:
+                    # No transcript replay. Real settled partial sessions can be finalized;
+                    # missing session identity is not proof a model call never happened.
+                    require((attempt / "implementation/private/session.json").exists(),
+                            "Campaign paused or pending; session ownership unknown")
+                    draft = read_json(attempt / "draft-report.json")
+                    draft.update(outcome="interrupted", reconciliation_required=False,
+                                 usage=safe_usage(recover_usage(attempt, [])))
+                    if (attempt / "report.json").exists():
+                        archive_report(attempt)
+                    with guard.action():
+                        publish(campaign, manifest, draft)
+                    durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
+                                 "state": "interrupted_finalized", "resources": resources,
+                                 "report_sha256": file_sha(attempt / "report.json")}, replace=True)
+                    return draft
+                orphan = attempt / "report.json"
+                if orphan.exists():
+                    archive_report(attempt)
             except Exception as error:
-                # Never put arbitrary candidate/provider exception text into safe reports.
-                report["error_class"] = type(error).__name__
-                report["outcome"] = "error"
-                report["usage"] = safe_usage(recover_usage(attempt, sessions))
-                paused = guard.failed or bool(re.search(r"auth|quota|modelpaused|ratelimit|credential", type(error).__name__, re.I))
-                report["paused"] = paused
-                uncertain = inflight is not None
-                if inflight is not None:
-                    kind, role = inflight
-                    if kind == "session":
-                        # Status exists even after failed cleanup; only an explicit
-                        # completed-cleanup receipt is safe-to-relaunch evidence.
-                        status = (attempt if role == "implementation" else generation_root) / role / "private/status.json"
-                        uncertain = not (status.is_file() and read_json(status).get("cleanup_complete") is True)
-                    elif kind == "evaluation":
-                        cleanup = generation_root / ("evaluation-" + role) / "cleanup.json"
-                        uncertain = not (cleanup.is_file() and read_json(cleanup).get("worker_removed") is True)
-                    elif kind == "checks":
-                        cleanup = generation_root / "full-checks/checks.json"
-                        uncertain = not (cleanup.is_file() and read_json(cleanup).get("cleanup_complete") is True)
-                report["reconciliation_required"] = uncertain
-                if not (attempt / "report.json").exists():
-                    with guard.lock:
-                        report["paused"] = paused or guard.failed
-                        publish(campaign, read_json(campaign / "manifest.json") if guard.failed else pending,
-                                report, paused=paused or guard.failed, hold_pending=uncertain)
-                raise
-            except BaseException as error:
-                report.update(outcome="interrupted", error_class=type(error).__name__,
-                              usage=safe_usage(recover_usage(attempt, sessions)), reconciliation_required=True)
-                if not (attempt / "interrupted.json").exists():
-                    durable_json(attempt / "interrupted.json", report)
-                raise
-            # Interruption/process death deliberately leaves pending intact.
+                # Recovery must not relabel/clear an independent disk pause.
+                if guard.failed:
+                    guard.check()
+                reason = str(error) if isinstance(error, recovery.RecoveryPaused) else "recovery_evidence_uncertain"
+                pause_recovery(campaign, reason)
+                raise ValueError("Campaign paused or pending; " + reason) from None
+        else:
+            attempt.mkdir(mode=0o700)
+            fsync_directory(attempt.parent)
+            durable_json(attempt / "attempt.json", {"attempt_id": attempt_id, **binding, **MODEL})
+            durable_json(attempt / "history.json", {"reports": [history_projection(r) for r in reports]})
+        with guard.action():
+            pending = {**manifest, "pending": attempt_id, "paused": False}
+            pending.pop("pause_source", None)
+            durable_json(campaign / "manifest.json", pending, replace=True)
+        report: dict[str, Any] = {"attempt_id": attempt_id, **binding, "revision": previous,
+            "hypothesis": None, "strategy": None, "related_attempts": [], "revisit_reason": None,
+            "actual_changes": [], "checks": [], "measured_outcomes": {}, "outcome": "error",
+            "lessons": [], "usage": [], "semantic_caveat": "Unknown returned top-five targets remain unjudged."}
+        lifecycle.enter_context(recovery.resources(attempt))
+        generation_root = attempt if generation == 0 else attempt / ("generation-" + str(generation))
+        if generation:
+            generation_root.mkdir(mode=0o700)
+        report["verification_generation"] = generation
+        sessions: list[dict] = recover_usage(attempt, []) if resuming else []
+        inflight: tuple[str, str] | None = None
+
+        def checkpoint(phase: str) -> None:
+            guard.check()
+            durable_json(attempt / "draft-report.json", report, replace=True)
+            durable_json(attempt / "checkpoint.json", {"phase": phase, "generation": generation,
+                         "revision": report["revision"]}, replace=True)
+
+        checkpoint("created")
+        worker_prefix = "lk-lab-" + attempt_id + ("-g" + str(generation) if generation else "")
+        common = {"repo": repo, "corpus": Path(config["corpus"]), "development": Path(config["development"]),
+                  "history": attempt / "history.json", "image": config["image"]}
+
+        def pins_unchanged() -> None:
+            guard.check()
+            require(read_json(campaign / "config.json") == config and controller_identity() == identity,
+                    "Controller/config evidence became stale")
+            validate_config(config, loader)
+
+        def measured(revision: str, role: str) -> dict:
+            nonlocal inflight
+            pins_unchanged()
+            inflight = ("evaluation", role)
+            checkpoint("evaluation-" + role)
+            result = evaluator(attempt=generation_root / ("evaluation-" + role), repo=repo, revision=revision,
+                               corpus=Path(config["corpus"]), image=config["image"],
+                               name=worker_prefix + "-" + role, benchmark=benchmark)
+            inflight = None
+            require(result.get("revision") == revision and result.get("image") == config["image"]
+                    and result.get("benchmark_identity") == config["composite_id"], "Stale evaluation identity")
+            pins_unchanged()
+            return safe_aggregate(result)
+
+        try:
+            guard.check()
+            pins_unchanged()
+            if implementation is None:
+                inflight = ("session", "implementation")
+                checkpoint("implementation")
+                implementation = session(attempt=attempt / "implementation", revision=previous,
+                    name="lk-lab-" + attempt_id + "-impl", role="implementation", task=IMPLEMENT_TASK, **common)
+                durable_json(attempt / "implementation-result.json", implementation)
+            session_valid(implementation, "implementation", previous)
+            if not any(s["session_id"] == implementation["session_id"] for s in sessions):
+                sessions.append(implementation)
+            guard.check()
+            inflight = None
+            validate_session_source(implementation, attempt / "implementation/work/plugin")
+            final = implementation["final"]
+            for key in ("hypothesis", "strategy", "related_attempts", "revisit_reason", "lessons"):
+                report[key] = final[key]
+            require(isinstance(final["strategy"], str) and bool(final["strategy"].strip()), "Strategy missing")
+            require(type(final["no_change"]) is bool, "Explicit no-change decision required")
+            report["strategy_id"] = sha(" ".join(final["strategy"].lower().split()))
+            failed = [r for r in reports if r.get("strategy_id") == report["strategy_id"] and r["outcome"] == "rejected"]
+            require(not failed or final["no_change"] or bool(str(final["revisit_reason"] or "").strip()),
+                    "Repeated failed strategy needs a new reason or no-change decision")
+            workspace = Path(implementation["workspace"])
+            work_identity = snapshot(workspace)
+            revision, changes = candidate_commit(repo, previous, workspace, attempt)
+            report.update(revision=revision, actual_changes=changes)
+            if final["no_change"] != (not changes):
+                report["delivery_validation"] = {
+                    "passed": False, "reason": "no_change_imported_edits_mismatch",
+                    "declared_no_change": final["no_change"], "imported_edits": bool(changes)}
+                raise ValueError("Candidate delivery mismatch: no_change contradicts imported edits")
+            exact_binding = {**binding, "revision": revision, "tree": git(repo, "rev-parse", revision + "^{tree}").decode().strip()}
+            if (attempt / "candidate.json").exists():
+                require(read_json(attempt / "candidate.json") == exact_binding, "Recovered candidate drift")
+            else:
+                durable_json(attempt / "candidate.json", exact_binding)
+            checkpoint("candidate")
+            old = measured(previous, "incumbent")
+            report["measured_outcomes"]["incumbent"] = old
+            new = measured(revision, "candidate")
+            report["measured_outcomes"]["candidate"] = new
+            decision = verdict(old, new)
+            report["measured_outcomes"]["score_verdict"] = decision
+            report["checks"] = [{"name": gate, "passed": new.get(gate) is True, "revision": revision}
+                                for gate in ("integrity", "trusted_tests", "official_integration", "complete")]
+            guard.check()
+            inflight = ("checks", "full-checks")
+            checkpoint("full-checks")
+            full_checks = checks(attempt=generation_root / "full-checks", repo=repo, revision=revision,
+                                 image=config["image"], name=worker_prefix + "-checks",
+                                 check_tools=Path(config["check_tools"]),
+                                 check_tools_sha256=config["check_tools_sha256"])
+            guard.check()
+            inflight = None
+            require(full_checks.get("revision") == revision and full_checks.get("image") == config["image"]
+                    and full_checks.get("controller") == sha(identity), "Stale full-check evidence")
+            actual_checks = full_checks.get("checks", [])
+            full_passed = (full_checks.get("passed") is True
+                           and {c["name"] for c in actual_checks} == {"full_pytest", "ruff", "mypy"}
+                           and all(c.get("passed") is True for c in actual_checks))
+            report["checks"].extend({**c, "revision": revision} for c in actual_checks)
+            gate_binding = {**exact_binding, "verification_generation": generation,
+                            "checks_sha256": sha(full_checks)}
+            clearance_binding = {**gate_binding, "measured_outcomes_sha256": sha(report["measured_outcomes"])}
+            cleared = clearance(campaign, clearance_binding) if decision["score_eligible"] else False
+            report["unknown_target_gate"] = {"cleared": cleared, "binding": clearance_binding}
+            # Reviewer sees aggregate integers and actual checks, never cases or raw responses.
+            durable_json(generation_root / "review-evidence.json", {"binding": gate_binding, "draft_report": report})
+            pins_unchanged()
+            require(snapshot(workspace) == work_identity, "Candidate changed after execution")
+            inflight = ("session", "review")
+            checkpoint("review")
+            review = session(attempt=generation_root / "review", revision=revision,
+                name=worker_prefix + "-review", role="review", task=REVIEW_TASK,
+                evidence=generation_root / "review-evidence.json", **common)
+            durable_json(generation_root / "review-result.json", review)
+            session_valid(review, "review", revision)
+            sessions.append(review)
+            guard.check()
+            inflight = None
+            validate_session_source(review, generation_root / "review/work/plugin")
+            require(review["session_id"] != implementation["session_id"], "Review must be independent")
+            # The frozen Git object is authoritative; nevertheless fail on edits to either export.
+            review_commit, review_changes = candidate_commit(repo, revision, Path(review["workspace"]), generation_root / "review")
+            require(review_commit == revision and not review_changes, "Reviewer source changed")
+            require(snapshot(workspace) == work_identity, "Implementation source changed after gates")
+            pins_unchanged()
+            review_final = review["final"]
+            approved = all(review_final.get(k) is True for k in (
+                "approved", "shortcuts_checked", "compatibility_checked", "report_checked"))
+            report["independent_review"] = {"session_id": review["session_id"], "approved": approved,
+                "revision": revision, "binding_sha256": sha(gate_binding), "findings": review_final.get("findings", [])}
+            report["outcome"] = ("no_change" if not changes else "accepted"
+                                 if decision["score_eligible"] and approved and full_passed and cleared else "rejected")
+            report["usage"] = safe_usage(sessions)
+            checkpoint("publication")
+            with guard.action():
+                publish(campaign, pending, report)
+            if resuming:
+                durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
+                             "state": "complete", "verification_generation": generation,
+                             "report_sha256": file_sha(attempt / "report.json")}, replace=True)
+            return report
+        except Exception as error:
+            # Never put arbitrary candidate/provider exception text into safe reports.
+            report["error_class"] = type(error).__name__
+            report["outcome"] = "error"
+            report["usage"] = safe_usage(recover_usage(attempt, sessions))
+            paused = guard.failed or bool(re.search(r"auth|quota|modelpaused|ratelimit|credential", type(error).__name__, re.I))
+            report["paused"] = paused
+            uncertain = inflight is not None
+            if inflight is not None:
+                kind, role = inflight
+                if kind == "session":
+                    # Status exists even after failed cleanup; only an explicit
+                    # completed-cleanup receipt is safe-to-relaunch evidence.
+                    status = (attempt if role == "implementation" else generation_root) / role / "private/status.json"
+                    uncertain = not (status.is_file() and read_json(status).get("cleanup_complete") is True)
+                elif kind == "evaluation":
+                    cleanup = generation_root / ("evaluation-" + role) / "cleanup.json"
+                    uncertain = not (cleanup.is_file() and read_json(cleanup).get("worker_removed") is True)
+                elif kind == "checks":
+                    cleanup = generation_root / "full-checks/checks.json"
+                    uncertain = not (cleanup.is_file() and read_json(cleanup).get("cleanup_complete") is True)
+            report["reconciliation_required"] = uncertain
+            if not (attempt / "report.json").exists():
+                with guard.lock:
+                    report["paused"] = paused or guard.failed
+                    publish(campaign, read_json(campaign / "manifest.json") if guard.failed else pending,
+                            report, paused=paused or guard.failed, hold_pending=uncertain)
+            raise
+        except BaseException as error:
+            report.update(outcome="interrupted", error_class=type(error).__name__,
+                          usage=safe_usage(recover_usage(attempt, sessions)), reconciliation_required=True)
+            if not (attempt / "interrupted.json").exists():
+                durable_json(attempt / "interrupted.json", report)
+            raise
+        # Interruption/process death deliberately leaves pending intact.
 
 
 def main() -> None:
