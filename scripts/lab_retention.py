@@ -29,6 +29,10 @@ MAX_TREE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ENTRIES = 50000
 MAX_DEPTH = 64
 CHUNK_BYTES = 64 * 1024
+# Only these exact attempt-root slots belong to retention, outside candidate
+# exports. Staging names are fixed so even repeated interrupted writes stay finite.
+BOOKKEEPING_NAMES = frozenset({"retention-plan.json", "retention-result.json",
+                               ".retention-plan.json.pending", ".retention-result.json.pending"})
 
 
 class RetentionBlocked(ValueError):
@@ -50,9 +54,10 @@ def _plain(path: Path, *, missing: bool = False) -> None:
 
 
 class _Budget:
-    def __init__(self) -> None:
+    def __init__(self, *, bookkeeping: bool = False) -> None:
         self.entries = 0
         self.bytes = 0
+        self.byte_limit = MAX_FILE_BYTES if bookkeeping else MAX_TREE_BYTES
 
     def entry(self, depth: int) -> None:
         self.entries += 1
@@ -62,7 +67,7 @@ class _Budget:
     def content(self, size: int) -> None:
         _require(0 <= size <= MAX_FILE_BYTES, "retention_file_budget_exceeded")
         self.bytes += size
-        _require(self.bytes <= MAX_TREE_BYTES, "retention_byte_budget_exceeded")
+        _require(self.bytes <= self.byte_limit, "retention_byte_budget_exceeded")
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:
@@ -101,13 +106,14 @@ def _digest(path: Path, budget: _Budget | None = None) -> str:
     return digest.hexdigest()
 
 
-def _json(path: Path) -> dict:
-    value = json.loads(b"".join(_chunks(path, _Budget())))
+def _json(path: Path, *, bookkeeping: bool = False) -> dict:
+    value = json.loads(b"".join(_chunks(path, _Budget(bookkeeping=bookkeeping))))
     _require(isinstance(value, dict), "nonobject_record")
     return value
 
 
-def _children(path: Path, budget: _Budget, depth: int) -> Iterator[Path]:
+def _children(path: Path, budget: _Budget, depth: int,
+              bookkeeping: frozenset[Path] = frozenset()) -> Iterator[Path]:
     _plain(path)
     before = path.lstat()
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -115,7 +121,8 @@ def _children(path: Path, budget: _Budget, depth: int) -> Iterator[Path]:
         _require(_identity(os.fstat(fd)) == _identity(before), "retention_read_drift")
         with os.scandir(fd) as stream:
             for child in stream:
-                budget.entry(depth)
+                if path / child.name not in bookkeeping:
+                    budget.entry(depth)
                 yield path / child.name
         _plain(path)
         _require(_identity(os.fstat(fd)) == _identity(before)
@@ -124,20 +131,26 @@ def _children(path: Path, budget: _Budget, depth: int) -> Iterator[Path]:
         os.close(fd)
 
 
-def _walk(path: Path, budget: _Budget, depth: int = 1) -> Iterator[Path]:
-    for child in _children(path, budget, depth):
+def _walk(path: Path, budget: _Budget, depth: int = 1,
+          bookkeeping: frozenset[Path] = frozenset()) -> Iterator[Path]:
+    for child in _children(path, budget, depth, bookkeeping):
         yield child
         info = child.lstat()
         if stat.S_ISDIR(info.st_mode):
-            yield from _walk(child, budget, depth + 1)
+            yield from _walk(child, budget, depth + 1, bookkeeping)
 
 
 def _preflight(attempt: Path) -> None:
     # Metadata only: bound the whole attempt, including protected evaluator output,
     # before controller receipt discovery or any content read. Repeat on restart.
     budget = _Budget()
-    for path in _walk(attempt, budget):
+    bookkeeping = frozenset(attempt / name for name in BOOKKEEPING_NAMES)
+    for path in _walk(attempt, budget, bookkeeping=bookkeeping):
         info = path.lstat()
+        if path in bookkeeping:
+            _require(stat.S_ISREG(info.st_mode), "nonregular_record")
+            _Budget(bookkeeping=True).content(info.st_size)
+            continue
         if stat.S_ISREG(info.st_mode):
             budget.content(info.st_size)
         else:
@@ -146,7 +159,8 @@ def _preflight(attempt: Path) -> None:
 
 
 def _generations(attempt: Path) -> list[Path]:
-    return [p for p in _children(attempt, _Budget(), 1)
+    return [p for p in _children(attempt, _Budget(), 1,
+                                frozenset(attempt / name for name in BOOKKEEPING_NAMES))
             if re.fullmatch(r"generation-[0-9]+", p.name)]
 
 
@@ -156,8 +170,31 @@ def _sessions(attempt: Path) -> list[Path]:
 
 
 def _save(path: Path, value: dict, *, replace: bool = False) -> None:
-    recovery.atomic_json(path, value, replace=replace)
-    _require(_json(path) == value, "receipt_readback_failed")
+    data = (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
+    _Budget(bookkeeping=True).content(len(data))  # Reject before durable publication.
+    temp = path.with_name("." + path.name + ".pending")
+    _plain(temp, missing=True)
+    if temp.exists():
+        _require(stat.S_ISREG(temp.lstat().st_mode), "nonregular_record")
+        # Never truncate a possible hardlink to evidence. This slot is not authority.
+        temp.unlink()
+        recovery.sync_directory(temp.parent)
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if replace:
+            os.replace(temp, path)
+        else:
+            os.link(temp, path)
+        recovery.sync_directory(path.parent)
+    finally:
+        if temp.exists():
+            temp.unlink()
+            recovery.sync_directory(temp.parent)
+    _require(_json(path, bookkeeping=True) == value, "receipt_readback_failed")
 
 
 def _roots(attempt: Path) -> list[str]:
@@ -383,7 +420,7 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
     if reconciled is not None:
         _require(resources == reconciled["resources"], "recovery_settlement_drift")
     if receipt_path.exists() or receipt_path.is_symlink():
-        plan = _json(receipt_path)
+        plan = _json(receipt_path, bookkeeping=True)
         _require(plan.get("schema") == SCHEMA and plan["report_sha256"] == pointer["sha256"]
                  and plan["attempt_id"] == attempt_id, "retention_plan_drift")
         if reconciled is not None:
@@ -411,12 +448,13 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
         raw = _inventory(attempt, _raw_paths(attempt))
         protected_hashes = {}
         discovery, reads = _Budget(), _Budget()
-        for path in _walk(attempt, discovery):
+        bookkeeping = frozenset(attempt / name for name in BOOKKEEPING_NAMES)
+        for path in _walk(attempt, discovery, bookkeeping=bookkeeping):
             name = path.relative_to(attempt).as_posix()
-            if name not in disposable and name not in raw and not path.is_dir():
+            if path not in bookkeeping and name not in disposable and name not in raw and not path.is_dir():
                 protected_hashes[name] = _digest(path, reads)
         revisions = {report["revision"], manifest["incumbent"], config["initial_incumbent"]}
-        for path in _children(attempt, _Budget(), 1):
+        for path in _children(attempt, _Budget(), 1, bookkeeping):
             if re.fullmatch(r"report\.pre-recovery-.*\.json", path.name):
                 revisions.add(_json(path)["revision"])
         for name in ("candidate.json", "attempt.json"):
@@ -469,7 +507,7 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
     if expired:
         _dispose(attempt, plan["raw"])
     result = {"schema": SCHEMA, "attempt_id": attempt_id, "report_sha256": pointer["sha256"],
-              "plan_sha256": _digest(receipt_path), "disposable_complete": True,
+              "plan_sha256": _digest(receipt_path, _Budget(bookkeeping=True)), "disposable_complete": True,
               "raw_complete": expired, "raw_delete_after": plan["raw_delete_after"]}
     _save(attempt / "retention-result.json", result, replace=True)
     return result

@@ -10,6 +10,7 @@ from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Iterator
 import uuid
@@ -196,8 +197,6 @@ def restore_exports(attempt: Path, image: str) -> None:
         if receipt["image"] != image or image not in args:
             raise RecoveryPaused("export_ownership_identity_uncertain")
         tail = args[args.index(image) + 1:]
-        if "10000:10000" not in tail:
-            continue  # A prior restoration is not a new ownership grant.
         mounts = [args[i + 1] for i, arg in enumerate(args) if arg == "--mount"]
         roots = [root for root, children in allowed.items()
                  if mounts == [f"type=bind,src={root / child},dst=/{child}" for child in children]]
@@ -206,8 +205,17 @@ def restore_exports(attempt: Path, image: str) -> None:
         root = roots[0]
         children = allowed[root]
         destinations = ["/" + c for c in children]
-        if (tail not in (["-R", "10000:10000", *destinations],
+        grant = tail in (["-R", "10000:10000", *destinations],
                          ["-R", "--no-dereference", "10000:10000", *destinations])
+        restored = (tail[:2] == ["-R", "--no-dereference"]
+                    and ((len(tail) == 4 + len(destinations)
+                          and tail[2] == "--from=10000:10000"
+                          and re.fullmatch(r"[0-9]+:[0-9]+", tail[3]) is not None
+                          and tail[4:] == destinations)
+                         or (len(tail) == 3 + len(destinations)
+                             and re.fullmatch(r"[0-9]+:[0-9]+", tail[2]) is not None
+                             and tail[3:] == destinations)))
+        if (not (grant or restored)
                 or args[:3] != ["docker", "run", "--rm"]
                 or args[args.index("--label") + 1] !=
                 ("lk.lab=ticket-69" if len(children) == 4 else "lk.lab=ticket-66")):
@@ -217,6 +225,8 @@ def restore_exports(attempt: Path, image: str) -> None:
             if (not target.is_dir() or any(p.is_symlink() for p in
                     [target, *target.parents] if p == attempt or attempt in p.parents)):
                 raise RecoveryPaused("export_ownership_identity_uncertain")
+        if restored and not grant:
+            continue  # Valid prior restoration, even if the host UID/GID is 10000.
         commands[root] = args[:args.index(image)] + [image, "-R", "--no-dereference",
             "--from=10000:10000", f"{os.getuid()}:{os.getgid()}", *destinations]
     with resources(attempt):

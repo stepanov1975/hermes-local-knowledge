@@ -16,6 +16,43 @@ Full-check containers use an init reaper so orphaned test descendants do not
 accumulate against the unchanged 256-PID allowance. The read-only/no-network
 worker boundary and non-executable temporary mounts remain unchanged.
 
+## Oversized exports: bounded helper, manual recovery
+
+Ownership restoration has a wall-clock bound, not an upfront tree-count bound.
+Each restoration helper invocation uses the existing **120-second subprocess
+timeout**, followed by an attempt to quiesce only its exact identity-matched
+helper. There is no
+upfront entry/depth quota for this recursive ownership operation, and no promise
+that an arbitrarily large export will finish inside that allowance.
+
+A restoration exception or timeout retains the pending attempt and writes the
+existing recovery safety pause. An automatic hourly tick checks that pause before
+admission, so it does **not** repeatedly retry restoration or launch another model
+session. If helper quiescence is uncertain, the resource and evidence remain
+protected; timeout is not proof that the helper stopped.
+
+For an oversized export, keep the campaign paused and inspect only the original
+receipt-named exports and matching resources. Manual filesystem/ownership repair
+requires a separate operator decision; do not rewrite reports, original
+request/response evidence, frozen inputs or setup grants, silently raise quotas,
+or erase a pause to force admission. Exports that cannot be handled inside the
+helper allowance are an explicit manual-maintenance boundary, not an automatic
+cleanup guarantee. After authorized repair and confirmed quiescence, use the
+existing explicit controls (placeholders below are not an active campaign):
+
+```sh
+python -m scripts.lab_automation pause --campaign /private/approved-campaign
+# Inspect/repair the exact owned exports only under separate authorization.
+python -m scripts.lab_experiment recover --campaign /private/approved-campaign
+# Only after pending recovery has settled and the cause has been repaired:
+python -m scripts.lab_automation resume --campaign /private/approved-campaign --acknowledge-blockers
+```
+
+Ordinary `resume` clears only the manual latch, not a recovery safety pause.
+Explicit recovery does not replay an unanswered model call; ambiguity still
+requires reconciliation. No additional recovery engine or tree-removal command
+is introduced by this policy.
+
 ## Bounded inventory and reads
 
 Every cleanup, including saved-plan retries and expiry, first checks the whole
@@ -28,6 +65,16 @@ are included. Each later inventory/hash/validation pass has its own finite
 aggregate allowance, so this is not a claim that cleanup reads at most 2 GiB total.
 The file limit accommodates supported 64 MiB command streams rather than applying
 the smaller source-workspace allowance to raw evidence.
+
+Four exact **controller-owned attempt-root** files are accounted separately:
+`retention-plan.json`, `retention-result.json`, `.retention-plan.json.pending`,
+and `.retention-result.json.pending`. Each must be a regular file no larger than
+128 MiB and its reads remain bounded; a derived plan exceeding that limit is
+rejected before publication. Fixed staging slots keep interrupted bookkeeping
+finite without consuming an already admitted export budget. The final plan stays
+immutable and a staging file is never authority. Nested same-name files, unknown
+files and legacy random temporary names still count against the ordinary limits;
+there is no filename-prefix exemption or historical migration.
 
 Budget violations retain evidence and return fixed actionable retention blockers;
 they never silently truncate an inventory or expand an immutable disposal plan.

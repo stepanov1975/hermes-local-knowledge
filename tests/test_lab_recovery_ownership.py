@@ -137,3 +137,148 @@ def test_finalized_pending_restore_metadata_bound_before_settlement(h, monkeypat
     assert h.manifest()["reports"][0]["recovery_sha256"] == lab.file_sha(attempt / "recovery-report.json")
     cleaned = retention.cleanup_campaign(h.campaign, now=100)
     assert not cleaned["blocked"] and cleaned["cleaned"][0]["disposable_complete"]
+
+
+@pytest.mark.parametrize("fail_at", [None, 2])
+def test_uid10000_mixed_receipts_partial_restore_and_repeat_retry(h, monkeypatch, fail_at):
+    attempt = pending_candidate(h)
+    setup_receipt(attempt)
+    setup_receipt(attempt, "review")
+    monkeypatch.setattr(recovery.os, "getuid", lambda: 10000)
+    monkeypatch.setattr(recovery.os, "getgid", lambda: 10000)
+    monkeypatch.setattr(recovery, "docker_inspect", lambda name: None)
+    calls, quiesced = [], []
+    def run(args):
+        calls.append(list(args))
+        if fail_at is not None and len(calls) == fail_at:
+            raise OSError("synthetic partial restore")
+        return ""
+    monkeypatch.setattr(agent, "run", run)
+    monkeypatch.setattr(agent, "quiesce_helper", lambda args, image: quiesced.append(list(args)))
+    if fail_at is not None:
+        with pytest.raises(recovery.RecoveryPaused, match="export_ownership_restore_failed"):
+            recovery.restore_exports(attempt, agent.IMAGE)
+    else:
+        recovery.restore_exports(attempt, agent.IMAGE)
+    # Original grants coexist with successful/failed restoration intents. Neither
+    # previous restoration nor its host UID is a new sandbox ownership grant.
+    for _ in range(2):
+        prior = len(calls)
+        recovery.restore_exports(attempt, agent.IMAGE)
+        assert len(calls) == prior + 2
+    assert calls == quiesced
+    assert all(args[args.index(agent.IMAGE) + 1:][:4] ==
+               ["-R", "--no-dereference", "--from=10000:10000", "10000:10000"] for args in calls)
+
+
+@pytest.mark.parametrize("kind", ["grant", "restore", "session_restore"])
+@pytest.mark.parametrize("unsafe", ["owner", "flags", "label", "mount", "image", "symlink"])
+def test_malformed_ownership_receipt_blocks_all_mutation(h, monkeypatch, kind, unsafe):
+    attempt = pending_candidate(h)
+    setup_receipt(attempt)
+    root = setup_receipt(attempt, "review")
+    receipts = [p for p in (attempt / "resources").glob("*.json")
+                if str(root / "home") in p.read_text()]
+    path = receipts[0]
+    value = lab.read_json(path)
+    args = value["args"]
+    index = args.index(agent.IMAGE)
+    if kind == "restore":
+        args[index + 1:] = ["-R", "--no-dereference", "--from=10000:10000", "10000:10000",
+                            "/home", "/work", "/scratch", "/output"]
+    if kind == "session_restore":
+        args[index + 1:] = ["-R", "--no-dereference", "1234:5678",
+                            "/home", "/work", "/scratch", "/output"]
+    if unsafe == "owner":
+        args[-5] = "not-an-owner"  # Owner immediately precedes the four destinations.
+    elif unsafe == "flags":
+        args[index + 1] = "--invalid"
+    elif unsafe == "label":
+        args[args.index("--label") + 1] = "lk.lab=wrong"
+    elif unsafe == "mount":
+        args[args.index("--mount") + 1] += ",readonly"
+    elif unsafe == "image":
+        value["image"] = "sha256:" + "a" * 64
+    elif unsafe == "symlink":
+        (root / "home").rmdir()
+        (root / "home").symlink_to(h.root / "corpus", target_is_directory=True)
+    lab.durable_json(path, value, replace=True)
+    monkeypatch.setattr(agent, "run", lambda args: pytest.fail("validate all before mutation"))
+    with pytest.raises(recovery.RecoveryPaused, match="export_ownership_identity_uncertain"):
+        recovery.restore_exports(attempt, agent.IMAGE)
+
+
+def test_restore_timeout_quiesces_and_pauses_without_automatic_replay(h, monkeypatch):
+    import subprocess
+
+    from scripts import lab_automation as auto
+    from scripts import lab_runtime as runtime
+
+    attempt = pending_candidate(h)
+    setup_receipt(attempt)
+    auto.initialize(h.campaign)
+    monkeypatch.setattr(recovery, "docker_inspect", lambda name: None)
+    assert agent.run is runtime.run  # Exercise the real default timeout boundary.
+    original_run = subprocess.run
+    docker_calls, quiesced = [], []
+    original_quiesce = agent.quiesce_helper
+    def process(args, **kwargs):
+        if args[0] != "docker":
+            return original_run(args, **kwargs)
+        docker_calls.append((list(args), kwargs["timeout"]))
+        if args[1] == "run":
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        assert args[1] == "ps"  # Real quiescence confirms the exact helper absent.
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    def quiesce(args, image):
+        quiesced.append((list(args), image))
+        return original_quiesce(args, image)
+    monkeypatch.setattr(runtime.subprocess, "run", process)
+    monkeypatch.setattr(agent, "quiesce_helper", quiesce)
+    calls, evaluations = len(h.calls), len(h.evaluations)
+    with pytest.raises(ValueError, match="export_ownership_restore_failed"):
+        h.run(recover_only=True)
+    manifest = h.manifest()
+    assert manifest["pending"] == attempt.name
+    assert manifest["paused"] and manifest["pause_source"] == "recovery"
+    assert lab.read_json(h.campaign / "recovery-alert.json")["reason"] == "export_ownership_restore_failed"
+    assert len(quiesced) == 1 and quiesced[0] == (docker_calls[0][0], agent.IMAGE)
+    assert [args[1] for args, _ in docker_calls] == ["run", "ps"]
+    assert all(timeout == 120 for _, timeout in docker_calls)
+    name = quiesced[0][0][quiesced[0][0].index("--name") + 1]
+    assert docker_calls[1][0][-1] == "name=^/" + name + "$"
+    def forbidden(*args, **kwargs) -> dict:
+        raise AssertionError("paused automation must not recover or launch a model")
+    monkeypatch.setattr(recovery, "restore_exports", forbidden)
+    monkeypatch.setattr(auto, "maintain", forbidden)
+    for stamp in (3600, 7200):
+        assert auto.tick(h.campaign, now=stamp, action=forbidden) == {"state": "paused"}
+    assert h.manifest() == manifest
+    assert (len(h.calls), len(h.evaluations)) == (calls, evaluations)
+    assert len(docker_calls) == 2
+
+
+@pytest.mark.parametrize("relative", ["implementation", "evaluation-candidate"])
+def test_session_restore_receipts_coexist_with_original_grants(h, monkeypatch, relative):
+    attempt = pending_candidate(h)
+    setup_receipt(attempt, relative)
+    path = next((attempt / "resources").glob("*.json"))
+    value = lab.read_json(path)
+    args = value["args"]
+    index = args.index(agent.IMAGE)
+    destinations = args[index + 3:]
+    # Current agent grants include --no-dereference; evaluator grants are legacy -R.
+    if relative == "implementation":
+        args[index + 2:index + 2] = ["--no-dereference"]
+        lab.durable_json(path, value, replace=True)
+    restored = {"image": agent.IMAGE, "args": args[:index + 1] +
+                ["-R", "--no-dereference", "1234:5678", *destinations]}
+    lab.durable_json(path.with_name("session-restore.json"), restored)
+    monkeypatch.setattr(recovery, "docker_inspect", lambda name: None)
+    calls = []
+    monkeypatch.setattr(agent, "run", lambda args: calls.append(list(args)) or "")
+    monkeypatch.setattr(agent, "quiesce_helper", lambda *args: None)
+    for _ in range(2):
+        recovery.restore_exports(attempt, agent.IMAGE)
+    assert len(calls) == 2  # Only the original grant produces a restore each retry.
+    assert all("--from=10000:10000" in args for args in calls)

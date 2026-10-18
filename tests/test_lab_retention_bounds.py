@@ -12,6 +12,179 @@ from tests.test_lab_retention import clean, finished as _finished
 finished = _finished
 
 
+@pytest.mark.parametrize("limit", ["entries", "bytes"])
+@pytest.mark.parametrize("interruption", ["plan", "before_result", "result"])
+def test_controller_receipts_do_not_consume_candidate_capacity(
+        finished, monkeypatch, limit, interruption):
+    h, attempt = finished
+    paths = list(attempt.rglob("*"))
+    cap = len(paths) if limit == "entries" else sum(p.stat().st_size for p in paths if p.is_file())
+    monkeypatch.setattr(retention, "MAX_ENTRIES" if limit == "entries" else "MAX_TREE_BYTES", cap)
+    original_save = retention._save
+
+    def save(path, value, **kwargs):
+        if interruption == "before_result" and path.name == "retention-result.json":
+            raise KeyboardInterrupt
+        original_save(path, value, **kwargs)
+        if path.name == "retention-" + interruption + ".json":
+            raise KeyboardInterrupt
+
+    def dispose(*args):
+        # Isolate bookkeeping capacity from capacity freed by disposal.
+        return None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(retention, "_save", save)
+        patch.setattr(retention, "_dispose", dispose)
+        with pytest.raises(KeyboardInterrupt):
+            clean(h)
+    plan = (attempt / "retention-plan.json").read_bytes()
+    assert (attempt / "implementation/work").is_dir()
+    assert (attempt / "retention-result.json").exists() == (interruption == "result")
+
+    assert clean(h, 200)["blocked"] == []
+    assert (attempt / "retention-plan.json").read_bytes() == plan
+    assert not (attempt / "implementation/work").exists()
+    assert clean(h, 100 + retention.RAW_RETENTION_SECONDS)["blocked"] == []
+    assert not (attempt / "implementation/private/request-1.json").exists()
+
+
+@pytest.mark.parametrize("limit", ["entries", "bytes"])
+@pytest.mark.parametrize("record", ["plan", "result"])
+@pytest.mark.parametrize("published", [False, True])
+def test_interrupted_atomic_receipt_slots_are_bounded_and_retryable(
+        finished, monkeypatch, limit, record, published):
+    h, attempt = finished
+    paths = list(attempt.rglob("*"))
+    cap = len(paths) if limit == "entries" else sum(p.stat().st_size for p in paths if p.is_file())
+    monkeypatch.setattr(retention, "MAX_ENTRIES" if limit == "entries" else "MAX_TREE_BYTES", cap)
+    target = attempt / ("retention-" + record + ".json")
+    pending = target.with_name("." + target.name + ".pending")
+    publish = "link" if record == "plan" else "replace"
+    original_publish, original_unlink = getattr(os, publish), Path.unlink
+
+    def interrupt(source, destination, *args, **kwargs):
+        if Path(destination) == target:
+            if published:
+                original_publish(source, destination, *args, **kwargs)
+            raise KeyboardInterrupt
+        return original_publish(source, destination, *args, **kwargs)
+
+    def retain_pending(path, *args, **kwargs):
+        if path == pending:
+            raise KeyboardInterrupt  # Model process death, bypassing finally cleanup.
+        return original_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(retention, "_dispose", lambda *args: None)
+        patch.setattr(os, publish, interrupt)
+        patch.setattr(Path, "unlink", retain_pending)
+        with pytest.raises(KeyboardInterrupt):
+            clean(h)
+    assert target.exists() == published
+    assert pending.exists() == (not published or record == "plan")
+    if not published:
+        pending.write_bytes(b"{")  # A staging record may be a partial JSON write.
+    before = (attempt / "retention-plan.json").read_bytes() if (attempt / "retention-plan.json").exists() else None
+    assert clean(h, 200)["blocked"] == []
+    if before is not None:
+        assert (attempt / "retention-plan.json").read_bytes() == before
+    assert not (attempt / "implementation/work").exists()
+    assert clean(h, 100 + retention.RAW_RETENTION_SECONDS + 200)["blocked"] == []
+
+
+@pytest.mark.parametrize("limit", ["entries", "bytes"])
+@pytest.mark.parametrize("name", ["copy-retention-plan.json", ".retention-plan.json.unknown",
+                                 "implementation/private/retention-result.json"])
+def test_unknown_and_candidate_bookkeeping_names_remain_budgeted(finished, monkeypatch, limit, name):
+    h, attempt = finished
+    with monkeypatch.context() as patch:
+        patch.setattr(retention, "_dispose", lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            clean(h)
+    paths = [p for p in attempt.rglob("*") if p.name not in retention.BOOKKEEPING_NAMES]
+    cap = len(paths) if limit == "entries" else sum(p.stat().st_size for p in paths if p.is_file())
+    monkeypatch.setattr(retention, "MAX_ENTRIES" if limit == "entries" else "MAX_TREE_BYTES", cap)
+    (attempt / name).write_bytes(b"untrusted copy")
+    result = clean(h)
+    assert result["blocked"][0]["reason"] == "retention_" + ("entry" if limit == "entries" else "byte") + "_budget_exceeded"
+    assert (attempt / "implementation/work").exists()
+
+
+@pytest.mark.parametrize("name", sorted(retention.BOOKKEEPING_NAMES))
+@pytest.mark.parametrize("kind", ["sparse", "symlink", "directory", "fifo"])
+def test_bookkeeping_slots_keep_finite_regular_file_bounds(finished, monkeypatch, name, kind):
+    h, attempt = finished
+    path = attempt / name
+    if kind == "sparse":
+        with path.open("wb") as stream:
+            stream.truncate(1024 * 1024)
+        monkeypatch.setattr(retention, "MAX_FILE_BYTES", 512 * 1024)
+    elif kind == "symlink":
+        path.symlink_to(attempt / "report.json")
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        os.mkfifo(path)
+    original = os.open
+
+    def guarded(name, *args, **kwargs):
+        assert Path(name) != path, "invalid bookkeeping slot was opened"
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", guarded)
+    result = clean(h)
+    assert result["blocked"][0]["reason"] == (
+        "retention_file_budget_exceeded" if kind == "sparse" else "nonregular_record")
+    assert (attempt / "implementation/work").exists()
+
+
+def test_stale_staging_hardlink_is_unlinked_not_truncated(finished):
+    h, attempt = finished
+    protected = attempt / "report.json"
+    before, identity = protected.read_bytes(), protected.stat().st_ino
+    pending = attempt / ".retention-plan.json.pending"
+    pending.hardlink_to(protected)
+    assert clean(h)["blocked"] == []
+    assert protected.read_bytes() == before and protected.stat().st_ino == identity
+    assert not pending.exists()
+
+
+def test_plan_size_rejected_before_publication(finished, monkeypatch):
+    h, attempt = finished
+    # Make the derived plan larger than every admitted input, independently of
+    # temporary-root path lengths or platform metadata serialization.
+    largest = max(p.stat().st_size for p in attempt.rglob("*") if p.is_file())
+    assert largest <= 64 * 1024, "keep this synthetic size-bound fixture small"
+    for number in range(largest // 128 + 1):
+        (attempt / "implementation/scratch" / (f"plan-{number:05d}-" + "x" * 128)).touch()
+    monkeypatch.setattr(retention, "MAX_FILE_BYTES", largest)
+    result = clean(h)
+    assert result["blocked"][0]["reason"] == "retention_file_budget_exceeded"
+    assert not (attempt / "retention-plan.json").exists()
+    assert not (attempt / ".retention-plan.json.pending").exists()
+    assert (attempt / "implementation/work").exists()
+
+
+def test_saved_plan_read_still_checks_identity(finished, monkeypatch):
+    h, attempt = finished
+    assert clean(h)["blocked"] == []
+    plan = attempt / "retention-plan.json"
+    identity = plan.stat().st_ino
+    original_read = os.read
+
+    def mutate(fd, size):
+        chunk = original_read(fd, size)
+        if os.fstat(fd).st_ino == identity:
+            with plan.open("ab") as stream:
+                stream.write(b" ")
+        return chunk
+
+    monkeypatch.setattr(os, "read", mutate)
+    assert clean(h, 100 + retention.RAW_RETENTION_SECONDS)["blocked"][0]["reason"] == "retention_read_drift"
+    assert (attempt / "implementation/private/request-1.json").exists()
+
+
 @pytest.mark.parametrize("location", ["implementation/scratch/large", "evaluation-candidate/output/large",
                                      "evaluation-candidate/transport.stdout"])
 @pytest.mark.parametrize("saved", [False, True])
@@ -49,16 +222,20 @@ def test_streaming_fanout_stops_at_entry_cap(finished, monkeypatch, location, sa
         assert clean(h)["blocked"] == []
     root = attempt / location
     root.mkdir(parents=True, exist_ok=True)
-    cap = sum(1 for _ in attempt.rglob("*")) + 8
+    bookkeeping = {attempt / name for name in retention.BOOKKEEPING_NAMES}
+    cap = sum(1 for p in attempt.rglob("*") if p not in bookkeeping) + 8
     for number in range(30):
         (root / str(number)).touch()
     monkeypatch.setattr(retention, "MAX_ENTRIES", cap)
     original = os.scandir
     seen = []
+    controller_seen = []
+    attempt_identity = attempt.stat().st_ino
 
     class Guarded:
         def __init__(self, path):
             self.stream = original(path)
+            self.attempt_root = os.fstat(path).st_ino == attempt_identity
 
         def __enter__(self):
             self.stream.__enter__()
@@ -72,7 +249,11 @@ def test_streaming_fanout_stops_at_entry_cap(finished, monkeypatch, location, sa
 
         def __next__(self):
             row = next(self.stream)
-            seen.append(row.name)
+            if self.attempt_root and row.name in retention.BOOKKEEPING_NAMES:
+                controller_seen.append(row.name)
+                assert len(controller_seen) <= len(retention.BOOKKEEPING_NAMES)
+            else:
+                seen.append(row.name)
             assert len(seen) <= cap + 1, "unbounded enumeration before rejection"
             return row
 
