@@ -52,15 +52,27 @@ def absent_session_helper(monkeypatch):
         assert name in names, "Only this fixture's planned helpers may be inspected"
         return None  # Successful exact-name lookup: helper has already exited/been removed.
 
+    from scripts import lab_agent as agent
     monkeypatch.setattr(recovery, "docker_inspect", inspect)
+    def restore(args):
+        assert args[args.index(agent.IMAGE) + 1:] == [
+            "-R", "--no-dereference", "--from=10000:10000",
+            f"{recovery.os.getuid()}:{recovery.os.getgid()}", "/home", "/work", "/scratch", "/output"]
+        names.add(args[args.index("--name") + 1])
+        return ""
+    monkeypatch.setattr(agent, "run", restore)
+    monkeypatch.setattr(agent, "quiesce_helper", lambda *args: None)
 
     def plan(session, image):
         name = f"lk-lab-{session.parent.name}-{session.name}-setup"
         args = ["docker", "run", "--rm", "--name", name, "--label", "lk.lab=ticket-69",
                 "--network", "none", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN",
-                "--security-opt", "no-new-privileges:true", "--read-only",
-                "--mount", f"type=bind,src={session / 'work'},dst=/work",
-                "--entrypoint", "/bin/chown", image, "-R", "--no-dereference", "10000:10000", "/work"]
+                "--security-opt", "no-new-privileges:true", "--read-only"]
+        for child in ("home", "work", "scratch", "output"):
+            (session / child).mkdir(exist_ok=True)
+            args += ["--mount", f"type=bind,src={session / child},dst=/{child}"]
+        args += ["--entrypoint", "/bin/chown", image, "-R", "--no-dereference", "10000:10000",
+                 "/home", "/work", "/scratch", "/output"]
         # The controller resource context is active around the injected session.
         assert recovery.plan_resource(args, image) is not None
         names.add(name)

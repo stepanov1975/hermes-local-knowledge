@@ -223,6 +223,7 @@ def isolated_check(args: list[str], *, name: str, image: str, work: Path,
                 and config["Labels"].get("lk.lab") == "ticket-69"
                 and config["User"] == f"{os.getuid()}:{os.getgid()}"
                 and host["NetworkMode"] == "none" and host["ReadonlyRootfs"] is True
+                and host.get("Init") is True
                 and host["Privileged"] is False and host["CapDrop"] == ["ALL"] and not host.get("CapAdd")
                 and "no-new-privileges:true" in host["SecurityOpt"]
                 and host["Memory"] == 2147483648 and host["MemorySwap"] == 2147483648
@@ -318,7 +319,7 @@ def full_candidate_checks(*, attempt: Path, repo: Path, revision: str, image: st
     checks = []
     for key, command in commands.items():
         check_name = name + "-" + key.replace("_", "-")
-        args = ["docker", "create", "--name", check_name,
+        args = ["docker", "create", "--init", "--name", check_name,
                 "--label", "lk.lab=ticket-69", "--network", "none", "--read-only",
                 "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges:true", "--pids-limit", "256",
@@ -663,8 +664,7 @@ def recovered_implementation(attempt: Path, config: dict) -> dict | None:
     from scripts import lab_agent as agent
     metadata = read_json(session_path)
     final = agent.validate_final(json.loads(message["content"]), "implementation")
-    # Resources were inspected and settled before this helper can execute.
-    agent.ownership(root, config["image"], "lk-lab-" + attempt.name + "-recover", f"{os.getuid()}:{os.getgid()}")
+    # All receipt-bound exports were restored before any recovery branch.
     result = {**metadata, "workspace": str(root / "work/plugin"), "final": final,
               "usage": [read_json(p).get("usage", {"available": False}) for p in responses],
               "complete": True, "cleanup_complete": True, "source_identity": agent.identity(root / "work/plugin")}
@@ -769,6 +769,9 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
                 guard.check()
                 resources = recovery.settle_resources(attempt)
                 guard.check()
+                recovery.restore_exports(attempt, config["image"])
+                guard.check()
+                resources = recovery.inspect_resources(attempt)
                 completion = recovery.session_completion(attempt)
                 durable_json(attempt / "recovery-report.json", {"attempt_id": attempt_id,
                              "resources": resources, "model_completion": completion,

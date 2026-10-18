@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -19,6 +21,14 @@ from scripts import lab_recovery as recovery
 
 RAW_RETENTION_SECONDS = 7 * 24 * 60 * 60
 SCHEMA = "lab-retention/v1"
+# Retention includes complete controller output streams (64 MiB per command),
+# evaluator indexes and full-check evidence, not only 8 MiB source-workspace files.
+# Oversized attempts are retained for operator inspection, never partially planned.
+MAX_FILE_BYTES = 128 * 1024 * 1024
+MAX_TREE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ENTRIES = 50000
+MAX_DEPTH = 64
+CHUNK_BYTES = 64 * 1024
 
 
 class RetentionBlocked(ValueError):
@@ -39,17 +49,110 @@ def _plain(path: Path, *, missing: bool = False) -> None:
         _require(not part.is_symlink(), "symlink_substitution")
 
 
-def _digest(path: Path) -> str:
+class _Budget:
+    def __init__(self) -> None:
+        self.entries = 0
+        self.bytes = 0
+
+    def entry(self, depth: int) -> None:
+        self.entries += 1
+        _require(self.entries <= MAX_ENTRIES, "retention_entry_budget_exceeded")
+        _require(depth <= MAX_DEPTH, "retention_depth_budget_exceeded")
+
+    def content(self, size: int) -> None:
+        _require(0 <= size <= MAX_FILE_BYTES, "retention_file_budget_exceeded")
+        self.bytes += size
+        _require(self.bytes <= MAX_TREE_BYTES, "retention_byte_budget_exceeded")
+
+
+def _identity(info: os.stat_result) -> tuple[int, ...]:
+    # Exclude atime and nlink: hashing and deletion of another ordinary hardlink
+    # legitimately change them. Content/identity changes during a read do not.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _chunks(path: Path, budget: _Budget) -> Iterator[bytes]:
     _plain(path)
-    _require(stat.S_ISREG(path.lstat().st_mode), "nonregular_record")
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    before = path.lstat()
+    _require(stat.S_ISREG(before.st_mode), "nonregular_record")
+    budget.content(before.st_size)  # Reject logical sparse size BEFORE open.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        _require(_identity(os.fstat(fd)) == _identity(before), "retention_read_drift")
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(CHUNK_BYTES, remaining))
+            _require(bool(chunk), "retention_read_drift")
+            remaining -= len(chunk)
+            _require(_identity(os.fstat(fd)) == _identity(before), "retention_read_drift")
+            yield chunk
+        _plain(path)
+        _require(_identity(os.fstat(fd)) == _identity(before)
+                 and _identity(path.lstat()) == _identity(before), "retention_read_drift")
+    finally:
+        os.close(fd)
+
+
+def _digest(path: Path, budget: _Budget | None = None) -> str:
+    digest = hashlib.sha256()
+    for chunk in _chunks(path, budget if budget is not None else _Budget()):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _json(path: Path) -> dict:
-    from scripts.lab_experiment import read_json
+    value = json.loads(b"".join(_chunks(path, _Budget())))
+    _require(isinstance(value, dict), "nonobject_record")
+    return value
+
+
+def _children(path: Path, budget: _Budget, depth: int) -> Iterator[Path]:
     _plain(path)
-    return read_json(path)
+    before = path.lstat()
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _require(_identity(os.fstat(fd)) == _identity(before), "retention_read_drift")
+        with os.scandir(fd) as stream:
+            for child in stream:
+                budget.entry(depth)
+                yield path / child.name
+        _plain(path)
+        _require(_identity(os.fstat(fd)) == _identity(before)
+                 and _identity(path.lstat()) == _identity(before), "retention_read_drift")
+    finally:
+        os.close(fd)
+
+
+def _walk(path: Path, budget: _Budget, depth: int = 1) -> Iterator[Path]:
+    for child in _children(path, budget, depth):
+        yield child
+        info = child.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            yield from _walk(child, budget, depth + 1)
+
+
+def _preflight(attempt: Path) -> None:
+    # Metadata only: bound the whole attempt, including protected evaluator output,
+    # before controller receipt discovery or any content read. Repeat on restart.
+    budget = _Budget()
+    for path in _walk(attempt, budget):
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode):
+            budget.content(info.st_size)
+        else:
+            _require(stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode),
+                     "foreign_or_special_file")
+
+
+def _generations(attempt: Path) -> list[Path]:
+    return [p for p in _children(attempt, _Budget(), 1)
+            if re.fullmatch(r"generation-[0-9]+", p.name)]
+
+
+def _sessions(attempt: Path) -> list[Path]:
+    return [attempt / "implementation", attempt / "review",
+            *(p / "review" for p in _generations(attempt))]
 
 
 def _save(path: Path, value: dict, *, replace: bool = False) -> None:
@@ -58,8 +161,7 @@ def _save(path: Path, value: dict, *, replace: bool = False) -> None:
 
 
 def _roots(attempt: Path) -> list[str]:
-    generations = [p for p in attempt.glob("generation-*")
-                   if re.fullmatch(r"generation-[0-9]+", p.name)]
+    generations = _generations(attempt)
     roots = ["candidate.index"]
     for generation in [attempt, *generations]:
         _plain(generation)
@@ -80,30 +182,30 @@ def _roots(attempt: Path) -> list[str]:
 
 def _raw_paths(attempt: Path) -> list[str]:
     paths: list[Path] = []
-    for session in recovery.session_directories(attempt):
+    discovery = _Budget()
+    for session in _sessions(attempt):
         _plain(session, missing=True)
         private = session / "private"
         _plain(private, missing=True)
         if private.exists():
-            paths.extend(p for p in private.iterdir() if re.fullmatch(
+            paths.extend(p for p in _children(private, discovery, 1) if re.fullmatch(
                 r"(?:request-[0-9]+\.json|wire-[0-9]+\.json|response-[0-9]+\.json|tool-[0-9]+-[0-9]+\.(?:stdout|stderr))", p.name))
-    for generation in [attempt, *[p for p in attempt.glob("generation-*")
-                                if re.fullmatch(r"generation-[0-9]+", p.name)]]:
+    for generation in [attempt, *_generations(attempt)]:
         for role in ("evaluation-incumbent", "evaluation-candidate", "full-checks"):
             root = generation / role
             _plain(root, missing=True)
             if root.exists():
-                paths.extend(p for p in root.iterdir() if re.fullmatch(
+                paths.extend(p for p in _children(root, discovery, 1) if re.fullmatch(
                     r"(?:(?:transport|trusted-tests|full_pytest|ruff|mypy)\.(?:stdout|stderr)|private-cases\.jsonl|warmups\.json)", p.name))
         proof = generation / "review-proof"
         _plain(proof, missing=True)
         if proof.exists():
-            paths.extend(p for p in proof.iterdir() if re.fullmatch(
+            paths.extend(p for p in _children(proof, discovery, 1) if re.fullmatch(
                 r"(?:full_pytest|ruff|mypy)\.(?:stdout|stderr)", p.name))
     return sorted(p.relative_to(attempt).as_posix() for p in paths)
 
 
-def _entry(path: Path) -> dict:
+def _entry(path: Path, budget: _Budget | None = None) -> dict:
     info = path.lstat()
     result: dict[str, Any] = {"device": info.st_dev, "inode": info.st_ino}
     if stat.S_ISLNK(info.st_mode):
@@ -113,29 +215,23 @@ def _entry(path: Path) -> dict:
     # Disposal unlinks only an enumerated name; other hardlinks retain their
     # inode and bytes. Link counts also change legitimately during partial disposal.
     _require(stat.S_ISREG(info.st_mode), "foreign_or_special_file")
-    return {**result, "kind": "file", "sha256": _digest(path)}
+    return {**result, "kind": "file", "sha256": _digest(path, budget)}
 
 
 def _inventory(attempt: Path, names: list[str]) -> dict[str, dict]:
     result = {}
+    budget = _Budget()
     for name in names:
         root = attempt / name
         _plain(root, missing=True)
         if not root.exists():
             continue
-        result[name] = _entry(root)
-        if root.is_dir():
-            for directory, dirs, files in os.walk(root, followlinks=False):
-                for child in [*dirs, *files]:
-                    path = Path(directory) / child
-                    # Links inside an owned sandbox are unlinked, never traversed.
-                    if path.is_symlink():
-                        info = path.lstat()
-                        row = {"device": info.st_dev, "inode": info.st_ino,
-                               "kind": "link", "target": os.readlink(path)}
-                    else:
-                        row = _entry(path)
-                    result[path.relative_to(attempt).as_posix()] = row
+        budget.entry(len(Path(name).parts))
+        result[name] = _entry(root, budget)
+        if result[name]["kind"] == "directory":
+            for path in _walk(root, budget, len(Path(name).parts) + 1):
+                # Links inside an owned sandbox are unlinked, never traversed.
+                result[path.relative_to(attempt).as_posix()] = _entry(path, budget)
     return result
 
 
@@ -162,7 +258,9 @@ def _quiescent(attempt: Path) -> list[dict]:
 
 
 def _validate_remaining(attempt: Path, entries: dict[str, dict]) -> None:
+    budget, children = _Budget(), _Budget()
     for name, row in entries.items():
+        budget.entry(len(Path(name).parts))
         path = attempt / name
         _plain(path.parent, missing=True)
         if not path.exists() and not path.is_symlink():
@@ -173,10 +271,11 @@ def _validate_remaining(attempt: Path, entries: dict[str, dict]) -> None:
                       "target": os.readlink(path)} if path.is_symlink() else {}
         else:
             _plain(path)
-            actual = _entry(path)
+            actual = _entry(path, budget)
         _require(actual == row, "planned_path_drift")
         if row["kind"] == "directory":
-            _require(all(p.relative_to(attempt).as_posix() in entries for p in path.iterdir()),
+            _require(all(p.relative_to(attempt).as_posix() in entries for p in _children(
+                         path, children, len(Path(name).parts) + 1)),
                      "unplanned_data")
 
 
@@ -218,13 +317,15 @@ def _dispose(attempt: Path, entries: dict[str, dict]) -> None:
 
 def settlement_evidence(attempt: Path) -> dict[str, str]:
     """Bind recovery to exact controller receipts, not a reusable success flag."""
+    discovery, reads = _Budget(), _Budget()
     paths = [attempt / "attempt.json", attempt / "checkpoint.json"]
-    paths.extend((attempt / "resources").iterdir())
-    for session in recovery.session_directories(attempt):
+    paths.extend(_children(attempt / "resources", discovery, 1))
+    for session in _sessions(attempt):
         private = session / "private"
         _plain(private, missing=True)
-        paths.extend(private.glob("*.json"))
-    return {p.relative_to(attempt).as_posix(): _digest(p) for p in sorted(paths)}
+        if private.exists():
+            paths.extend(p for p in _children(private, discovery, 1) if p.suffix == ".json")
+    return {p.relative_to(attempt).as_posix(): _digest(p, reads) for p in sorted(paths)}
 
 
 def _reconciled(attempt: Path, manifest: dict, pointer: dict, report: dict) -> dict | None:
@@ -256,6 +357,7 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
     _require(manifest.get("pending") != attempt_id, "attempt_pending")
     attempt = campaign / "attempts" / attempt_id
     _plain(attempt)
+    _preflight(attempt)
     report_path = attempt / "report.json"
     _require(_digest(report_path) == pointer["sha256"], "report_drift")
     report = _json(report_path)
@@ -268,17 +370,14 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
     repo = campaign / "repo.git"
     _plain(repo)
     _plain(attempt / "resources")
-    _require((attempt / "resources").is_dir()
-             and any((attempt / "resources").glob("*.json")), "resource_receipts_missing")
-    for record in (attempt / "resources").iterdir():
-        _plain(record)
-        if record.suffix == ".observed":
-            _require(record.with_suffix(".json").is_file(), "resource_receipt_missing")
+    has_receipt = False
+    for resource_record in _children(attempt / "resources", _Budget(), 1):
+        _plain(resource_record)
+        has_receipt |= resource_record.suffix == ".json"
+        if resource_record.suffix == ".observed":
+            _require(resource_record.with_suffix(".json").is_file(), "resource_receipt_missing")
+    _require(has_receipt, "resource_receipts_missing")
     receipt_path = attempt / "retention-plan.json"
-    if receipt_path.exists() or receipt_path.is_symlink():
-        existing = _json(receipt_path)
-        for name, digest in existing["protected"].items():
-            _require(_digest(attempt / name) == digest, "structural_evidence_drift")
     resources = recovery.inspect_resources(attempt)
     _require(all(r.get("state") in {"absent", "stopped"} for r in resources), "resource_not_quiescent")
     if reconciled is not None:
@@ -311,16 +410,15 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
         disposable = _inventory(attempt, roots)
         raw = _inventory(attempt, _raw_paths(attempt))
         protected_hashes = {}
-        for directory, dirs, files in os.walk(attempt, followlinks=False):
-            dirs[:] = [d for d in dirs if str((Path(directory) / d).relative_to(attempt)) not in disposable]
-            for filename in files:
-                path = Path(directory) / filename
-                name = path.relative_to(attempt).as_posix()
-                if name not in disposable and name not in raw:
-                    protected_hashes[name] = _digest(path)
+        discovery, reads = _Budget(), _Budget()
+        for path in _walk(attempt, discovery):
+            name = path.relative_to(attempt).as_posix()
+            if name not in disposable and name not in raw and not path.is_dir():
+                protected_hashes[name] = _digest(path, reads)
         revisions = {report["revision"], manifest["incumbent"], config["initial_incumbent"]}
-        for path in attempt.glob("report.pre-recovery-*.json"):
-            revisions.add(_json(path)["revision"])
+        for path in _children(attempt, _Budget(), 1):
+            if re.fullmatch(r"report\.pre-recovery-.*\.json", path.name):
+                revisions.add(_json(path)["revision"])
         for name in ("candidate.json", "attempt.json"):
             if (attempt / name).exists():
                 record = _json(attempt / name)
@@ -344,8 +442,10 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
              "retention_clock_invalid")
     for revision in plan["refs"]:
         _anchor(repo, revision)
+    reads = _Budget()
+    _require(len(plan["protected"]) <= MAX_ENTRIES, "retention_entry_budget_exceeded")
     for name, digest in plan["protected"].items():
-        _require(_digest(attempt / name) == digest, "structural_evidence_drift")
+        _require(_digest(attempt / name, reads) == digest, "structural_evidence_drift")
     expired = now >= plan["raw_delete_after"]
     if reconciled is not None:
         evidence = dict(reconciled["evidence"])
@@ -363,7 +463,7 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
     if not expired:
         # Before expiry even a missing raw file is unexplained drift.
         for name, row in plan["raw"].items():
-            _require(_entry(attempt / name) == row, "raw_evidence_drift")
+            _require((attempt / name).exists(), "raw_evidence_drift")
     _quiescent(attempt)
     _dispose(attempt, plan["disposable"])
     if expired:

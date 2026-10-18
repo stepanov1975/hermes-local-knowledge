@@ -25,9 +25,11 @@ _LINUX_ONLY_LAB_TESTS = frozenset({
     "test_lab_notifications.py",
     "test_lab_process_output.py",
     "test_lab_recovery.py",
+    "test_lab_recovery_ownership.py",
     "test_lab_recovery_regressions.py",
     "test_lab_recovery_successor.py",
     "test_lab_retention.py",
+    "test_lab_retention_bounds.py",
     "test_lab_review_evidence.py",
     "test_lab_workspace_bounds_lock.py",
 })

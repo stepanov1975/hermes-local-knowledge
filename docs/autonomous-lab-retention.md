@@ -6,6 +6,34 @@ evaluations and full checks already remove containers and restore ownership
 before publishing reports. Retention does not rewrite that lifecycle, recover an
 attempt, replay inference, launch work, or change the incumbent.
 
+After controller death, explicit execution recovery first establishes quiescence
+of all identity-matched workers/helpers, then restores only the exact setup-receipt
+exports from sandbox ownership before settlement or a successor generation.
+It does not guess export roots or follow links. Restoration failure preserves
+pending/recovery protection; retention does not replace that recovery step.
+
+Full-check containers use an init reaper so orphaned test descendants do not
+accumulate against the unchanged 256-PID allowance. The read-only/no-network
+worker boundary and non-executable temporary mounts remain unchanged.
+
+## Bounded inventory and reads
+
+Every cleanup, including saved-plan retries and expiry, first checks the whole
+attempt with a streaming metadata-only walk. Limits are **50,000 entries**,
+**64 path components**, **128 MiB per regular file** and **2 GiB aggregate
+logical file size**. Empty directories and hardlinked names count. Sparse logical
+size is checked before opening content; reads use fixed chunks and reject growth
+or identity/type replacement. Raw, disposable and protected evaluator evidence
+are included. Each later inventory/hash/validation pass has its own finite
+aggregate allowance, so this is not a claim that cleanup reads at most 2 GiB total.
+The file limit accommodates supported 64 MiB command streams rather than applying
+the smaller source-workspace allowance to raw evidence.
+
+Budget violations retain evidence and return fixed actionable retention blockers;
+they never silently truncate an inventory or expand an immutable disposal plan.
+Oversized attempts require operator inspection. There is no automatic migration
+or permission to remove frozen inputs.
+
 ## Integration boundary
 
 - `cleanup_finished(campaign: Path, *, now: float) -> dict` requires the caller to

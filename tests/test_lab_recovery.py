@@ -199,8 +199,12 @@ def test_final_response_can_be_recovered_only_after_cleanup_and_source_validatio
     lab.durable_json(private / "wire-1.json", {"synthetic": True})
     lab.durable_json(private / "response-1.json", {"message": {"content": json.dumps(result["final"])},
                                                 "usage": {"input_tokens": 19}})
+    from tests.test_lab_recovery_ownership import setup_receipt
+    setup_receipt(attempt)
+    monkeypatch.setattr(recovery, "docker_inspect", lambda name: None)
     events = []
-    monkeypatch.setattr(agent, "ownership", lambda *args: events.append("ownership-restored"))
+    monkeypatch.setattr(agent, "run", lambda *args: events.append("ownership-restored") or "")
+    monkeypatch.setattr(agent, "quiesce_helper", lambda *args: None)
     report = h.run()
     assert events == ["ownership-restored"] and report["outcome"] == "accepted"
     assert report["usage"][0]["usage"] == [{"input_tokens": 19}]

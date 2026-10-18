@@ -718,10 +718,12 @@ def test_failed_session_cleanup_receipt_controls_pending_and_preserves_usage(h: 
     assert manifest["incumbent"] == h.initial
 
 
-@pytest.mark.parametrize("infinite,stopped_exit,attach_exit", [(False, 0, 0), (False, 1, 0),
-                                                           (False, 0, 7), (True, 0, 0)])
+@pytest.mark.parametrize("infinite,stopped_exit,attach_exit,missing_init", [
+    (False, 0, 0, False), (False, 1, 0, False), (False, 0, 7, False),
+    (True, 0, 0, False), (False, 0, 0, True)])
 def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: pytest.MonkeyPatch,
-                                                     infinite: bool, stopped_exit: int, attach_exit: int) -> None:
+                                                     infinite: bool, stopped_exit: int, attach_exit: int,
+                                                     missing_init: bool) -> None:
     """Real full-check caller and pipes, mocked daemon only; no candidate host execution."""
     import os
     import sys
@@ -741,6 +743,7 @@ def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: p
             return real_run(args, **kwargs)
         calls.append(args)
         if args[:2] == ["docker", "create"]:
+            assert "--init" in args, "full-check workers must reap orphaned test descendants"
             cid = "synthetic-" + str(len(specs))
             name = args[args.index("--name") + 1]
             image = h.config["image"]
@@ -751,6 +754,7 @@ def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: p
                     "Cmd": args[args.index(image) + 1:],
                     "Env": [args[i + 1] for i, a in enumerate(args) if a == "--env"]},
                 "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "Privileged": False,
+                    "Init": not missing_init,
                     "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges:true"], "Memory": 2147483648,
                     "MemorySwap": 2147483648, "NanoCpus": 2000000000, "PidsLimit": 256,
                     "RestartPolicy": {"Name": "no"}, "Tmpfs": {
@@ -787,6 +791,13 @@ def test_authoritative_checks_stream_candidate_output(h: Harness, monkeypatch: p
     attempt = h.root / "stream-checks"
     tracemalloc.start()
     try:
+        if missing_init:
+            with pytest.raises(ValueError, match="Full-check isolation readback mismatch"):
+                lab.full_candidate_checks(attempt=attempt, repo=h.repo, revision=h.initial,
+                    image=h.config["image"], name="lk-lab-stream-check", check_tools=h.campaign / "check-tools",
+                    check_tools_sha256=h.config["check_tools_sha256"])
+            assert not attached
+            return
         report = lab.full_candidate_checks(attempt=attempt, repo=h.repo, revision=h.initial,
             image=h.config["image"], name="lk-lab-stream-check", check_tools=h.campaign / "check-tools",
             check_tools_sha256=h.config["check_tools_sha256"])

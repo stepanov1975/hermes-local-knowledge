@@ -125,9 +125,8 @@ def test_recovery_rm_child_keeps_real_flock_after_controller_death(tmp_path):
     spec = {"Id": "owned-id", "Name": "/owned", "Image": "image", "Mounts": [],
             "Config": {"Labels": {}, "Cmd": [], "Entrypoint": ["/bin/true"]},
             "State": {"Running": False}}
-    docker = tmp_path / "docker"
-    docker.write_text(f'''#!{sys.executable}
-import json, os, sys
+    docker = tmp_path / "docker.py"
+    docker.write_text(f'''import json, os, sys
 if sys.argv[1] == "ps":
     print("owned-id")
 elif sys.argv[1] == "inspect":
@@ -141,7 +140,6 @@ elif sys.argv[1:] == ["rm", "--volumes", "owned-id"]:
 else:
     raise AssertionError(sys.argv)
 ''')
-    docker.chmod(0o700)
     controller = tmp_path / "controller.py"
     repo = Path(__file__).resolve().parents[1]
     lock = tmp_path / "lock"
@@ -149,6 +147,13 @@ else:
 from pathlib import Path
 sys.path.insert(0, {str(repo)!r})
 from scripts import lab_recovery as recovery
+# /tmp is noexec in the sealed checker. Adapt only the synthetic CLI argv;
+# preserve real subprocess.run, especially production pass_fds lock inheritance.
+run = recovery.subprocess.run
+def docker_run(args, **kwargs):
+    assert args[0] == "docker", args
+    return run([sys.executable, {str(docker)!r}, *args[1:]], **kwargs)
+recovery.subprocess.run = docker_run
 with open({str(lock)!r}, "a+b") as stream:
     fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
     with recovery.controller_lock(stream.fileno()):
@@ -156,7 +161,6 @@ with open({str(lock)!r}, "a+b") as stream:
 ''')
     child_pid = None
     process = subprocess.Popen([sys.executable, str(controller)],
-                               env={**os.environ, "PATH": str(tmp_path)},
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         assert select.select([ready_fd], [], [], 10)[0], "removal client did not become ready"

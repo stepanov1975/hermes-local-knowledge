@@ -167,6 +167,74 @@ def settle_resources(attempt: Path) -> list[dict]:
     return rows
 
 
+def restore_exports(attempt: Path, image: str) -> None:
+    """Restore only known exports bound by original setup intent, after quiescence.
+
+    Receipts are controller-owned. Never infer export ownership from a directory's
+    existence alone. Repeating a partially completed restore is safe: only the
+    sandbox UID/GID is changed, and chown never traverses symbolic links.
+    """
+    from scripts import lab_agent as agent
+
+    if image != agent.IMAGE:
+        raise RecoveryPaused("export_ownership_identity_uncertain")
+    generations = [attempt, *(p.parent for p in session_directories(attempt)[2:])]
+    allowed: dict[Path, tuple[str, ...]] = {
+        attempt / "implementation": ("home", "work", "scratch", "output")}
+    for generation in generations:
+        allowed[generation / "review"] = ("home", "work", "scratch", "output")
+        for role in ("incumbent", "candidate"):
+            allowed[generation / ("evaluation-" + role)] = ("home", "work", "output")
+    commands = {}
+    # Validate every target before the first mutation, just as resource settlement
+    # inspects every worker/helper before removing any stopped resource.
+    for path in sorted((attempt / "resources").glob("*.json")):
+        receipt = json.loads(path.read_text())
+        args = receipt["args"]
+        if "--entrypoint" not in args or args[args.index("--entrypoint") + 1] != "/bin/chown":
+            continue
+        if receipt["image"] != image or image not in args:
+            raise RecoveryPaused("export_ownership_identity_uncertain")
+        tail = args[args.index(image) + 1:]
+        if "10000:10000" not in tail:
+            continue  # A prior restoration is not a new ownership grant.
+        mounts = [args[i + 1] for i, arg in enumerate(args) if arg == "--mount"]
+        roots = [root for root, children in allowed.items()
+                 if mounts == [f"type=bind,src={root / child},dst=/{child}" for child in children]]
+        if len(roots) != 1:
+            raise RecoveryPaused("export_ownership_identity_uncertain")
+        root = roots[0]
+        children = allowed[root]
+        destinations = ["/" + c for c in children]
+        if (tail not in (["-R", "10000:10000", *destinations],
+                         ["-R", "--no-dereference", "10000:10000", *destinations])
+                or args[:3] != ["docker", "run", "--rm"]
+                or args[args.index("--label") + 1] !=
+                ("lk.lab=ticket-69" if len(children) == 4 else "lk.lab=ticket-66")):
+            raise RecoveryPaused("export_ownership_identity_uncertain")
+        for child in children:
+            target = root / child
+            if (not target.is_dir() or any(p.is_symlink() for p in
+                    [target, *target.parents] if p == attempt or attempt in p.parents)):
+                raise RecoveryPaused("export_ownership_identity_uncertain")
+        commands[root] = args[:args.index(image)] + [image, "-R", "--no-dereference",
+            "--from=10000:10000", f"{os.getuid()}:{os.getgid()}", *destinations]
+    with resources(attempt):
+        for command in commands.values():
+            command[command.index("--name") + 1] = "lk-lab-recover-" + uuid.uuid4().hex
+            plan_resource(command, image)
+            try:
+                try:
+                    agent.run(command)
+                finally:
+                    agent.quiesce_helper(command, image)
+            except Exception:
+                raise RecoveryPaused("export_ownership_restore_failed") from None
+    # Include newly persisted helper metadata in every subsequent settlement hash.
+    if any(row["state"] != "absent" for row in inspect_resources(attempt)):
+        raise RecoveryPaused("export_ownership_restore_unconfirmed")
+
+
 def session_directories(attempt: Path) -> list[Path]:
     """Only controller-owned session roots, never worker scratch/output trees."""
     generations = sorted(p for p in attempt.glob("generation-*")
