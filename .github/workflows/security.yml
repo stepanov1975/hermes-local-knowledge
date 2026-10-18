@@ -126,7 +126,14 @@ jobs:
           # contains the security scanners and is not the project's dependency set.
           if compgen -G 'requirements*.txt' > /dev/null; then
             for requirements_file in requirements*.txt; do
-              pip-audit --progress-spinner off -r "${requirements_file}"
+              audit_args=(--progress-spinner off -r "${requirements_file}")
+              if [[ "${requirements_file}" == "requirements-security.txt" ]]; then
+                # Semgrep pins mcp 1.29.0; this advisory affects stateful MCP HTTP
+                # servers, not the fixed `semgrep scan` command used here.
+                # GHSA-84m7-p3x7-pcfv: remove when Semgrep's MCP pin is fixed.
+                audit_args+=(--ignore-vuln CVE-2026-59951)
+              fi
+              pip-audit "${audit_args[@]}"
             done
           fi
           if [[ -s "${RUNNER_TEMP}/project-dependencies.txt" ]]; then

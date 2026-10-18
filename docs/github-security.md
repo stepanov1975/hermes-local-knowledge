@@ -75,6 +75,22 @@ Recommended settings:
 - Docker-based scanners remain pinned by digest because Dependabot does not update image references embedded in workflow shell commands. Their human-readable versions are recorded beside the digest variables in `security.yml`.
 - When updating a scanner image, verify the release tag's manifest digest with `docker buildx imagetools inspect`, run the digest-pinned image's version command, then update `security.yml` and the local-validation examples together. A scheduled updater is intentionally not required for this small repository.
 
+## Scanner-only advisory exception
+
+The audit of `requirements-security.txt` alone excludes **CVE-2026-59951 /
+GHSA-84m7-p3x7-pcfv**. Semgrep 1.179.0 pins `mcp==1.29.0`; Semgrep
+1.181.0 also pins it. Forcing MCP 1.30.0 would violate the
+scanner's declared dependency contract. The [MCP advisory](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-84m7-p3x7-pcfv)
+affects unbounded sessions in **stateful Streamable HTTP servers**. This job
+runs the fixed `semgrep scan` CLI, not an MCP server; the affected transport is
+not exposed. Stdio, SSE and stateless HTTP are outside the advisory as well.
+
+All other scanner vulnerabilities still fail, and release/other requirements
+plus project dependencies are audited without this exception. A regression
+executes the actual audit recipe with a recording executable to verify this
+scope. Remove the exception when Semgrep adopts a fixed MCP pin. This is not
+a waiver for an MCP HTTP server or a production dependency.
+
 ## Notes
 
 - The security workflow intentionally uses pinned action SHAs and pinned Docker image digests. Review both the human-readable version and the pinned SHA/digest before merging updates.

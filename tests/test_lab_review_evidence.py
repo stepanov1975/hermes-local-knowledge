@@ -1,0 +1,460 @@
+"""Offline receipt/projection regressions; synthetic checks are never production evidence."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+import pytest
+
+from scripts import lab_agent as agent, lab_experiment as lab, lab_review_evidence as proof
+from tests.test_lab_agent import review_inputs, setup_session, spec_for
+
+
+# This verifier runs with -I from scratch, with only the visible JSON/sidecars.
+# No repository imports, Git checkout, or omitted source are available to it.
+VISIBLE_VERIFIER = r'''
+import base64
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+CONTRACT = (
+    "check-inputs snapshot: map exact-candidate/<path> to inputs.json.candidate[<path>], "
+    "tools/<path> to inputs.json.tools[<path>], and inputs.json to SHA256 of its raw sidecar bytes. "
+    "inputs_sha256 is SHA256 of UTF-8 (json.dumps(map, sort_keys=True, separators=(',', ':'), "
+    "allow_nan=False, ensure_ascii=True) + '\\n'); inputs_manifest_sha256 is only the raw inputs.json SHA256."
+)
+
+def sha(value):
+    return hashlib.sha256((json.dumps(value, sort_keys=True, separators=(',', ':'),
+        allow_nan=False, ensure_ascii=True) + '\n').encode('utf-8')).hexdigest()
+
+
+def verify(packet_path, proof_path):
+    packet = json.loads(Path(packet_path).read_bytes())
+    proof = Path(proof_path)
+    assert packet['schema'] == 'lab-review-evidence/v2'
+    binding, projection = packet['binding'], packet['projection']
+    assert sha(projection) == packet['projection_sha256']
+    assert binding['revision'] == projection['revision']
+    assert binding['tree'] == projection['tree']
+    obj = packet['commit_object']
+    assert obj['kind'] == 'commit'
+    body = base64.b64decode(obj['body_base64'], validate=True)
+    assert base64.b64encode(body).decode('ascii') == obj['body_base64']
+    assert b'\x00' not in body and b'\n\n' in body
+    headers = body.split(b'\n\n', 1)[0].split(b'\n')
+    assert re.fullmatch(rb'tree [0-9a-f]{40}', headers[0])
+    assert any(h.startswith(b'author ') for h in headers)
+    assert any(h.startswith(b'committer ') for h in headers)
+    oid = hashlib.sha1(b'commit ' + str(len(body)).encode('ascii') + b'\0' + body).hexdigest()
+    assert oid == binding['revision']
+    assert headers[0][5:].decode('ascii') == binding['tree']
+    names = {'checks.json', 'inputs.json'} | {
+        n + s for n in ('full_pytest', 'ruff', 'mypy')
+        for s in ('.output.json', '.cleanup.json', '.stdout', '.stderr')}
+    assert {p.name for p in proof.iterdir()} == names == set(packet['proof_files'])
+    for name in names:
+        path = proof / name
+        assert path.is_file() and not path.is_symlink()
+        raw = path.read_bytes()
+        assert packet['proof_files'][name] == {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+    checks = json.loads((proof / 'checks.json').read_bytes())
+    raw_inputs = (proof / 'inputs.json').read_bytes()
+    inputs = json.loads(raw_inputs)
+    assert sha(checks) == binding['checks_sha256']
+    assert checks['revision'] == inputs['revision'] == binding['revision']
+    assert checks['image'] == binding['image'] and checks['controller'] == binding['controller']
+    assert checks['inputs_manifest_sha256'] == hashlib.sha256(raw_inputs).hexdigest()
+    members = {**projection['admitted'], **projection['omitted']}
+    assert inputs['candidate'] == {n: v['sha256'] for n, v in members.items()}
+    assert checks['exact_candidate_sha256'] == sha(inputs['candidate'])
+    assert checks['overlay_sha256'] == sha(inputs['overlay'])
+    assert checks['controller'] == sha(inputs['controller'])
+    required_inputs = {'docker/autonomous_lab/native_probe.py', '.github/workflows/security.yml'}
+    assert set(inputs['trusted_test_inputs']) == required_inputs
+    for name, digest in inputs['trusted_test_inputs'].items():
+        assert re.fullmatch('[0-9a-f]{64}', digest)
+        assert inputs['controller'][name] == inputs['overlay'][name] == digest
+    assert checks['check_tools_sha256'] == inputs['check_tools_sha256'] == sha(inputs['tools'])
+    assert packet['inputs_snapshot_contract'] == CONTRACT
+    snapshot = {'exact-candidate/' + n: h for n, h in inputs['candidate'].items()}
+    snapshot.update({'tools/' + n: h for n, h in inputs['tools'].items()})
+    snapshot['inputs.json'] = hashlib.sha256(raw_inputs).hexdigest()
+    assert checks['inputs_sha256'] == sha(snapshot)
+    print(json.dumps({'revision': oid, 'tree': binding['tree'],
+        'inputs_sha256': checks['inputs_sha256'], 'snapshot_entries': len(snapshot)}, sort_keys=True))
+
+if __name__ == '__main__':
+    verify(*sys.argv[1:])
+'''
+
+
+def visible_verify(value, directory, tmp_path):
+    packet_path = tmp_path / "visible-packet.json"
+    packet_path.write_text(json.dumps(value))
+    return subprocess.run([sys.executable, "-I", "-c", VISIBLE_VERIFIER,
+                           str(packet_path), str(directory)], cwd=tmp_path,
+                          capture_output=True, text=True)
+
+
+def refresh_links(value, directory, *, inputs=None, checks=None):
+    if inputs is not None:
+        path = directory / "inputs.json"
+        path.chmod(0o644)
+        path.write_text(json.dumps(inputs, ensure_ascii=False))
+    if checks is not None:
+        checks["inputs_manifest_sha256"] = hashlib.sha256((directory / "inputs.json").read_bytes()).hexdigest()
+        path = directory / "checks.json"
+        path.chmod(0o644)
+        path.write_text(json.dumps(checks))
+        value["binding"]["checks_sha256"] = lab.sha(checks)
+    value["projection_sha256"] = lab.sha(value["projection"])
+    value["proof_files"] = proof.inventory(directory)
+
+
+def test_visible_links_reproduce_without_controller_or_checkout(packet, tmp_path):
+    _, value, directory = packet
+    result = visible_verify(value, directory, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["revision"] == value["binding"]["revision"]
+
+
+@pytest.mark.parametrize("mutation", ["base64", "kind", "body", "tree", "revision", "malformed", "forged-tree"])
+def test_commit_link_rejects_rehashed_forgery(packet, tmp_path, mutation):
+    kwargs, value, directory = packet
+    obj = value["commit_object"]
+    body = base64.b64decode(obj["body_base64"])
+    if mutation == "base64":
+        obj["body_base64"] += "\n"
+    elif mutation == "kind":
+        obj["kind"] = "blob"
+    elif mutation == "body":
+        obj["body_base64"] = base64.b64encode(body + b"changed").decode("ascii")
+    elif mutation == "revision":
+        value["projection"]["revision"] = "0" * 40
+    elif mutation == "tree":
+        value["binding"]["tree"] = value["projection"]["tree"] = "0" * 40
+    else:
+        altered = b"not a commit" if mutation == "malformed" else body.replace(
+            body.split(b"\n", 1)[0], b"tree " + b"0" * 40, 1)
+        obj["body_base64"] = base64.b64encode(altered).decode("ascii")
+        if mutation == "forged-tree":
+            value["binding"]["tree"] = value["projection"]["tree"] = "0" * 40
+    refresh_links(value, directory)
+    with pytest.raises(ValueError):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    assert visible_verify(value, directory, tmp_path).returncode != 0
+
+
+@pytest.mark.parametrize("mutation", ["digest", "preimage", "descriptor"])
+def test_snapshot_link_rejects_rehashed_forgery(packet, tmp_path, mutation):
+    kwargs, value, directory = packet
+    checks = lab.read_json(directory / "checks.json")
+    inputs = lab.read_json(directory / "inputs.json")
+    if mutation == "digest":
+        checks["inputs_sha256"] = "0" * 64
+    elif mutation == "preimage":
+        inputs["tools"]["changed-tool"] = hashlib.sha256(b"changed").hexdigest()
+        checks["check_tools_sha256"] = inputs["check_tools_sha256"] = lab.sha(inputs["tools"])
+    else:
+        value["inputs_snapshot_contract"] = "hash inputs.json instead"
+    refresh_links(value, directory, inputs=inputs, checks=checks)
+    with pytest.raises(ValueError, match="snapshot"):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    assert visible_verify(value, directory, tmp_path).returncode != 0
+
+
+def test_snapshot_unicode_uses_ascii_escaped_canonical_json(packet, tmp_path):
+    kwargs, value, directory = packet
+    checks = lab.read_json(directory / "checks.json")
+    inputs = lab.read_json(directory / "inputs.json")
+    inputs["tools"]["bin/é-工具"] = hashlib.sha256(b"synthetic Unicode tool").hexdigest()
+    checks["check_tools_sha256"] = inputs["check_tools_sha256"] = lab.sha(inputs["tools"])
+    refresh_links(value, directory, inputs=inputs, checks=checks)
+    snapshot = {"exact-candidate/" + n: h for n, h in inputs["candidate"].items()}
+    snapshot.update({"tools/" + n: h for n, h in inputs["tools"].items()})
+    snapshot["inputs.json"] = hashlib.sha256((directory / "inputs.json").read_bytes()).hexdigest()
+    raw = (json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                      ensure_ascii=True) + "\n").encode("utf-8")
+    checks["inputs_sha256"] = hashlib.sha256(raw).hexdigest()
+    refresh_links(value, directory, checks=checks)
+    proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    result = visible_verify(value, directory, tmp_path)
+    assert result.returncode == 0, result.stderr
+    checks["inputs_sha256"] = hashlib.sha256((json.dumps(snapshot, sort_keys=True,
+        separators=(",", ":"), allow_nan=False, ensure_ascii=False) + "\n").encode()).hexdigest()
+    refresh_links(value, directory, checks=checks)
+    with pytest.raises(ValueError, match="snapshot"):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    assert visible_verify(value, directory, tmp_path).returncode != 0
+
+
+@pytest.fixture
+def packet(tmp_path, monkeypatch):
+    kwargs, _ = setup_session(tmp_path, monkeypatch)
+    review_inputs(kwargs, tmp_path, monkeypatch)
+    return kwargs, lab.read_json(kwargs["evidence"]), tmp_path / "review-proof"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "overlay", "controller", "controller-digest"])
+def test_trusted_public_input_correspondence_rejects_rehashed_receipts(packet, tmp_path, mutation):
+    kwargs, value, directory = packet
+    checks = lab.read_json(directory / "checks.json")
+    inputs = lab.read_json(directory / "inputs.json")
+    name = "docker/autonomous_lab/native_probe.py"
+    if mutation == "missing":
+        inputs["trusted_test_inputs"].pop(name)
+    elif mutation == "extra":
+        inputs["trusted_test_inputs"]["private/heldout.json"] = "0" * 64
+    elif mutation == "controller-digest":
+        inputs["controller"]["scripts/another.py"] = "0" * 64
+    else:
+        inputs[mutation][name] = "0" * 64
+    checks["overlay_sha256"] = lab.sha(inputs["overlay"])
+    refresh_links(value, directory, inputs=inputs)
+    snapshot = {"exact-candidate/" + n: h for n, h in inputs["candidate"].items()}
+    snapshot.update({"tools/" + n: h for n, h in inputs["tools"].items()})
+    snapshot["inputs.json"] = lab.file_sha(directory / "inputs.json")
+    checks["inputs_sha256"] = lab.sha(snapshot)
+    refresh_links(value, directory, checks=checks)
+    with pytest.raises(ValueError, match="[Tt]rusted"):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    assert visible_verify(value, directory, tmp_path).returncode != 0
+
+
+def test_explicit_projection_and_receipts_exclude_controller_bytes(packet):
+    kwargs, value, directory = packet
+    assert value["projection"]["omitted"]["scripts/controller.py"]["reason"]
+    assert "scripts/controller.py" not in value["projection"]["admitted"]
+    assert "excluded synthetic controller" not in json.dumps(value)
+    assert {p.name for p in directory.iterdir()} == proof.PROOF_FILES
+    assert "full suite" in value["runnable_scope"]["scope"]
+    assert "incomplete previews" in value["trusted_full_checks"]
+    workspace = agent.export(kwargs["attempt"], kwargs["repo"], kwargs["revision"])
+    proof.prepare(kwargs["evidence"], kwargs["attempt"], workspace,
+                  kwargs["repo"], kwargs["revision"], agent.IMAGE)
+    assert proof.inventory(kwargs["attempt"] / "inputs/review-proof") == value["proof_files"]
+    assert all(not rw for _, target, rw in agent.mounts(kwargs["attempt"], kwargs["corpus"], "review", True)
+               if target.startswith("/inputs/"))
+    assert not any("review-proof" in target for _, target, _ in
+                   agent.mounts(kwargs["attempt"], kwargs["corpus"], "implementation", False))
+
+
+@pytest.mark.parametrize("phase", ["build", "prepare"])
+def test_proof_directory_readable_by_worker_under_private_umask(packet, tmp_path, phase):
+    kwargs, value, _ = packet
+    private = tmp_path / "private-context"
+    private.mkdir(mode=0o700)
+    previous = os.umask(0o077)
+    try:
+        if phase == "build":
+            directory = private / "review-proof"
+            result = proof.build(repo=kwargs["repo"], revision=kwargs["revision"],
+                binding=value["binding"], report=value["draft_report"],
+                checks_root=tmp_path / "review-checks", proof=directory)
+        else:
+            workspace = agent.export(kwargs["attempt"], kwargs["repo"], kwargs["revision"])
+            result = proof.prepare(kwargs["evidence"], kwargs["attempt"], workspace,
+                kwargs["repo"], kwargs["revision"], agent.IMAGE)
+            directory = kwargs["attempt"] / "inputs/review-proof"
+            private = kwargs["attempt"]
+    finally:
+        os.umask(previous)
+    assert directory.stat().st_mode & 0o777 == 0o755
+    assert private.stat().st_mode & 0o077 == 0
+    assert proof.inventory(directory) == result["proof_files"]
+    assert all(path.stat().st_mode & 0o777 == 0o444 for path in directory.iterdir())
+
+
+@pytest.mark.parametrize("mutation", ["bytes", "mode", "extra", "symlink"])
+def test_export_drift_rejected(packet, mutation):
+    kwargs, value, _ = packet
+    workspace = agent.export(kwargs["attempt"], kwargs["repo"], kwargs["revision"])
+    path = workspace / "README.md"
+    if mutation == "bytes":
+        path.write_text("changed")
+    elif mutation == "mode":
+        path.chmod(0o755)
+    elif mutation == "extra":
+        (workspace / "unexpected.md").write_text("unexpected")
+    else:
+        path.unlink()
+        path.symlink_to(kwargs["development"])
+    with pytest.raises(ValueError):
+        proof.validate_projection(workspace, value["projection"])
+
+
+@pytest.mark.parametrize("field", ["revision", "tree", "image", "controller", "checks_sha256"])
+def test_identity_mismatch_rejected(packet, field):
+    kwargs, value, directory = packet
+    value["binding"][field] = "incorrect"
+    with pytest.raises(ValueError):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+
+
+@pytest.mark.parametrize("name", sorted(proof.PROOF_FILES))
+def test_every_receipt_hash_and_size_checked(packet, name):
+    kwargs, value, directory = packet
+    path = directory / name
+    path.chmod(0o644)
+    path.write_bytes(path.read_bytes() + b"tamper")
+    with pytest.raises(ValueError, match="hash/size"):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "extra", "missing"])
+def test_proof_narrow_regular_inventory(packet, kind):
+    kwargs, value, directory = packet
+    if kind == "extra":
+        (directory / "private-cases.jsonl").write_text("SYNTHETIC_HIDDEN_LABEL")
+    else:
+        path = directory / "full_pytest.stdout"
+        path.unlink()
+        if kind == "symlink":
+            path.symlink_to(kwargs["development"])
+    with pytest.raises(ValueError):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+
+
+def test_old_unexplained_packet_and_implementation_proof_refused(packet):
+    kwargs, value, directory = packet
+    old = {**value, "schema": "lab-review-evidence/v1"}
+    with pytest.raises(ValueError, match="schema"):
+        proof.validate(old, directory, revision=kwargs["revision"], image=agent.IMAGE)
+    with pytest.raises((ValueError, KeyError)):
+        proof.validate({"binding": value["binding"], "draft_report": {}}, directory,
+                       revision=kwargs["revision"], image=agent.IMAGE)
+    with pytest.raises(ValueError, match="review-only"):
+        agent.run_session(**kwargs)
+    kwargs["role"] = "review"
+    kwargs.pop("evidence")
+    with pytest.raises(ValueError, match="requires explicit"):
+        agent.run_session(**kwargs)
+
+
+def test_rehashed_manifest_forgery_rejected_before_dispatch(packet):
+    kwargs, value, _ = packet
+    value["projection"]["policy"] = "invented policy"
+    value["projection_sha256"] = lab.sha(value["projection"])
+    kwargs["evidence"].write_text(json.dumps(value))
+    workspace = agent.export(kwargs["attempt"], kwargs["repo"], kwargs["revision"])
+    with pytest.raises(ValueError, match="provenance"):
+        proof.prepare(kwargs["evidence"], kwargs["attempt"], workspace,
+                      kwargs["repo"], kwargs["revision"], agent.IMAGE)
+
+
+def test_rehashed_contradictory_cleanup_rejected(packet):
+    kwargs, value, directory = packet
+    path = directory / "full_pytest.cleanup.json"
+    data = json.loads(path.read_text())
+    data["cleanup_complete"] = False
+    path.chmod(0o644)
+    path.write_text(json.dumps(data))
+    value["proof_files"] = proof.inventory(directory)
+    with pytest.raises(ValueError, match="receipt binding"):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+
+
+@pytest.mark.parametrize("kind", ["mode", "proof", "packet"])
+def test_post_dispatch_drift_cannot_complete(packet, monkeypatch, kind):
+    kwargs, _, _ = packet
+    kwargs["role"] = "review"
+    monkeypatch.setattr(agent, "inspect", lambda name: spec_for(name, agent.mounts(
+            kwargs["attempt"], kwargs["corpus"], "review", True)))
+    def send(*args):
+        if kind == "mode":
+            (kwargs["attempt"] / "work/plugin/README.md").chmod(0o755)
+        elif kind == "proof":
+            path = kwargs["attempt"] / "inputs/review-proof/full_pytest.stdout"
+            path.chmod(0o644)
+            path.write_text("changed")
+        else:
+            path = kwargs["attempt"] / "inputs/evidence.json"
+            path.chmod(0o644)
+            path.write_text("{}")
+        return {"message": {"role": "assistant", "content": json.dumps({
+            "approved": True, "shortcuts_checked": True, "compatibility_checked": True,
+            "report_checked": True, "findings": []})}, "usage": {}}
+    monkeypatch.setattr(agent.model, "send", send)
+    with pytest.raises(ValueError):
+        agent.run_session(**kwargs)
+    assert not (kwargs["attempt"] / "private/result.json").exists()
+    assert not lab.read_json(kwargs["attempt"] / "private/status.json")["complete"]
+
+
+@pytest.mark.parametrize("kind", ["cleanup", "exit", "size", "worker"])
+def test_semantic_receipt_contradictions_fail_even_with_fresh_hashes(packet, kind):
+    kwargs, value, directory = packet
+    name = "full_pytest.cleanup.json" if kind == "cleanup" else "full_pytest.output.json"
+    path = directory / name
+    data = lab.read_json(path)
+    if kind == "cleanup":
+        data["cleanup_complete"] = False
+    elif kind == "exit":
+        data["exit_code"] = 3
+    elif kind == "size":
+        data["stored_bytes"]["stdout"] = 999
+    else:
+        data["args"][-1] = "wrong-worker"
+    path.chmod(0o644)
+    path.write_text(json.dumps(data))
+    checks_path = directory / "checks.json"
+    checks = lab.read_json(checks_path)
+    checks["checks"][0]["evidence_files"] = proof.receipt_files(directory, "full_pytest")
+    checks_path.chmod(0o644)
+    checks_path.write_text(json.dumps(checks))
+    value["binding"]["checks_sha256"] = lab.sha(checks)
+    value["proof_files"] = proof.inventory(directory)
+    with pytest.raises(ValueError):
+        proof.validate(value, directory, revision=kwargs["revision"], image=agent.IMAGE)
+
+
+def test_builder_does_not_copy_sibling_hidden_data(packet, tmp_path):
+    kwargs, value, _ = packet
+    (tmp_path / "review-checks/private-cases.jsonl").write_text("SYNTHETIC_HIDDEN_LABEL")
+    second = proof.build(repo=kwargs["repo"], revision=kwargs["revision"], binding=value["binding"],
+        report={}, checks_root=tmp_path / "review-checks", proof=tmp_path / "second-proof")
+    assert "SYNTHETIC_HIDDEN_LABEL" not in json.dumps(second)
+    assert {p.name for p in (tmp_path / "second-proof").iterdir()} == proof.PROOF_FILES
+    assert all("SYNTHETIC_HIDDEN_LABEL" not in p.read_text() for p in (tmp_path / "second-proof").iterdir())
+
+
+def test_check_failure_format_does_not_export_source_or_captured_content(tmp_path):
+    path = tmp_path / "test_synthetic.py"
+    path.write_text("def test_failure():\n    print('SYNTHETIC_CAPTURE_PRIVATE')\n"
+                    "    assert False, 'SYNTHETIC_SOURCE_PRIVATE'\n")
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "--tb=no", "--show-capture=no",
+                             "--disable-warnings", "--no-summary", "-p", "no:cacheprovider", str(path)],
+                            cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "SYNTHETIC_CAPTURE_PRIVATE" not in result.stdout + result.stderr
+    assert "SYNTHETIC_SOURCE_PRIVATE" not in result.stdout + result.stderr
+
+
+def test_declared_scope_runs_against_actual_filtered_git_export(tmp_path):
+    """Use actual source bytes, including in the immutable non-Git check export."""
+    source = Path(__file__).resolve().parents[1]
+    repo = tmp_path / "source-snapshot"
+    shutil.copytree(source, repo, ignore=shutil.ignore_patterns(
+        ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"))
+    lab.git(repo, "init", "-q")
+    lab.git(repo, "add", ".")
+    lab.git(repo, "commit", "-m", "disposable actual source snapshot")
+    revision = lab.git(repo, "rev-parse", "HEAD").decode().strip()
+    workspace = agent.export(tmp_path / "real-filtered-export", repo, revision)
+    manifest = proof.projection(repo, revision)
+    proof.validate_projection(workspace, manifest)
+    assert not (workspace / "scripts").exists()
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", proof.SCOPE],
+                            cwd=workspace, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[100%]" in result.stdout
