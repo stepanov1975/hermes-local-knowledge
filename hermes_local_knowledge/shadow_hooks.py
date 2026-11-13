@@ -11,7 +11,6 @@ import logging
 import os
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -23,6 +22,7 @@ from typing import Any
 from .config import Config, resolve_config
 from .implicit import _hook_succeeded, _usage_event_id
 from .okf import OKF_WORKER_ENV, _detached_process_kwargs, _start_worker_reaper
+from .worker_launch import hermes_command
 
 logger = logging.getLogger(__name__)
 SHADOW_WORKER_ENV = "LOCAL_KNOWLEDGE_SHADOW_WORKER"
@@ -246,8 +246,9 @@ def _spawn_worker(cfg: Config) -> bool:
 
     env = worker_env(cfg)
     process = subprocess.Popen(
-        [sys.executable, "-m", "hermes_cli.main", "local-knowledge", "routing-supervisor",
-         "--hermes-home", str(cfg.hermes_home), "--wake-ns", str(time.time_ns())],
+        hermes_command(["local-knowledge", "routing-supervisor",
+                        "--hermes-home", str(cfg.hermes_home), "--wake-ns", str(time.time_ns())],
+                       hermes_home=cfg.hermes_home),
         cwd=str(cfg.hermes_home),
         env=env,
         stdin=subprocess.DEVNULL,

@@ -8,7 +8,6 @@ import os
 import re
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -25,6 +24,7 @@ from ._frontmatter import (
     _parse_frontmatter_scalar,
 )
 from .config import Config, resolve_config
+from .worker_launch import hermes_command
 
 logger = logging.getLogger(__name__)
 
@@ -1803,15 +1803,12 @@ def _on_post_tool_call(**kwargs: Any) -> None:
 
 
 def _worker_command(cfg: Config) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "hermes_cli.main",
+    return hermes_command([
         "local-knowledge",
         "okf-worker",
         "--hermes-home",
         str(cfg.hermes_home),
-    ]
+    ], hermes_home=cfg.hermes_home)
 
 
 def _detached_process_kwargs() -> dict[str, Any]:
