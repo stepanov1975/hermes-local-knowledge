@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file.
 
 - Launch detached OKF, routing supervisor and routing workers through the matching Hermes installation's bootstrap-aware runtime command on managed hosts. Older Python/venv installations retain their existing launch path; a broken managed launcher is reported rather than silently retried with raw Python.
 - Update the release build's pinned setuptools to 84.2.1, fixing the dependency-audit failure caused by the former 84.0.0 pin.
+- Document five approved, scanner-manifest-only audit exceptions for Semgrep's pinned MCP/OpenTelemetry dependencies: the affected optional MCP/tracing paths are not used by this CI scan. Other advisories and all project/release manifests remain strict; the scanner dependencies themselves are not patched.
 
 ### Included from the beta series
 
