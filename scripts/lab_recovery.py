@@ -252,6 +252,32 @@ def session_directories(attempt: Path) -> list[Path]:
     return [attempt / "implementation", attempt / "review", *(p / "review" for p in generations)]
 
 
+def prelaunch_failure(attempt: Path) -> bool:
+    """Positive controller evidence, not absence of resource/model receipts alone."""
+    from scripts import lab_agent_model as model
+
+    private = attempt / "implementation/private"
+    if not private.is_dir():
+        return False
+    if {p.name for p in private.iterdir()} != {"session.json", "prelaunch-failure.json"}:
+        return False
+    if any((s / "private").exists() for s in session_directories(attempt)[1:]):
+        return False
+    resources = attempt / "resources"
+    if resources.exists() and any(resources.iterdir()):
+        return False
+    session = json.loads((private / "session.json").read_text())
+    binding = json.loads((attempt / "attempt.json").read_text())
+    receipt = json.loads((private / "prelaunch-failure.json").read_text())
+    return (receipt == {"schema": "lab-prelaunch-failure/v1", "stage": "mount_validation",
+                        "session": session}
+            and session.get("role") == "implementation"
+            and bool(session.get("session_id"))
+            and session.get("revision") == binding["previous_incumbent"]
+            and all(session.get(k) == v for k, v in {
+                "model": model.MODEL, "provider": model.PROVIDER, "effort": model.EFFORT}.items()))
+
+
 def session_completion(attempt: Path) -> str:
     """Never replay a possibly dispatched inference or uncertain tool operation."""
     incomplete = False

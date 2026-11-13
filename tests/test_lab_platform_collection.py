@@ -18,6 +18,7 @@ LINUX_ONLY = {
     "test_lab_benchmark.py",
     "test_lab_candidate_bounds.py",
     "test_lab_experiment.py",
+    "test_lab_initialization_recovery.py",
     "test_lab_lifecycle.py",
     "test_lab_notifications.py",
     "test_lab_process_output.py",

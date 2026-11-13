@@ -389,6 +389,9 @@ def init_campaign(campaign: Path, config: dict, *, loader: Callable[..., dict] =
         config[key] = str(Path(config[key]).resolve(strict=True))
     for repository in (Path(__file__).resolve().parents[1], Path(config["repo"])):
         require(not campaign.is_relative_to(repository), "Campaign must be outside the repository")
+    tools = Path(config["check_tools"])
+    require(not campaign.is_relative_to(tools) and not tools.is_relative_to(campaign),
+            "Campaign and check-tools must not overlap")
     validate_config(config, loader)
     revision_exists(Path(config["repo"]), config["initial_incumbent"])
     campaign.mkdir(mode=0o700)  # Never reuse a partially initialized campaign.
@@ -457,7 +460,7 @@ def candidate_commit(repo: Path, previous: str, workspace: Path, attempt: Path) 
             continue
         changes.append({"path": name, "operation": "delete" if oid is None else "modify" if old else "add"})
         if oid is None:
-            git(repo, "update-index", "--index-info", data=("0 " + "0" * 40 + "\t" + name + "\n").encode(), index=index)
+            git(repo, "update-index", "-z", "--index-info", data=("0 " + "0" * 40 + "\t" + name + "\0").encode(), index=index)
         else:
             git(repo, "update-index", "--add", "--cacheinfo", old[0] if old else "100644", oid, name, index=index)
     if not changes:
@@ -784,7 +787,8 @@ def run_under_existing_lock(campaign: Path, *, session: Callable[..., dict] | No
                     # settle_resources returns its pre-removal observations. Bind
                     # authorization to a fresh all-absent readback instead.
                     resources = recovery.inspect_resources(attempt)
-                    require(bool(resources) and all(r["state"] == "absent" for r in resources),
+                    require((bool(resources) or recovery.prelaunch_failure(attempt))
+                            and all(r["state"] == "absent" for r in resources),
                             "Recovery resource settlement unconfirmed")
                     receipt_path = attempt / "recovery-report.json"
                     receipt = {"schema": "lab-finalized-recovery/v1", "attempt_id": attempt_id,

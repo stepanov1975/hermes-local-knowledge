@@ -356,7 +356,10 @@ def settlement_evidence(attempt: Path) -> dict[str, str]:
     """Bind recovery to exact controller receipts, not a reusable success flag."""
     discovery, reads = _Budget(), _Budget()
     paths = [attempt / "attempt.json", attempt / "checkpoint.json"]
-    paths.extend(_children(attempt / "resources", discovery, 1))
+    resources = attempt / "resources"
+    _plain(resources, missing=True)
+    if resources.exists():
+        paths.extend(_children(resources, discovery, 1))
     for session in _sessions(attempt):
         private = session / "private"
         _plain(private, missing=True)
@@ -380,7 +383,7 @@ def _reconciled(attempt: Path, manifest: dict, pointer: dict, report: dict) -> d
              and receipt.get("config_sha256") == manifest["config_sha256"]
              and receipt.get("model_completion") in {"settled", "incomplete"}
              and isinstance(receipt.get("resources"), list)
-             and bool(receipt["resources"])
+             and (bool(receipt["resources"]) or recovery.prelaunch_failure(attempt))
              and all(r.get("state") == "absent" for r in receipt["resources"]),
              "recovery_receipt_invalid")
     return receipt
@@ -406,14 +409,15 @@ def _cleanup_attempt(campaign: Path, manifest: dict, pointer: dict, now: float) 
     _require(sha(config) == manifest["config_sha256"], "configuration_drift")
     repo = campaign / "repo.git"
     _plain(repo)
-    _plain(attempt / "resources")
+    resources_root = attempt / "resources"
+    _plain(resources_root, missing=True)
     has_receipt = False
-    for resource_record in _children(attempt / "resources", _Budget(), 1):
+    for resource_record in (_children(resources_root, _Budget(), 1) if resources_root.exists() else []):
         _plain(resource_record)
         has_receipt |= resource_record.suffix == ".json"
         if resource_record.suffix == ".observed":
             _require(resource_record.with_suffix(".json").is_file(), "resource_receipt_missing")
-    _require(has_receipt, "resource_receipts_missing")
+    _require(has_receipt or recovery.prelaunch_failure(attempt), "resource_receipts_missing")
     receipt_path = attempt / "retention-plan.json"
     resources = recovery.inspect_resources(attempt)
     _require(all(r.get("state") in {"absent", "stopped"} for r in resources), "resource_not_quiescent")

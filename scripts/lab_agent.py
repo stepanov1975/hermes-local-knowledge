@@ -301,7 +301,15 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
         "Inspect public contracts, make reusable plugin improvements only, run meaningful checks. "
         "A useful no-change outcome is permitted. Explain revisiting prior failed strategies. "
         "Finish with ONLY a JSON object containing: " + schema}, {"role": "user", "content": task}]
-    binds = mounts(attempt, corpus, role, evidence is not None)
+    try:
+        binds = mounts(attempt, corpus, role, evidence is not None)
+    except Exception:
+        # This validation precedes ownership helpers, worker plans and inference.
+        # A session identity alone cannot prove that those side effects never ran.
+        model.save(private / "prelaunch-failure.json", {
+            "schema": "lab-prelaunch-failure/v1", "stage": "mount_validation",
+            "session": json.loads((private / "session.json").read_text())})
+        raise
     container_id: str | None = None
     changed_owner = False
     helper_uncertain = False
