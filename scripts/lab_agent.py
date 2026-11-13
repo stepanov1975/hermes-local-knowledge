@@ -356,8 +356,10 @@ def run_session(*, attempt: Path, repo: Path, revision: str, corpus: Path,
             disk.checkpoint()
             response = model.send(messages, private / f"wire-{turn}.json")
             usages[-1] = response["usage"]
-            disk.checkpoint()
+            # Preserve a received response before honoring a pause; otherwise a
+            # known-completed wire would become permanently ambiguous on recovery.
             model.save(private / f"response-{turn}.json", response)
+            disk.checkpoint()
             message = response["message"]
             messages.append(message)
             calls = message.get("tool_calls") or []

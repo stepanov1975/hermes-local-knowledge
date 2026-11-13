@@ -212,6 +212,7 @@ def test_disk_stop_during_blocked_model_is_exact_and_preserves_usage(tmp_path, m
     from scripts import lab_disk_guard as disk
     real_cleanup = agent.cleanup
     kwargs, events = setup_session(tmp_path, monkeypatch)
+    kwargs["attempt"] = tmp_path / "implementation"
     monkeypatch.setattr(agent, "cleanup", real_cleanup)
     trigger, sampled = threading.Event(), threading.Event()
     low = [False]
@@ -237,7 +238,8 @@ def test_disk_stop_during_blocked_model_is_exact_and_preserves_usage(tmp_path, m
             assert alerts, "durable pause callback precedes worker stop"
             running["synthetic-id"] = False
         return original_run(args, **kw)
-    def send(*args):
+    def send(messages, receipt):
+        model.save(receipt, {"synthetic_wire": True})
         low[0] = True
         trigger.set()
         assert sampled.wait(5), "monitor must act before provider returns"
@@ -254,6 +256,12 @@ def test_disk_stop_during_blocked_model_is_exact_and_preserves_usage(tmp_path, m
             agent.run_session(**kwargs)
     status = json.loads((kwargs["attempt"] / "private/status.json").read_text())
     assert status["complete"] is False and status["usage"] == [{"input_tokens": 23}]
+    response = json.loads((kwargs["attempt"] / "private/response-1.json").read_text())
+    assert response["usage"] == {"input_tokens": 23}
+    assert json.loads(response["message"]["content"]) == FINAL
+    assert agent.recovery.session_completion(tmp_path) == "settled"
+    assert not list((kwargs["attempt"] / "private").glob("tool-intent-*.json"))
+    assert not (kwargs["attempt"] / "private/request-2.json").exists()
     assert status["cleanup_complete"] is (not replacement)
     assert (["docker", "rm", "-f", "synthetic-id"] in events) is (not replacement)
     assert ["docker", "rm", "-f", "unrelated-id"] not in events

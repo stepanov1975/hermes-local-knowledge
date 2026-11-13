@@ -62,6 +62,31 @@ def contextual_corpus(tmp_path: Path) -> Corpus:
     return Corpus(root, hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest())
 
 
+@pytest.mark.parametrize("namespace", ["mcp_servers", "mcp.servers"])
+@pytest.mark.parametrize("name", ["widget", "widget.with.dots"])
+def test_mcp_source_fragments_preserve_namespace_and_complete_name(
+        tmp_path: Path, namespace: str, name: str) -> None:
+    root = tmp_path / "mcp-corpus"
+    root.mkdir()
+    value = {"command": "/opt/widget/launch.sh", "args": ["--read-only"]}
+    servers = {name: value}
+    config = {"mcp_servers": servers} if namespace == "mcp_servers" else {"mcp": {"servers": servers}}
+    text = json.dumps(config)
+    (root / "config.json").write_text(text)
+    locator = f"config.json#{namespace}.{name}"
+    logical = hashlib.sha256(json.dumps(["mcp_server", "fixture", locator, ""]).encode()).hexdigest()
+    artifact = {"logical_id": logical, "id": f"mcp:{name}", "locator": locator,
+                "source": "fixture", "type": "mcp_server",
+                "content_sha256": hashlib.sha256(text.encode()).hexdigest()}
+    (root / "mapping.json").write_text(json.dumps([artifact]))
+    (root / "manifest.json").write_text(json.dumps({
+        "inputs": frozen_manifest(root), "policy": "synthetic-fixture", "settings": {}}))
+    corpus = Corpus(root, hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest())
+    actual, citation = corpus.text(artifact)
+    assert json.loads(actual) == value
+    assert citation == f"canonical-JSON-fragment:{namespace}.{name}"
+
+
 def test_explicit_and_domain_relevant_frozen_evidence(tmp_path: Path) -> None:
     c = contextual_corpus(tmp_path)
     origins = {a["id"]: a["logical_id"] for a in c.artifacts}

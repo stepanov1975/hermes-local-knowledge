@@ -236,8 +236,12 @@ class Corpus:
                 raise PreparationBlocked("Cron source fragment mismatch")
             value = matches[0]
         elif artifact["type"] == "mcp_server":
-            section, name = fragment.split(".", 1)
-            value = obj[section][name]
+            if fragment.startswith("mcp_servers."):
+                value = obj["mcp_servers"][fragment.removeprefix("mcp_servers.")]
+            elif fragment.startswith("mcp.servers."):
+                value = obj["mcp"]["servers"][fragment.removeprefix("mcp.servers.")]
+            else:
+                raise PreparationBlocked("MCP source fragment mismatch")
         else:
             raise PreparationBlocked("Unexpected frozen source fragment")
         return encoded(value).decode(), "canonical-JSON-fragment:" + fragment
