@@ -85,7 +85,7 @@ that manifest, every other `requirements*.txt` manifest (including release
 tools), and the generated project/optional-dependency audit remain strict and
 fail the job on findings. No ambient-environment audit or global ignore applies.
 
-The owning scanner is pinned to [Semgrep 1.179.0](https://pypi.org/pypi/semgrep/1.179.0/json).
+The owning scanner is pinned to [Semgrep 1.184.0](https://pypi.org/pypi/semgrep/1.184.0/json).
 Its published metadata requires `mcp==1.29.0` and the OpenTelemetry API, SDK and
 OTLP-proto-HTTP exporter at `~=1.37.0`; the SDK resolves the API to 1.37.0.
 [Semgrep 1.185.0 metadata](https://pypi.org/pypi/semgrep/1.185.0/json) retains these

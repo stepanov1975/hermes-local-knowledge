@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.5] - 2026-11-13
+
+### Changed
+
+- Permit Ruff 0.17 in the test extra and update the pinned release/security tools to pip 26.3, Semgrep 1.184.0 and zizmor 1.32.0. Runtime behavior and dependencies are unchanged; existing scanner-only audit exceptions remain scoped to the security manifest.
+
+[0.5.5]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.4...v0.5.5
+
 ## [0.5.4] - 2026-11-13
 
 ### Fixed
