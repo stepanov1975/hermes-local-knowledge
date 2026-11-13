@@ -32,7 +32,7 @@ PROJECT = "project-dependencies.txt"
 TARGETS = [*REQUIREMENTS, PROJECT]
 pytestmark = pytest.mark.skipif(
     os.name != "posix" or shutil.which("bash") is None,
-    reason="CI audit recipe requires POSIX executable shims and Bash",
+    reason="CI audit recipe requires POSIX and Bash",
 )
 
 
@@ -52,7 +52,6 @@ def _run_audit(
     bin_dir.mkdir()
     recorder = bin_dir / "pip-audit"
     recorder.write_text(
-        f"#!{sys.executable}\n"
         "import json, os, sys\n"
         "from pathlib import Path\n"
         "args = sys.argv[1:]\n"
@@ -64,16 +63,19 @@ def _run_audit(
         "remaining = set(findings.get(target, [])) - ignored\n"
         "sys.exit(1 if remaining else 0)\n"
     )
-    recorder.chmod(0o755)
     log = tmp_path / "audit-log.jsonl"
     env = {
         **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "TEST_AUDIT_PYTHON": sys.executable,
+        "TEST_AUDIT_SCRIPT": str(recorder),
         "RUNNER_TEMP": str(runner_temp),
         "AUDIT_LOG": str(log),
         "AUDIT_FINDINGS": json.dumps({vulnerable_target: advisories}),
         "LC_ALL": "C",
     }
+    # Interpret only the synthetic recorder so sealed noexec workers keep the
+    # same audit argument/fail-fast assertions without relaxing their mounts.
+    recipe = 'pip-audit() { "$TEST_AUDIT_PYTHON" "$TEST_AUDIT_SCRIPT" "$@"; }\n' + recipe
     # Match Actions' Bash error/pipe handling, in addition to the recipe's own
     # set -euo pipefail. Do not wrap the recipe in a success-masking shell.
     result = subprocess.run(
