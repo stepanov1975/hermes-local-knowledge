@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.6] - 2026-11-13
+
+### Added
+
+- Include the isolated development lab in the release's Git source: frozen corpus and benchmark preparation, native search evaluation, recoverable experiments, independent-review evidence, protected retention, and optional hourly controls with quiet notifications.
+
+### Fixed
+
+- Reconcile conclusively proven prelaunch failures without replaying model calls or treating arbitrary missing receipts as safety evidence.
+- Reject campaign/check-tools directory overlap before initialization writes and preserve literal filenames when deleting candidate Git index entries.
+- Retain already-received model responses before honoring a disk pause, keeping completed inference receipts recoverable without allowing further dispatch.
+- Read both `mcp_servers` and legacy `mcp.servers` frozen configurations, preserving complete dotted server names.
+
+### Operational notes
+
+- This tag includes all lab work merged after v0.5.5. The wheel and Python source distribution remain the standard plugin package; operate the optional lab from a Git source checkout.
+- Installing or upgrading does not start a campaign, install a schedule, enable unattended work, or deploy a lab candidate. Model-backed lab work requires explicit operation and consumes provider tokens. No new ranking gain or model-backed pilot result is claimed.
+- Plugin search behavior, defaults, and runtime dependencies are unchanged from v0.5.5.
+
+[0.5.6]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.5...v0.5.6
+
 ## [0.5.5] - 2026-11-13
 
 ### Changed
