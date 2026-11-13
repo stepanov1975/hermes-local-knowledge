@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.4] - 2026-11-13
+
+### Fixed
+
+- Launch detached OKF, routing supervisor and routing workers through the matching Hermes installation's bootstrap-aware runtime command on managed hosts. Older Python/venv installations retain their existing launch path; a broken managed launcher is reported rather than silently retried with raw Python.
+- Update the release build's pinned setuptools to 84.2.1, fixing the dependency-audit failure caused by the former 84.0.0 pin.
+
+### Included from the beta series
+
+- Off-by-default cached applicability veto for explicit learned promotions, with source freshness and scope binding. Upgrading does not enable veto or shadow mode; background preparation can consume model tokens when opted in.
+- Best-effort observer coverage diagnostics and bounded metadata-only handling of large file/skill results, without retaining arbitrary tool bodies.
+- Live evaluation progress and private failure diagnostics for operator-run evaluation commands.
+
+[0.5.4]: https://github.com/stepanov1975/hermes-local-knowledge/compare/v0.5.3...v0.5.4
+
 ## [0.5.4b2] - 2026-10-05
 
 ### Added
