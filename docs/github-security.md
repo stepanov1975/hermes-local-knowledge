@@ -75,21 +75,54 @@ Recommended settings:
 - Docker-based scanners remain pinned by digest because Dependabot does not update image references embedded in workflow shell commands. Their human-readable versions are recorded beside the digest variables in `security.yml`.
 - When updating a scanner image, verify the release tag's manifest digest with `docker buildx imagetools inspect`, run the digest-pinned image's version command, then update `security.yml` and the local-validation examples together. A scheduled updater is intentionally not required for this small repository.
 
-## Scanner-only advisory exception
+## Scanner-only audit exceptions
 
-The audit of `requirements-security.txt` alone excludes **CVE-2026-59951 /
-GHSA-84m7-p3x7-pcfv**. Semgrep 1.179.0 pins `mcp==1.29.0`; Semgrep
-1.181.0 also pins it. Forcing MCP 1.30.0 would violate the
-scanner's declared dependency contract. The [MCP advisory](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-84m7-p3x7-pcfv)
-affects unbounded sessions in **stateful Streamable HTTP servers**. This job
-runs the fixed `semgrep scan` CLI, not an MCP server; the affected transport is
-not exposed. Stdio, SSE and stateless HTTP are outside the advisory as well.
+The `Run pip-audit` step excludes exactly **five advisories, still unpatched in
+its scanner dependency graph**, only when auditing `requirements-security.txt`.
+These are non-applicability exceptions for the fixed CI invocation, not security
+updates or general approvals of the affected libraries. Every other advisory in
+that manifest, every other `requirements*.txt` manifest (including release
+tools), and the generated project/optional-dependency audit remain strict and
+fail the job on findings. No ambient-environment audit or global ignore applies.
 
-All other scanner vulnerabilities still fail, and release/other requirements
-plus project dependencies are audited without this exception. A regression
-executes the actual audit recipe with a recording executable to verify this
-scope. Remove the exception when Semgrep adopts a fixed MCP pin. This is not
-a waiver for an MCP HTTP server or a production dependency.
+The owning scanner is pinned to [Semgrep 1.179.0](https://pypi.org/pypi/semgrep/1.179.0/json).
+Its published metadata requires `mcp==1.29.0` and the OpenTelemetry API, SDK and
+OTLP-proto-HTTP exporter at `~=1.37.0`; the SDK resolves the API to 1.37.0.
+[Semgrep 1.185.0 metadata](https://pypi.org/pypi/semgrep/1.185.0/json) retains these
+constraints, so simply updating to that version does not fix the findings.
+Forcing incompatible transitive upgrades or installing with `--no-deps` is not a
+supported remediation.
+
+| Excluded advisory | Affected component and why the CI command does not reach it |
+| --- | --- |
+| [CVE-2026-59951](https://github.com/advisories/GHSA-84m7-p3x7-pcfv) | `mcp`: unbounded stateful Streamable HTTP server sessions. The scan does not start an MCP server. |
+| [CVE-2026-116684](https://github.com/advisories/GHSA-w4fh-qvv9-3v23) | `mcp`: server bearer-token audience validation. The scan does not expose an MCP authentication endpoint. |
+| [CVE-2026-116685](https://github.com/advisories/GHSA-5h93-6whr-6q8j) | `mcp`: HTTP/SSE client redirects carrying custom headers/bodies. The scan does not connect to MCP servers or use the MCP OAuth client. |
+| [CVE-2026-116686](https://github.com/advisories/GHSA-rwrf-2pqf-9j8j) | `mcp`: client tool-result validation fetching server-supplied schema references. The scan does not create an MCP client or call remote MCP tools. |
+| [CVE-2026-114603](https://github.com/advisories/GHSA-xcq7-p3pf-p88h) | `opentelemetry-api`: quadratic inbound `tracestate` parsing. The scan leaves tracing disabled (the CLI default) and does not extract untrusted propagation headers. |
+
+This assessment is limited to
+`semgrep scan --config p/ci --config p/secrets --error --metrics=off .`.
+The registry configuration downloads are not MCP client sessions. Semgrep's MCP
+entry point is separate from this scan command; the presence/import of the SDK
+does not start a server or client. The tracing argument defaults to false;
+`--metrics=off` is not itself the tracing control. Published-wheel inspection and
+an isolated scan probe supported these reachability conclusions. They do not
+establish safety for other Semgrep modes, enabled tracing, a production MCP
+service, or arbitrary use of these packages.
+
+The repository maintainers own these exceptions. On each Semgrep update,
+recheck its dependency metadata, resolve the scanner requirements, and audit
+without exclusions. Remove each exception as soon as a compatible scanner
+release resolves a patched dependency (`mcp>=1.30.0` for these four MCP
+advisories; `opentelemetry-api>=1.45.1` for the tracing advisory), or the advisory
+is withdrawn. Reassess before changing the scan invocation, enabling tracing,
+or adding MCP use; if the affected path becomes reachable or uncertain, remove
+the exception and fix the dependency or block the job rather than widening the
+waiver. Keep this table, workflow arguments, and
+`tests/test_security_workflow.py` synchronized. That regression test executes
+the actual YAML shell recipe with a recording audit executable and checks both
+argument isolation and fail-fast behavior; it is not a live vulnerability scan.
 
 ## Notes
 

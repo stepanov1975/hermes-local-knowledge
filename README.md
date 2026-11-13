@@ -58,6 +58,12 @@ Only a recent search from the same Hermes session, task, and turn is eligible. `
 
 ## Install and model-token notice
 
+### Hermes compatibility
+
+Version 0.5.4 supports Hermes v0.23.0's managed runtime: detached OKF and routing workers resolve the bootstrap-aware command from the launcher belonging to the loaded host, rather than relying on raw Python or a different `hermes` on `PATH`. The release was checked against unmodified official v0.23.0 source for native search/get registration and empty-queue startup of all three worker roles, alongside the legacy PyPI Hermes 0.19.0 test suite. The official-host check verifies loader/worker compatibility, not a fresh full host dependency installation or model-backed generation.
+
+Legacy Python/venv hosts retain their module-based worker command. A missing or broken managed launcher is reported without silently falling back to a command that cannot load that host. No Hermes core patch is required.
+
 Install and enable the directory plugin:
 
 ```bash

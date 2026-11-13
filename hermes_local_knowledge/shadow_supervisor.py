@@ -11,7 +11,6 @@ import os
 import signal
 import sqlite3
 import subprocess
-import sys
 import time
 from contextlib import closing
 from pathlib import Path
@@ -19,6 +18,7 @@ from pathlib import Path
 from . import shadow
 from .config import Config, resolve_config
 from .okf import OKF_WORKER_ENV, _detached_process_kwargs
+from .worker_launch import hermes_command
 
 MAX_SECONDS = 900
 MAX_LAUNCHES = 16
@@ -91,8 +91,8 @@ def _run(cfg: Config, deadline: float, gate: sqlite3.Connection) -> str:
             continue
         launches += 1  # Never replenish, including failed/cheap/empty batches.
         with subprocess.Popen(
-            [sys.executable, "-m", "hermes_cli.main", "local-knowledge", "routing-worker",
-             "--hermes-home", str(cfg.hermes_home)],
+            hermes_command(["local-knowledge", "routing-worker", "--hermes-home", str(cfg.hermes_home)],
+                           hermes_home=cfg.hermes_home),
             cwd=str(cfg.hermes_home), env=worker_env(cfg), close_fds=True,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **_detached_process_kwargs(),

@@ -78,7 +78,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
           cache: pip
@@ -126,14 +126,19 @@ jobs:
           # contains the security scanners and is not the project's dependency set.
           if compgen -G 'requirements*.txt' > /dev/null; then
             for requirements_file in requirements*.txt; do
-              audit_args=(--progress-spinner off -r "${requirements_file}")
+              audit_args=()
               if [[ "${requirements_file}" == "requirements-security.txt" ]]; then
-                # Semgrep pins mcp 1.29.0; this advisory affects stateful MCP HTTP
-                # servers, not the fixed `semgrep scan` command used here.
-                # GHSA-84m7-p3x7-pcfv: remove when Semgrep's MCP pin is fixed.
-                audit_args+=(--ignore-vuln CVE-2026-59951)
+                # Scanner-only non-applicability; see docs/github-security.md.
+                # These exclusions do not patch Semgrep's transitive dependencies.
+                audit_args+=(
+                  --ignore-vuln CVE-2026-59951
+                  --ignore-vuln CVE-2026-116684
+                  --ignore-vuln CVE-2026-116685
+                  --ignore-vuln CVE-2026-116686
+                  --ignore-vuln CVE-2026-114603
+                )
               fi
-              pip-audit "${audit_args[@]}"
+              pip-audit --progress-spinner off "${audit_args[@]}" -r "${requirements_file}"
             done
           fi
           if [[ -s "${RUNNER_TEMP}/project-dependencies.txt" ]]; then
